@@ -1,0 +1,3 @@
+*.parquet
+.ipynb_checkpoints/
+*manifest
