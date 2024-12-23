@@ -1,3 +1,6 @@
 *.parquet
 .ipynb_checkpoints/
 *manifest
+*.pkl
+.idea/
+.DS_Store
