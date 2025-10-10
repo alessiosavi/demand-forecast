@@ -4,3 +4,8 @@
 *.pkl
 .idea/
 .DS_Store
+*.csv
+*.db
+models/
+plotly/
+__pycache__/
