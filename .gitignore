@@ -8,4 +8,4 @@
 *.db
 models/
 plotly/
-Diagraph*
+__pycache__/
