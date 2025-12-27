@@ -14,7 +14,7 @@ Guide for contributing to and developing the demand forecasting system.
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/demand-forecast.git
+git clone https://github.com/alessiosavi/demand-forecast.git
 cd demand-forecast
 
 # Create virtual environment

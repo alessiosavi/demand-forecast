@@ -22,6 +22,7 @@ dependencies = [
     "pyyaml>=6.0",
     "joblib>=1.3",
     "dill",
+    "optuna>=3.0",            # Hyperparameter tuning
 ]
 
 [project.optional-dependencies]
@@ -32,6 +33,15 @@ dev = [
     "mypy>=1.5",
     "ruff>=0.1",
     "pre-commit>=3.4",
+]
+deploy = [
+    "onnx>=1.14",             # ONNX model export
+    "onnxruntime>=1.15",      # ONNX inference runtime
+]
+docs = [
+    "mkdocs-material>=9.4",   # Material theme for MkDocs
+    "mkdocs-minify-plugin",   # HTML minification
+    "pymdown-extensions"
 ]
 
 [project.scripts]
