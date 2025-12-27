@@ -1,0 +1,47 @@
+# Demand Forecast Configuration Example
+# Copy this file to config.yaml and customize as needed
+
+data:
+  input_path: "sample_data_small.csv"
+  resample_period: "1W"
+  max_zeros_ratio: 0.7
+  date_column: "date"
+  sku_column: "sku"
+  quantity_column: "qty"
+  store_column: "store_id"
+
+timeseries:
+  window: 52 # Lookback window in periods (weeks)
+  n_out: 16 # Forecast horizon in periods
+  test_size: 0.2 # Test set ratio
+
+model:
+  sku_emb_dim: 32
+  cat_emb_dims: 32
+  d_model: 256
+  nhead: 8
+  num_encoder_layers: 4
+  num_decoder_layers: 4
+  dim_feedforward: 2048
+  dropout: 0.3
+
+training:
+  num_epochs: 10
+  batch_size: 128
+  learning_rate: 0.00001
+  weight_decay: 0.01
+  early_stop_patience: 3
+  early_stop_min_delta: 1.0
+  num_workers: 0 # 0=single process (safer), increase for speed if no "too many files" error
+  pin_memory: true
+  flatten_loss: true
+
+output:
+  model_dir: "models"
+  cache_dir: "dataset"
+  #FIXME: use the dataset name as suffix
+  metafeatures_path: "metafeatures_minimal_small..csv"
+
+seed: 42
+device: null # Auto-detect: cpu, cuda, or mps
+log_level: "INFO"

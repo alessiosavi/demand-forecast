@@ -1,24 +1,21 @@
 import random
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
-from typing import List
 
 import numpy as np
 import torch
+import utils
 from pandas import DataFrame
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, Dataset
 from torchtnt.utils.data import CudaDataPrefetcher
-from torchtnt.utils.data.iterators import (RoundRobin, RoundRobinIterator,
-                                           StoppingMechanism)
-
-import utils
+from torchtnt.utils.data.iterators import RoundRobin, RoundRobinIterator, StoppingMechanism
 
 
 def create_time_series_data(
     series: DataFrame,
-    series_features: List[str],
-    encoded_categorical_features: List[str],
+    series_features: list[str],
+    encoded_categorical_features: list[str],
     test_size=0.2,
     window=52,
     n_out=16,
@@ -178,9 +175,7 @@ def get_data(
     )
     ds_test = RoundRobinIterator(
         individual_dataloaders=dls_test,
-        iteration_strategy=RoundRobin(
-            stopping_mechanism=StoppingMechanism.ALL_DATASETS_EXHAUSTED
-        ),
+        iteration_strategy=RoundRobin(stopping_mechanism=StoppingMechanism.ALL_DATASETS_EXHAUSTED),
     )
     utils._collect()
     return ds_train, ds_test

@@ -1,0 +1,94 @@
+version: "3.8"
+
+services:
+  # Run tests
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: pytest -v --tb=short
+    volumes:
+      - ./tests:/app/tests:ro
+      - ./demand_forecast:/app/demand_forecast:ro
+
+  # Run tests with coverage
+  test-cov:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: pytest --cov=demand_forecast --cov-report=term-missing --cov-report=html
+    volumes:
+      - ./tests:/app/tests:ro
+      - ./demand_forecast:/app/demand_forecast:ro
+      - ./htmlcov:/app/htmlcov
+
+  # Run linting
+  lint:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ruff check .
+    volumes:
+      - ./demand_forecast:/app/demand_forecast:ro
+
+  # Run type checking
+  typecheck:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: mypy demand_forecast/
+    volumes:
+      - ./demand_forecast:/app/demand_forecast:ro
+
+  # Interactive shell for development
+  dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: /bin/bash
+    stdin_open: true
+    tty: true
+    volumes:
+      - ./:/app
+      - demand-forecast-cache:/app/.cache
+
+  # Generate sample data
+  generate-data:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: demand-forecast generate-data /app/data/sample_sales.csv --products 50 --stores 10 --days 730
+    volumes:
+      - ./data:/app/data
+
+  # Train model (CPU)
+  train:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: demand-forecast train --config /app/config.yaml
+    volumes:
+      - ./data:/app/data:ro
+      - ./models:/app/models
+      - ./config.yaml:/app/config.yaml:ro
+
+  # Train model (GPU)
+  train-gpu:
+    build:
+      context: .
+      dockerfile: Dockerfile.gpu
+    command: demand-forecast train --config /app/config.yaml
+    volumes:
+      - ./data:/app/data:ro
+      - ./models:/app/models
+      - ./config.yaml:/app/config.yaml:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+volumes:
+  demand-forecast-cache:
