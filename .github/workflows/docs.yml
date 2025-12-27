@@ -9,7 +9,6 @@ on:
       - 'docs/**'
       - 'mkdocs.yml'
       - 'README.md'
-      - 'CHANGELOG.md'
       - '.github/workflows/docs.yml'
 
   # Allows you to run this workflow manually from the Actions tab
@@ -54,7 +53,7 @@ jobs:
       - name: Install MkDocs and dependencies
         run: |
           pip install --upgrade pip
-          pip install mkdocs-material mkdocs-minify-plugin
+          pip install mkdocs-material mkdocs-minify-plugin pymdown-extensions
 
       - name: Build documentation
         run: mkdocs build --strict
