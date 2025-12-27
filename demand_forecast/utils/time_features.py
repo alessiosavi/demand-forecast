@@ -12,8 +12,7 @@ def calculate_time_features(
     series: pd.DatetimeIndex,
     label: Literal["present", "future"] = "present",
     window: int = 1,
-) -> np.ndarray:
-    ...
+) -> np.ndarray: ...
 
 
 @overload
@@ -21,8 +20,7 @@ def calculate_time_features(
     series: pd.DataFrame,
     label: Literal["present", "future"] = "present",
     window: int = 1,
-) -> None:
-    ...
+) -> None: ...
 
 
 def calculate_time_features(
