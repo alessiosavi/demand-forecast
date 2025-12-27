@@ -104,9 +104,9 @@ class TestForecastPipelineEvaluate:
             pipeline.evaluate()
 
     @patch("demand_forecast.core.pipeline.create_dataloaders")
-    @patch("demand_forecast.core.pipeline.get_round_robin_iterators")
-    @patch("demand_forecast.core.pipeline.Evaluator")
-    @patch("demand_forecast.core.pipeline.init_metrics")
+    @patch("demand_forecast.data.dataloader.get_round_robin_iterators")
+    @patch("demand_forecast.core.evaluator.Evaluator")
+    @patch("demand_forecast.utils.metrics.init_metrics")
     def test_evaluate_returns_metrics(
         self,
         mock_init_metrics,
@@ -118,13 +118,24 @@ class TestForecastPipelineEvaluate:
         """Test evaluate returns dictionary of metrics."""
         pipeline = ForecastPipeline(sample_config)
         pipeline.model = MagicMock()
-        pipeline._raw_datasets = {"0": (np.array([[[1]]]), np.array([1]), np.array([[1]]))}
+        pipeline._raw_datasets = {
+            "0": (
+                np.array([[[1]]]),
+                np.array([1]),
+                np.array([[1]]),
+                np.array([[[1]]]),
+                np.array([1]),
+                np.array([[1]]),
+            )
+        }
         pipeline.categorical_encoder = MagicMock()
         pipeline.categorical_encoder.get_encoded_columns.return_value = []
         pipeline.sku_to_index = {"SKU1": 0}
 
-        # Mock dataloaders
-        mock_create_dls.return_value = ({}, {}, {"0": []}, {"0": []})
+        # Mock dataloaders - returns (train_dls, test_dls, train_dss, test_dss)
+        mock_test_dl = MagicMock()
+        mock_test_dl.__iter__ = MagicMock(return_value=iter([]))
+        mock_create_dls.return_value = ({"0": MagicMock()}, {"0": mock_test_dl}, {}, {})
         mock_rr_iterators.return_value = (iter([]), iter([]))
 
         # Mock evaluator
@@ -155,9 +166,9 @@ class TestForecastPipelineEvaluate:
         assert "correlation" in result
 
     @patch("demand_forecast.core.pipeline.create_dataloaders")
-    @patch("demand_forecast.core.pipeline.get_round_robin_iterators")
-    @patch("demand_forecast.core.pipeline.Evaluator")
-    @patch("demand_forecast.core.pipeline.init_metrics")
+    @patch("demand_forecast.data.dataloader.get_round_robin_iterators")
+    @patch("demand_forecast.core.evaluator.Evaluator")
+    @patch("demand_forecast.utils.metrics.init_metrics")
     def test_evaluate_with_plot(
         self,
         mock_init_metrics,
@@ -171,13 +182,24 @@ class TestForecastPipelineEvaluate:
         sample_config.output.model_dir = tmp_path / "models"
         pipeline = ForecastPipeline(sample_config)
         pipeline.model = MagicMock()
-        pipeline._raw_datasets = {"0": (np.array([[[1]]]), np.array([1]), np.array([[1]]))}
+        pipeline._raw_datasets = {
+            "0": (
+                np.array([[[1]]]),
+                np.array([1]),
+                np.array([[1]]),
+                np.array([[[1]]]),
+                np.array([1]),
+                np.array([[1]]),
+            )
+        }
         pipeline.categorical_encoder = MagicMock()
         pipeline.categorical_encoder.get_encoded_columns.return_value = []
         pipeline.sku_to_index = {"SKU1": 0}
 
-        # Mock dataloaders
-        mock_create_dls.return_value = ({}, {}, {"0": []}, {"0": []})
+        # Mock dataloaders - returns (train_dls, test_dls, train_dss, test_dss)
+        mock_test_dl = MagicMock()
+        mock_test_dl.__iter__ = MagicMock(return_value=iter([]))
+        mock_create_dls.return_value = ({"0": MagicMock()}, {"0": mock_test_dl}, {}, {})
         mock_rr_iterators.return_value = (iter([]), iter([]))
 
         # Mock evaluator
@@ -198,7 +220,7 @@ class TestForecastPipelineEvaluate:
         mock_init_metrics.return_value = {}
 
         plot_dir = tmp_path / "eval_plots"
-        with patch("demand_forecast.core.pipeline.plot_prediction_quality") as mock_plot:
+        with patch("demand_forecast.utils.visualization.plot_prediction_quality") as mock_plot:
             pipeline.evaluate(plot=True, plot_dir=plot_dir)
 
             # Check that plot_prediction_quality was called

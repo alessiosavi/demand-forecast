@@ -14,7 +14,7 @@ This guide walks you through training your first demand forecasting model.
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/demand-forecast.git
+git clone https://github.com/alessiosavi/demand-forecast.git
 cd demand-forecast
 
 # Create virtual environment (recommended)
@@ -40,7 +40,7 @@ If you prefer not to install the package, you can run directly using Python:
 
 ```bash
 # Clone and enter the directory
-git clone https://github.com/yourusername/demand-forecast.git
+git clone https://github.com/alessiosavi/demand-forecast.git
 cd demand-forecast
 
 # Install dependencies only
@@ -449,6 +449,79 @@ ls test_models/training_plots/
 ls test_models/evaluation/
 ls test_models/plots/
 ```
+
+## Hyperparameter Tuning
+
+Once you have a baseline model, you can use Optuna-based hyperparameter tuning to improve performance:
+
+### CLI Tuning
+
+```bash
+# Run hyperparameter tuning with 50 trials
+python demand_forecast/cli.py tune \
+    --config config.yaml \
+    --n-trials 50 \
+    --timeout 3600 \
+    --metric mae
+
+# The best parameters are saved to best_params.json
+```
+
+### Python API
+
+```python
+from demand_forecast.core.tuning import quick_tune, HyperparameterTuner, TuningConfig, SearchSpace
+
+# Quick tuning (uses default search space)
+best_params = quick_tune(
+    train_dataloader=train_dl,
+    val_dataloader=val_dl,
+    n_trials=20,
+)
+
+# Or full control with custom search space
+search_space = SearchSpace(
+    d_model=[64, 128, 256],
+    nhead=[4, 8],
+    num_encoder_layers=(1, 6),
+    dropout=(0.1, 0.5),
+    learning_rate=(1e-5, 1e-3),
+)
+
+config = TuningConfig(
+    n_trials=50,
+    timeout=3600,
+    metric="mse",
+    sampler="tpe",
+)
+
+tuner = HyperparameterTuner(config, search_space)
+best_params = tuner.tune(train_dl, val_dl)
+
+print(f"Best parameters: {best_params}")
+```
+
+## Model Types
+
+The system supports three model architectures:
+
+### Standard Model (Default)
+```bash
+python demand_forecast/cli.py train --config config.yaml --model-type standard
+```
+Classic Transformer with optional improvements (RoPE, Pre-LN, FiLM).
+
+### Advanced Model (V2)
+```bash
+python demand_forecast/cli.py train --config config.yaml --model-type advanced
+```
+Research-grade model with TFT/PatchTST features and quantile forecasting.
+
+### Lightweight Model
+```bash
+python demand_forecast/cli.py train --config config.yaml --model-type lightweight
+```
+CPU-optimized TCN model for edge deployment with ONNX export support.
 
 ## Next Steps
 

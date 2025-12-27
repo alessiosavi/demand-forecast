@@ -191,7 +191,7 @@ train_dls, test_dls, train_dss, test_dss = create_dataloaders(
 
 ### `demand_forecast.models.AdvancedDemandForecastModel`
 
-Transformer encoder-decoder for demand forecasting.
+Standard Transformer encoder-decoder for demand forecasting with optional improvements.
 
 ```python
 from demand_forecast.models import AdvancedDemandForecastModel
@@ -212,11 +212,157 @@ model = AdvancedDemandForecastModel(
     n_out=1,
     max_past_len=52,
     max_future_len=16,
+    # Optional improvements
+    use_rope=False,              # Rotary Position Embeddings
+    use_pre_layernorm=False,     # Pre-LayerNorm for stability
+    use_film_conditioning=False, # FiLM for static features
+    use_improved_head=False,     # GELU activation in output head
+    stochastic_depth_rate=0.0,   # Stochastic depth regularization
 )
 
 # Forward pass
 output = model(qty, past_time, future_time, sku, cats)
 # output: [batch_size, n_out]
+```
+
+---
+
+### `demand_forecast.models.AdvancedDemandForecastModelV2`
+
+Research-grade model combining TFT, PatchTST, and Autoformer concepts.
+
+```python
+from demand_forecast.models import AdvancedDemandForecastModelV2
+
+model = AdvancedDemandForecastModelV2(
+    sku_vocab_size=1000,
+    sku_emb_dim=32,
+    cat_features_dim={"color": 10, "size": 5},
+    cat_emb_dims=32,
+    past_time_features_dim=5,
+    future_time_features_dim=4,
+    d_model=256,
+    nhead=8,
+    num_encoder_layers=4,
+    num_decoder_layers=4,
+    dim_feedforward=2048,
+    dropout=0.3,
+    n_out=16,
+    max_past_len=52,
+    max_future_len=16,
+    # V2-specific parameters
+    use_quantiles=True,          # Probabilistic forecasting
+    num_quantiles=3,             # Number of quantile outputs (e.g., 0.1, 0.5, 0.9)
+    use_decomposition=True,      # Autoformer-style trend/seasonality separation
+    patch_len=4,                 # PatchTST patch length
+    use_vsn=True,                # Variable Selection Networks
+    use_grn=True,                # Gated Residual Networks
+)
+
+# Forward pass
+output = model(qty, past_time, future_time, sku, cats)
+# output: [batch_size, n_out] or [batch_size, n_out, num_quantiles] if use_quantiles=True
+```
+
+**Key Features:**
+- **Variable Selection Networks (VSN)**: TFT-style learnable feature importance
+- **Gated Residual Networks (GRN)**: Enhanced information flow
+- **Patch Embedding**: PatchTST-style time series tokenization
+- **Series Decomposition**: Autoformer-style trend/seasonality separation
+- **Quantile Output**: Probabilistic forecasting with uncertainty
+
+---
+
+### `demand_forecast.models.LightweightDemandModel`
+
+CPU-optimized TCN-based model for edge deployment (< 1M parameters).
+
+```python
+from demand_forecast.models import LightweightDemandModel
+
+model = LightweightDemandModel(
+    sku_vocab_size=1000,
+    sku_emb_dim=16,
+    cat_features_dim={"color": 10, "size": 5},
+    cat_emb_dims=16,
+    past_time_features_dim=5,
+    future_time_features_dim=4,
+    n_out=16,
+    tcn_channels=[32, 64, 128],  # TCN channel progression
+    tcn_kernel_size=3,           # Convolution kernel size
+    use_film=True,               # FiLM conditioning for static features
+    dropout=0.2,
+)
+
+# Forward pass
+output = model(qty, past_time, future_time, sku, cats)
+# output: [batch_size, n_out]
+
+# ONNX export
+model.export_onnx("model.onnx", example_inputs)
+
+# TorchScript export
+scripted = model.to_torchscript()
+```
+
+---
+
+### `demand_forecast.models.LightweightMixerModel`
+
+MLP-Mixer architecture for ultra-lightweight deployment (< 500K parameters).
+
+```python
+from demand_forecast.models import LightweightMixerModel
+
+model = LightweightMixerModel(
+    sku_vocab_size=1000,
+    sku_emb_dim=16,
+    cat_features_dim={"color": 10, "size": 5},
+    cat_emb_dims=16,
+    past_time_features_dim=5,
+    future_time_features_dim=4,
+    n_out=16,
+    hidden_dim=128,
+    num_mixer_layers=4,
+    dropout=0.1,
+)
+
+# Forward pass
+output = model(qty, past_time, future_time, sku, cats)
+```
+
+---
+
+### `demand_forecast.models.create_model`
+
+Factory function for creating models by type.
+
+```python
+from demand_forecast.models import create_model
+
+# Create standard model
+model = create_model(
+    model_type="standard",
+    n_clusters=5,
+    sku_vocab_size=1000,
+    # ... other kwargs
+)
+
+# Create advanced model
+model = create_model(
+    model_type="advanced",
+    n_clusters=5,
+    use_quantiles=True,
+    # ... other kwargs
+)
+
+# Create lightweight model
+model = create_model(
+    model_type="lightweight",
+    n_clusters=5,
+    tcn_channels=[32, 64],
+    # ... other kwargs
+)
 ```
 
 ---
@@ -231,7 +377,8 @@ from demand_forecast.models import ModelWrapper
 wrapper = ModelWrapper(
     n=5,  # Number of clusters
     sku_vocab_size=1000,
-    # ... same kwargs as AdvancedDemandForecastModel
+    model_type="standard",  # "standard", "advanced", or "lightweight"
+    # ... same kwargs as the selected model type
 )
 
 # Forward pass with cluster ID
@@ -242,6 +389,30 @@ model = wrapper.get_model("0")
 
 # Number of models
 print(wrapper.num_models)  # 5
+```
+
+#### Model Types
+
+| Type | Model Class | Description |
+|------|-------------|-------------|
+| `"standard"` | `AdvancedDemandForecastModel` | Transformer with optional improvements |
+| `"advanced"` | `AdvancedDemandForecastModelV2` | TFT/PatchTST research model |
+| `"lightweight"` | `LightweightDemandModel` | TCN for CPU deployment |
+
+---
+
+### `demand_forecast.models.EnsembleWrapper`
+
+Wrapper for model ensembles with prediction averaging.
+
+```python
+from demand_forecast.models import EnsembleWrapper
+
+# Create ensemble from multiple models
+ensemble = EnsembleWrapper(models=[model1, model2, model3])
+
+# Forward pass (averages predictions)
+output = ensemble(qty, past_time, future_time, sku, cats)
 ```
 
 ---
@@ -255,6 +426,90 @@ from demand_forecast.models import PositionalEncoding
 
 pos_enc = PositionalEncoding(d_model=256, max_len=1000)
 encoded = pos_enc(x)  # x: [batch, seq_len, d_model]
+```
+
+---
+
+## Model Components
+
+### `demand_forecast.models.components`
+
+Reusable building blocks for model architectures.
+
+| Component | Description |
+|-----------|-------------|
+| `RotaryPositionEmbedding` | RoPE implementation for better long-range dependencies |
+| `GatedResidualNetwork` | TFT-style GRN with optional context |
+| `VariableSelectionNetwork` | Learnable feature importance |
+| `PatchEmbedding` | PatchTST-style time series tokenization |
+| `SeriesDecomposition` | Moving average decomposition |
+| `FiLMConditioning` | Feature-wise Linear Modulation layer |
+| `StochasticDepth` | Layer dropping regularization |
+| `InterpretableMultiHeadAttention` | TFT-style interpretable attention |
+| `TemporalBlock` | Dilated causal convolution block |
+| `TemporalConvNet` | Full TCN architecture |
+
+```python
+from demand_forecast.models.components import (
+    RotaryPositionEmbedding,
+    GatedResidualNetwork,
+    VariableSelectionNetwork,
+    FiLMConditioning,
+    TemporalConvNet,
+)
+
+# RoPE
+rope = RotaryPositionEmbedding(dim=64, max_seq_len=512)
+q_rotated, k_rotated = rope(query, key)
+
+# GRN
+grn = GatedResidualNetwork(input_dim=256, hidden_dim=128, output_dim=256, dropout=0.1)
+output = grn(x, context=static_features)
+
+# VSN
+vsn = VariableSelectionNetwork(input_dim=256, num_inputs=10, hidden_dim=128)
+selected, weights = vsn(inputs)  # weights are interpretable
+
+# FiLM
+film = FiLMConditioning(feature_dim=256, condition_dim=64)
+modulated = film(features, condition)
+
+# TCN
+tcn = TemporalConvNet(num_inputs=1, num_channels=[32, 64, 128], kernel_size=3)
+output = tcn(sequence)  # [batch, channels, seq_len]
+```
+
+---
+
+## Loss Functions
+
+### `demand_forecast.models.losses`
+
+Specialized loss functions for forecasting.
+
+```python
+from demand_forecast.models.losses import (
+    CombinedForecastLoss,
+    SMAPELoss,
+    MASELoss,
+)
+
+# Combined loss: Huber + quantile + decomposition
+loss_fn = CombinedForecastLoss(
+    huber_weight=1.0,
+    quantile_weight=0.5,
+    decomposition_weight=0.1,
+    quantiles=[0.1, 0.5, 0.9],
+)
+loss = loss_fn(predictions, targets, trend=trend, seasonal=seasonal)
+
+# SMAPE loss
+smape = SMAPELoss()
+loss = smape(predictions, targets)
+
+# MASE loss
+mase = MASELoss(seasonality=52)
+loss = mase(predictions, targets, historical=past_values)
 ```
 
 ---
@@ -360,6 +615,123 @@ predictions_df = pipeline.predict(
 | `predict(confidence, plot, plot_dir, show_plots)` | Generate predictions with confidence intervals |
 | `save(path)` | Save model, scalers, and encoders |
 | `load(path)` | Load model and artifacts |
+
+---
+
+## Hyperparameter Tuning
+
+### `demand_forecast.core.tuning.HyperparameterTuner`
+
+Optuna-based hyperparameter optimization.
+
+```python
+from demand_forecast.core.tuning import HyperparameterTuner, TuningConfig, SearchSpace
+
+# Define search space
+search_space = SearchSpace(
+    d_model=[64, 128, 256],          # Categorical choices
+    nhead=[4, 8],
+    num_layers=(1, 6),               # Integer range
+    dropout=(0.1, 0.5),              # Float range
+    learning_rate=(1e-5, 1e-3),
+    batch_size=[32, 64, 128, 256],
+)
+
+# Configure tuning
+config = TuningConfig(
+    n_trials=50,
+    timeout=3600,                    # 1 hour max
+    metric="mse",                    # Optimize MSE
+    direction="minimize",
+    sampler="tpe",                   # TPE, Random, or CMA-ES
+    pruner="median",                 # Median or Hyperband
+    study_name="demand_forecast_study",
+    storage="sqlite:///optuna.db",   # For persistence
+)
+
+# Run tuning
+tuner = HyperparameterTuner(config, search_space)
+best_params = tuner.tune(train_dataloader, val_dataloader)
+
+# Access study results
+print(f"Best params: {best_params}")
+print(f"Best value: {tuner.study.best_value}")
+```
+
+---
+
+### `demand_forecast.core.tuning.quick_tune`
+
+Convenience function for quick hyperparameter tuning.
+
+```python
+from demand_forecast.core.tuning import quick_tune
+
+best_params = quick_tune(
+    train_dataloader=train_dl,
+    val_dataloader=val_dl,
+    n_trials=20,
+    timeout=1800,
+    metric="mae",
+)
+
+print(f"Best learning rate: {best_params['learning_rate']}")
+print(f"Best d_model: {best_params['d_model']}")
+```
+
+---
+
+### `demand_forecast.core.tuning.TuningConfig`
+
+Configuration dataclass for tuning parameters.
+
+```python
+from demand_forecast.core.tuning import TuningConfig
+
+config = TuningConfig(
+    n_trials=100,                    # Number of trials
+    timeout=7200,                    # Max time in seconds
+    metric="mse",                    # Metric to optimize
+    direction="minimize",            # "minimize" or "maximize"
+    sampler="tpe",                   # "tpe", "random", or "cmaes"
+    pruner="hyperband",              # "median", "hyperband", or None
+    study_name="my_study",
+    storage=None,                    # SQLite URL for persistence
+)
+```
+
+---
+
+### `demand_forecast.core.tuning.SearchSpace`
+
+Flexible search space definition.
+
+```python
+from demand_forecast.core.tuning import SearchSpace
+
+# Define search space with different parameter types
+search_space = SearchSpace(
+    # Categorical (list of choices)
+    d_model=[64, 128, 256, 512],
+    nhead=[4, 8, 16],
+
+    # Integer range (tuple)
+    num_encoder_layers=(1, 8),
+    num_decoder_layers=(1, 8),
+
+    # Float range (tuple)
+    dropout=(0.0, 0.5),
+    learning_rate=(1e-6, 1e-3),
+    weight_decay=(1e-6, 1e-2),
+
+    # Boolean
+    use_rope=[True, False],
+    use_pre_layernorm=[True, False],
+)
+
+# Access parameters
+print(search_space.get_param_names())
+```
 
 ---
 

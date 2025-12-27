@@ -39,7 +39,7 @@ Please be respectful and constructive in all interactions. We welcome contributo
 
 ```bash
 # Clone your fork
-git clone https://github.com/yourusername/demand-forecast.git
+git clone https://github.com/alessiosavi/demand-forecast.git
 cd demand-forecast
 
 # Create virtual environment

@@ -16,12 +16,17 @@ timeseries:
   # ... other time series options
 
 model:
+  model_type: "standard"
   d_model: 256
   # ... other model options
 
 training:
   num_epochs: 10
   # ... other training options
+
+tuning:
+  enabled: false
+  # ... tuning options
 
 output:
   model_dir: "models"
@@ -143,19 +148,38 @@ timeseries:
 
 ## Model Configuration
 
-### `model.sku_emb_dim`
+### `model.model_type`
+
+**Type:** `str` | **Default:** `"standard"` | **Options:** `"standard"`, `"advanced"`, `"lightweight"`
+
+Model architecture to use.
+
+| Type | Description | Use Case |
+|------|-------------|----------|
+| `standard` | Transformer encoder-decoder | General purpose, balanced performance |
+| `advanced` | TFT/PatchTST-inspired model | Research, best accuracy |
+| `lightweight` | TCN or MLP-Mixer | CPU deployment, low latency |
+
+```yaml
+model:
+  model_type: "standard"  # or "advanced" or "lightweight"
+```
+
+### Common Model Parameters
+
+#### `model.sku_emb_dim`
 
 **Type:** `int` | **Default:** `32` | **Min:** `1`
 
 Embedding dimension for SKU identifiers.
 
-### `model.cat_emb_dims`
+#### `model.cat_emb_dims`
 
 **Type:** `int` | **Default:** `32` | **Min:** `1`
 
 Embedding dimension for categorical features (color, size, etc.).
 
-### `model.d_model`
+#### `model.d_model`
 
 **Type:** `int` | **Default:** `256` | **Min:** `1`
 
@@ -168,7 +192,7 @@ model:
   # d_model: 512  # Larger/more capacity
 ```
 
-### `model.nhead`
+#### `model.nhead`
 
 **Type:** `int` | **Default:** `8` | **Min:** `1`
 
@@ -180,25 +204,25 @@ model:
   nhead: 8  # 256/8 = 32 dim per head
 ```
 
-### `model.num_encoder_layers`
+#### `model.num_encoder_layers`
 
 **Type:** `int` | **Default:** `4` | **Min:** `1`
 
 Number of Transformer encoder layers.
 
-### `model.num_decoder_layers`
+#### `model.num_decoder_layers`
 
 **Type:** `int` | **Default:** `4` | **Min:** `1`
 
 Number of Transformer decoder layers.
 
-### `model.dim_feedforward`
+#### `model.dim_feedforward`
 
 **Type:** `int` | **Default:** `2048` | **Min:** `1`
 
 Dimension of feedforward network in Transformer layers. Typically 4x `d_model`.
 
-### `model.dropout`
+#### `model.dropout`
 
 **Type:** `float` | **Default:** `0.3` | **Range:** `[0.0, 1.0)`
 
@@ -209,6 +233,184 @@ model:
   dropout: 0.3  # Standard
   # dropout: 0.1  # Less regularization (larger datasets)
   # dropout: 0.5  # More regularization (smaller datasets)
+```
+
+### Standard Model Improvements
+
+These options enhance the standard Transformer model with modern techniques.
+
+#### `model.use_rope`
+
+**Type:** `bool` | **Default:** `false`
+
+Enable Rotary Position Embeddings (RoPE) for better sequence modeling.
+
+```yaml
+model:
+  use_rope: true
+```
+
+#### `model.use_pre_layernorm`
+
+**Type:** `bool` | **Default:** `false`
+
+Use Pre-LayerNorm instead of Post-LayerNorm for improved training stability.
+
+```yaml
+model:
+  use_pre_layernorm: true
+```
+
+#### `model.use_film_conditioning`
+
+**Type:** `bool` | **Default:** `false`
+
+Enable FiLM (Feature-wise Linear Modulation) conditioning on static features.
+
+```yaml
+model:
+  use_film_conditioning: true
+```
+
+#### `model.use_improved_head`
+
+**Type:** `bool` | **Default:** `false`
+
+Use enhanced output head with GELU activation.
+
+```yaml
+model:
+  use_improved_head: true
+```
+
+#### `model.stochastic_depth_rate`
+
+**Type:** `float` | **Default:** `0.0` | **Range:** `[0.0, 1.0)`
+
+Stochastic depth drop rate for regularization. Higher values = more regularization.
+
+```yaml
+model:
+  stochastic_depth_rate: 0.1  # 10% layer drop probability
+```
+
+### Advanced Model Parameters
+
+These options are specific to `model_type: "advanced"`.
+
+#### `model.use_quantiles`
+
+**Type:** `bool` | **Default:** `false`
+
+Enable quantile output heads for probabilistic forecasting.
+
+```yaml
+model:
+  model_type: "advanced"
+  use_quantiles: true
+  num_quantiles: 3
+  quantiles: [0.1, 0.5, 0.9]  # Optional specific quantiles
+```
+
+#### `model.num_quantiles`
+
+**Type:** `int` | **Default:** `3` | **Min:** `1`
+
+Number of quantile outputs when `use_quantiles` is enabled.
+
+#### `model.quantiles`
+
+**Type:** `list[float] | null` | **Default:** `null`
+
+Specific quantile values. If null, uses evenly spaced quantiles.
+
+```yaml
+model:
+  quantiles: [0.1, 0.25, 0.5, 0.75, 0.9]
+```
+
+#### `model.use_decomposition`
+
+**Type:** `bool` | **Default:** `false`
+
+Enable Autoformer-style trend/seasonality decomposition.
+
+```yaml
+model:
+  use_decomposition: true
+  decomposition_kernel: 25
+```
+
+#### `model.decomposition_kernel`
+
+**Type:** `int` | **Default:** `25` | **Min:** `3`
+
+Kernel size for moving average decomposition.
+
+#### `model.patch_size`
+
+**Type:** `int` | **Default:** `4` | **Min:** `1`
+
+Patch size for PatchTST-style time series tokenization.
+
+```yaml
+model:
+  patch_size: 8  # Larger patches for longer sequences
+```
+
+#### `model.use_patch_embedding`
+
+**Type:** `bool` | **Default:** `true`
+
+Enable patch embedding for the advanced model.
+
+#### `model.hidden_continuous_size`
+
+**Type:** `int` | **Default:** `64` | **Min:** `1`
+
+Hidden size for continuous feature processing in VSN.
+
+### Lightweight Model Parameters
+
+These options are specific to `model_type: "lightweight"`.
+
+#### `model.lightweight_variant`
+
+**Type:** `str` | **Default:** `"tcn"` | **Options:** `"tcn"`, `"mixer"`
+
+Lightweight model architecture variant.
+
+| Variant | Description | Parameters |
+|---------|-------------|------------|
+| `tcn` | Temporal Convolutional Network | ~500K-1M |
+| `mixer` | MLP-Mixer architecture | ~200K-500K |
+
+```yaml
+model:
+  model_type: "lightweight"
+  lightweight_variant: "tcn"
+```
+
+#### `model.tcn_channels`
+
+**Type:** `list[int]` | **Default:** `[32, 64, 64]`
+
+Channel sizes for each TCN layer.
+
+```yaml
+model:
+  tcn_channels: [32, 64, 128]  # Increasing channels
+```
+
+#### `model.tcn_kernel_size`
+
+**Type:** `int` | **Default:** `3` | **Min:** `2`
+
+Convolution kernel size for TCN.
+
+```yaml
+model:
+  tcn_kernel_size: 5  # Larger receptive field
 ```
 
 ## Training Configuration
@@ -294,6 +496,134 @@ training:
   # flatten_loss: false  # Optimize per-timestep accuracy
 ```
 
+## Tuning Configuration
+
+Configuration for Optuna hyperparameter tuning.
+
+### `tuning.enabled`
+
+**Type:** `bool` | **Default:** `false`
+
+Enable hyperparameter tuning.
+
+```yaml
+tuning:
+  enabled: true
+```
+
+### `tuning.n_trials`
+
+**Type:** `int` | **Default:** `50` | **Min:** `1`
+
+Number of Optuna trials to run.
+
+```yaml
+tuning:
+  n_trials: 100  # More trials for better results
+```
+
+### `tuning.timeout`
+
+**Type:** `int | null` | **Default:** `null` | **Min:** `1`
+
+Maximum time in seconds for tuning. If null, no timeout.
+
+```yaml
+tuning:
+  timeout: 3600  # 1 hour timeout
+```
+
+### `tuning.direction`
+
+**Type:** `str` | **Default:** `"minimize"` | **Options:** `"minimize"`, `"maximize"`
+
+Optimization direction.
+
+### `tuning.metric`
+
+**Type:** `str` | **Default:** `"mse"` | **Options:** `"mse"`, `"mae"`, `"loss"`
+
+Metric to optimize.
+
+```yaml
+tuning:
+  metric: "mae"  # Optimize MAE instead of MSE
+```
+
+### `tuning.pruner`
+
+**Type:** `str` | **Default:** `"median"` | **Options:** `"median"`, `"hyperband"`, `"none"`
+
+Optuna pruner for early stopping unpromising trials.
+
+| Pruner | Description |
+|--------|-------------|
+| `median` | Prune based on median intermediate values |
+| `hyperband` | Hyperband pruning algorithm |
+| `none` | No pruning |
+
+```yaml
+tuning:
+  pruner: "hyperband"
+```
+
+### `tuning.sampler`
+
+**Type:** `str` | **Default:** `"tpe"` | **Options:** `"tpe"`, `"random"`, `"cmaes"`
+
+Optuna sampler for hyperparameter suggestions.
+
+| Sampler | Description |
+|---------|-------------|
+| `tpe` | Tree-structured Parzen Estimator (recommended) |
+| `random` | Random sampling |
+| `cmaes` | CMA-ES algorithm |
+
+```yaml
+tuning:
+  sampler: "tpe"
+```
+
+### `tuning.study_name`
+
+**Type:** `str` | **Default:** `"demand_forecast_tuning"`
+
+Name for the Optuna study (useful for persistence).
+
+### `tuning.storage`
+
+**Type:** `str | null` | **Default:** `null`
+
+SQLite database path for study persistence. Enables resuming interrupted tuning.
+
+```yaml
+tuning:
+  storage: "sqlite:///tuning.db"
+```
+
+### `tuning.n_jobs`
+
+**Type:** `int` | **Default:** `1` | **Min:** `-1`
+
+Number of parallel jobs. Use -1 for all CPU cores.
+
+```yaml
+tuning:
+  n_jobs: 4  # 4 parallel trials
+```
+
+### `tuning.epochs_per_trial`
+
+**Type:** `int` | **Default:** `5` | **Min:** `1`
+
+Number of training epochs per trial.
+
+### `tuning.early_stop_patience`
+
+**Type:** `int` | **Default:** `2` | **Min:** `1`
+
+Early stopping patience for each trial.
+
 ## Output Configuration
 
 ### `output.model_dir`
@@ -341,19 +671,17 @@ device: null    # Auto-detect
 
 Logging verbosity level.
 
-## Complete Example
+## Complete Examples
+
+### Standard Training Configuration
 
 ```yaml
-# config.yaml - Production configuration
+# config.yaml - Standard model training
 
 data:
-  input_path: "data/production_sales.parquet"
+  input_path: "data/sales.parquet"
   resample_period: "1W"
   max_zeros_ratio: 0.7
-  date_column: "transaction_date"
-  sku_column: "product_id"
-  quantity_column: "units_sold"
-  store_column: "store_code"
 
 timeseries:
   window: 52
@@ -361,34 +689,139 @@ timeseries:
   test_size: 0.15
 
 model:
-  sku_emb_dim: 64
-  cat_emb_dims: 32
+  model_type: "standard"
   d_model: 256
   nhead: 8
   num_encoder_layers: 4
   num_decoder_layers: 4
-  dim_feedforward: 1024
   dropout: 0.3
 
 training:
   num_epochs: 50
   batch_size: 128
   learning_rate: 0.00001
-  weight_decay: 0.01
   early_stop_patience: 5
-  early_stop_min_delta: 0.5
-  num_workers: 8
-  pin_memory: true
-  flatten_loss: true
 
 output:
-  model_dir: "models/production"
-  cache_dir: "cache/datasets"
-  metafeatures_path: "cache/metafeatures.csv"
+  model_dir: "models/standard"
 
 seed: 42
 device: "cuda"
 log_level: "INFO"
+```
+
+### Advanced Model with Improvements
+
+```yaml
+# config.yaml - Advanced model with all improvements
+
+data:
+  input_path: "data/sales.parquet"
+  resample_period: "1W"
+
+timeseries:
+  window: 52
+  n_out: 16
+
+model:
+  model_type: "advanced"
+  d_model: 256
+  nhead: 8
+  num_encoder_layers: 4
+  num_decoder_layers: 4
+  dropout: 0.3
+  # Advanced features
+  use_quantiles: true
+  quantiles: [0.1, 0.5, 0.9]
+  use_decomposition: true
+  patch_size: 4
+
+training:
+  num_epochs: 100
+  batch_size: 64
+  learning_rate: 0.0001
+
+output:
+  model_dir: "models/advanced"
+
+seed: 42
+device: "cuda"
+```
+
+### Lightweight Model for Deployment
+
+```yaml
+# config.yaml - Lightweight model for CPU deployment
+
+data:
+  input_path: "data/sales.parquet"
+  resample_period: "1W"
+
+timeseries:
+  window: 26  # Shorter window for faster inference
+  n_out: 8
+
+model:
+  model_type: "lightweight"
+  lightweight_variant: "tcn"
+  tcn_channels: [32, 64, 64]
+  tcn_kernel_size: 3
+  d_model: 64  # Smaller for efficiency
+  dropout: 0.2
+
+training:
+  num_epochs: 30
+  batch_size: 256
+  learning_rate: 0.001
+
+output:
+  model_dir: "models/lightweight"
+
+device: "cpu"
+```
+
+### Hyperparameter Tuning Configuration
+
+```yaml
+# config.yaml - Hyperparameter tuning setup
+
+data:
+  input_path: "data/sales.parquet"
+  resample_period: "1W"
+
+timeseries:
+  window: 52
+  n_out: 16
+
+model:
+  model_type: "standard"
+  d_model: 256  # Will be tuned
+  nhead: 8
+  dropout: 0.3  # Will be tuned
+
+training:
+  num_epochs: 10  # Override by tuning.epochs_per_trial
+  batch_size: 128
+  learning_rate: 0.00001  # Will be tuned
+
+tuning:
+  enabled: true
+  n_trials: 50
+  timeout: 7200  # 2 hours
+  metric: "mse"
+  direction: "minimize"
+  sampler: "tpe"
+  pruner: "median"
+  storage: "sqlite:///tuning_study.db"
+  n_jobs: 2
+  epochs_per_trial: 5
+  early_stop_patience: 2
+
+output:
+  model_dir: "models/tuned"
+
+seed: 42
+device: "cuda"
 ```
 
 ## Environment Variables
@@ -399,6 +832,7 @@ Configuration can be overridden with environment variables:
 export DEMAND_DATA__INPUT_PATH=/path/to/data.csv
 export DEMAND_TRAINING__NUM_EPOCHS=20
 export DEMAND_DEVICE=cuda
+export DEMAND_TUNING__ENABLED=true
 ```
 
 Pattern: `DEMAND_<SECTION>__<OPTION>`
@@ -418,6 +852,7 @@ except ValidationError as e:
 
 Common validation errors:
 
-- `input_path` must exist
 - `d_model` must be divisible by `nhead`
 - Numeric values must be in valid ranges
+- `quantiles` must be between 0 and 1
+- `model_type` must be one of: "standard", "advanced", "lightweight"

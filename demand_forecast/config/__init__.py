@@ -7,6 +7,7 @@ from demand_forecast.config.settings import (
     Settings,
     TimeSeriesConfig,
     TrainingConfig,
+    TuningConfig,
 )
 
 __all__ = [
@@ -15,5 +16,6 @@ __all__ = [
     "TimeSeriesConfig",
     "ModelConfig",
     "TrainingConfig",
+    "TuningConfig",
     "OutputConfig",
 ]

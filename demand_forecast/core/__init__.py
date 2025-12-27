@@ -50,4 +50,20 @@ def __getattr__(name: str):
         from demand_forecast.core.evaluator import ValidationResult
 
         return ValidationResult
+    elif name == "HyperparameterTuner":
+        from demand_forecast.core.tuning import HyperparameterTuner
+
+        return HyperparameterTuner
+    elif name == "TuningConfig":
+        from demand_forecast.core.tuning import TuningConfig
+
+        return TuningConfig
+    elif name == "SearchSpace":
+        from demand_forecast.core.tuning import SearchSpace
+
+        return SearchSpace
+    elif name == "quick_tune":
+        from demand_forecast.core.tuning import quick_tune
+
+        return quick_tune
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

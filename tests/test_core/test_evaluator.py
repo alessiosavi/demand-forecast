@@ -21,7 +21,8 @@ class MockModel(nn.Module):
     def forward(self, model_idx, qty, past_time, future_time, sku, cats):
         batch_size = qty.shape[0]
         n_out = future_time.shape[1]
-        return torch.full((batch_size, n_out, 1), self.output_value)
+        # Return shape (batch_size, n_out) to match target shape
+        return torch.full((batch_size, n_out), self.output_value)
 
 
 class TestValidationResult:
@@ -82,6 +83,13 @@ class TestEvaluator:
         batch_size = 4
         window = 10
         n_out = 4
+        cat_vocab_size = 5
+
+        # Create 2D categorical tensor (batch_size, vocab_size)
+        cat_indices = torch.zeros(batch_size, cat_vocab_size, dtype=torch.long)
+        for i in range(batch_size):
+            active_idx = torch.randint(0, cat_vocab_size, (1,)).item()
+            cat_indices[i, active_idx] = active_idx
 
         return {
             "qty": torch.randn(batch_size, window, 1),
@@ -90,7 +98,7 @@ class TestEvaluator:
             "sku": torch.randint(0, 10, (batch_size,)),
             "y": torch.randn(batch_size, n_out),
             "cats": {
-                "category": torch.randint(0, 5, (batch_size,)),
+                "category": cat_indices,
             },
         }
 
@@ -148,9 +156,16 @@ class TestEvaluatorValidate:
         """Create a mock round-robin dataloader."""
         batch_size = 4
         n_out = 4
+        cat_vocab_size = 5
 
         def mock_batch_generator():
             for i in range(2):  # 2 batches
+                # Create 2D categorical tensor (batch_size, vocab_size)
+                cat_indices = torch.zeros(batch_size, cat_vocab_size, dtype=torch.long)
+                for j in range(batch_size):
+                    active_idx = torch.randint(0, cat_vocab_size, (1,)).item()
+                    cat_indices[j, active_idx] = active_idx
+
                 yield {
                     "0": {
                         "qty": torch.randn(batch_size, 10, 1),
@@ -158,7 +173,7 @@ class TestEvaluatorValidate:
                         "future_time": torch.randn(batch_size, n_out, 4),
                         "sku": torch.randint(0, 10, (batch_size,)),
                         "y": torch.randn(batch_size, n_out),
-                        "cats": {"category": torch.randint(0, 5, (batch_size,))},
+                        "cats": {"category": cat_indices},
                     }
                 }
 

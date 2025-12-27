@@ -146,7 +146,7 @@ predictions.csv
 metrics.json
 sample_sales.csv
 training_data.csv
-models/
+/models/
 
 # Config with secrets
 config.yaml

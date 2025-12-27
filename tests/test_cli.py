@@ -76,8 +76,8 @@ class TestTrainCommand:
         )
         assert result.exit_code != 0
 
-    @patch("demand_forecast.cli.ForecastPipeline")
-    @patch("demand_forecast.cli.Settings")
+    @patch("demand_forecast.core.pipeline.ForecastPipeline")
+    @patch("demand_forecast.config.settings.Settings")
     def test_train_with_plot_flag(self, mock_settings, mock_pipeline, tmp_path: Path):
         """Test train command with --plot flag."""
         # Create mock config
@@ -110,8 +110,8 @@ class TestEvaluateCommand:
         result = runner.invoke(app, ["evaluate"])
         assert result.exit_code != 0
 
-    @patch("demand_forecast.cli.ForecastPipeline")
-    @patch("demand_forecast.cli.Settings")
+    @patch("demand_forecast.core.pipeline.ForecastPipeline")
+    @patch("demand_forecast.config.settings.Settings")
     def test_evaluate_saves_metrics(self, mock_settings, mock_pipeline, tmp_path: Path):
         """Test evaluate command saves metrics to file."""
         # Create mock config
@@ -162,8 +162,8 @@ class TestEvaluateCommand:
         assert "mse" in metrics
         assert "rmse" in metrics
 
-    @patch("demand_forecast.cli.ForecastPipeline")
-    @patch("demand_forecast.cli.Settings")
+    @patch("demand_forecast.core.pipeline.ForecastPipeline")
+    @patch("demand_forecast.config.settings.Settings")
     def test_evaluate_with_plot(self, mock_settings, mock_pipeline, tmp_path: Path):
         """Test evaluate command with --plot flag."""
         config_path = tmp_path / "config.yaml"
@@ -216,8 +216,8 @@ class TestPredictCommand:
         result = runner.invoke(app, ["predict"])
         assert result.exit_code != 0
 
-    @patch("demand_forecast.cli.ForecastPipeline")
-    @patch("demand_forecast.cli.Settings")
+    @patch("demand_forecast.core.pipeline.ForecastPipeline")
+    @patch("demand_forecast.config.settings.Settings")
     def test_predict_saves_csv(self, mock_settings, mock_pipeline, tmp_path: Path):
         """Test predict command saves predictions to CSV."""
         import pandas as pd
@@ -264,8 +264,8 @@ class TestPredictCommand:
         assert result.exit_code == 0
         assert output_csv.exists()
 
-    @patch("demand_forecast.cli.ForecastPipeline")
-    @patch("demand_forecast.cli.Settings")
+    @patch("demand_forecast.core.pipeline.ForecastPipeline")
+    @patch("demand_forecast.config.settings.Settings")
     def test_predict_with_confidence(self, mock_settings, mock_pipeline, tmp_path: Path):
         """Test predict command with custom confidence level."""
         import pandas as pd
@@ -312,8 +312,8 @@ class TestPredictCommand:
         call_kwargs = mock_pipeline_instance.predict.call_args
         assert call_kwargs[1]["confidence"] == 0.90
 
-    @patch("demand_forecast.cli.ForecastPipeline")
-    @patch("demand_forecast.cli.Settings")
+    @patch("demand_forecast.core.pipeline.ForecastPipeline")
+    @patch("demand_forecast.config.settings.Settings")
     def test_predict_with_plot(self, mock_settings, mock_pipeline, tmp_path: Path):
         """Test predict command with --plot flag."""
         import pandas as pd

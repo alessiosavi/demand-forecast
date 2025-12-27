@@ -164,7 +164,9 @@ Uses `torchtnt.utils.data.RoundRobinIterator` to balance sampling across cluster
 
 ### 3. Model Layer (`models/`)
 
-#### Architecture Diagram
+The model layer supports three architecture types: **Standard**, **Advanced (V2)**, and **Lightweight**.
+
+#### Standard Model Architecture (AdvancedDemandForecastModel)
 
 ```
                     ┌─────────────────────┐
@@ -187,22 +189,22 @@ Uses `torchtnt.utils.data.RoundRobinIterator` to balance sampling across cluster
                   │                                 │
                   │    ┌────────────────────────────┘
                   │    ▼
-                  │ ┌───────────────┐
-                  │ │   Past Proj   │
-                  │ │[B, L, d_model]│
-                  │ └───────────────┘
+                  │ ┌───────────────┐      ┌─────────────────┐
+                  │ │   Past Proj   │      │ Optional: FiLM  │
+                  │ │[B, L, d_model]│◄─────│  Conditioning   │
+                  │ └───────────────┘      └─────────────────┘
                   │         │
                   └────┬────┘
                        ▼
               ┌─────────────────┐
-              │ + Pos Encoding  │
+              │ + Pos Encoding  │  (or RoPE if enabled)
               └─────────────────┘
                        │
                        ▼
               ┌─────────────────┐
               │   Transformer   │
-              │     Encoder     │
-              │   (4 layers)    │
+              │     Encoder     │  + Stochastic Depth
+              │   (4 layers)    │  + Pre-LayerNorm (optional)
               └─────────────────┘
                        │
                        ▼ (memory)
@@ -214,20 +216,204 @@ Uses `torchtnt.utils.data.RoundRobinIterator` to balance sampling across cluster
                        │
                        ▼
               ┌─────────────────┐
-              │   Output Head   │
+              │   Output Head   │  (Improved: Linear→GELU→Linear)
               │   [B, n_out]    │
               └─────────────────┘
 ```
+
+**Optional Improvements:**
+- **RoPE**: Rotary Position Embeddings for better long-range modeling
+- **Pre-LayerNorm**: Improved training stability
+- **FiLM Conditioning**: Feature-wise Linear Modulation for static features
+- **Stochastic Depth**: Random layer dropping for regularization
+- **Improved Head**: GELU activation in output projection
+
+---
+
+#### Advanced Model V2 Architecture (AdvancedDemandForecastModelV2)
+
+```
+                    ┌─────────────────────┐
+                    │   Input Features    │
+                    └─────────────────────┘
+                              │
+        ┌─────────────────────┼─────────────────────┐
+        ▼                     ▼                     ▼
+┌───────────────┐    ┌───────────────┐    ┌───────────────┐
+│ SKU Embedding │    │  Cat Embeds   │    │  Past Series  │
+│   [B, d_sku]  │    │  [B, d_cat]   │    │ [B, L, 1]     │
+└───────────────┘    └───────────────┘    └───────────────┘
+        │                     │                     │
+        │                     │                     ▼
+        │                     │           ┌─────────────────┐
+        │                     │           │Series Decompose │
+        │                     │           │ (Autoformer)    │
+        │                     │           └────────┬────────┘
+        │                     │                    │
+        │                     │        ┌───────────┴───────────┐
+        │                     │        ▼                       ▼
+        │                     │   ┌─────────┐            ┌──────────┐
+        │                     │   │  Trend  │            │ Seasonal │
+        │                     │   └────┬────┘            └────┬─────┘
+        │                     │        │                      │
+        │                     │        └──────────┬───────────┘
+        │                     │                   ▼
+        │                     │          ┌───────────────┐
+        │                     │          │Patch Embedding│ (PatchTST)
+        │                     │          │  [B, P, d]    │
+        │                     │          └───────┬───────┘
+        │                     │                  │
+        └─────────────────────┴──────────────────┘
+                              │
+                              ▼
+                    ┌─────────────────────┐
+                    │ Variable Selection  │ (TFT-style VSN)
+                    │      Network        │
+                    │   + Feature Weights │
+                    └──────────┬──────────┘
+                               │
+                               ▼
+                    ┌─────────────────────┐
+                    │  Gated Residual     │ (TFT-style GRN)
+                    │     Networks        │
+                    └──────────┬──────────┘
+                               │
+                               ▼
+                    ┌─────────────────────┐
+                    │  Interpretable MHA  │
+                    │  (TFT-style)        │
+                    └──────────┬──────────┘
+                               │
+                               ▼
+                    ┌─────────────────────┐
+                    │   Quantile Heads    │ (if enabled)
+                    │ [B, n_out, Q]       │
+                    └─────────────────────┘
+```
+
+**Key Features:**
+- **Series Decomposition**: Autoformer-style trend/seasonality separation
+- **Patch Embedding**: PatchTST-style time series tokenization
+- **Variable Selection Network (VSN)**: Learnable feature importance
+- **Gated Residual Network (GRN)**: Enhanced information flow
+- **Interpretable MHA**: TFT-style attention with interpretable weights
+- **Quantile Output**: Probabilistic forecasting with uncertainty
+
+---
+
+#### Lightweight Model Architecture (LightweightDemandModel)
+
+```
+                    ┌─────────────────────┐
+                    │   Input Features    │
+                    └─────────────────────┘
+                              │
+        ┌─────────────────────┼─────────────────────┐
+        ▼                     ▼                     ▼
+┌───────────────┐    ┌───────────────┐    ┌───────────────┐
+│ SKU Embedding │    │  Cat Embeds   │    │  Past Series  │
+│   [B, d_sku]  │    │  [B, d_cat]   │    │ [B, L, 1]     │
+└───────────────┘    └───────────────┘    └───────────────┘
+        │                     │                     │
+        └─────────┬───────────┘                     │
+                  ▼                                 │
+          ┌───────────────┐                         │
+          │ FiLM Context  │                         │
+          │ [B, d_cond]   │                         │
+          └───────┬───────┘                         │
+                  │                                 │
+                  │    ┌────────────────────────────┘
+                  │    ▼
+                  │ ┌───────────────────────────────┐
+                  │ │   Temporal Convolutional Net  │
+                  │ │   (Dilated Causal Conv)       │
+                  │ │   [32] → [64] → [128]         │
+                  │ └───────────────┬───────────────┘
+                  │                 │
+                  └────────────────►│ FiLM Modulation
+                                    ▼
+                          ┌─────────────────┐
+                          │   Output Head   │
+                          │   [B, n_out]    │
+                          └─────────────────┘
+```
+
+**Key Features:**
+- **TCN Backbone**: Dilated causal convolutions for efficient sequence modeling
+- **FiLM Conditioning**: Static feature conditioning via γ and β parameters
+- **< 1M Parameters**: Suitable for CPU and edge deployment
+- **ONNX Export**: Optimized inference via ONNX runtime
+- **TorchScript**: JIT compilation support
+
+---
+
+#### MLP-Mixer Architecture (LightweightMixerModel)
+
+```
+┌─────────────────────────────────────────┐
+│              Input Patches              │
+│             [B, P, d_patch]             │
+└────────────────────┬────────────────────┘
+                     │
+         ┌───────────┴───────────┐
+         │    Mixer Block (×N)   │
+         │  ┌─────────────────┐  │
+         │  │  Token Mixing   │  │ (MLP across patches)
+         │  └────────┬────────┘  │
+         │           │           │
+         │  ┌────────┴────────┐  │
+         │  │ Channel Mixing  │  │ (MLP across features)
+         │  └─────────────────┘  │
+         └───────────┬───────────┘
+                     │
+         ┌───────────┴───────────┐
+         │      Global Pool      │
+         └───────────┬───────────┘
+                     │
+         ┌───────────┴───────────┐
+         │     Output Head       │
+         │      [B, n_out]       │
+         └───────────────────────┘
+```
+
+**Key Features:**
+- **No Attention**: Pure MLP architecture
+- **Token Mixing**: Cross-patch information exchange
+- **Channel Mixing**: Cross-feature information exchange
+- **< 500K Parameters**: Ultra-lightweight
+- **Fast Inference**: No quadratic attention complexity
+
+---
 
 #### `transformer.py` - AdvancedDemandForecastModel
 
 Key features:
 
 - **Multi-head attention** (8 heads by default)
-- **Positional encoding** for temporal information
+- **Positional encoding** for temporal information (or RoPE)
 - **Causal masking** in decoder (future can't attend to future)
 - **GELU activation** for better gradient flow
 - **Dropout regularization** (0.3 default)
+- **Optional improvements**: RoPE, Pre-LN, FiLM, Stochastic Depth
+
+#### `transformer_v2.py` - AdvancedDemandForecastModelV2
+
+Key features:
+
+- **Variable Selection Networks** for feature importance
+- **Gated Residual Networks** for information gating
+- **Patch embeddings** from PatchTST
+- **Series decomposition** from Autoformer
+- **Quantile outputs** for probabilistic forecasting
+
+#### `lightweight.py` - LightweightDemandModel / LightweightMixerModel
+
+Key features:
+
+- **TCN architecture** with dilated causal convolutions
+- **MLP-Mixer** for attention-free modeling
+- **FiLM conditioning** for static features
+- **Export utilities** for ONNX and TorchScript
 
 #### `wrapper.py` - ModelWrapper
 
@@ -235,9 +421,10 @@ Key features:
 class ModelWrapper(nn.Module):
     """Wrapper for multiple cluster-specific models."""
 
-    def __init__(self, n: int, **kwargs):
+    def __init__(self, n: int, model_type: str = "standard", **kwargs):
+        model_class = MODEL_REGISTRY[model_type]
         self.models = nn.ModuleDict({
-            f"{i}": AdvancedDemandForecastModel(**kwargs)
+            f"{i}": model_class(**kwargs)
             for i in range(n)
         })
 
@@ -245,11 +432,39 @@ class ModelWrapper(nn.Module):
         return self.models[n](qty, past_time, future_time, sku, cats)
 ```
 
+**Model Registry:**
+
+| Type | Model Class |
+|------|-------------|
+| `"standard"` | `AdvancedDemandForecastModel` |
+| `"advanced"` | `AdvancedDemandForecastModelV2` |
+| `"lightweight"` | `LightweightDemandModel` |
+
 **Design Decision:** One model per cluster because:
 
 - Different demand patterns require different parameters
 - Clustering groups similar time series
 - Improves accuracy for heterogeneous product catalogs
+
+#### `components.py` - Reusable Building Blocks
+
+| Component | Source | Purpose |
+|-----------|--------|---------|
+| `RotaryPositionEmbedding` | RoFormer | Better position encoding |
+| `GatedResidualNetwork` | TFT | Information gating |
+| `VariableSelectionNetwork` | TFT | Feature importance |
+| `PatchEmbedding` | PatchTST | Time series tokenization |
+| `SeriesDecomposition` | Autoformer | Trend/seasonal separation |
+| `FiLMConditioning` | FiLM | Static feature conditioning |
+| `TemporalConvNet` | TCN | Causal convolutions |
+
+#### `losses.py` - Loss Functions
+
+| Loss | Use Case |
+|------|----------|
+| `CombinedForecastLoss` | Multi-objective training |
+| `SMAPELoss` | Scale-independent error |
+| `MASELoss` | Comparison to naive baseline |
 
 ### 4. Training Layer (`core/`)
 
@@ -296,7 +511,74 @@ class ValidationResult:
     metrics: Dict[str, float]
 ```
 
-### 5. Inference Layer (`inference/`)
+### 5. Tuning Layer (`core/tuning.py`)
+
+Optuna-based hyperparameter optimization integrated into the training workflow.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           Hyperparameter Tuning                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐        │
+│  │  TuningConfig   │────►│  SearchSpace    │────►│ HyperparamTuner │        │
+│  │                 │     │                 │     │                 │        │
+│  │ - n_trials      │     │ - d_model       │     │ - create_study  │        │
+│  │ - timeout       │     │ - nhead         │     │ - objective_fn  │        │
+│  │ - metric        │     │ - dropout       │     │ - tune()        │        │
+│  │ - sampler       │     │ - learning_rate │     │                 │        │
+│  │ - pruner        │     │ - ...           │     │                 │        │
+│  └─────────────────┘     └─────────────────┘     └────────┬────────┘        │
+│                                                           │                  │
+│                                                           ▼                  │
+│                                                  ┌─────────────────┐        │
+│                                                  │   Optuna Study  │        │
+│                                                  │   - TPE Sampler │        │
+│                                                  │   - Median Prune│        │
+│                                                  │   - SQLite DB   │        │
+│                                                  └────────┬────────┘        │
+│                                                           │                  │
+│                                                           ▼                  │
+│                                                  ┌─────────────────┐        │
+│                                                  │  Best Params    │        │
+│                                                  └─────────────────┘        │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+Key classes:
+
+```python
+@dataclass
+class TuningConfig:
+    n_trials: int = 50
+    timeout: Optional[int] = None
+    metric: str = "mse"
+    direction: str = "minimize"
+    sampler: str = "tpe"      # tpe, random, cmaes
+    pruner: str = "median"    # median, hyperband, None
+
+@dataclass
+class SearchSpace:
+    # Supports categorical, integer range, float range
+    d_model: List[int]           # Categorical
+    num_layers: Tuple[int, int]  # Integer range
+    dropout: Tuple[float, float] # Float range
+
+class HyperparameterTuner:
+    def tune(train_dl, val_dl) -> Dict[str, Any]
+```
+
+**Design Decisions:**
+
+- **Optuna integration**: Industry-standard hyperparameter optimization
+- **TPE sampler**: Efficient Bayesian optimization
+- **Median pruner**: Early stopping for unpromising trials
+- **SQLite persistence**: Resume studies across sessions
+
+---
+
+### 6. Inference Layer (`inference/`)
 
 #### `predictor.py`
 
@@ -324,7 +606,7 @@ def calculate_confidence_intervals(
     """Calculate CI using historical residuals."""
 ```
 
-### 6. Pipeline Orchestration (`core/pipeline.py`)
+### 7. Pipeline Orchestration (`core/pipeline.py`)
 
 The `ForecastPipeline` class orchestrates the entire workflow:
 
@@ -363,7 +645,7 @@ metrics = pipeline.evaluate(plot=True, plot_dir=Path("evaluation"))
 # }
 ```
 
-### 7. Visualization Layer (`utils/visualization.py`)
+### 8. Visualization Layer (`utils/visualization.py`)
 
 Comprehensive plotting utilities for model analysis:
 
@@ -504,8 +786,11 @@ Each module uses `logger = logging.getLogger(__name__)` for namespaced logging.
 
 ## Future Architecture Considerations
 
-1. **Distributed Training**: Add PyTorch DDP support
-2. **Model Registry**: MLflow integration for versioning
-3. **Feature Store**: External feature store integration
-4. **Streaming Inference**: gRPC or async HTTP support
-5. **Model Serving**: ONNX export for optimized inference
+1. **Distributed Training**: Add PyTorch DDP support for multi-GPU training
+2. **Model Registry**: MLflow integration for experiment tracking and versioning
+3. **Feature Store**: External feature store integration (Feast, Tecton)
+4. **Streaming Inference**: gRPC or async HTTP support for real-time predictions
+5. ~~**Model Serving**: ONNX export for optimized inference~~ ✅ (Implemented in lightweight models)
+6. **AutoML Integration**: Neural Architecture Search (NAS) for automatic model design
+7. **Explainability**: SHAP values and attention visualization for interpretability
+8. **Online Learning**: Incremental model updates without full retraining
