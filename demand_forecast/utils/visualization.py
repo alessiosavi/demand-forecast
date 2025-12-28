@@ -474,13 +474,14 @@ def save_prediction_report(
         sample_df = predictions_df.head(50)
         x = range(len(sample_df))
 
+        # Calculate yerr ensuring non-negative values
+        yerr_lower = np.maximum(0, sample_df["prediction"] - sample_df["lower_bound"])
+        yerr_upper = np.maximum(0, sample_df["upper_bound"] - sample_df["prediction"])
+
         ax.errorbar(
             x,
             sample_df["prediction"],
-            yerr=[
-                sample_df["prediction"] - sample_df["lower_bound"],
-                sample_df["upper_bound"] - sample_df["prediction"],
-            ],
+            yerr=[yerr_lower, yerr_upper],
             fmt="o",
             capsize=3,
             capthick=1,

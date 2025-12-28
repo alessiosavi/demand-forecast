@@ -32,6 +32,7 @@ class DemandDataset(Dataset):
         cat_dataset: np.ndarray,
         y: np.ndarray,
         encoded_categorical_features: list[str],
+        n_out: int | None = None,
     ):
         """Initialize the dataset.
 
@@ -40,11 +41,13 @@ class DemandDataset(Dataset):
             cat_dataset: Array of categorical data, shape (N,).
             y: Array of target sequences, shape (N, n_out).
             encoded_categorical_features: List of encoded categorical column names.
+            n_out: Forecast horizon length (inferred from y if not provided).
         """
         self.raw_dataset = raw_dataset
         self.cat_dataset = cat_dataset
         self.encoded_categorical_features = encoded_categorical_features
         self.y = y
+        self.n_out = n_out if n_out is not None else y.shape[1] if len(y.shape) > 1 else 1
 
     def __len__(self) -> int:
         """Return the number of samples."""
@@ -92,9 +95,10 @@ class DemandDataset(Dataset):
             dtype=torch.float32,
         )
 
-        # Future time features (columns 6+, first 16 steps)
+        # Future time features (columns 6+, first n_out steps)
+        # Use the last n_out rows of the future time feature columns
         future_time = torch.as_tensor(
-            np.asarray([x["sequence"][:, 6:][:16] for x in batch], dtype=np.float32),
+            np.asarray([x["sequence"][-self.n_out :, 6:] for x in batch], dtype=np.float32),
             dtype=torch.float32,
         )
 
@@ -139,6 +143,7 @@ def create_time_series_data(
     test_size: float = 0.2,
     window: int = 52,
     n_out: int = 16,
+    store_column: str = "store_id",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Create time series datasets from grouped data.
 
@@ -149,6 +154,7 @@ def create_time_series_data(
         test_size: Fraction of data to use for testing.
         window: Lookback window size.
         n_out: Forecast horizon.
+        store_column: Name of the store column.
 
     Returns:
         Tuple of (train_x, train_y, train_cat, test_x, test_y, test_cat) arrays.
@@ -156,7 +162,7 @@ def create_time_series_data(
     ts_train_x, ts_train_cat, ts_train_y = [], [], []
     ts_test_x, ts_test_cat, ts_test_y = [], [], []
 
-    grouped = series.groupby(["sku_code", "store_id"])
+    grouped = series.groupby(["sku_code", store_column])
 
     def process_group(_series: pd.DataFrame, window: int, n_out: int) -> tuple[np.ndarray, ...]:
         """Process a single SKU-store group."""

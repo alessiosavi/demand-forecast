@@ -105,6 +105,8 @@ class ForecastPipeline:
             sku_column=cfg.sku_column,
             quantity_column=cfg.quantity_column,
             store_column=cfg.store_column,
+            product_id_column=cfg.product_id_column,
+            sales_qty_column=cfg.sales_qty_column,
         )
 
         # Resample to specified period
@@ -135,7 +137,11 @@ class ForecastPipeline:
         series = self._add_clustering(series)
 
         # Scale quantity by cluster
-        series = scale_by_group(series, self.scaler_manager)
+        series = scale_by_group(
+            series,
+            self.scaler_manager,
+            quantity_column=cfg.quantity_column,
+        )
 
         # Remove outliers
         series = self._remove_outliers(series)
@@ -155,11 +161,15 @@ class ForecastPipeline:
 
     def _add_clustering(self, series: pd.DataFrame) -> pd.DataFrame:
         """Add cluster assignments to series."""
+        cfg = self.settings.data
         output_cfg = self.settings.output
         cache_path = output_cfg.metafeatures_path
 
         feature_df = extract_metafeatures(
             series,
+            store_column=cfg.store_column,
+            quantity_column=cfg.quantity_column,
+            date_column=cfg.date_column,
             cache_path=cache_path if cache_path.exists() else None,
         )
 
@@ -175,14 +185,20 @@ class ForecastPipeline:
 
         feature_df["bins"] = cluster_result.kmeans.fit_predict(x)
 
-        # Merge cluster assignments
-        index = series.index
+        # Merge cluster assignments (preserve index)
+        series = series.reset_index(drop=False)
         series = series.merge(
-            feature_df[["sku_code", "store_id", "bins"]],
-            on=["sku_code", "store_id"],
-            how="inner",
+            feature_df[["sku_code", cfg.store_column, "bins"]],
+            on=["sku_code", cfg.store_column],
+            how="left",
         )
-        series.index = index
+        # Fill any missing cluster assignments with 0
+        series["bins"] = series["bins"].fillna(0).astype(int)
+        # Restore DatetimeIndex
+        if cfg.date_column in series.columns:
+            series = series.set_index(cfg.date_column)
+        elif "index" in series.columns:
+            series = series.set_index("index")
 
         return series
 
@@ -205,8 +221,19 @@ class ForecastPipeline:
         """Encode categorical features."""
         cfg = self.settings.data
 
-        categorical_columns = get_categorical_columns(series, exclude_patterns=["sku"])
-        onehot_columns = ["is_promo_day", cfg.store_column]
+        # Use configured categorical columns or auto-detect
+        if cfg.categorical_columns:
+            categorical_columns = cfg.categorical_columns
+        else:
+            categorical_columns = get_categorical_columns(series, exclude_patterns=["sku"])
+
+        # Use configured onehot columns or default to store column + is_promo_day if present
+        if cfg.onehot_columns is not None:
+            onehot_columns = cfg.onehot_columns
+        else:
+            onehot_columns = [cfg.store_column]
+            if "is_promo_day" in series.columns:
+                onehot_columns.append("is_promo_day")
 
         series = self.categorical_encoder.fit_transform(series, categorical_columns, onehot_columns)
 
@@ -230,6 +257,7 @@ class ForecastPipeline:
             [c for c in self._series.select_dtypes(np.number) if "cos" in c or "sin" in c]
         )
 
+        cfg = self.settings.data
         raw_datasets = {}
         for label, group in self._series.groupby("bins"):
             raw_datasets[label] = create_time_series_data(
@@ -239,6 +267,7 @@ class ForecastPipeline:
                 test_size=ts_cfg.test_size,
                 window=ts_cfg.window,
                 n_out=ts_cfg.n_out,
+                store_column=cfg.store_column,
             )
 
         self._raw_datasets = raw_datasets
@@ -270,7 +299,7 @@ class ForecastPipeline:
         cat_features_shapes = {col: 20 for col in encoded_features}
 
         model = ModelWrapper(
-            n=len(self._raw_datasets),
+            cluster_keys=list(self._raw_datasets.keys()),
             sku_vocab_size=len(self.sku_to_index),
             sku_emb_dim=cfg.sku_emb_dim,
             cat_features_dim=cat_features_shapes,
@@ -283,7 +312,7 @@ class ForecastPipeline:
             num_decoder_layers=cfg.num_decoder_layers,
             dim_feedforward=cfg.dim_feedforward,
             dropout=cfg.dropout,
-            n_out=1,
+            n_out=ts_cfg.n_out,
             max_past_len=ts_cfg.window,
             max_future_len=ts_cfg.n_out,
         )
