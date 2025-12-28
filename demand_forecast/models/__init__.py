@@ -33,7 +33,7 @@ from demand_forecast.models.losses import (
 # Models
 from demand_forecast.models.transformer import AdvancedDemandForecastModel
 from demand_forecast.models.transformer_v2 import AdvancedDemandForecastModelV2
-from demand_forecast.models.wrapper import ModelWrapper
+from demand_forecast.models.wrapper import MODEL_REGISTRY, ModelWrapper, create_model
 
 __all__ = [
     # Components
@@ -62,4 +62,6 @@ __all__ = [
     "LightweightDemandModel",
     "LightweightMixerModel",
     "ModelWrapper",
+    "MODEL_REGISTRY",
+    "create_model",
 ]

@@ -19,6 +19,22 @@ class DataConfig(BaseModel):
     quantity_column: str = Field("qty", description="Name of quantity column")
     store_column: str = Field("store_id", description="Name of store column")
 
+    # Column mapping for renaming (optional)
+    product_id_column: str | None = Field(
+        "product_id", description="Original product ID column name (renamed to sku_column)"
+    )
+    sales_qty_column: str | None = Field(
+        "sales_qty", description="Original sales qty column name (renamed to quantity_column)"
+    )
+
+    # Categorical encoding configuration
+    categorical_columns: list[str] | None = Field(
+        None, description="Columns to encode as categorical (auto-detected if None)"
+    )
+    onehot_columns: list[str] | None = Field(
+        None, description="Columns to encode with OneHotEncoder (subset of categorical_columns)"
+    )
+
     @field_validator("input_path")
     @classmethod
     def validate_path(cls, v: Path) -> Path:

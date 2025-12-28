@@ -123,6 +123,7 @@ def extract_metafeatures(
     sku_code_column: str = "sku_code",
     store_column: str = "store_id",
     quantity_column: str = "qty",
+    date_column: str = "date",
     cache_path: Path | None = None,
 ) -> pd.DataFrame:
     """Extract time series meta-features using TSFresh.
@@ -132,6 +133,7 @@ def extract_metafeatures(
         sku_code_column: Column with SKU codes.
         store_column: Column with store IDs.
         quantity_column: Column with quantity values.
+        date_column: Column with date/time values for sorting.
         cache_path: Optional path to cache/load features.
 
     Returns:
@@ -155,7 +157,7 @@ def extract_metafeatures(
             group.reset_index(),
             column_id=sku_code_column,
             column_value=quantity_column,
-            column_sort="date",
+            column_sort=date_column,
             disable_progressbar=True,
             default_fc_parameters=default_fc_params,
         )

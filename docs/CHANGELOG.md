@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Debug Scripts**
+  - `debug_notebook.py` - Comprehensive debug script with cell markers for Jupyter conversion
+  - `debug_quick.py` - Minimal quick test script (~1-2 minute runtime)
+  - Covers data generation, training, tuning, evaluation, and inference
+
+- **Extended DataConfig Fields** (`config/settings.py`)
+  - `product_id_column` - Source column name for product ID (renamed to sku_column)
+  - `sales_qty_column` - Source column name for sales quantity (renamed to quantity_column)
+  - `categorical_columns` - Explicit list of columns to encode (auto-detected if null)
+  - `onehot_columns` - Subset of categorical columns for OneHot encoding
+
+- **Model Factory Exports** (`models/__init__.py`)
+  - Exported `create_model()` factory function
+  - Exported `MODEL_REGISTRY` for model type lookup
+
 - **Advanced Model Architecture (V2)**
   - `AdvancedDemandForecastModelV2` - Research-grade model combining TFT, PatchTST, and Autoformer concepts
   - Variable Selection Networks (VSN) for learnable feature importance
@@ -99,6 +114,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Configuration Propagation Improvements**
+  - `extract_metafeatures()` now accepts `date_column` parameter (was hardcoded to "date")
+  - `extract_metafeatures()` now receives `store_column` from config
+  - `create_time_series_data()` now accepts `store_column` parameter
+  - Pipeline merge operations use `cfg.store_column` instead of hardcoded "store_id"
+  - Pipeline index restoration uses `cfg.date_column` instead of hardcoded "date"
+  - `_encode_categoricals()` uses config fields or auto-detects categorical columns
+
+- **Configuration Files**
+  - `config.example.yaml` - Comprehensive template with all 125+ options documented
+  - `config.yaml` - Minimal working configuration aligned with example
+
 - `training.num_workers` default changed from 4 to 0 to avoid file descriptor issues
 - Predictions DataFrame now includes `actual` column alongside predictions
 - Evaluator now accepts `plot_dir` and `epoch` parameters
@@ -109,6 +136,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added single-threading configuration in tests for stability
 
 ### Fixed
+
+- **Pipeline Bugs**
+  - `scale_by_group()` not receiving `quantity_column` parameter
+  - `load_sales_data()` not receiving `product_id_column` and `sales_qty_column` parameters
+  - Clustering merge losing DatetimeIndex (changed to `how="left"` with proper index restoration)
+  - Model wrapper creating models with consecutive keys (0,1,2,3) instead of actual bin labels
+  - Trainer creating optimizers with wrong keys (now uses `train_dataloaders.keys()`)
+  - `n_out=1` hardcoded in pipeline model creation (now uses `ts_cfg.n_out`)
+
+- **Dataset Bugs**
+  - `future_time` slicing using wrong indices (changed to `[-self.n_out:, 6:]`)
+  - Added `n_out` parameter to `DemandDataset.__init__` for correct slicing
+
+- **Visualization Bugs**
+  - `save_prediction_report()` error bar calculation could produce negative values (now uses `np.maximum(0, ...)`)
 
 - Circular import issues with lazy imports using `__getattr__`
 - `seed_worker` pickle error with DataLoader multiprocessing

@@ -100,10 +100,9 @@ class Trainer:
         if self.device is None:
             self.device = torch.device("cpu")
 
-        # Create optimizer and scheduler per cluster
-        num_clusters = len(self.train_dataloaders)
-        for i in range(num_clusters):
-            key = str(i)
+        # Create optimizer and scheduler per cluster (use actual cluster keys)
+        for cluster_key in self.train_dataloaders.keys():
+            key = str(cluster_key)
             self._optimizers[key] = optim.AdamW(
                 self.model.parameters(),
                 lr=self.learning_rate,

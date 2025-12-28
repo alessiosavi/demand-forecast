@@ -65,7 +65,8 @@ class ModelWrapper(nn.Module):
 
     def __init__(
         self,
-        n: int,
+        n: int | list[str] | None = None,
+        cluster_keys: list[str] | None = None,
         model_type: Literal[
             "standard", "advanced", "lightweight", "lightweight_mixer"
         ] = "standard",
@@ -74,7 +75,10 @@ class ModelWrapper(nn.Module):
         """Initialize model wrapper.
 
         Args:
-            n: Number of clusters/models to create.
+            n: Number of clusters/models to create (deprecated, use cluster_keys).
+            cluster_keys: List of cluster key names for creating models.
+                If provided, creates models with these exact keys.
+                If not provided, uses range(n) for backwards compatibility.
             model_type: Type of model to use for each cluster.
                 - "standard": AdvancedDemandForecastModel (original transformer)
                 - "advanced": AdvancedDemandForecastModelV2 (research-grade with TFT/PatchTST)
@@ -87,7 +91,17 @@ class ModelWrapper(nn.Module):
         self.model_type = model_type
         self._model_kwargs = kwargs
 
-        self.models = nn.ModuleDict({f"{i}": create_model(model_type, **kwargs) for i in range(n)})
+        # Determine cluster keys
+        if cluster_keys is not None:
+            keys = [str(k) for k in cluster_keys]
+        elif isinstance(n, list):
+            keys = [str(k) for k in n]
+        elif n is not None:
+            keys = [str(i) for i in range(n)]
+        else:
+            raise ValueError("Must provide either n or cluster_keys")
+
+        self.models = nn.ModuleDict({k: create_model(model_type, **kwargs) for k in keys})
 
     def forward(
         self,
