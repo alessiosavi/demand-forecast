@@ -1,9 +1,12 @@
 # Git
-.git
+.worktrees/
+.git/
 .gitignore
 
 # Python
-__pycache__
+__pycache__/
+tests/__pycache__
+*.pyc
 *.py[cod]
 *$py.class
 *.so
@@ -25,8 +28,8 @@ wheels/
 *.egg
 
 # Virtual environments
+.venv/
 .env
-.venv
 env/
 venv/
 ENV/

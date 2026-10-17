@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pandas as pd
+import pytest
 from typer.testing import CliRunner
 
 from demand_forecast.cli import app
@@ -58,6 +60,87 @@ class TestGenerateDataCommand:
 
         assert result.exit_code == 0
         assert output_file.exists()
+
+
+class TestGenerateSalesCommand:
+    """Exercise plain/gzipped catalogues and the store's exact CSV contract."""
+
+    @pytest.mark.parametrize("suffix", [".csv", ".csv.gz"])
+    def test_generate_sales(self, tmp_path, suffix):
+        products = pd.DataFrame(
+            {
+                "id": ["catalogue:001", "catalogue:002"],
+                "category": ["outerwear", "clothing"],
+                "subcategory": ["jacket", "shorts"],
+                "price": [100.0, 20.0],
+                "embedding": ["unused huge payload", "unused huge payload"],
+            }
+        )
+        product_file = tmp_path / f"products{suffix}"
+        products.to_csv(product_file, index=False)
+        output = tmp_path / "data" / "sales.csv"
+        with patch("pandas.read_csv", wraps=pd.read_csv) as read_csv:
+            result = runner.invoke(
+                app,
+                [
+                    "generate-sales",
+                    "--products",
+                    str(product_file),
+                    "--output",
+                    str(output),
+                    "--start",
+                    "2024-10-17",
+                    "--end",
+                    "2024-11-16",
+                    "--seed",
+                    "7",
+                    "--promo-share",
+                    "0",
+                    "-v",
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        assert set(read_csv.call_args.kwargs["usecols"]) == {
+            "id",
+            "price",
+            "category",
+            "subcategory",
+        }
+        sales = pd.read_csv(output)
+        assert list(sales.columns) == ["date", "product_id", "qty", "unit_price"]
+        assert sales["date"].str.fullmatch(r"\d{4}-\d{2}-\d{2}").all()
+        assert sales["date"].between("2024-10-17", "2024-11-16").all()
+        assert sales["qty"].ge(1).all()
+        expected_prices = sales["product_id"].map(products.set_index("id")["price"])
+        pd.testing.assert_series_equal(sales["unit_price"], expected_prices, check_names=False)
+        assert all(
+            len(line.rsplit(",", 1)[1].split(".")[1]) == 2
+            for line in output.read_text().splitlines()[1:]
+        )
+
+    def test_generate_sales_defaults(self, tmp_path):
+        catalogue = tmp_path / "products.csv"
+        catalogue.write_text("id,category,subcategory,price\nreal:001,clothing,shorts,25.00\n")
+        output = tmp_path / "sales.csv"
+        result = runner.invoke(
+            app, ["generate-sales", "--products", str(catalogue), "--output", str(output)]
+        )
+        assert result.exit_code == 0, result.output
+        sales = pd.read_csv(output)
+        assert sales["date"].min() == "2024-10-17"
+        assert sales["date"].max() == "2026-10-16"
+
+    @pytest.mark.parametrize("arguments", [["--start", "2026-10-17"], ["--promo-share", "1.1"]])
+    def test_invalid_generate_sales_arguments(self, tmp_path, arguments):
+        catalogue = tmp_path / "products.csv"
+        catalogue.write_text("id,category,subcategory,price\nreal:001,clothing,shorts,25.00\n")
+        output = tmp_path / "sales.csv"
+        result = runner.invoke(
+            app,
+            ["generate-sales", "--products", str(catalogue), "--output", str(output), *arguments],
+        )
+        assert result.exit_code != 0
+        assert not output.exists()
 
 
 class TestTrainCommand:

@@ -245,22 +245,27 @@ import pytest
 import pandas as pd
 import numpy as np
 
+
 @pytest.fixture
 def sample_sales_data():
     """Generate sample sales data for testing."""
     dates = pd.date_range("2020-01-01", periods=200, freq="D")
-    return pd.DataFrame({
-        "date": dates,
-        "sku": ["SKU001"] * 100 + ["SKU002"] * 100,
-        "store_id": ["store_1"] * 200,
-        "qty": np.random.randint(0, 100, 200),
-        "category": ["shoes"] * 200,
-    })
+    return pd.DataFrame(
+        {
+            "date": dates,
+            "sku": ["SKU001"] * 100 + ["SKU002"] * 100,
+            "store_id": ["store_1"] * 200,
+            "qty": np.random.randint(0, 100, 200),
+            "category": ["shoes"] * 200,
+        }
+    )
+
 
 @pytest.fixture
 def sample_config():
     """Create sample configuration for testing."""
     from demand_forecast.config import Settings, DataConfig
+
     return Settings(
         data=DataConfig(input_path=Path("test.csv")),
     )
@@ -348,6 +353,7 @@ def new_command(
 
 ```python
 from demand_forecast import configure_logging
+
 configure_logging("DEBUG")
 ```
 
@@ -361,10 +367,13 @@ demand-forecast train --config config.yaml --verbose
 
 ```python
 # Add breakpoint in code
-import pdb; pdb.set_trace()
+import pdb
+
+pdb.set_trace()
 
 # Or use debugpy for VS Code
 import debugpy
+
 debugpy.listen(5678)
 debugpy.wait_for_client()
 ```
@@ -373,6 +382,7 @@ debugpy.wait_for_client()
 
 ```python
 from memory_profiler import profile
+
 
 @profile
 def my_function():

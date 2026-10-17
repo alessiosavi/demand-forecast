@@ -268,15 +268,11 @@ from demand_forecast.models import create_model, ModelWrapper
 model = create_model(
     model_type="advanced",  # "standard", "advanced", or "lightweight"
     n_clusters=5,
-    **kwargs
+    **kwargs,
 )
 
 # Or with ModelWrapper directly
-wrapper = ModelWrapper(
-    n=5,
-    model_type="advanced",
-    **kwargs
-)
+wrapper = ModelWrapper(n=5, model_type="advanced", **kwargs)
 ```
 
 #### Hyperparameter Tuning
@@ -355,6 +351,8 @@ training:
 
 ```python
 scalers = {}  # Global dict
+
+
 def scale_data(group):
     scaler = StandardScaler()
     scaled_data = scaler.fit_transform(...)
