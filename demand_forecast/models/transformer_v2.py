@@ -257,6 +257,7 @@ class AdvancedDemandForecastModelV2(nn.Module):
         max_future_len: int = 50,
         stochastic_depth_rate: float = 0.1,
         use_patch_embedding: bool = True,
+        cont_features_dim: int = 0,
         **kwargs,
     ):
         """Initialize the advanced model.
@@ -307,7 +308,9 @@ class AdvancedDemandForecastModelV2(nn.Module):
         )
 
         # Static feature dimension
-        num_static_features = 1 + len(cat_features_dim)  # SKU + categories
+        self.cont_proj = nn.Linear(cont_features_dim, cat_emb_dims) if cont_features_dim else None
+        self.static_emb_dim = max(sku_emb_dim, cat_emb_dims)
+        num_static_features = 1 + len(cat_features_dim) + bool(cont_features_dim)
 
         # Variable Selection Network for static features
         self.static_vsn = VariableSelectionNetwork(
@@ -416,6 +419,7 @@ class AdvancedDemandForecastModelV2(nn.Module):
         self,
         sku: torch.Tensor,
         cats: dict[str, torch.Tensor],
+        cont: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Process static features through VSN.
 
@@ -428,11 +432,17 @@ class AdvancedDemandForecastModelV2(nn.Module):
         # Category embeddings (max pool over vocabulary)
         cat_emb_list = []
         for name, emb_layer in self.cat_embeddings.items():
-            cat_emb = torch.max(emb_layer(cats[name]), dim=1)[0]
+            embedded = emb_layer(cats[name])
+            cat_emb = embedded if cats[name].ndim == 1 else embedded.max(dim=1).values
             cat_emb_list.append(cat_emb)
 
-        # Pad to same dimension for VSN
-        max_dim = max(sku_emb.size(-1), cat_emb_list[0].size(-1) if cat_emb_list else 0)
+        if self.cont_proj is not None:
+            if cont is None:
+                raise ValueError("Continuous static features are required")
+            cat_emb_list.append(self.cont_proj(cont))
+
+        # Pad to the configured VSN input dimension, including category-free models.
+        max_dim = self.static_emb_dim
         sku_padded = F.pad(sku_emb, (0, max_dim - sku_emb.size(-1)))
 
         static_inputs = [sku_padded]
@@ -454,6 +464,7 @@ class AdvancedDemandForecastModelV2(nn.Module):
         sku: torch.Tensor,
         cats: dict[str, torch.Tensor],
         return_attention: bool = False,
+        cont: torch.Tensor | None = None,
         **kwargs,
     ) -> dict[str, torch.Tensor]:
         """Forward pass.
@@ -478,7 +489,7 @@ class AdvancedDemandForecastModelV2(nn.Module):
         device = qty.device
 
         # Process static features
-        static, feature_weights = self._process_static_features(sku, cats)
+        static, feature_weights = self._process_static_features(sku, cats, cont)
 
         # Process past inputs
         past_inputs = torch.cat([qty, past_time], dim=-1)

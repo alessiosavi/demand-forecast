@@ -104,6 +104,85 @@ def forecast(
 
 
 @app.command()
+def benchmark(
+    config: Path = typer.Option(..., "--config", exists=True, dir_okay=False),
+    products: Path = typer.Option(..., "--products", exists=True, dir_okay=False),
+    sales: Path = typer.Option(..., "--sales", exists=True, dir_okay=False),
+    out_dir: Path = typer.Option(..., "--out-dir"),
+    models: str = typer.Option("standard,advanced,lightweight_tcn,lightweight_mixer", "--models"),
+    device: str | None = typer.Option(None, "--device", help="cpu or cuda"),
+    trials: int | None = typer.Option(None, "--trials", min=0),
+    timeout: int | None = typer.Option(None, "--timeout", min=1),
+    max_epochs: int | None = typer.Option(
+        None, "--max-epochs", min=1, help="Cap selection and trial epochs"
+    ),
+    budget_seconds: float | None = typer.Option(
+        None, "--budget-seconds", min=0.001, help="Full budget for EACH model"
+    ),
+    max_products: int | None = typer.Option(None, "--max-products", min=1),
+    seed: int | None = typer.Option(None, "--seed", min=0),
+    holdout_from: str | None = typer.Option(None, "--holdout-from"),
+    k: int | None = typer.Option(None, "--k", min=1),
+    expect_origins: str | None = typer.Option(None, "--expect-origins", metavar="HOLDOUT,FUTURE"),
+    compare_only: bool = typer.Option(
+        False,
+        "--compare-only",
+        help="Rebuild reports from existing CSVs without training; repeat original options",
+    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+):
+    """Compare four neural families and two baselines on the same data with equal caps."""
+    from datetime import date
+
+    from demand_forecast.config.settings import Settings
+    from demand_forecast.core.benchmark import run_benchmark
+
+    configure_logging("DEBUG" if verbose else "INFO")
+    try:
+        settings = Settings.from_yaml(config)
+        if device not in (None, "cpu", "cuda"):
+            raise ValueError("--device must be cpu or cuda")
+        settings.data.products_path = products
+        settings.data.input_path = sales
+        settings.device = device or settings.device
+        if seed is not None:
+            settings.seed = seed
+        if k is not None:
+            settings.data.k = k
+        if holdout_from:
+            settings.timeseries.holdout_from = date.fromisoformat(holdout_from)
+        if trials is not None:
+            settings.tuning.n_trials = trials
+        if timeout is not None:
+            settings.tuning.timeout = timeout
+        if max_epochs is not None:
+            settings.training.num_epochs = max_epochs
+            settings.tuning.epochs_per_trial = min(settings.tuning.epochs_per_trial, max_epochs)
+        if budget_seconds is not None:
+            settings.budget_seconds = budget_seconds
+        expected = None
+        if expect_origins is not None:
+            try:
+                holdout, future = expect_origins.split(",")
+                expected = (date.fromisoformat(holdout), date.fromisoformat(future))
+            except ValueError as exc:
+                raise ValueError("--expect-origins requires HOLDOUT,FUTURE as ISO dates") from exc
+        report = run_benchmark(
+            settings,
+            out_dir,
+            models=tuple(name.strip() for name in models.split(",")),
+            max_products=max_products,
+            expect_origins=expected,
+            compare_only=compare_only,
+        )
+        typer.echo(f"Comparison saved to {out_dir / 'benchmark.md'}")
+        if any(r["status"] != "ok" for r in report["results"].values()):
+            typer.echo("Some models failed or are incomplete; see benchmark.json.", err=True)
+    except (ValueError, FileNotFoundError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
+@app.command()
 def train(
     config: Path = typer.Option(..., "--config", "-c", help="Path to YAML configuration file"),
     data_path: Path | None = typer.Option(

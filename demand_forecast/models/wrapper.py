@@ -68,7 +68,7 @@ class ModelWrapper(nn.Module):
         n: int | list[str] | None = None,
         cluster_keys: list[str] | None = None,
         model_type: Literal[
-            "standard", "advanced", "lightweight", "lightweight_mixer"
+            "standard", "advanced", "lightweight", "lightweight_tcn", "lightweight_mixer"
         ] = "standard",
         **kwargs,
     ):

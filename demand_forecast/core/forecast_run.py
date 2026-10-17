@@ -6,6 +6,7 @@ import logging
 import os
 import subprocess
 import time
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -23,8 +24,11 @@ from sklearn.preprocessing import MinMaxScaler  # noqa: E402
 from torch.utils.data import ConcatDataset, DataLoader  # noqa: E402
 
 from demand_forecast.core.pipeline import ForecastPipeline  # noqa: E402
+from demand_forecast.core.trainer import move_batch  # noqa: E402
 from demand_forecast.core.tuning import HyperparameterTuner, SearchSpace, TuningConfig  # noqa: E402
 from demand_forecast.data.feature_engineering import extract_metafeatures  # noqa: E402
+from demand_forecast.models.losses import point_forecast  # noqa: E402
+from demand_forecast.models.wrapper import MODEL_REGISTRY  # noqa: E402
 from demand_forecast.utils.device import describe_device  # noqa: E402
 from demand_forecast.utils.metrics import wape  # noqa: E402
 from demand_forecast.utils.visualization import (  # noqa: E402
@@ -126,6 +130,81 @@ def sha256(path):
     return digest.hexdigest()
 
 
+def forecast_provenance(pipeline, budget_seconds, max_products=None):
+    """Comparable inputs and protocol, captured before tuning mutates settings."""
+    settings = pipeline.settings
+    data = settings.data.model_dump(mode="json")
+    for key in ("input_path", "products_path"):
+        data.pop(key)
+    val, holdout, future = pipeline.cutoffs()
+    return {
+        "inputs_sha256": {
+            "products": sha256(settings.data.products_path),
+            "sales": sha256(settings.data.input_path),
+        },
+        "product_ids": sorted(pipeline.products[settings.data.product_key_column].tolist()),
+        "validation_from": val.date().isoformat(),
+        "holdout_from": holdout.date().isoformat(),
+        "origin_future": future.date().isoformat(),
+        "seed": settings.seed,
+        "protocol": {
+            "version": 1,
+            "data": data,
+            "timeseries": settings.timeseries.model_dump(mode="json"),
+            "training": settings.training.model_dump(mode="json"),
+            "tuning": settings.tuning.model_dump(mode="json"),
+            "budget_seconds": budget_seconds,
+            "max_products": max_products,
+            "point_loss": "MSE on standardized weekly targets",
+            "selection": "validation only; fresh refit for best_epoch before holdout",
+            "caps": "equal caps; actual completed work may differ",
+        },
+    }
+
+
+def network_latency(pipeline, origin):
+    """Time only warmed forward passes on 512 fixed holdout inputs on the device."""
+    cluster, _, loader = next(pipeline.forecast_batches(origin, batch_size=512))
+    batch = next(iter(loader))
+    n = len(batch["qty"])
+    indices = torch.arange(512) % n
+    batch = {
+        k: {name: tensor[indices] for name, tensor in value.items()}
+        if isinstance(value, dict)
+        else value[indices]
+        for k, value in batch.items()
+        if k != "y"
+    }
+    batch = move_batch(batch, pipeline.device)
+    pipeline.model.eval()
+
+    def synchronize():
+        if pipeline.device.type == "cuda":
+            torch.cuda.synchronize(pipeline.device)
+
+    with torch.no_grad():
+        for _ in range(5):
+            point_forecast(pipeline.model(cluster, **batch))
+        synchronize()
+        started = time.perf_counter()
+        for _ in range(20):
+            point_forecast(pipeline.model(cluster, **batch))
+        synchronize()
+        latency_ms = 1000 * (time.perf_counter() - started) / 20
+    return {
+        "network_latency_ms": latency_ms,
+        "network_latency_protocol": {
+            "device": str(pipeline.device),
+            "batch_size": 512,
+            "unique_inputs": n,
+            "cluster": cluster,
+            "small_batch_policy": "repeat sorted inputs cyclically to 512",
+            "warmup_passes": 5,
+            "timed_passes": 20,
+        },
+    }
+
+
 def diagnostic_clustering(pipeline, holdout, out_dir):
     cfg = pipeline.settings.data
     history = pipeline._weekly.loc[pipeline._weekly.index < holdout].copy()
@@ -221,15 +300,14 @@ def run_forecast(
     budget_seconds=None,
     expect_origins=None,
     preprocess_only=False,
+    measure_latency=False,
     started=None,
 ):
     started = time.monotonic() if started is None else started
     started_at = datetime.now(timezone.utc).isoformat()
-    deadline = started + (settings.budget_seconds if budget_seconds is None else budget_seconds)
-    if settings.model.model_type != "standard":
-        raise ValueError(
-            "forecast supports model.model_type='standard' only; V2/lightweight are not wired to static codes"
-        )
+    budget_seconds = settings.budget_seconds if budget_seconds is None else budget_seconds
+    deadline = started + budget_seconds
+    requested_settings = settings.model_dump(mode="json")
     if settings.timeseries.n_out != 16:
         raise ValueError("Store forecasts require n_out=16 (the contract horizon)")
     if not settings.data.products_path:
@@ -261,6 +339,7 @@ def run_forecast(
                 f"Forecast origins differ: derived {holdout_from.date()},{origin_future.date()}; "
                 f"expected {','.join(str(origin.date()) for origin in expected)}"
             )
+    provenance = forecast_provenance(pipeline, budget_seconds, max_products)
     diagnostic_clustering(pipeline, holdout_from, out_dir)
     pipeline.fit_preprocessing(val_from)
     pipeline.create_datasets(validation_origin=val_from)
@@ -283,8 +362,9 @@ def run_forecast(
         return result
     train_loaders, val_loaders, _, _ = pipeline.dataloaders()
     cfg = settings.tuning
+    model_type = pipeline.resolved_model_type()
     tuner = HyperparameterTuner(
-        "standard",
+        model_type,
         pooled_loader(train_loaders, settings.training.batch_size, True, settings.seed),
         pooled_loader(val_loaders, settings.training.batch_size, False, settings.seed),
         pipeline.model_kwargs(),
@@ -292,7 +372,7 @@ def run_forecast(
             **{k: v for k, v in cfg.model_dump().items() if k in TuningConfig.__dataclass_fields__},
             seed=settings.seed,
         ),
-        search_space=SearchSpace.hackathon(),
+        search_space=SearchSpace.hackathon(model_type),
         device=pipeline.device,
         num_epochs_per_trial=cfg.epochs_per_trial,
         early_stop_patience=cfg.early_stop_patience,
@@ -302,8 +382,11 @@ def run_forecast(
             for k in ("learning_rate", "weight_decay", "batch_size")
         },
     )
+    training_started = time.monotonic()
     resolved = tuner.tune(n_trials=cfg.n_trials if cfg.enabled else 0, show_progress_bar=False)
     for key, value in resolved.items():
+        if key == "kernel_size":
+            settings.model.tcn_kernel_size = value
         if key in type(settings.model).model_fields:
             setattr(settings.model, key, value)
         if key in ("learning_rate", "weight_decay", "batch_size"):
@@ -311,6 +394,7 @@ def run_forecast(
     pipeline._set_seeds(settings.seed)
     pipeline.build_model()
     selection = pipeline.train(plot=True, plot_dir=out_dir / "plots", deadline=deadline)
+    train_seconds = time.monotonic() - training_started
     plot_training_history(
         selection.history["train_loss"],
         selection.history["val_loss"],
@@ -319,13 +403,18 @@ def run_forecast(
     )
     best_epoch = selection.best_epoch
     ids = pipeline.products[settings.data.product_key_column].tolist()
+    inference_started = time.monotonic()
     validation = pipeline.forecast(val_from)
+    forecast_pipeline_seconds = time.monotonic() - inference_started
     validate_forecast_contract(validation, ids, val_from)
     validation.to_csv(
         out_dir / "artifacts/validation_predictions.csv", index=False, float_format="%.2f"
     )
+    validation.to_csv(out_dir / "validation_predictions.csv", index=False, float_format="%.2f")
     _, validation_score, validation_baseline = score_forecast(
-        pipeline, pd.read_csv(out_dir / "artifacts/validation_predictions.csv"), val_from
+        pipeline,
+        pd.read_csv(out_dir / "artifacts/validation_predictions.csv", dtype={"product_id": str}),
+        val_from,
     )
     logger.info(
         "Validation WAPE (percent): wape_validation=%s wape_validation_naive_last8=%s",
@@ -335,12 +424,17 @@ def run_forecast(
     # Fresh scalers, encoders, embeddings and weights. Never fit on holdout quantities.
     pipeline.fit_preprocessing(holdout_from)
     pipeline.create_datasets(refit=True)
+    training_started = time.monotonic()
     pipeline._set_seeds(settings.seed)
     pipeline.build_model()
     settings.training.num_epochs = best_epoch
     refit = pipeline.train(deadline=deadline, scheduler_epochs=selection.num_epochs)
+    train_seconds += time.monotonic() - training_started
+    inference_started = time.monotonic()
     holdout = pipeline.forecast(holdout_from)
     future = pipeline.forecast(origin_future)
+    forecast_pipeline_seconds += time.monotonic() - inference_started
+    latency = network_latency(pipeline, holdout_from) if measure_latency else {}
     for frame, origin, filename in (
         (holdout, holdout_from, "holdout_predictions.csv"),
         (future, origin_future, "forecasts.csv"),
@@ -348,7 +442,7 @@ def run_forecast(
         validate_forecast_contract(frame, ids, origin)
         frame.to_csv(out_dir / filename, index=False, float_format="%.2f")
     # Score the rounded file itself once, aligned by product and week.
-    holdout = pd.read_csv(out_dir / "holdout_predictions.csv")
+    holdout = pd.read_csv(out_dir / "holdout_predictions.csv", dtype={"product_id": str})
     cfg_data = settings.data
     scored, score, baseline = score_forecast(pipeline, holdout, holdout_from)
     actual = scored.actual.to_numpy().reshape(len(ids), 16)
@@ -370,12 +464,55 @@ def run_forecast(
     )
     forecast_examples(pipeline, holdout, future, out_dir)
     notes = [tuner.fallback_reason] if tuner.fallback_reason else []
+    if model_type == "advanced":
+        notes.append("Point MSE only; auxiliary quantile/decomposition output heads are untrained")
+    if model_type == "lightweight_mixer":
+        notes.append("Mixer architecture does not consume future_time features")
     tuning_plots(tuner, out_dir / "plots", notes)
     tuner.get_study_dataframe().to_csv(out_dir / "artifacts/optuna_trials.csv", index=False)
     pipeline.save(out_dir / "artifacts/model.pt")
     commit, source_dirty = package_source_identity()
+    trials = tuner.study.get_trials()
+    trial_counts = {
+        name: sum(trial.state == state for trial in trials)
+        for name, state in (
+            ("completed", optuna.trial.TrialState.COMPLETE),
+            ("pruned", optuna.trial.TrialState.PRUNED),
+            ("failed", optuna.trial.TrialState.FAIL),
+        )
+    }
+    complete = len(refit.history["train_loss"]) == best_epoch and trial_counts["completed"] >= 1
     result = {
-        "model": "AdvancedDemandForecastModel " + json.dumps(resolved, sort_keys=True),
+        **provenance,
+        **latency,
+        "status": "ok" if complete else "incomplete",
+        "model_type": model_type,
+        "model": MODEL_REGISTRY[model_type].__name__ + " " + json.dumps(resolved, sort_keys=True),
+        "n_parameters": sum(p.numel() for p in pipeline.model.parameters()),
+        "requested_settings": requested_settings,
+        "resolved_settings": settings.model_dump(mode="json"),
+        "search_space": asdict(tuner.search_space),
+        "history": selection.history,
+        "trial_values": [t.value for t in trials if t.state == optuna.trial.TrialState.COMPLETE],
+        "trial_counts": trial_counts,
+        "trial_stop_reasons": [
+            {
+                "number": t.number,
+                "state": t.state.name,
+                "reason": t.user_attrs.get("stop_reason"),
+                "error": t.user_attrs.get("error"),
+            }
+            for t in trials
+        ],
+        "stop_reasons": {
+            "tuning": tuner.stop_reason,
+            "selection": selection.stop_reason,
+            "refit": refit.stop_reason,
+        },
+        "train_seconds": train_seconds,
+        "inference_seconds": forecast_pipeline_seconds,
+        "forecast_pipeline_seconds": forecast_pipeline_seconds,
+        "forecast_pipeline_timing": "whole-pipeline: pandas prep + batching + transfer + inverse scaling",
         "wape_validation": validation_score,
         "wape_validation_naive_last8": validation_baseline,
         "wape_holdout": score,

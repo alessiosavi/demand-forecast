@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 from tqdm.auto import tqdm
 
-from demand_forecast.models.losses import compute_loss
+from demand_forecast.models.losses import compute_loss, point_forecast
 from demand_forecast.utils.visualization import (
     plot_prediction_quality,
     plot_validation_results,
@@ -106,6 +106,7 @@ class Evaluator:
 
                 extra = {"cont": batch["cont"]} if "cont" in batch else {}
                 outputs = self.model(model_idx, qty, past_time, future_time, sku, cats, **extra)
+                outputs = point_forecast(outputs)
                 loss, flatten_outputs, flatten_targets = compute_loss(
                     outputs, targets, self.criterion, self.flatten_loss
                 )

@@ -444,3 +444,40 @@ ROCm uses the same `torch.cuda` code path: pass `--device cuda`. The run metadat
 reports `rocm` when `torch.version.hip` is set. GPU validation for this run is
 scoped to CUDA only and is performed separately from the local CPU checks;
 ROCm hardware validation is pending. There is no ROCm Docker image.
+
+## Benchmark
+
+Train all four families on the **same generated sales file and seed**, with equal per-model
+caps, then compare them with last-eight-week mean and seasonal-naive (exactly 52 weeks earlier):
+
+```bash
+demand-forecast benchmark --config configs/benchmark-w26.yaml \
+  --products products.csv.gz --sales sales.csv --out-dir benchmark \
+  --models standard,advanced,lightweight_tcn,lightweight_mixer --device cuda \
+  --expect-origins 2026-06-22,2026-10-12 --seed 42 --budget-seconds 2700
+```
+
+Run training on the GPU host. For a smoke run add `--max-products 40 --trials 1 --max-epochs 1`
+and use a separate output directory. `--max-epochs` caps both selection and trial epochs here.
+Repeat the original command with `--compare-only` to rebuild the report without training.
+Inputs, product sets, origins, seed and protocol must match; relocated input paths are allowed
+only when their hashes match. Use a new empty output directory for each training run.
+
+Outputs: `benchmark.json`, `benchmark.md` (performance table), eight comparison plots under
+`plots/`, and full model artifacts under `models/<name>/`, including `run.json`,
+`validation_predictions.csv`, `holdout_predictions.csv`, `forecasts.csv` and saved models.
+`benchmark_request.json` freezes settings, search spaces and example products before training.
+Rankings use **validation WAPE only**; holdout is reported, never used for selection. Incomplete
+refits, zero completed tuning trials and failures are visible and excluded from ranking.
+All scores are recomputed from aligned CSVs in original units; zero-demand groups have null scores.
+
+Every family uses point MSE on standardized targets and the same learning-rate, dropout and
+weight-decay ranges. Capacity choices are transformer width 64/128, TCN width 32/64 (depth 3),
+or Mixer hidden width 64/128. V2's auxiliary quantile/decomposition output heads are untrained;
+Mixer does not use future calendar features. Equal caps do not imply equal completed work.
+The standard constructor settings match `hackathon-w26.yaml`; freeze this config before the GPU
+run and do not tune it using the previously observed standard holdout score.
+
+Timing separates training (tuning + selection + refit), whole forecast pipeline (pandas preparation,
+batching, transfer and inverse scaling), and network latency (5 warmups, mean of 20 synchronized
+forward passes on 512 fixed holdout inputs, cycled for smaller catalogues, with device recorded).

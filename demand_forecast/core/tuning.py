@@ -22,9 +22,7 @@ except ImportError:
     OPTUNA_AVAILABLE = False
     Trial = Any  # type: ignore
 
-from demand_forecast.models import (
-    CombinedForecastLoss,
-)
+from demand_forecast.models.losses import point_forecast
 from demand_forecast.models.wrapper import create_model
 
 logger = logging.getLogger(__name__)
@@ -102,15 +100,26 @@ class SearchSpace:
     tcn_channels_width: tuple[int, int] | None = (16, 128)
     tcn_kernel_size: list[int] | None = field(default_factory=lambda: [3, 5, 7])
 
+    tcn_width_choices: list[int] | None = None
+    hidden_dim_choices: list[int] | None = None
+
     @classmethod
-    def hackathon(cls):
+    def hackathon(cls, model_type="standard"):
         """Only four searched fields; all remaining settings come from the base config."""
         from dataclasses import fields
 
+        capacity = {
+            "standard": ("d_model_choices", [64, 128]),
+            "advanced": ("d_model_choices", [64, 128]),
+            "lightweight": ("tcn_width_choices", [32, 64]),
+            "lightweight_tcn": ("tcn_width_choices", [32, 64]),
+            "lightweight_mixer": ("hidden_dim_choices", [64, 128]),
+        }
+        knob, choices = capacity[model_type]
         return cls(
             **{
                 **{f.name: None for f in fields(cls)},
-                "d_model_choices": [64, 128],
+                knob: choices,
                 "learning_rate": (1e-4, 3e-3),
                 "dropout": (0.05, 0.3),
                 "weight_decay": (1e-5, 1e-2),
@@ -187,33 +196,34 @@ def suggest_hyperparameters(
     """
     params: dict[str, Any] = {}
 
-    heads = search_space.nhead or [fixed_nhead]
-    choices = search_space.d_model_choices
-    if choices is None and search_space.d_model is not None:
-        low, high = search_space.d_model
-        choices = list(range(low, high + 1))
-    if choices is not None:
-        choices = [d for d in choices if all(d % head == 0 for head in heads)]
-        if not choices:
-            raise ValueError("No d_model choice is divisible by configured attention heads")
-        params["d_model"] = trial.suggest_categorical("d_model", choices)
-    if search_space.nhead is not None:
-        params["nhead"] = trial.suggest_categorical("nhead", search_space.nhead)
+    if model_type in ("standard", "advanced"):
+        heads = search_space.nhead or [fixed_nhead]
+        choices = search_space.d_model_choices
+        if choices is None and search_space.d_model is not None:
+            low, high = search_space.d_model
+            choices = list(range(low, high + 1))
+        if choices is not None:
+            choices = [d for d in choices if all(d % head == 0 for head in heads)]
+            if not choices:
+                raise ValueError("No d_model choice is divisible by configured attention heads")
+            params["d_model"] = trial.suggest_categorical("d_model", choices)
+        if search_space.nhead is not None:
+            params["nhead"] = trial.suggest_categorical("nhead", search_space.nhead)
 
-    if search_space.num_encoder_layers is not None:
-        params["num_encoder_layers"] = trial.suggest_int(
-            "num_encoder_layers", *search_space.num_encoder_layers
-        )
+        if search_space.num_encoder_layers is not None:
+            params["num_encoder_layers"] = trial.suggest_int(
+                "num_encoder_layers", *search_space.num_encoder_layers
+            )
 
-    if search_space.num_decoder_layers is not None:
-        params["num_decoder_layers"] = trial.suggest_int(
-            "num_decoder_layers", *search_space.num_decoder_layers
-        )
+        if search_space.num_decoder_layers is not None:
+            params["num_decoder_layers"] = trial.suggest_int(
+                "num_decoder_layers", *search_space.num_decoder_layers
+            )
 
-    if search_space.dim_feedforward is not None:
-        params["dim_feedforward"] = trial.suggest_int(
-            "dim_feedforward", *search_space.dim_feedforward, step=64
-        )
+        if search_space.dim_feedforward is not None:
+            params["dim_feedforward"] = trial.suggest_int(
+                "dim_feedforward", *search_space.dim_feedforward, step=64
+            )
 
     if search_space.dropout is not None:
         params["dropout"] = trial.suggest_float("dropout", *search_space.dropout)
@@ -275,7 +285,10 @@ def suggest_hyperparameters(
             )
 
     elif model_type in ("lightweight", "lightweight_tcn"):
-        if (
+        if search_space.tcn_width_choices is not None:
+            width = trial.suggest_categorical("tcn_width", search_space.tcn_width_choices)
+            params["tcn_channels"] = [width * (2**i) for i in range(3)]
+        elif (
             search_space.tcn_channels_depth is not None
             and search_space.tcn_channels_width is not None
         ):
@@ -285,6 +298,12 @@ def suggest_hyperparameters(
         if search_space.tcn_kernel_size is not None:
             params["kernel_size"] = trial.suggest_categorical(
                 "tcn_kernel_size", search_space.tcn_kernel_size
+            )
+
+    elif model_type == "lightweight_mixer":
+        if search_space.hidden_dim_choices is not None:
+            params["hidden_dim"] = trial.suggest_categorical(
+                "hidden_dim", search_space.hidden_dim_choices
             )
 
     return params
@@ -352,6 +371,7 @@ class HyperparameterTuner:
         }
         self.resolved_params = {**base_model_kwargs, **self.base_training_params}
         self.fallback_reason = None
+        self.stop_reason = "trial_cap"
 
         self.study: optuna.Study | None = None
         self.best_model: nn.Module | None = None
@@ -376,8 +396,10 @@ class HyperparameterTuner:
                     training_params[key] = params.pop(key)
 
             model_params.update(params)
-            if model_params.get("d_model", 1) % model_params.get("nhead", 1):
-                raise optuna.TrialPruned("d_model is not divisible by nhead")
+            if self.model_type in ("standard", "advanced") and model_params.get(
+                "d_model", 1
+            ) % model_params.get("nhead", 1):
+                raise ValueError("d_model is not divisible by nhead")
             train_loader = self.train_dataloader
             if training_params["batch_size"] != train_loader.batch_size:
                 train_loader = DataLoader(
@@ -394,18 +416,18 @@ class HyperparameterTuner:
                 model = model.to(self.device)
             except Exception as e:
                 logger.warning(f"Failed to create model with params {model_params}: {e}")
-                raise optuna.TrialPruned()
+                trial.set_user_attr("error", str(e))
+                trial.set_user_attr("stop_reason", "construction_error")
+                raise
 
             # Setup training
             lr = training_params.get("learning_rate", 1e-4)
             wd = training_params.get("weight_decay", 1e-2)
             optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
 
-            # Use appropriate loss
-            if self.model_type == "advanced":
-                criterion = CombinedForecastLoss()
-            else:
-                criterion = nn.MSELoss()
+            # The point objective is identical for every family. Auxiliary heads are unused.
+            criterion = nn.MSELoss()
+            trial.set_user_attr("stop_reason", "max_epochs")
 
             # Training loop
             best_val_metric = float("inf")
@@ -413,6 +435,7 @@ class HyperparameterTuner:
 
             for epoch in range(self.num_epochs_per_trial):
                 if self._deadline_reached():
+                    trial.set_user_attr("stop_reason", "budget")
                     self.study.stop()
                     raise optuna.TrialPruned("Tuning deadline exceeded")
                 started = time.monotonic()
@@ -436,10 +459,9 @@ class HyperparameterTuner:
                     )
 
                     # Compute loss
-                    if isinstance(outputs, dict):
-                        loss, _ = criterion(outputs, batch["y"])
-                    else:
-                        loss = criterion(outputs, batch["y"])
+                    loss = criterion(point_forecast(outputs), batch["y"])
+                    if not torch.isfinite(loss):
+                        raise ValueError("Non-finite tuning loss")
 
                     # Backward
                     optimizer.zero_grad()
@@ -463,11 +485,13 @@ class HyperparameterTuner:
                     val_metric,
                 )
                 if self._deadline_reached():
+                    trial.set_user_attr("stop_reason", "budget")
                     self.study.stop()
                     raise optuna.TrialPruned("Tuning deadline exceeded after epoch")
                 # Report to Optuna for pruning
                 trial.report(val_metric, epoch)
                 if trial.should_prune():
+                    trial.set_user_attr("stop_reason", "pruned")
                     raise optuna.TrialPruned()
 
                 # Early stopping
@@ -478,6 +502,7 @@ class HyperparameterTuner:
                 else:
                     epochs_no_improve += 1
                     if epochs_no_improve >= self.early_stop_patience:
+                        trial.set_user_attr("stop_reason", "early_stop")
                         break
 
                 logger.debug(
@@ -524,13 +549,8 @@ class HyperparameterTuner:
 
                 targets = batch["y"]
 
-                # Handle dict outputs
-                if isinstance(outputs, dict):
-                    predictions = outputs["prediction"]
-                    loss, _ = criterion(outputs, targets)
-                else:
-                    predictions = outputs
-                    loss = criterion(predictions, targets)
+                predictions = point_forecast(outputs)
+                loss = criterion(predictions, targets)
 
                 total_loss += loss.item() * len(targets)
 
@@ -601,8 +621,10 @@ class HyperparameterTuner:
             timeout=timeout,
             n_jobs=self.config.n_jobs,
             show_progress_bar=show_progress_bar,
+            catch=(Exception,),  # Failed trials remain visible; try the remaining budget.
         )
 
+        self.stop_reason = "budget" if self._deadline_reached() else "trial_cap"
         completed = self.study.get_trials(states=(optuna.trial.TrialState.COMPLETE,))
         if not completed:
             self.fallback_reason = "No completed Optuna trials; using base configuration"

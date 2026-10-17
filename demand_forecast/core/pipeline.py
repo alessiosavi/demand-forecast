@@ -30,8 +30,8 @@ from demand_forecast.data.preprocessor import (
     filter_skus,
     resample_series,
 )
-from demand_forecast.models.transformer import AdvancedDemandForecastModel
-from demand_forecast.models.wrapper import ModelWrapper
+from demand_forecast.models.losses import point_forecast
+from demand_forecast.models.wrapper import MODEL_REGISTRY, ModelWrapper
 from demand_forecast.utils.checkpoint import load_checkpoint
 from demand_forecast.utils.time_features import calculate_time_features
 
@@ -272,11 +272,21 @@ class ForecastPipeline:
         self._raw_datasets = datasets
         return datasets
 
+    def resolved_model_type(self):
+        """Return the registry key, resolving the lightweight settings alias."""
+        cfg = self.settings.model
+        return (
+            f"lightweight_{cfg.lightweight_variant}"
+            if cfg.model_type == "lightweight"
+            else cfg.model_type
+        )
+
     def model_kwargs(self):
         cfg = self.settings.model
-        allowed = inspect.signature(AdvancedDemandForecastModel.__init__).parameters
+        model_type = self.resolved_model_type()
+        allowed = inspect.signature(MODEL_REGISTRY[model_type].__init__).parameters
         kwargs = {key: value for key, value in cfg.model_dump().items() if key in allowed}
-        return {
+        kwargs = {
             **kwargs,
             "sku_vocab_size": len(self.sku_to_index),
             "cat_features_dim": self.categorical_encoder.vocab_sizes,
@@ -288,16 +298,20 @@ class ForecastPipeline:
             "max_future_len": self.settings.timeseries.n_out,
         }
 
+        if model_type == "lightweight_tcn":
+            kwargs["kernel_size"] = cfg.tcn_kernel_size
+        if model_type == "lightweight_mixer":
+            kwargs["max_seq_len"] = self.settings.timeseries.window
+        return {key: value for key, value in kwargs.items() if key in allowed}
+
     def build_model(self):
         if self._raw_datasets is None:
             raise ValueError("Must call create_datasets first")
-        if self.settings.model.model_type != "standard":
-            raise ValueError(
-                "The integer/static feature pipeline supports model_type='standard' only"
-            )
-        self.model = ModelWrapper(cluster_keys=list(self._raw_datasets), **self.model_kwargs()).to(
-            self.device
-        )
+        self.model = ModelWrapper(
+            cluster_keys=list(self._raw_datasets),
+            model_type=self.resolved_model_type(),
+            **self.model_kwargs(),
+        ).to(self.device)
         return self.model
 
     def dataloaders(self):
@@ -336,8 +350,8 @@ class ForecastPipeline:
         trainer.train(plot_every_n_epochs=5)
         return trainer
 
-    def forecast(self, origin):
-        """Forecast in units, using the latest window weeks strictly before origin."""
+    def forecast_batches(self, origin, batch_size=None):
+        """Yield deterministic per-cluster inputs from weeks strictly before origin."""
         if self.model is None or self._series is None:
             raise ValueError("A fitted model and transformed history are required")
         cfg, ts = self.settings.data, self.settings.timeseries
@@ -347,7 +361,6 @@ class ForecastPipeline:
         weeks = pd.date_range(origin, periods=ts.n_out, freq="W-MON")
         past = pd.date_range(end=origin - pd.Timedelta(weeks=1), periods=ts.window, freq="W-MON")
         future_features = calculate_time_features(weeks).astype(np.float32)
-        records = []
         self.model.eval()
         for cluster, group in self._series.groupby("bins"):
             xs, cats, cont, ids = [], [], [], []
@@ -372,17 +385,28 @@ class ForecastPipeline:
                 np.asarray(cats),
                 np.zeros((len(ids), ts.n_out), dtype=np.float32),
                 self.categorical_encoder.get_encoded_columns(),
-                batch_size=self.settings.training.batch_size,
+                batch_size=batch_size or self.settings.training.batch_size,
                 shuffle=False,
                 future_time=np.repeat(future_features[None], len(ids), axis=0),
                 cont=np.asarray(cont),
             )
+            yield str(cluster), ids, loader
+
+    def forecast(self, origin):
+        """Forecast weekly units, including preparation, transfer and inverse scaling."""
+        origin = pd.Timestamp(origin)
+        cfg, ts = self.settings.data, self.settings.timeseries
+        weeks = pd.date_range(origin, periods=ts.n_out, freq="W-MON")
+        records = []
+        for cluster, ids, loader in self.forecast_batches(origin):
             predictions = []
             with torch.no_grad():
                 for batch in loader:
                     batch = move_batch(batch, self.device)
                     predictions.extend(
-                        self.model(str(cluster), **{k: v for k, v in batch.items() if k != "y"})
+                        point_forecast(
+                            self.model(str(cluster), **{k: v for k, v in batch.items() if k != "y"})
+                        )
                         .cpu()
                         .numpy()
                     )

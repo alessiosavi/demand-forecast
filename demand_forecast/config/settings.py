@@ -117,12 +117,14 @@ class ModelConfig(BaseModel):
     )
     tcn_kernel_size: int = Field(3, ge=2, description="TCN convolution kernel size")
 
+    hidden_dim: int = Field(64, ge=1, description="Mixer hidden dimension")
+
     @field_validator("nhead")
     @classmethod
     def validate_nhead(cls, v: int, info) -> int:
         """Validate that d_model is divisible by nhead."""
         d_model = info.data.get("d_model", 256)
-        if d_model % v != 0:
+        if info.data.get("model_type", "standard") in ("standard", "advanced") and d_model % v != 0:
             raise ValueError(f"d_model ({d_model}) must be divisible by nhead ({v})")
         return v
 

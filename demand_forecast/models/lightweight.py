@@ -53,6 +53,7 @@ class LightweightDemandModel(nn.Module):
         past_time_features_dim: int = 5,  # qty + 4 time features
         future_time_features_dim: int = 4,
         use_film: bool = True,
+        cont_features_dim: int = 0,
         **kwargs,
     ):
         """Initialize the lightweight model.
@@ -88,7 +89,10 @@ class LightweightDemandModel(nn.Module):
         )
 
         # Static feature dimension
-        total_static_dim = sku_emb_dim + cat_emb_dims * len(cat_features_dim)
+        self.cont_proj = nn.Linear(cont_features_dim, cat_emb_dims) if cont_features_dim else None
+        total_static_dim = sku_emb_dim + cat_emb_dims * (
+            len(cat_features_dim) + bool(cont_features_dim)
+        )
         self.static_proj = nn.Linear(total_static_dim, tcn_channels[-1])
 
         # Input projection
@@ -132,6 +136,7 @@ class LightweightDemandModel(nn.Module):
         self,
         sku: torch.Tensor,
         cats: dict[str, torch.Tensor],
+        cont: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Extract and combine static features.
 
@@ -148,8 +153,14 @@ class LightweightDemandModel(nn.Module):
         # Category embeddings with max pooling
         cat_embs = []
         for name, emb_layer in self.cat_embeddings.items():
-            cat_emb = torch.max(emb_layer(cats[name]), dim=1)[0]
+            embedded = emb_layer(cats[name])
+            cat_emb = embedded if cats[name].ndim == 1 else embedded.max(dim=1).values
             cat_embs.append(cat_emb)
+
+        if self.cont_proj is not None:
+            if cont is None:
+                raise ValueError("Continuous static features are required")
+            cat_embs.append(self.cont_proj(cont))
 
         # Combine all static features
         if cat_embs:
@@ -166,6 +177,7 @@ class LightweightDemandModel(nn.Module):
         future_time: torch.Tensor,
         sku: torch.Tensor,
         cats: dict[str, torch.Tensor],
+        cont: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         """Forward pass.
@@ -181,7 +193,7 @@ class LightweightDemandModel(nn.Module):
             Predictions of shape (batch, n_out).
         """
         # Get static features
-        static = self._get_static_features(sku, cats)
+        static = self._get_static_features(sku, cats, cont)
 
         # Process past inputs through TCN
         past_inputs = torch.cat([qty, past_time], dim=-1)
@@ -378,6 +390,7 @@ class LightweightMixerModel(nn.Module):
         past_time_features_dim: int = 5,
         future_time_features_dim: int = 4,
         max_seq_len: int = 52,
+        cont_features_dim: int = 0,
         **kwargs,
     ):
         """Initialize MLP-Mixer model.
@@ -409,7 +422,10 @@ class LightweightMixerModel(nn.Module):
             }
         )
 
-        total_static_dim = sku_emb_dim + cat_emb_dims * len(cat_features_dim)
+        self.cont_proj = nn.Linear(cont_features_dim, cat_emb_dims) if cont_features_dim else None
+        total_static_dim = sku_emb_dim + cat_emb_dims * (
+            len(cat_features_dim) + bool(cont_features_dim)
+        )
         self.static_proj = nn.Linear(total_static_dim, hidden_dim)
 
         # Input projection
@@ -430,15 +446,20 @@ class LightweightMixerModel(nn.Module):
         future_time: torch.Tensor,
         sku: torch.Tensor,
         cats: dict[str, torch.Tensor],
+        cont: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         """Forward pass."""
         # Static features
         sku_emb = self.sku_embedding(sku)
-        cat_embs = [
-            torch.max(self.cat_embeddings[name](cats[name]), dim=1)[0]
-            for name in self.cat_embeddings.keys()
-        ]
+        cat_embs = []
+        for name, emb_layer in self.cat_embeddings.items():
+            embedded = emb_layer(cats[name])
+            cat_embs.append(embedded if cats[name].ndim == 1 else embedded.max(dim=1).values)
+        if self.cont_proj is not None:
+            if cont is None:
+                raise ValueError("Continuous static features are required")
+            cat_embs.append(self.cont_proj(cont))
         static = self.static_proj(torch.cat([sku_emb] + cat_embs, dim=-1))
 
         # Input

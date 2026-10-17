@@ -12,7 +12,7 @@ import torch.nn as nn
 from torch import optim
 
 from demand_forecast.core.evaluator import Evaluator
-from demand_forecast.models.losses import compute_loss
+from demand_forecast.models.losses import compute_loss, point_forecast
 from demand_forecast.utils.checkpoint import load_checkpoint as safe_load_checkpoint
 
 logger = logging.getLogger(__name__)
@@ -94,6 +94,7 @@ class Trainer:
     epoch_seconds: list[float] = field(default_factory=list)
     best_epoch: int = 0
     budget_exceeded: bool = False
+    stop_reason: str = "max_epochs"
     scheduler_epochs: int | None = None
 
     # Internal state
@@ -162,6 +163,7 @@ class Trainer:
             batch["cats"],
             **extra,
         )
+        outputs = point_forecast(outputs)
         loss, flatten_outputs, flatten_targets = compute_loss(
             outputs, targets, self._criterion, self.flatten_loss
         )
@@ -255,9 +257,11 @@ class Trainer:
                 )
             if self.deadline is not None and time.monotonic() >= self.deadline:
                 self.budget_exceeded = True
+                self.stop_reason = "budget"
                 logger.warning("Budget exceeded; stopping training after current epoch")
                 break
             if should_stop:
+                self.stop_reason = "early_stop"
                 break
         # Restore on exhaustion as well as early stopping. Refit keeps its final weights.
         if self.val_dataloaders and self._state.best_model_state is not None:
