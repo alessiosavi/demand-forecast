@@ -5,6 +5,11 @@ import torch.nn as nn
 import torch.nn.functional as F  # noqa: N812
 
 
+def point_forecast(outputs: torch.Tensor | dict[str, torch.Tensor]) -> torch.Tensor:
+    """Extract the point head; auxiliary V2 heads are not trained by point MSE."""
+    return outputs["prediction"] if isinstance(outputs, dict) else outputs
+
+
 def compute_loss(
     outputs: torch.Tensor,
     targets: torch.Tensor,
