@@ -1,6 +1,7 @@
 """Training loop for demand forecasting models."""
 
 import logging
+import time
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -9,10 +10,8 @@ from typing import Any, Protocol
 import torch
 import torch.nn as nn
 from torch import optim
-from tqdm.auto import tqdm
 
 from demand_forecast.core.evaluator import Evaluator
-from demand_forecast.data.dataloader import get_round_robin_iterators
 from demand_forecast.models.losses import compute_loss
 from demand_forecast.utils.checkpoint import load_checkpoint as safe_load_checkpoint
 
@@ -64,6 +63,7 @@ class Trainer:
         train_dataloaders: Dictionary of training dataloaders per cluster.
         test_dataloaders: Dictionary of test dataloaders per cluster.
         num_epochs: Number of training epochs.
+        scheduler_epochs: Cosine schedule horizon (defaults to num_epochs).
         batch_size: Batch size.
         learning_rate: Learning rate.
         weight_decay: Weight decay for AdamW.
@@ -75,16 +75,26 @@ class Trainer:
 
     model: nn.Module
     train_dataloaders: dict[str, Any]
-    test_dataloaders: dict[str, Any]
+    val_dataloaders: dict[str, Any] = field(default_factory=dict)
+    test_dataloaders: dict[str, Any] = field(default_factory=dict)
     num_epochs: int = 10
     batch_size: int = 128
     learning_rate: float = 1e-5
     weight_decay: float = 1e-2
     early_stop: EarlyStopConfig = field(default_factory=EarlyStopConfig)
-    flatten_loss: bool = True
+    flatten_loss: bool = False
     device: torch.device | None = None
     callbacks: list[TrainingCallback] = field(default_factory=list)
     plot_dir: Path | None = None
+
+    deadline: float | None = None
+    history: dict[str, list[float]] = field(
+        default_factory=lambda: {"train_loss": [], "val_loss": []}
+    )
+    epoch_seconds: list[float] = field(default_factory=list)
+    best_epoch: int = 0
+    budget_exceeded: bool = False
+    scheduler_epochs: int | None = None
 
     # Internal state
     _optimizers: dict[str, optim.Optimizer] = field(default_factory=dict, init=False)
@@ -99,6 +109,8 @@ class Trainer:
         """Initialize optimizers, schedulers, and evaluator."""
         if self.device is None:
             self.device = torch.device("cpu")
+        if self.scheduler_epochs is None:
+            self.scheduler_epochs = self.num_epochs
 
         # Create optimizer and scheduler per cluster (use actual cluster keys)
         for cluster_key in self.train_dataloaders.keys():
@@ -109,7 +121,7 @@ class Trainer:
                 weight_decay=self.weight_decay,
             )
             self._schedulers[key] = optim.lr_scheduler.CosineAnnealingLR(
-                self._optimizers[key], T_max=self.num_epochs
+                self._optimizers[key], T_max=self.scheduler_epochs
             )
 
         self._criterion = nn.MSELoss()
@@ -138,14 +150,18 @@ class Trainer:
         Returns:
             Tuple of (loss, outputs, targets, flatten_outputs, flatten_targets).
         """
-        qty = batch["qty"]
-        past_time = batch["past_time"]
-        future_time = batch["future_time"]
-        sku = batch["sku"]
-        cats = {key: value.to(dtype=torch.int32) for key, value in batch["cats"].items()}
+        batch = move_batch(batch, self.device)
         targets = batch["y"]
-
-        outputs = self.model(model_idx, qty, past_time, future_time, sku, cats)
+        extra = {"cont": batch["cont"]} if "cont" in batch else {}
+        outputs = self.model(
+            model_idx,
+            batch["qty"],
+            batch["past_time"],
+            batch["future_time"],
+            batch["sku"],
+            batch["cats"],
+            **extra,
+        )
         loss, flatten_outputs, flatten_targets = compute_loss(
             outputs, targets, self._criterion, self.flatten_loss
         )
@@ -163,95 +179,92 @@ class Trainer:
             metrics: Optional dictionary of torchmetrics to compute.
             plot_every_n_epochs: Plot validation results every N epochs.
         """
-        if metrics is None:
-            metrics = {}
-
-        total_steps = self._total_train_examples // self.batch_size
-
         self._evaluator = Evaluator(
             model=self.model,
             criterion=self._criterion,
             batch_size=self.batch_size,
-            total_examples=self._total_test_examples,
+            total_examples=sum(len(dl.dataset) for dl in self.val_dataloaders.values()),
             flatten_loss=self.flatten_loss,
-            metrics=metrics,
+            metrics=metrics or {},
             plot_dir=self.plot_dir,
         )
-
-        logger.info(f"Starting training for {self.num_epochs} epochs")
-
-        with tqdm(range(self.num_epochs), position=0, desc="Training") as pbar:
-            for epoch in pbar:
-                self._state.current_epoch = epoch
-
-                # Notify callbacks
-                for callback in self.callbacks:
-                    callback.on_epoch_start(epoch, self.num_epochs)
-
-                # Get fresh iterators
-                dls_train, dls_test = get_round_robin_iterators(
-                    self.train_dataloaders, self.test_dataloaders
-                )
-
-                epoch_loss = 0.0
-                self.model.train()
-
-                for i, item in tqdm(
-                    enumerate(dls_train),
-                    position=1,
-                    leave=False,
-                    total=total_steps,
-                    desc=f"Epoch {epoch + 1}",
-                ):
-                    model_idx = list(item.keys())[0]
-                    batch = item[model_idx]
-
-                    loss, _, _, _, _ = self._forward_step(model_idx, batch)
-
-                    # Backward pass
-                    self._optimizers[model_idx].zero_grad()
+        for epoch in range(self.num_epochs):
+            started = time.monotonic()
+            self._state.current_epoch = epoch
+            for callback in self.callbacks:
+                callback.on_epoch_start(epoch, self.num_epochs)
+            self.model.train()
+            total_loss, count = 0.0, 0
+            for key, loader in self.train_dataloaders.items():
+                for i, batch in enumerate(loader):
+                    loss, _, targets, _, _ = self._forward_step(key, batch)
+                    if not torch.isfinite(loss):
+                        raise ValueError("Non-finite training loss")
+                    self._optimizers[key].zero_grad()
                     loss.backward()
-                    self._optimizers[model_idx].step()
-
-                    epoch_loss += loss.item()
-                    pbar.set_description(
-                        f"Epoch [{epoch + 1}/{self.num_epochs}] - Loss: {(epoch_loss / (i + 1)):.4f}"
-                    )
-
-                    # Notify callbacks
+                    self._optimizers[key].step()
+                    total_loss += loss.item() * len(targets)
+                    count += len(targets)
                     for callback in self.callbacks:
                         callback.on_batch_end(i, loss.item())
-
-                # Update learning rate schedulers
-                for scheduler in self._schedulers.values():
-                    scheduler.step()
-
-                avg_loss = epoch_loss / total_steps
-                logger.info(f"Epoch [{epoch + 1}/{self.num_epochs}], Loss: {avg_loss:.4f}")
-
-                # Validation
-                should_plot = (epoch + 1) % plot_every_n_epochs == 0
-                val_result = self._evaluator.validate(dls_test, plot=should_plot, epoch=epoch + 1)
-
-                # Notify callbacks
-                for callback in self.callbacks:
-                    callback.on_epoch_end(epoch, avg_loss, val_result.metrics)
-
-                # Early stopping check
-                metric = val_result.flatten_mse if self.flatten_loss else val_result.mse
-
+            if not count:
+                raise ValueError("No training windows before cutoff")
+            avg_loss = total_loss / count
+            self.history["train_loss"].append(avg_loss)
+            for scheduler in self._schedulers.values():
+                scheduler.step()
+            should_stop = False
+            if self.val_dataloaders:
+                batches = ({key: batch} for key, dl in self.val_dataloaders.items() for batch in dl)
+                result = self._evaluator.validate(
+                    batches,
+                    plot=self.plot_dir is not None
+                    and ((epoch + 1) % plot_every_n_epochs == 0 or epoch == self.num_epochs - 1),
+                    epoch=epoch + 1,
+                )
+                metric = result.avg_loss
+                self.history["val_loss"].append(metric)
                 if metric < self._state.best_metric:
+                    improvement = self._state.best_metric - metric
                     self._state.best_model_state = deepcopy(self.model.state_dict())
                     self._state.best_metric = metric
-                    self._state.epochs_no_improve = 0
+                    self.best_epoch = epoch + 1
+                    if improvement > self.early_stop.min_delta:
+                        self._state.epochs_no_improve = 0
+                    else:
+                        self._state.epochs_no_improve += 1
                 else:
                     self._state.epochs_no_improve += 1
-                    if self._state.epochs_no_improve >= self.early_stop.patience:
-                        logger.info(f"Early stopping triggered after {epoch + 1} epochs")
-                        self.model.load_state_dict(self._state.best_model_state)
-                        return
-
-        logger.info("Training completed")
+                should_stop = self._state.epochs_no_improve >= self.early_stop.patience
+            else:
+                self.best_epoch = epoch + 1
+            elapsed = time.monotonic() - started
+            self.epoch_seconds.append(elapsed)
+            logger.info(
+                "Epoch %d/%d: train_loss=%.6f seconds/epoch=%.3f",
+                epoch + 1,
+                self.num_epochs,
+                avg_loss,
+                elapsed,
+            )
+            for callback in self.callbacks:
+                callback.on_epoch_end(
+                    epoch,
+                    avg_loss,
+                    {"val_loss": self.history["val_loss"][-1]} if self.val_dataloaders else {},
+                )
+            if self.deadline is not None and time.monotonic() >= self.deadline:
+                self.budget_exceeded = True
+                logger.warning("Budget exceeded; stopping training after current epoch")
+                break
+            if should_stop:
+                break
+        # Restore on exhaustion as well as early stopping. Refit keeps its final weights.
+        if self.val_dataloaders and self._state.best_model_state is not None:
+            self.model.load_state_dict(self._state.best_model_state)
+            if self.plot_dir is not None:
+                batches = ({key: batch} for key, dl in self.val_dataloaders.items() for batch in dl)
+                self._evaluator.validate(batches, plot=True, epoch="best")
 
     def save_checkpoint(self, path: str) -> None:
         """Save training checkpoint.
@@ -293,3 +306,17 @@ class Trainer:
         self._state.current_epoch = training_state["current_epoch"]
 
         logger.info(f"Loaded checkpoint from {path}")
+
+
+def move_batch(batch, device):
+    """Move tensors, including nested categories, to the actual model device."""
+    return {
+        key: (
+            {k: v.to(device) for k, v in value.items()}
+            if isinstance(value, dict)
+            else value.to(device)
+            if isinstance(value, torch.Tensor)
+            else value
+        )
+        for key, value in batch.items()
+    }

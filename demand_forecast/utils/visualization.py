@@ -17,6 +17,8 @@ def plot_clustering(
     inertia_values: list[float],
     dbi_scores: list[float],
     optimal_k: int,
+    save_path: Path | str | None = None,
+    show: bool = True,
 ) -> None:
     """Plot elbow method and Davies-Bouldin Index for K selection.
 
@@ -47,7 +49,11 @@ def plot_clustering(
 
     plt.title("Optimal K Selection: Elbow Method & DBI")
     plt.grid()
-    plt.show()
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    if show:
+        plt.show()
+    plt.close()
 
 
 def plot_model(model: torch.nn.Module, batch: dict[str, Any]) -> Any:

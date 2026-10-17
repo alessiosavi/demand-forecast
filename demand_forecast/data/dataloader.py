@@ -5,7 +5,6 @@ import logging
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
-from torchtnt.utils.data import CudaDataPrefetcher
 from torchtnt.utils.data.iterators import (
     RoundRobin,
     RoundRobinIterator,
@@ -34,6 +33,8 @@ def create_dataloader(
     shuffle: bool = True,
     seed: int = 42,
     device: torch.device | None = None,
+    future_time: np.ndarray | None = None,
+    cont: np.ndarray | None = None,
 ) -> tuple[DataLoader, DemandDataset]:
     """Create a DataLoader for demand forecasting data.
 
@@ -58,7 +59,7 @@ def create_dataloader(
     g.manual_seed(seed)
     pin_memory = device.type == "cuda"
 
-    ds = DemandDataset(x, cat, y, encoded_categorical_features)
+    ds = DemandDataset(x, cat, y, encoded_categorical_features, future_time=future_time, cont=cont)
 
     # Build DataLoader kwargs - persistent_workers requires num_workers > 0
     dl_kwargs = {
@@ -76,10 +77,6 @@ def create_dataloader(
     #     dl_kwargs["persistent_workers"] = True
 
     dl = DataLoader(ds, **dl_kwargs)
-
-    # Wrap with CUDA prefetcher if using GPU
-    if device.type == "cuda":
-        dl = CudaDataPrefetcher(dl, device, 16)
 
     return dl, ds
 
@@ -129,39 +126,28 @@ def create_dataloaders(
                 f"to stay within {max_total_workers} total workers"
             )
 
-    for _bin, ds in raw_datasets.items():
-        x_train, y_train, x_cat_train, x_test, y_test, x_cat_test = ds
-
-        dl_train, ds_train = create_dataloader(
-            x=x_train,
-            cat=x_cat_train,
-            y=y_train,
-            encoded_categorical_features=encoded_categorical_features,
-            batch_size=batch_size,
-            num_workers=num_workers,
-            shuffle=True,
-            seed=seed,
-            device=device,
-        )
-
-        dl_test, ds_test = create_dataloader(
-            x=x_test,
-            cat=x_cat_test,
-            y=y_test,
-            encoded_categorical_features=encoded_categorical_features,
-            batch_size=batch_size,
-            num_workers=num_workers,
-            shuffle=False,
-            seed=seed,
-            device=device,
-        )
-
-        # Convert bin to string (PyTorch module requirement)
-        bin_str = str(_bin)
-        train_dls[bin_str] = dl_train
-        test_dls[bin_str] = dl_test
-        train_dss[bin_str] = ds_train
-        test_dss[bin_str] = ds_test
+    for _bin, (train, val) in raw_datasets.items():
+        for data, loaders, datasets, shuffle in (
+            (train, train_dls, train_dss, True),
+            (val, test_dls, test_dss, False),
+        ):
+            if data is None or not len(data.y):
+                continue
+            loader, dataset = create_dataloader(
+                x=data.x,
+                cat=data.cat_codes,
+                y=data.y,
+                future_time=data.future_time,
+                cont=data.cont,
+                encoded_categorical_features=encoded_categorical_features,
+                batch_size=batch_size,
+                num_workers=num_workers,
+                shuffle=shuffle,
+                seed=seed,
+                device=device,
+            )
+            loaders[str(_bin)] = loader
+            datasets[str(_bin)] = dataset
 
     logger.info(f"Created DataLoaders for {n_clusters} clusters (num_workers={num_workers})")
 

@@ -56,7 +56,7 @@ class Evaluator:
     criterion: nn.Module
     batch_size: int
     total_examples: int
-    flatten_loss: bool = True
+    flatten_loss: bool = False
     metrics: dict[str, Any] = field(default_factory=dict)
     plot_dir: Path | None = None
 
@@ -64,14 +64,14 @@ class Evaluator:
         self,
         dataloader: Any,
         plot: bool = False,
-        epoch: int | None = None,
+        epoch: int | str | None = None,
     ) -> ValidationResult:
         """Validate model on test data.
 
         Args:
             dataloader: Test dataloader (RoundRobinIterator).
             plot: Whether to plot results.
-            epoch: Current epoch number (for plot filenames).
+            epoch: Current epoch number or label (for plot filenames).
 
         Returns:
             ValidationResult with predictions and metrics.
@@ -85,12 +85,16 @@ class Evaluator:
         actuals: list[np.ndarray] = []
         skus: list[int] = []
 
-        total_steps = self.total_examples // self.batch_size
+        total_steps = (self.total_examples + self.batch_size - 1) // self.batch_size
+        sample_count = 0
+        device = next(self.model.parameters()).device
 
         with torch.no_grad():
             for item in tqdm(dataloader, total=total_steps, leave=False, desc="Validating"):
                 model_idx = list(item.keys())[0]
-                batch = item[model_idx]
+                from demand_forecast.core.trainer import move_batch
+
+                batch = move_batch(item[model_idx], device)
 
                 # Forward pass
                 qty = batch["qty"]
@@ -100,22 +104,24 @@ class Evaluator:
                 cats = {key: value.to(dtype=torch.int32) for key, value in batch["cats"].items()}
                 targets = batch["y"]
 
-                outputs = self.model(model_idx, qty, past_time, future_time, sku, cats)
+                extra = {"cont": batch["cont"]} if "cont" in batch else {}
+                outputs = self.model(model_idx, qty, past_time, future_time, sku, cats, **extra)
                 loss, flatten_outputs, flatten_targets = compute_loss(
                     outputs, targets, self.criterion, self.flatten_loss
                 )
-                total_loss += loss.item()
+                total_loss += loss.item() * len(targets)
+                sample_count += len(targets)
 
-                # Store predictions and actuals
-                flatten_predictions.extend(
-                    flatten_outputs.squeeze().detach().cpu().numpy().tolist()
-                )
-                flatten_actuals.extend(flatten_targets.detach().cpu().numpy().tolist())
-                predictions.extend(outputs.squeeze().detach().cpu().numpy())
-                actuals.extend(targets.detach().cpu().numpy())
+                # Quality plots are weekly observations; horizon plots retain (N, H).
+                flatten_predictions.extend(outputs.detach().cpu().numpy().reshape(-1).tolist())
+                flatten_actuals.extend(targets.detach().cpu().numpy().reshape(-1).tolist())
+                predictions.extend(outputs.detach().cpu().numpy().reshape(len(targets), -1))
+                actuals.extend(targets.detach().cpu().numpy().reshape(len(targets), -1))
                 skus.extend(batch["sku"].detach().cpu().numpy().tolist())
 
-        avg_loss = total_loss / total_steps
+        if not sample_count:
+            raise ValueError("No validation examples")
+        avg_loss = total_loss / sample_count
 
         # Calculate metrics
         _actuals = np.array(actuals)
@@ -145,6 +151,7 @@ class Evaluator:
 
             for metric_name, metric in self.metrics.items():
                 try:
+                    metric.reset()
                     _res_metric[metric_name] = metric(_p, _a).item()
                 except Exception:
                     logger.debug(f"Skipping metric {metric_name}")
@@ -155,7 +162,7 @@ class Evaluator:
             save_path = None
             if self.plot_dir is not None:
                 self.plot_dir.mkdir(parents=True, exist_ok=True)
-                epoch_suffix = f"_epoch{epoch}" if epoch is not None else ""
+                epoch_suffix = f"_epoch_{epoch}" if epoch is not None else ""
                 save_path = self.plot_dir / f"validation{epoch_suffix}.png"
 
             # Simple validation plot

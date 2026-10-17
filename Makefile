@@ -118,3 +118,9 @@ docker-dev:
 docker-clean:
 	docker-compose down --rmi local -v
 	docker rmi demand-forecast:latest 2>/dev/null || true
+
+.PHONY: install-rocm
+ROCM_INDEX ?= https://download.pytorch.org/whl/rocm6.4
+install-rocm:
+	$(PIP) install torch --index-url $(ROCM_INDEX)
+	$(PIP) install -e .

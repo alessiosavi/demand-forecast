@@ -1,6 +1,7 @@
 """Hyperparameter tuning for demand forecasting models using Optuna."""
 
 import logging
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -68,6 +69,7 @@ class SearchSpace:
 
     # Model architecture
     d_model: tuple[int, int] | None = (64, 512)
+    d_model_choices: list[int] | None = None
     nhead: list[int] | None = field(default_factory=lambda: [4, 8, 16])
     num_encoder_layers: tuple[int, int] | None = (2, 8)
     num_decoder_layers: tuple[int, int] | None = (2, 6)
@@ -84,21 +86,36 @@ class SearchSpace:
     batch_size: list[int] | None = field(default_factory=lambda: [32, 64, 128, 256])
 
     # Model improvements
-    use_rope: bool | None = True  # Include in search if True
-    use_pre_layernorm: bool | None = True
-    use_film_conditioning: bool | None = True
-    use_improved_head: bool | None = True
-    stochastic_depth_rate: tuple[float, float] | None = (0.0, 0.3)
+    use_rope: bool | None = None  # Include in search if True
+    use_pre_layernorm: bool | None = None
+    use_film_conditioning: bool | None = None
+    use_improved_head: bool | None = None
+    stochastic_depth_rate: tuple[float, float] | None = None
 
     # Advanced model
     patch_size: list[int] | None = field(default_factory=lambda: [2, 4, 8])
-    use_decomposition: bool | None = True
+    use_decomposition: bool | None = None
     decomposition_kernel: list[int] | None = field(default_factory=lambda: [13, 25, 51])
 
     # Lightweight model
     tcn_channels_depth: tuple[int, int] | None = (2, 5)
     tcn_channels_width: tuple[int, int] | None = (16, 128)
     tcn_kernel_size: list[int] | None = field(default_factory=lambda: [3, 5, 7])
+
+    @classmethod
+    def hackathon(cls):
+        """Only four searched fields; all remaining settings come from the base config."""
+        from dataclasses import fields
+
+        return cls(
+            **{
+                **{f.name: None for f in fields(cls)},
+                "d_model_choices": [64, 128],
+                "learning_rate": (1e-4, 3e-3),
+                "dropout": (0.05, 0.3),
+                "weight_decay": (1e-5, 1e-2),
+            }
+        )
 
 
 def _check_optuna() -> None:
@@ -156,6 +173,7 @@ def suggest_hyperparameters(
     trial: Trial,
     search_space: SearchSpace,
     model_type: str = "standard",
+    fixed_nhead: int = 8,
 ) -> dict[str, Any]:
     """Suggest hyperparameters for a trial.
 
@@ -169,13 +187,16 @@ def suggest_hyperparameters(
     """
     params: dict[str, Any] = {}
 
-    # Model architecture
-    if search_space.d_model is not None:
-        # Ensure d_model is divisible by potential nhead values
-        d_model_base = trial.suggest_int("d_model_base", 1, 8)
-        max_nhead = max(search_space.nhead) if search_space.nhead else 8
-        params["d_model"] = d_model_base * max_nhead * 8  # Ensures divisibility
-
+    heads = search_space.nhead or [fixed_nhead]
+    choices = search_space.d_model_choices
+    if choices is None and search_space.d_model is not None:
+        low, high = search_space.d_model
+        choices = list(range(low, high + 1))
+    if choices is not None:
+        choices = [d for d in choices if all(d % head == 0 for head in heads)]
+        if not choices:
+            raise ValueError("No d_model choice is divisible by configured attention heads")
+        params["d_model"] = trial.suggest_categorical("d_model", choices)
     if search_space.nhead is not None:
         params["nhead"] = trial.suggest_categorical("nhead", search_space.nhead)
 
@@ -294,6 +315,8 @@ class HyperparameterTuner:
         device: torch.device | None = None,
         num_epochs_per_trial: int = 5,
         early_stop_patience: int = 2,
+        deadline: float | None = None,
+        base_training_params: dict | None = None,
     ):
         """Initialize the tuner.
 
@@ -319,6 +342,16 @@ class HyperparameterTuner:
         self.device = device or torch.device("cpu")
         self.num_epochs_per_trial = num_epochs_per_trial
         self.early_stop_patience = early_stop_patience
+        self.deadline = deadline
+        self.tuning_deadline = None
+        self.base_training_params = {
+            "learning_rate": 1e-4,
+            "weight_decay": 1e-2,
+            "batch_size": train_dataloader.batch_size,
+            **(base_training_params or {}),
+        }
+        self.resolved_params = {**base_model_kwargs, **self.base_training_params}
+        self.fallback_reason = None
 
         self.study: optuna.Study | None = None
         self.best_model: nn.Module | None = None
@@ -328,10 +361,14 @@ class HyperparameterTuner:
 
         def objective(trial: Trial) -> float:
             # Suggest hyperparameters
-            params = suggest_hyperparameters(trial, self.search_space, self.model_type)
+            params = suggest_hyperparameters(
+                trial, self.search_space, self.model_type, self.base_model_kwargs.get("nhead", 8)
+            )
+            resolved = {**self.base_model_kwargs, **self.base_training_params, **params}
+            trial.set_user_attr("resolved_params", resolved)
 
             # Separate model and training params
-            training_params = {}
+            training_params = dict(self.base_training_params)
             model_params = dict(self.base_model_kwargs)
 
             for key in ["learning_rate", "weight_decay", "batch_size"]:
@@ -339,6 +376,17 @@ class HyperparameterTuner:
                     training_params[key] = params.pop(key)
 
             model_params.update(params)
+            if model_params.get("d_model", 1) % model_params.get("nhead", 1):
+                raise optuna.TrialPruned("d_model is not divisible by nhead")
+            train_loader = self.train_dataloader
+            if training_params["batch_size"] != train_loader.batch_size:
+                train_loader = DataLoader(
+                    train_loader.dataset,
+                    batch_size=training_params["batch_size"],
+                    shuffle=True,
+                    collate_fn=train_loader.collate_fn,
+                    num_workers=train_loader.num_workers,
+                )
 
             # Create model
             try:
@@ -364,12 +412,16 @@ class HyperparameterTuner:
             epochs_no_improve = 0
 
             for epoch in range(self.num_epochs_per_trial):
+                if self._deadline_reached():
+                    self.study.stop()
+                    raise optuna.TrialPruned("Tuning deadline exceeded")
+                started = time.monotonic()
                 # Training
                 model.train()
                 train_loss = 0.0
                 num_batches = 0
 
-                for batch in self.train_dataloader:
+                for batch in train_loader:
                     # Move to device
                     batch = self._move_batch_to_device(batch)
 
@@ -380,6 +432,7 @@ class HyperparameterTuner:
                         batch["future_time"],
                         batch["sku"],
                         batch["cats"],
+                        **({"cont": batch["cont"]} if "cont" in batch else {}),
                     )
 
                     # Compute loss
@@ -402,6 +455,16 @@ class HyperparameterTuner:
                 model.eval()
                 val_metric = self._evaluate(model, criterion)
 
+                logger.info(
+                    "Trial %d epoch %d seconds/epoch=%.3f val=%.6f",
+                    trial.number,
+                    epoch + 1,
+                    time.monotonic() - started,
+                    val_metric,
+                )
+                if self._deadline_reached():
+                    self.study.stop()
+                    raise optuna.TrialPruned("Tuning deadline exceeded after epoch")
                 # Report to Optuna for pruning
                 trial.report(val_metric, epoch)
                 if trial.should_prune():
@@ -410,6 +473,7 @@ class HyperparameterTuner:
                 # Early stopping
                 if val_metric < best_val_metric:
                     best_val_metric = val_metric
+                    trial.set_user_attr("best_epoch", epoch + 1)
                     epochs_no_improve = 0
                 else:
                     epochs_no_improve += 1
@@ -455,6 +519,7 @@ class HyperparameterTuner:
                     batch["future_time"],
                     batch["sku"],
                     batch["cats"],
+                    **({"cont": batch["cont"]} if "cont" in batch else {}),
                 )
 
                 targets = batch["y"]
@@ -467,14 +532,14 @@ class HyperparameterTuner:
                     predictions = outputs
                     loss = criterion(predictions, targets)
 
-                total_loss += loss.item()
+                total_loss += loss.item() * len(targets)
 
                 # Compute MSE and MAE
                 mse = ((predictions - targets) ** 2).mean().item()
                 mae = (predictions - targets).abs().mean().item()
-                total_mse += mse
-                total_mae += mae
-                num_batches += 1
+                total_mse += mse * len(targets)
+                total_mae += mae * len(targets)
+                num_batches += len(targets)
 
         avg_loss = total_loss / max(num_batches, 1)
         avg_mse = total_mse / max(num_batches, 1)
@@ -505,8 +570,14 @@ class HyperparameterTuner:
         """
         _check_optuna()
 
-        n_trials = n_trials or self.config.n_trials
-        timeout = timeout or self.config.timeout
+        n_trials = self.config.n_trials if n_trials is None else n_trials
+        timeout = self.config.timeout if timeout is None else timeout
+        deadlines = [
+            d
+            for d in (self.deadline, time.monotonic() + timeout if timeout is not None else None)
+            if d is not None
+        ]
+        self.tuning_deadline = min(deadlines) if deadlines else None
 
         # Create study
         sampler = create_sampler(self.config.sampler, self.config.seed)
@@ -532,11 +603,16 @@ class HyperparameterTuner:
             show_progress_bar=show_progress_bar,
         )
 
-        logger.info(f"Best trial: {self.study.best_trial.number}")
-        logger.info(f"Best value: {self.study.best_value:.6f}")
-        logger.info(f"Best params: {self.study.best_params}")
+        completed = self.study.get_trials(states=(optuna.trial.TrialState.COMPLETE,))
+        if not completed:
+            self.fallback_reason = "No completed Optuna trials; using base configuration"
+            logger.warning(self.fallback_reason)
+        else:
+            self.resolved_params = self.study.best_trial.user_attrs["resolved_params"]
+        return dict(self.resolved_params)
 
-        return self.study.best_params
+    def _deadline_reached(self):
+        return self.tuning_deadline is not None and time.monotonic() >= self.tuning_deadline
 
     def get_best_model(self) -> nn.Module:
         """Get the best model from tuning.
@@ -547,17 +623,9 @@ class HyperparameterTuner:
         if self.study is None:
             raise RuntimeError("Must run tune() before getting best model")
 
-        params = suggest_hyperparameters(
-            self.study.best_trial,
-            self.search_space,
-            self.model_type,
-        )
-
-        # Filter out training params
-        model_params = dict(self.base_model_kwargs)
+        model_params = dict(self.resolved_params)
         for key in ["learning_rate", "weight_decay", "batch_size"]:
-            params.pop(key, None)
-        model_params.update(params)
+            model_params.pop(key, None)
 
         model = create_model(self.model_type, **model_params)
         self.best_model = model.to(self.device)

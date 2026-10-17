@@ -1,0 +1,51 @@
+data:
+  input_path: sales.csv
+  products_path: products.csv.gz
+  product_key_column: id
+  sku_column: product_id
+  product_id_column: null
+  sales_qty_column: null
+  date_column: date
+  quantity_column: qty
+  store_column: null
+  resample_period: W-MON
+  product_categorical: [category, subcategory, gender, brand]
+  product_continuous: [price]
+  scaling_group: sku
+  clip_outliers: false
+  filter_sparse_skus: false
+  k: 1
+timeseries:
+  window: 52
+  n_out: 16
+  validation_periods: 16
+  holdout_from: 2026-06-22
+model:
+  model_type: standard
+  d_model: 64
+  nhead: 4
+  num_encoder_layers: 2
+  num_decoder_layers: 1
+  dim_feedforward: 256
+  sku_emb_dim: 16
+  cat_emb_dims: 16
+  dropout: 0.1
+training:
+  num_epochs: 60
+  batch_size: 128
+  learning_rate: 0.001
+  weight_decay: 0.001
+  early_stop_patience: 8
+  early_stop_min_delta: 0.0
+  flatten_loss: false
+  num_workers: 0
+tuning:
+  enabled: true
+  n_trials: 12
+  epochs_per_trial: 5
+  timeout: 900
+  early_stop_patience: 2
+  pruner: median
+  sampler: tpe
+seed: 42
+budget_seconds: 2700

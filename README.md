@@ -70,6 +70,7 @@ demand-forecast tune --config config.yaml --n-trials 50 --timeout 3600
 
 ```bash
 demand-forecast predict models/model.pt input_data.csv --config config.yaml --output predictions.csv
+# (predict and forecast require resample_period: W-MON, Monday weeks; see config.example.yaml)
 ```
 
 ## Model Architectures
@@ -385,3 +386,61 @@ If you use this software in your research, please cite:
 - Configuration via [Pydantic](https://docs.pydantic.dev/)
 - CLI powered by [Typer](https://typer.tiangolo.com/)
 - Feature extraction with [TSFresh](https://tsfresh.readthedocs.io/)
+
+## Weekly store forecasts
+
+```bash
+demand-forecast forecast --config configs/hackathon.yaml \
+  --products products.csv.gz --sales sales.csv --out-dir forecast-run --device cuda \
+  --expect-origins 2026-06-22,2026-10-12
+```
+
+`predict` (and `forecast`) require `resample_period: W-MON` (Monday weeks). Use a new output directory for each run. The command exports the exact catalogue × 16
+Monday weeks as `holdout_predictions.csv` and `forecasts.csv`, plus `run.json`,
+`plots/` and `artifacts/`. Quantities are non-negative weekly units, rounded to two
+decimals. `wape_holdout` is a percentage (100 × Σ|actual − forecast| / Σactual) computed from
+the exported holdout file and reported once per run; `wape_naive_last8` is the same
+score for a flat last-8-weeks baseline. Compare configurations on `wape_validation`,
+the pre-holdout validation WAPE in weekly units, also expressed as a percentage.
+It uses the selection model and scalers before refitting; `wape_validation_naive_last8`
+uses only the eight weeks before validation. The corresponding 16-week predictions
+are saved as `artifacts/validation_predictions.csv` with the same four columns.
+Static features are integer category codes and standardized log1p(price).
+
+Selection preprocessing is fitted strictly before the validation block; refit
+preprocessing and training use only pre-holdout data. Future predictions use the
+latest `window` complete weeks as model inputs with the pre-holdout fitted model/scalers.
+Within one execution of the command, no holdout values choose model parameters
+or epochs. Refit retains the selection run's maximum-epoch learning-rate schedule.
+This command supports the standard transformer only. Saved artifacts include the fitted preprocessing state
+and resolved settings, which must be used together when reloading.
+
+`--trials`, `--timeout`, `--max-epochs`, `--k`, `--seed` and `--budget-seconds`
+override YAML only when supplied. The hackathon configs use 12 trials, a 900-second
+tuning timeout, at most 60 selection epochs, k=1, seed=42 and a top-level
+`budget_seconds: 2700`. `--expect-origins HOLDOUT,FUTURE` optionally checks derived
+origins against the supplied ISO dates before training; the CLI has no fixed store dates.
+
+`--max-products 60 --trials 2 --max-epochs 2 --timeout 120 --device cpu` is a debug
+run; omit `--max-products` for the full catalogue. `--preprocess-only` times both
+preprocessing stages without training. `--budget-seconds 2700` is a cooperative
+budget: tuning checks it each epoch, and selection/refit finish their current
+epoch before stopping. Each stage runs at least one epoch to export a trained
+model; preprocessing and report generation can also exceed the budget. The run
+records `budget_exceeded`, `best_epoch` and `refit_epochs_completed` explicitly.
+Zero completed trials fall back to the fixed base configuration.
+
+## Running on AMD GPUs (ROCm)
+
+Install a PyTorch ROCm wheel first, then this package in the same environment:
+
+```bash
+pip install torch --index-url https://download.pytorch.org/whl/rocm6.4
+pip install -e .
+# Equivalent: make install-rocm
+```
+
+ROCm uses the same `torch.cuda` code path: pass `--device cuda`. The run metadata
+reports `rocm` when `torch.version.hip` is set. GPU validation for this run is
+scoped to CUDA only and is performed separately from the local CPU checks;
+ROCm hardware validation is pending. There is no ROCm Docker image.

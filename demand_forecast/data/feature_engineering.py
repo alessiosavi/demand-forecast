@@ -7,115 +7,65 @@ from pathlib import Path
 import joblib
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import MultiLabelBinarizer, OneHotEncoder
-from tqdm.auto import tqdm
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
 class CategoricalEncoder:
-    """Encapsulates categorical encoding logic.
+    """Stage-fitted integer vocabularies (unknown=0) and log continuous features."""
 
-    Replaces the global `label_encoders` dict pattern with a proper
-    encapsulated data structure.
-    """
-
-    encoders: dict[str, MultiLabelBinarizer | OneHotEncoder] = field(default_factory=dict)
+    encoders: dict[str, dict[str, int]] = field(default_factory=dict)
     encoded_columns: list[str] = field(default_factory=list)
+    vocab_sizes: dict[str, int] = field(default_factory=dict)
+    continuous_stats: dict[str, tuple[float, float]] = field(default_factory=dict)
 
-    def fit_transform(
-        self,
-        df: pd.DataFrame,
-        categorical_columns: list[str],
-        onehot_columns: list[str] | None = None,
-    ) -> pd.DataFrame:
-        """Fit encoders and transform categorical columns.
+    def fit(self, df, categorical_columns, continuous_columns=()):
+        self.encoders = {}
+        self.encoded_columns = []
+        self.vocab_sizes = {}
+        self.continuous_stats = {}
+        for column in categorical_columns:
+            values = sorted(df[column].dropna().astype(str).unique())
+            self.encoders[column] = {value: i + 1 for i, value in enumerate(values)}
+            encoded = f"encoded_{column}"
+            self.encoded_columns.append(encoded)
+            self.vocab_sizes[encoded] = len(values) + 1
+        for column in continuous_columns:
+            values = self._log_values(df[column])
+            self.continuous_stats[column] = (float(values.mean()), float(values.std()) or 1.0)
+        return self
 
-        Args:
-            df: DataFrame to transform.
-            categorical_columns: Columns to encode with MultiLabelBinarizer.
-            onehot_columns: Columns to encode with OneHotEncoder.
+    @staticmethod
+    def _log_values(values):
+        values = np.asarray(values, dtype=float)
+        if not np.isfinite(values).all() or (values < 0).any():
+            raise ValueError("Continuous static features must be finite and non-negative")
+        return np.log1p(values)
 
-        Returns:
-            DataFrame with encoded columns added.
-        """
-        if onehot_columns is None:
-            onehot_columns = []
+    def fit_transform(self, df, categorical_columns, onehot_columns=None):
+        self.fit(df, categorical_columns)
+        return self.transform(df)
 
-        for column in tqdm(categorical_columns, desc="Encoding categoricals"):
-            if column in onehot_columns:
-                encoder = OneHotEncoder(sparse_output=False, dtype=int)
-                encoded = encoder.fit_transform(df[column].reset_index(drop=True).to_frame())
-            else:
-                encoder = MultiLabelBinarizer()
-                encoded = encoder.fit_transform(df[column].reset_index(drop=True))
-
-            self.encoders[column] = encoder
-            encoded_col = f"encoded_{column}"
-            df[encoded_col] = encoded.tolist()
-            self.encoded_columns.append(encoded_col)
-
-        logger.info(f"Encoded {len(categorical_columns)} categorical columns")
+    def transform(self, df):
+        df = df.copy()
+        for column, mapping in self.encoders.items():
+            df[f"encoded_{column}"] = (
+                df[column].astype("string").map(mapping).fillna(0).astype("int64")
+            )
+        for column, (mean, std) in self.continuous_stats.items():
+            df[f"continuous_{column}"] = (self._log_values(df[column]) - mean) / std
         return df
 
-    def transform(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Transform using fitted encoders.
-
-        Args:
-            df: DataFrame to transform.
-
-        Returns:
-            DataFrame with encoded columns added.
-        """
-        for column, encoder in self.encoders.items():
-            if isinstance(encoder, OneHotEncoder):
-                encoded = encoder.transform(df[column].reset_index(drop=True).to_frame())
-            else:
-                encoded = encoder.transform(df[column].reset_index(drop=True))
-
-            encoded_col = f"encoded_{column}"
-            df[encoded_col] = encoded.tolist()
-
-        return df
-
-    def get_encoded_columns(self) -> list[str]:
-        """Get list of encoded column names.
-
-        Returns:
-            List of column names for encoded features.
-        """
+    def get_encoded_columns(self):
         return self.encoded_columns
 
-    def save(self, path: Path) -> None:
-        """Save encoders to file.
-
-        Args:
-            path: Path to save encoders.
-        """
-        data = {
-            "encoders": self.encoders,
-            "encoded_columns": self.encoded_columns,
-        }
-        joblib.dump(data, path)
-        logger.info(f"Saved {len(self.encoders)} encoders to {path}")
+    def save(self, path):
+        joblib.dump(vars(self), path)
 
     @classmethod
-    def load(cls, path: Path) -> "CategoricalEncoder":
-        """Load encoders from file.
-
-        Args:
-            path: Path to load encoders from.
-
-        Returns:
-            CategoricalEncoder instance with loaded encoders.
-        """
-        data = joblib.load(path)
-        instance = cls()
-        instance.encoders = data["encoders"]
-        instance.encoded_columns = data["encoded_columns"]
-        logger.info(f"Loaded {len(instance.encoders)} encoders from {path}")
-        return instance
+    def load(cls, path):
+        return cls(**joblib.load(path))
 
 
 def extract_metafeatures(
@@ -139,34 +89,26 @@ def extract_metafeatures(
     Returns:
         DataFrame with extracted meta-features.
     """
-    if cache_path and cache_path.exists():
-        logger.info(f"Loading cached metafeatures from {cache_path}")
-        return pd.read_csv(cache_path)
-
     import tsfresh
     from tsfresh.feature_extraction import MinimalFCParameters
 
     logger.info("Extracting TSFresh meta-features")
 
-    default_fc_params = MinimalFCParameters()
-    metafeatures = {}
-
-    grouped = df.groupby([sku_code_column, store_column])
-    for label, group in tqdm(grouped, desc="Extracting features"):
-        metafeatures[label] = tsfresh.extract_features(
-            group.reset_index(),
-            column_id=sku_code_column,
-            column_value=quantity_column,
-            column_sort=date_column,
-            disable_progressbar=True,
-            default_fc_parameters=default_fc_params,
-        )
-
-    feature_df = pd.DataFrame(metafeatures.keys())
-    tmp = pd.concat(metafeatures.values()).reset_index(drop=True)
-
-    feature_df = pd.concat([feature_df, tmp], axis=1, ignore_index=True)
-    feature_df.columns = [sku_code_column, store_column] + list(tmp.columns)
+    # One extraction call, no worker pool per SKU; cache is output-only, never blindly reused.
+    keys = [sku_code_column, store_column]
+    data = df.reset_index().copy()
+    data["_series_id"] = data.groupby(keys, sort=True).ngroup()
+    identities = data.drop_duplicates("_series_id").set_index("_series_id")[keys]
+    features = tsfresh.extract_features(
+        data[["_series_id", date_column, quantity_column]],
+        column_id="_series_id",
+        column_value=quantity_column,
+        column_sort=date_column,
+        default_fc_parameters=MinimalFCParameters(),
+        n_jobs=0,
+        disable_progressbar=True,
+    )
+    feature_df = identities.join(features).reset_index(drop=True)
 
     if cache_path:
         feature_df.to_csv(cache_path, index=False)
