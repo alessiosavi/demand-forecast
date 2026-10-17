@@ -184,6 +184,7 @@ class Evaluator:
                     title=f"Prediction Quality{f' - Epoch {epoch}' if epoch else ''}",
                     save_path=quality_path,
                     show=False,
+                    standardized=True,
                 )
 
         return ValidationResult(

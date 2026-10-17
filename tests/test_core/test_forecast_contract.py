@@ -367,6 +367,25 @@ def test_trainer_restores_best_weights_on_exhaustion_and_ignores_test(monkeypatc
     assert fixed.history["val_loss"] == []
 
 
+def test_evaluator_quality_plot_marks_standardized_targets(tmp_path, monkeypatch):
+    loader = small_loader()
+    calls = []
+    monkeypatch.setattr(
+        "demand_forecast.core.evaluator.plot_prediction_quality",
+        lambda **kwargs: calls.append(kwargs),
+    )
+    evaluator = Evaluator(
+        ConstantModel(), nn.MSELoss(), batch_size=8, total_examples=3, plot_dir=tmp_path
+    )
+    result = evaluator.validate(({"0": batch} for batch in loader), plot=True, epoch=1)
+    assert len(calls) == 1
+    assert calls[0]["standardized"] is True
+    assert calls[0]["save_path"] == tmp_path / "quality_epoch_1.png"
+    np.testing.assert_array_equal(calls[0]["actuals"], result.flatten_actuals)
+    np.testing.assert_array_equal(calls[0]["predictions"], result.flatten_predictions)
+    assert len(result.flatten_predictions) == 6
+
+
 def test_trainer_deadline_and_evaluator_weekly_plot(tmp_path):
     loader = small_loader()
     model = ConstantModel()

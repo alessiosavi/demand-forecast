@@ -225,6 +225,7 @@ class TestForecastPipelineEvaluate:
 
             # Check that plot_prediction_quality was called
             mock_plot.assert_called_once()
+            assert mock_plot.call_args.kwargs["standardized"] is True
 
 
 class TestForecastPipelineSaveLoad:

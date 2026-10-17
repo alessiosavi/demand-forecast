@@ -461,17 +461,26 @@ demand-forecast benchmark --config configs/benchmark-w26.yaml \
 
 Run training on the GPU host. For a smoke run add `--max-products 40 --trials 1 --max-epochs 1`
 and use a separate output directory. `--max-epochs` caps both selection and trial epochs here.
-Repeat the original command with `--compare-only` to rebuild the report without training.
+Repeat the original command with `--compare-only` to rebuild the report and redraw each model's
+`plots/holdout_prediction_quality.png` from saved predictions without training. This works on CPU-only
+machines with the original `--device cuda` option; no model is loaded or run.
 Inputs, product sets, origins, seed and protocol must match; relocated input paths are allowed
 only when their hashes match. Use a new empty output directory for each training run.
 
-Outputs: `benchmark.json`, `benchmark.md` (performance table), eight comparison plots under
+Outputs: `benchmark.json`, `benchmark.md` (performance and holdout error metrics tables), eight comparison plots under
 `plots/`, and full model artifacts under `models/<name>/`, including `run.json`,
 `validation_predictions.csv`, `holdout_predictions.csv`, `forecasts.csv` and saved models.
 `benchmark_request.json` freezes settings, search spaces and example products before training.
 Rankings use **validation WAPE only**; holdout is reported, never used for selection. Incomplete
 refits, zero completed tuning trials and failures are visible and excluded from ranking.
-All scores are recomputed from aligned CSVs in original units; zero-demand groups have null scores.
+All scores pool aligned product-weeks in original units. MAE/RMSE (units per product-week), R² and Pearson
+correlation are reported for every model and baseline, with both validation and holdout values in JSON.
+WAPE/bias are null for zero total demand; MAE/RMSE remain defined. R² is null for constant actuals;
+correlation is null for either constant series or fewer than two observations.
+
+Holdout quality plots show WAPE (`n/a` for zero total demand). New standardized-target quality plots
+omit percentage metrics and are labelled standardized. Existing per-epoch snapshots retain their old
+MAPE labels: their predictions were not saved, so compare-only cannot redraw them.
 
 Every family uses point MSE on standardized targets and the same learning-rate, dropout and
 weight-decay ranges. Capacity choices are transformer width 64/128, TCN width 32/64 (depth 3),

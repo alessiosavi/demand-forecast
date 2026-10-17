@@ -2,7 +2,7 @@
 
 import json
 import re
-from dataclasses import fields
+from dataclasses import asdict, fields
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -29,8 +29,10 @@ from demand_forecast.core.benchmark import (
     run_benchmark,
 )
 from demand_forecast.core.forecast_run import (
+    forecast_provenance,
     network_latency,
     pooled_loader,
+    score_forecast,
     validate_forecast_contract,
 )
 from demand_forecast.core.pipeline import ForecastPipeline
@@ -41,6 +43,7 @@ from demand_forecast.core.tuning import (
     suggest_hyperparameters,
 )
 from demand_forecast.models.losses import point_forecast
+from demand_forecast.utils.visualization import plot_prediction_quality
 
 
 @pytest.fixture
@@ -274,6 +277,227 @@ def test_grouped_scores_and_exact_seasonal_week(tiny_settings):
     scored["actual"] = 0
     metrics = performance(scored, scored)
     assert metrics["wape_holdout"] is metrics["holdout_bias_percent"] is None
+
+
+def test_pooled_error_metrics():
+    # Two products x two weeks: SSE=12, SST=20, absolute error=6.
+    holdout = pd.DataFrame(
+        {
+            "actual": [0.0, 2.0, 4.0, 6.0],
+            "qty": [1.0, 1.0, 5.0, 3.0],
+            "horizon": [1, 2, 1, 2],
+            "category": ["a", "a", "b", "b"],
+        }
+    )
+    result = performance(holdout.assign(qty=holdout.actual), holdout)
+    assert result["mae_holdout"] == 1.5
+    assert result["rmse_holdout"] == pytest.approx(np.sqrt(3))
+    assert result["r_squared_holdout"] == pytest.approx(0.4)
+    assert result["correlation_holdout"] == pytest.approx(10 / np.sqrt(220))
+    assert result["wape_holdout"] == 50
+    assert result["holdout_bias_percent"] == pytest.approx(-100 / 6)
+    assert result["mae_validation"] == result["rmse_validation"] == 0
+    assert result["r_squared_validation"] == pytest.approx(1)
+    assert result["correlation_validation"] == pytest.approx(1)
+    assert result["wape_validation"] == 0
+    json.dumps(result, allow_nan=False)
+
+
+@pytest.mark.parametrize(
+    "actual,prediction,mae,rmse,r_squared,correlation,wape",
+    [
+        ([0, 0], [0, 2], 1, np.sqrt(2), None, None, None),
+        ([2, 2], [1, 3], 1, 1, None, None, 50),
+        ([0.1, 0.1, 0.1], [0, 0, 0], 0.1, 0.1, None, None, 100),
+        ([1, 3], [2, 2], 1, 1, 0, None, 50),
+        ([0], [1], 1, 1, None, None, None),
+        ([1], [1], 0, 0, None, None, 0),
+        ([1, 3], [3, 1], 2, 2, -3, -1, 100),
+    ],
+)
+def test_error_metrics_null_and_negative_cases(
+    actual, prediction, mae, rmse, r_squared, correlation, wape
+):
+    frame = pd.DataFrame({"actual": actual, "qty": prediction, "horizon": 1, "category": "a"})
+    with np.errstate(divide="raise", invalid="raise"):
+        result = performance(frame, frame)
+    for block in ("validation", "holdout"):
+        for metric, value in (
+            ("mae", mae),
+            ("rmse", rmse),
+            ("r_squared", r_squared),
+            ("correlation", correlation),
+            ("wape", wape),
+        ):
+            if value is None:
+                assert result[f"{metric}_{block}"] is None
+            else:
+                assert result[f"{metric}_{block}"] == pytest.approx(value)
+    json.dumps(result, allow_nan=False)
+
+
+@pytest.fixture
+def saved_comparison(tiny_settings, tmp_path):
+    """Create saved CSV artifacts for every family without constructing any model."""
+    tiny_settings.device = "cuda"
+    pipeline = ForecastPipeline(tiny_settings, data_only=True)
+    pipeline.load_data()
+    weekly = comparison_history(pipeline)
+    provenance = forecast_provenance(pipeline, tiny_settings.budget_seconds)
+    out = tmp_path / "saved"
+    out.mkdir()
+    (out / "benchmark_request.json").write_text(
+        json.dumps(
+            {
+                "settings": tiny_settings.model_dump(mode="json"),
+                "models": MODEL_TYPES,
+                "provenance": provenance,
+                "example_products": example_products(weekly, provenance["holdout_from"]),
+                "search_spaces": {
+                    name: asdict(SearchSpace.hackathon(name)) for name in MODEL_TYPES
+                },
+            }
+        )
+    )
+    for name in MODEL_TYPES:
+        directory = out / "models" / name
+        (directory / "plots").mkdir(parents=True)
+        (directory / "plots/holdout_prediction_quality.png").write_bytes(b"old quality plot")
+        (directory / "plots/quality_epoch_best.png").write_bytes(b"archived epoch plot")
+        (directory / "run.json").write_text(
+            json.dumps(
+                {
+                    **provenance,
+                    "model_type": name,
+                    "requested_settings": model_settings(tiny_settings, name).model_dump(
+                        mode="json"
+                    ),
+                    "status": "ok",
+                    "best_epoch": 1,
+                    "refit_epochs_completed": 1,
+                    "trial_counts": {"completed": 1, "pruned": 0, "failed": 0},
+                }
+            )
+        )
+        for filename, origin in (
+            ("validation_predictions.csv", "validation_from"),
+            ("holdout_predictions.csv", "holdout_from"),
+            ("forecasts.csv", "origin_future"),
+        ):
+            frame = baseline_forecast(
+                weekly, provenance["product_ids"], provenance[origin], "seasonal_naive"
+            )
+            frame["qty"] = np.arange(len(frame)) + 0.5
+            # Compare must restore run_forecast's ordering even for shuffled CSVs.
+            frame.iloc[::-1].to_csv(directory / filename, index=False)
+    return tiny_settings, pipeline, out
+
+
+def test_compare_only_cuda_redraws_without_runtime(saved_comparison, monkeypatch):
+    settings, pipeline, out = saved_comparison
+    original_settings = settings.model_dump(mode="json")
+    preserved = {
+        path: path.read_bytes()
+        for path in out.rglob("*")
+        if path.is_file() and path.name != "holdout_prediction_quality.png"
+    }
+    plots = {}
+
+    def record_plot(actuals, predictions, **kwargs):
+        plots[kwargs["save_path"].parent.parent.name] = (actuals.copy(), predictions.copy(), kwargs)
+        plot_prediction_quality(actuals, predictions, **kwargs)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("compare-only touched the model or CUDA runtime")
+
+    class NoCuda:
+        def __getattr__(self, name):
+            pytest.fail(f"compare-only accessed torch.cuda.{name}")
+
+    for method in ("build_model", "load", "train", "forecast", "_set_seeds", "fit_preprocessing"):
+        monkeypatch.setattr(ForecastPipeline, method, forbidden)
+    monkeypatch.setattr("demand_forecast.core.benchmark.run_forecast", forbidden)
+    monkeypatch.setattr(torch, "manual_seed", forbidden)
+    monkeypatch.setattr(torch, "cuda", NoCuda())
+    monkeypatch.setattr("demand_forecast.core.benchmark.plot_prediction_quality", record_plot)
+    monkeypatch.setattr("demand_forecast.core.benchmark.comparison_plots", lambda *args: None)
+    config = out / "config.yaml"
+    settings.to_yaml(config)
+    result = CliRunner().invoke(
+        app,
+        [
+            "benchmark",
+            "--config",
+            str(config),
+            "--products",
+            str(settings.data.products_path),
+            "--sales",
+            str(settings.data.input_path),
+            "--out-dir",
+            str(out),
+            "--models",
+            ",".join(MODEL_TYPES),
+            "--device",
+            "cuda",
+            "--compare-only",
+            "--expect-origins",
+            "2026-06-22,2026-10-12",
+        ],
+    )
+    assert result.exit_code == 0, f"{result.output}\n{result.exception}"
+    assert settings.model_dump(mode="json") == original_settings
+    assert set(plots) == set(MODEL_TYPES)
+    for name, (actual, prediction, kwargs) in plots.items():
+        directory = out / "models" / name
+        original = pd.read_csv(directory / "holdout_predictions.csv").sort_values(
+            ["product_id", "week_start"]
+        )
+        scored, _, _ = score_forecast(pipeline, original, pipeline.cutoffs()[1])
+        np.testing.assert_array_equal(actual, scored.actual)
+        np.testing.assert_array_equal(prediction, scored.qty)
+        assert kwargs == {
+            "title": "Holdout weekly demand (units)",
+            "save_path": directory / "plots/holdout_prediction_quality.png",
+            "show": False,
+        }
+        assert kwargs["save_path"].read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+    assert all(path.read_bytes() == content for path, content in preserved.items())
+    report = json.loads((out / "benchmark.json").read_text())
+    assert report["requested_settings"]["device"] == "cuda"
+    for result in report["results"].values():
+        for block in ("validation", "holdout"):
+            assert all(
+                f"{metric}_{block}" in result
+                for metric in ("mae", "rmse", "r_squared", "correlation")
+            )
+    markdown = (out / "benchmark.md").read_text()
+    assert "## Error metrics" in markdown
+    assert "Holdout R²" in markdown and "Holdout correlation" in markdown
+    assert "dimensionless" in markdown
+
+
+@pytest.mark.parametrize("mutation", ["device", "seed", "inputs", "missing_row"])
+def test_compare_only_preserves_strict_checks(saved_comparison, mutation):
+    settings, _, out = saved_comparison
+    if mutation == "device":
+        settings.device = "cpu"
+        message = "requested settings"
+    elif mutation == "seed":
+        settings.seed += 1
+        message = "frozen request"
+    elif mutation == "inputs":
+        path = settings.data.input_path
+        sales = pd.read_csv(path)
+        sales.loc[0, "qty"] += 1
+        sales.to_csv(path, index=False)
+        message = "frozen request"
+    else:
+        path = out / "models/standard/holdout_predictions.csv"
+        pd.read_csv(path).iloc[1:].to_csv(path, index=False)
+        message = "keys"
+    with pytest.raises(ValueError, match=message):
+        run_benchmark(settings, out, compare_only=True)
+    assert not (out / "benchmark.json").exists()
 
 
 def test_latency_fixed_batch_and_warmup():

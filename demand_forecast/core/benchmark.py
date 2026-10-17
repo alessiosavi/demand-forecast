@@ -20,6 +20,7 @@ from demand_forecast.core.forecast_run import (  # noqa: E402
 from demand_forecast.core.pipeline import ForecastPipeline  # noqa: E402
 from demand_forecast.core.tuning import SearchSpace  # noqa: E402
 from demand_forecast.utils.metrics import wape  # noqa: E402
+from demand_forecast.utils.visualization import plot_prediction_quality  # noqa: E402
 
 logger = logging.getLogger(__name__)
 MODEL_TYPES = ("standard", "advanced", "lightweight_tcn", "lightweight_mixer")
@@ -136,11 +137,34 @@ def percent_wape(frame):
     return None if value is None else 100.0 * value
 
 
+def error_metrics(frame):
+    """Pool all product-weeks in original units, preserving undefined scores as null."""
+    actual = frame.actual.to_numpy(dtype=float)
+    prediction = frame.qty.to_numpy(dtype=float)
+    squared_error = (actual - prediction) ** 2
+    total_variation = float(((actual - actual.mean()) ** 2).sum())
+    return {
+        "mae": float(np.abs(actual - prediction).mean()),
+        "rmse": float(np.sqrt(squared_error.mean())),
+        "r_squared": float(1 - squared_error.sum() / total_variation)
+        if total_variation and np.ptp(actual) > 0
+        else None,
+        "correlation": float(np.corrcoef(actual, prediction)[0, 1])
+        if len(actual) > 1 and np.ptp(actual) > 0 and np.ptp(prediction) > 0
+        else None,
+    }
+
+
 def performance(validation, holdout):
     total = float(holdout.actual.sum())
     return {
         "wape_validation": percent_wape(validation),
         "wape_holdout": percent_wape(holdout),
+        **{
+            f"{metric}_{block}": value
+            for block, frame in (("validation", validation), ("holdout", holdout))
+            for metric, value in error_metrics(frame).items()
+        },
         "holdout_bias_percent": 100 * float((holdout.qty - holdout.actual).sum()) / total
         if total
         else None,
@@ -163,7 +187,7 @@ def compare(settings, out_dir, models=MODEL_TYPES, *, max_products=None, expect_
     """Rebuild reports without training; reject incompatible or stale input artifacts."""
     out_dir = Path(out_dir)
     manifest = json.loads((out_dir / "benchmark_request.json").read_text())
-    pipeline = ForecastPipeline(settings.model_copy(deep=True))
+    pipeline = ForecastPipeline(settings.model_copy(deep=True), data_only=True)
     pipeline.load_data(max_products=max_products)
     provenance = forecast_provenance(pipeline, settings.budget_seconds, max_products)
     if manifest["provenance"] != provenance:
@@ -277,7 +301,9 @@ def compare(settings, out_dir, models=MODEL_TYPES, *, max_products=None, expect_
         "results": results,
         "notes": [
             "Equal caps, not equal completed work. Incomplete/error runs are excluded from ranking.",
-            "All scores are recomputed in original units from aligned CSVs; zero-demand groups are null.",
+            "All scores pool aligned product-weeks in original units; MAE/RMSE are units per product-week.",
+            "WAPE and bias are null for zero total demand; MAE/RMSE remain defined.",
+            "R² is null for constant actuals; Pearson correlation is null if either series is constant or fewer than two observations are available.",
             "Seasonal naive uses the exact W-MON week 52 weeks earlier.",
             "V2 auxiliary quantile/decomposition output heads are untrained under point MSE.",
             "Mixer does not use future_time inputs.",
@@ -285,6 +311,18 @@ def compare(settings, out_dir, models=MODEL_TYPES, *, max_products=None, expect_
         ],
         "plots": [f"plots/{name}.png" for name in PLOT_NAMES],
     }
+    for name, frame in predictions.items():
+        if results[name]["kind"] == "neural":
+            plot_dir = out_dir / "models" / name / "plots"
+            plot_dir.mkdir(parents=True, exist_ok=True)
+            # Match run_forecast's product/week ordering and default sampling.
+            plot_prediction_quality(
+                frame.actual.to_numpy(),
+                frame.qty.to_numpy(),
+                title="Holdout weekly demand (units)",
+                save_path=plot_dir / "holdout_prediction_quality.png",
+                show=False,
+            )
     write_json(out_dir / "benchmark.json", report)
     write_table(out_dir / "benchmark.md", report)
     comparison_plots(out_dir / "plots", report, predictions, weekly)
@@ -426,7 +464,21 @@ def write_table(path, report):
         "Forecast pipeline time includes pandas preparation, batching, transfer and inverse scaling.",
         "Network latency: 5 warmups, mean of 20 forward passes, synchronized on CUDA; fixed 512 inputs (cycled for small catalogues).",
         "",
+        "## Error metrics",
+        "",
+        "Pooled holdout product-weeks. MAE/RMSE are in units per product-week; R² and Pearson correlation are dimensionless. Validation metrics are in benchmark.json.",
+        "",
+        "| Model | Holdout MAE (units/week) | Holdout RMSE (units/week) | Holdout R² | Holdout correlation |",
+        "|---|---:|---:|---:|---:|",
     ]
+    for name in ordered:
+        result = report["results"][name]
+        values = [name] + [
+            number(result.get(f"{metric}_holdout"))
+            for metric in ("mae", "rmse", "r_squared", "correlation")
+        ]
+        lines.append("| " + " | ".join(values) + " |")
+    lines.append("")
     for name, result in report["results"].items():
         if result.get("error"):
             lines.append(f"- {name}: {result['error']}")

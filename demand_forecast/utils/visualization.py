@@ -165,6 +165,7 @@ def plot_prediction_quality(
     save_path: Path | str | None = None,
     show: bool = True,
     max_samples: int = 100,
+    standardized: bool = False,
 ) -> None:
     """Plot comprehensive prediction quality analysis.
 
@@ -182,9 +183,12 @@ def plot_prediction_quality(
         save_path: Path to save the plot.
         show: Whether to display the plot.
         max_samples: Maximum samples to show in line plot.
+        standardized: Label standardized targets and omit percentage metrics.
     """
     fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-    fig.suptitle(title, fontsize=14, fontweight="bold")
+    fig.suptitle(
+        f"{title} (standardized)" if standardized else title, fontsize=14, fontweight="bold"
+    )
 
     # 1. Scatter plot: Actual vs Predicted
     ax1 = axes[0, 0]
@@ -201,13 +205,22 @@ def plot_prediction_quality(
     # Calculate metrics
     mse = np.mean((actuals - predictions) ** 2)
     mae = np.mean(np.abs(actuals - predictions))
-    mape = np.mean(np.abs((actuals - predictions) / (actuals + 1e-8))) * 100
-    corr = np.corrcoef(actuals, predictions)[0, 1] if len(actuals) > 1 else 0
+    corr = (
+        np.corrcoef(actuals, predictions)[0, 1]
+        if len(actuals) > 1 and np.ptp(actuals) > 0 and np.ptp(predictions) > 0
+        else None
+    )
+    metrics_text = f"MSE: {mse:.2f}\nMAE: {mae:.2f}"
+    if not standardized:
+        total = np.abs(actuals).sum()
+        wape_text = f"{100 * np.abs(actuals - predictions).sum() / total:.1f}%" if total else "n/a"
+        metrics_text += f"\nWAPE: {wape_text}"
+    metrics_text += "\nCorr: " + (f"{corr:.3f}" if corr is not None else "n/a")
 
     ax1.text(
         0.05,
         0.95,
-        f"MSE: {mse:.2f}\nMAE: {mae:.2f}\nMAPE: {mape:.1f}%\nCorr: {corr:.3f}",
+        metrics_text,
         transform=ax1.transAxes,
         verticalalignment="top",
         fontsize=10,
