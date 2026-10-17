@@ -1,6 +1,7 @@
 """Tiny synthetic checks for the same-data comparison (no real catalogue required)."""
 
 import json
+import re
 from dataclasses import fields
 from pathlib import Path
 from types import SimpleNamespace
@@ -454,8 +455,11 @@ def test_settings_isolation_failure_and_incomplete(tiny_settings, tmp_path, monk
 
 
 def test_benchmark_help():
-    result = CliRunner().invoke(app, ["benchmark", "--help"])
+    result = CliRunner().invoke(
+        app, ["benchmark", "--help"], env={"COLUMNS": "200", "TERM": "dumb", "NO_COLOR": "1"}
+    )
     assert result.exit_code == 0
+    output = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", result.output)
     for option in (
         "--models",
         "--compare-only",
@@ -463,4 +467,4 @@ def test_benchmark_help():
         "--max-epochs",
         "--expect-origins",
     ):
-        assert option in result.output
+        assert option in output

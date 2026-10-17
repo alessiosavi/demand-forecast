@@ -496,7 +496,8 @@ def comparison_plots(directory, report, predictions, weekly):
     )
     for ax, sku in zip(axes[:, 0], examples):
         demand_lines(ax, sku)
-        ax.set_title(f"{sku} — selected by pre-holdout category volume")
+        category = weekly.loc[weekly.product_id == sku, "category"].iloc[0]
+        ax.set_title(f"{category} — {sku} (selected by pre-holdout category volume)")
     axes[0, 0].legend(fontsize=7, ncol=3)
     finish(fig, "example_products")
 

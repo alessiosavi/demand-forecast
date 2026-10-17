@@ -412,8 +412,10 @@ preprocessing and training use only pre-holdout data. Future predictions use the
 latest `window` complete weeks as model inputs with the pre-holdout fitted model/scalers.
 Within one execution of the command, no holdout values choose model parameters
 or epochs. Refit retains the selection run's maximum-epoch learning-rate schedule.
-This command supports the standard transformer only. Saved artifacts include the fitted preprocessing state
-and resolved settings, which must be used together when reloading.
+This command supports four model families: the standard transformer, the advanced
+transformer, and the lightweight TCN and MLP-Mixer models. Saved artifacts include
+the fitted preprocessing state and resolved settings, which must be used together
+when reloading.
 
 `--trials`, `--timeout`, `--max-epochs`, `--k`, `--seed` and `--budget-seconds`
 override YAML only when supplied. The hackathon configs use 12 trials, a 900-second

@@ -302,20 +302,31 @@ class LightweightDemandModel(nn.Module):
         for name, vocab_size in self._config["cat_features_dim"].items():
             dummy_cats[name] = torch.zeros(batch_size, vocab_size, dtype=torch.long)
 
+        # ONNX flattens cats before cont, so name each categorical input.
+        input_names = ["qty", "past_time", "future_time", "sku"] + [
+            "cats" if i == 0 else f"cats_{name}" for i, name in enumerate(dummy_cats)
+        ]
+        dynamic_axes = {
+            "qty": {0: "batch_size", 1: "past_len"},
+            "past_time": {0: "batch_size", 1: "past_len"},
+            "future_time": {0: "batch_size", 1: "future_len"},
+            "sku": {0: "batch_size"},
+            "predictions": {0: "batch_size"},
+        }
+        dummy_cont = None
+        if self.cont_proj is not None:
+            dummy_cont = torch.randn(batch_size, self.cont_proj.in_features)
+            input_names.append("cont")
+            dynamic_axes["cont"] = {0: "batch_size"}
+
         # Export
         torch.onnx.export(
             self,
-            (dummy_qty, dummy_past_time, dummy_future_time, dummy_sku, dummy_cats),
+            (dummy_qty, dummy_past_time, dummy_future_time, dummy_sku, dummy_cats, dummy_cont),
             path,
-            input_names=["qty", "past_time", "future_time", "sku", "cats"],
+            input_names=input_names,
             output_names=["predictions"],
-            dynamic_axes={
-                "qty": {0: "batch_size", 1: "past_len"},
-                "past_time": {0: "batch_size", 1: "past_len"},
-                "future_time": {0: "batch_size", 1: "future_len"},
-                "sku": {0: "batch_size"},
-                "predictions": {0: "batch_size"},
-            },
+            dynamic_axes=dynamic_axes,
             opset_version=opset_version,
         )
 
@@ -326,7 +337,8 @@ class LightweightDemandModel(nn.Module):
             optimize: Whether to apply optimizations.
 
         Returns:
-            TorchScript module.
+            TorchScript module accepting qty, past_time, future_time, sku,
+            categorical tensors in configuration order, then cont if configured.
         """
         self.eval()
 
@@ -347,21 +359,24 @@ class LightweightDemandModel(nn.Module):
                 self.model = model
                 self.cat_names = cat_names
 
-            def forward(self, qty, past_time, future_time, sku, *cat_tensors):
-                cats = {name: tensor for name, tensor in zip(self.cat_names, cat_tensors)}
-                return self.model(qty, past_time, future_time, sku, cats)
+            def forward(self, qty, past_time, future_time, sku, *static_tensors):
+                cats = {name: tensor for name, tensor in zip(self.cat_names, static_tensors)}
+                cont = static_tensors[-1] if self.model.cont_proj is not None else None
+                return self.model(qty, past_time, future_time, sku, cats, cont)
 
         wrapper = TracingWrapper(self, list(self._config["cat_features_dim"].keys()))
 
-        # Create dummy cat inputs
-        cat_tensors = []
+        # Create dummy categorical inputs, followed by continuous features when present.
+        static_tensors = []
         for name, vocab_size in self._config["cat_features_dim"].items():
-            cat_tensors.append(torch.zeros(batch_size, vocab_size, dtype=torch.long))
+            static_tensors.append(torch.zeros(batch_size, vocab_size, dtype=torch.long))
+        if self.cont_proj is not None:
+            static_tensors.append(torch.randn(batch_size, self.cont_proj.in_features))
 
         # Trace
         traced = torch.jit.trace(
             wrapper,
-            (dummy_qty, dummy_past_time, dummy_future_time, dummy_sku, *cat_tensors),
+            (dummy_qty, dummy_past_time, dummy_future_time, dummy_sku, *static_tensors),
         )
 
         if optimize:
