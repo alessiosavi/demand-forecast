@@ -244,7 +244,7 @@ def generate_sales(
     try:
         catalogue = pd.read_csv(products, usecols=PRODUCT_COLUMNS, dtype={"id": str})
         sales = generate_product_sales(catalogue, start, end, seed, promo_share)
-    except ValueError as exc:
+    except (ValueError, OSError) as exc:
         raise typer.BadParameter(str(exc)) from exc
 
     output.parent.mkdir(parents=True, exist_ok=True)
