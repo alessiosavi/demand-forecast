@@ -394,7 +394,7 @@ demand-forecast forecast --config configs/hackathon.yaml \
   --expect-origins 2026-06-22,2026-10-12
 ```
 
-Use a new output directory for each run. The command exports the exact catalogue × 16
+`predict` (and `forecast`) require `resample_period: W-MON` (Monday weeks). Use a new output directory for each run. The command exports the exact catalogue × 16
 Monday weeks as `holdout_predictions.csv` and `forecasts.csv`, plus `run.json`,
 `plots/` and `artifacts/`. Quantities are non-negative weekly units, rounded to two
 decimals. `wape_holdout` is a percentage (100 × Σ|actual − forecast| / Σactual) computed from

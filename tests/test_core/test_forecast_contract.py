@@ -729,3 +729,18 @@ def test_tuner_applies_sampled_batch_size(weekly_pipeline, monkeypatch):
     params = tuner.tune(n_trials=1, show_progress_bar=False)
     assert params["batch_size"] == 2
     assert sizes and max(sizes) == 2
+
+
+def test_catalogue_grid_coerces_numeric_sales_ids_and_rejects_no_match():
+    from demand_forecast.config.settings import DataConfig
+    from demand_forecast.data.preprocessor import catalogue_weekly_grid
+
+    cfg = DataConfig(input_path="x.csv", sku_column="product_id", store_column=None)
+    days = pd.date_range("2026-01-05", periods=21, freq="D")
+    sales = pd.DataFrame({"product_id": 7, "qty": 1}, index=days)
+    sales.index.name = "date"
+    products = pd.DataFrame({"id": ["7"], "category": ["c"], "price": [1.0]})
+    grid = catalogue_weekly_grid(sales, products, cfg)
+    assert grid["qty"].sum() == 21 and set(grid["product_id"]) == {"7"}
+    with pytest.raises(ValueError, match="No sales rows match"):
+        catalogue_weekly_grid(sales, products.assign(id=["8"]), cfg)

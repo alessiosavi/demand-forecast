@@ -450,6 +450,8 @@ class ForecastPipeline:
             raise ValueError("Must load or build model first")
         if self._raw_datasets is None:
             raise ValueError("Must call create_datasets first")
+        if self.settings.data.resample_period != "W-MON":
+            raise ValueError("predict requires resample_period=W-MON (Monday weeks)")
         return self.forecast(self.cutoffs()[2])
 
     def evaluate(

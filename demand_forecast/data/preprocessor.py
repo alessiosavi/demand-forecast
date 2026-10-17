@@ -256,7 +256,11 @@ def catalogue_weekly_grid(sales: pd.DataFrame, products: pd.DataFrame, cfg) -> p
     weeks = pd.date_range(first, last, freq="W-MON", name=cfg.date_column)
     ids = products[cfg.product_key_column]
     index = pd.MultiIndex.from_product([ids, weeks], names=[cfg.sku_column, cfg.date_column])
+    # Keys must share a dtype with the catalogue ids (str), or nothing matches and the grid is all zeros.
+    sales = sales.assign(**{cfg.sku_column: sales[cfg.sku_column].astype(str)})
     selected = sales[sales[cfg.sku_column].isin(ids)]
+    if selected.empty:
+        raise ValueError("No sales rows match the catalogue ids; check product_id values and types")
     qty = selected.groupby([cfg.sku_column, pd.Grouper(freq="W-MON", closed="left", label="left")])[
         cfg.quantity_column
     ].sum()
