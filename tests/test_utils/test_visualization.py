@@ -2,8 +2,10 @@
 
 from pathlib import Path
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import pytest
 
 from demand_forecast.utils.visualization import (
     plot_prediction_quality,
@@ -15,6 +17,43 @@ from demand_forecast.utils.visualization import (
 
 class TestPlotPredictionQuality:
     """Tests for plot_prediction_quality function."""
+
+    @pytest.mark.parametrize(
+        "actuals,predictions,standardized,wape_text,corr_text",
+        [
+            ([0, 2], [1, 1], False, "WAPE: 100.0%", "Corr: n/a"),
+            ([0, 0], [1, 2], False, "WAPE: n/a", "Corr: n/a"),
+            ([2, 2], [1, 3], False, "WAPE: 50.0%", "Corr: n/a"),
+            ([2], [3], False, "WAPE: 50.0%", "Corr: n/a"),
+            ([0], [1], False, "WAPE: n/a", "Corr: n/a"),
+            ([-1, 1], [0, 2], False, "WAPE: 100.0%", "Corr: 1.000"),
+            ([-1, 1], [0, 2], True, None, "Corr: 1.000"),
+        ],
+    )
+    def test_metric_box(
+        self, monkeypatch, actuals, predictions, standardized, wape_text, corr_text
+    ):
+        figures = []
+        monkeypatch.setattr(plt, "show", lambda: figures.append(plt.gcf()))
+        with np.errstate(divide="raise", invalid="raise"):
+            plot_prediction_quality(
+                np.array(actuals, dtype=float),
+                np.array(predictions, dtype=float),
+                title="Quality",
+                standardized=standardized,
+            )
+        figure = figures[0]
+        text = figure.axes[0].texts[0].get_text()
+        assert "MAPE" not in text
+        assert "nan" not in text.lower() and "inf" not in text.lower()
+        assert corr_text in text
+        assert "MSE:" in text and "MAE:" in text
+        if standardized:
+            assert "WAPE" not in text and "%" not in text
+            assert figure._suptitle.get_text() == "Quality (standardized)"
+        else:
+            assert wape_text in text
+            assert figure._suptitle.get_text() == "Quality"
 
     def test_basic_plot(self, tmp_path: Path):
         """Test basic plotting without errors."""

@@ -42,12 +42,16 @@ TIME_COLUMNS = ["p_t_sin", "p_t_cos", "p_m_sin", "p_m_cos"]
 class ForecastPipeline:
     """All fitted state comes from rows strictly before ``cutoff``."""
 
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, *, data_only: bool = False):
+        """Use data_only for CSV comparison without device detection or RNG seeding."""
         self.settings = settings
         self.device = torch.device(
-            settings.device or ("cuda" if torch.cuda.is_available() else "cpu")
+            "cpu"
+            if data_only
+            else settings.device or ("cuda" if torch.cuda.is_available() else "cpu")
         )
-        self._set_seeds(settings.seed)
+        if not data_only:
+            self._set_seeds(settings.seed)
         self.scaler_manager = ScalerManager()
         self.categorical_encoder = CategoricalEncoder()
         self.sku_to_index = {}
@@ -605,6 +609,7 @@ class ForecastPipeline:
                 title="Model Evaluation - Prediction Quality",
                 save_path=eval_plot_dir / "evaluation_quality.png",
                 show=show_plots,
+                standardized=True,
             )
 
             logger.info(f"Saved evaluation plots to {eval_plot_dir}")
