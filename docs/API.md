@@ -66,7 +66,7 @@ df = load_sales_data(
     quantity_column="qty",
     store_column="store_id",
     product_id_column="product_id",  # Optional: rename to sku_column
-    sales_qty_column="sales_qty",    # Optional: rename to quantity_column
+    sales_qty_column="sales_qty",  # Optional: rename to quantity_column
 )
 ```
 
@@ -136,14 +136,15 @@ PyTorch Dataset for demand forecasting.
 from demand_forecast.data import DemandDataset
 
 dataset = DemandDataset(
-    raw_dataset=x_train,      # np.ndarray [N, window, features]
-    cat_dataset=cat_train,    # np.ndarray [N, num_cats]
-    y=y_train,                # np.ndarray [N, n_out]
+    raw_dataset=x_train,  # np.ndarray [N, window, features]
+    cat_dataset=cat_train,  # np.ndarray [N, num_cats]
+    y=y_train,  # np.ndarray [N, n_out]
     encoded_categorical_features=["encoded_color", "encoded_size"],
 )
 
 # Use with DataLoader
 from torch.utils.data import DataLoader
+
 loader = DataLoader(dataset, batch_size=32, collate_fn=dataset.collate_fn)
 ```
 
@@ -213,11 +214,11 @@ model = AdvancedDemandForecastModel(
     max_past_len=52,
     max_future_len=16,
     # Optional improvements
-    use_rope=False,              # Rotary Position Embeddings
-    use_pre_layernorm=False,     # Pre-LayerNorm for stability
-    use_film_conditioning=False, # FiLM for static features
-    use_improved_head=False,     # GELU activation in output head
-    stochastic_depth_rate=0.0,   # Stochastic depth regularization
+    use_rope=False,  # Rotary Position Embeddings
+    use_pre_layernorm=False,  # Pre-LayerNorm for stability
+    use_film_conditioning=False,  # FiLM for static features
+    use_improved_head=False,  # GELU activation in output head
+    stochastic_depth_rate=0.0,  # Stochastic depth regularization
 )
 
 # Forward pass
@@ -251,12 +252,12 @@ model = AdvancedDemandForecastModelV2(
     max_past_len=52,
     max_future_len=16,
     # V2-specific parameters
-    use_quantiles=True,          # Probabilistic forecasting
-    num_quantiles=3,             # Number of quantile outputs (e.g., 0.1, 0.5, 0.9)
-    use_decomposition=True,      # Autoformer-style trend/seasonality separation
-    patch_len=4,                 # PatchTST patch length
-    use_vsn=True,                # Variable Selection Networks
-    use_grn=True,                # Gated Residual Networks
+    use_quantiles=True,  # Probabilistic forecasting
+    num_quantiles=3,  # Number of quantile outputs (e.g., 0.1, 0.5, 0.9)
+    use_decomposition=True,  # Autoformer-style trend/seasonality separation
+    patch_len=4,  # PatchTST patch length
+    use_vsn=True,  # Variable Selection Networks
+    use_grn=True,  # Gated Residual Networks
 )
 
 # Forward pass
@@ -289,8 +290,8 @@ model = LightweightDemandModel(
     future_time_features_dim=4,
     n_out=16,
     tcn_channels=[32, 64, 128],  # TCN channel progression
-    tcn_kernel_size=3,           # Convolution kernel size
-    use_film=True,               # FiLM conditioning for static features
+    tcn_kernel_size=3,  # Convolution kernel size
+    use_film=True,  # FiLM conditioning for static features
     dropout=0.2,
 )
 
@@ -629,10 +630,10 @@ from demand_forecast.core.tuning import HyperparameterTuner, TuningConfig, Searc
 
 # Define search space
 search_space = SearchSpace(
-    d_model=[64, 128, 256],          # Categorical choices
+    d_model=[64, 128, 256],  # Categorical choices
     nhead=[4, 8],
-    num_layers=(1, 6),               # Integer range
-    dropout=(0.1, 0.5),              # Float range
+    num_layers=(1, 6),  # Integer range
+    dropout=(0.1, 0.5),  # Float range
     learning_rate=(1e-5, 1e-3),
     batch_size=[32, 64, 128, 256],
 )
@@ -640,13 +641,13 @@ search_space = SearchSpace(
 # Configure tuning
 config = TuningConfig(
     n_trials=50,
-    timeout=3600,                    # 1 hour max
-    metric="mse",                    # Optimize MSE
+    timeout=3600,  # 1 hour max
+    metric="mse",  # Optimize MSE
     direction="minimize",
-    sampler="tpe",                   # TPE, Random, or CMA-ES
-    pruner="median",                 # Median or Hyperband
+    sampler="tpe",  # TPE, Random, or CMA-ES
+    pruner="median",  # Median or Hyperband
     study_name="demand_forecast_study",
-    storage="sqlite:///optuna.db",   # For persistence
+    storage="sqlite:///optuna.db",  # For persistence
 )
 
 # Run tuning
@@ -689,14 +690,14 @@ Configuration dataclass for tuning parameters.
 from demand_forecast.core.tuning import TuningConfig
 
 config = TuningConfig(
-    n_trials=100,                    # Number of trials
-    timeout=7200,                    # Max time in seconds
-    metric="mse",                    # Metric to optimize
-    direction="minimize",            # "minimize" or "maximize"
-    sampler="tpe",                   # "tpe", "random", or "cmaes"
-    pruner="hyperband",              # "median", "hyperband", or None
+    n_trials=100,  # Number of trials
+    timeout=7200,  # Max time in seconds
+    metric="mse",  # Metric to optimize
+    direction="minimize",  # "minimize" or "maximize"
+    sampler="tpe",  # "tpe", "random", or "cmaes"
+    pruner="hyperband",  # "median", "hyperband", or None
     study_name="my_study",
-    storage=None,                    # SQLite URL for persistence
+    storage=None,  # SQLite URL for persistence
 )
 ```
 
@@ -714,16 +715,13 @@ search_space = SearchSpace(
     # Categorical (list of choices)
     d_model=[64, 128, 256, 512],
     nhead=[4, 8, 16],
-
     # Integer range (tuple)
     num_encoder_layers=(1, 8),
     num_decoder_layers=(1, 8),
-
     # Float range (tuple)
     dropout=(0.0, 0.5),
     learning_rate=(1e-6, 1e-3),
     weight_decay=(1e-6, 1e-2),
-
     # Boolean
     use_rope=[True, False],
     use_pre_layernorm=[True, False],
@@ -841,7 +839,7 @@ from demand_forecast.utils import remove_outliers
 
 clipped_data, had_outliers = remove_outliers(
     data=series,  # pd.Series
-    n=3,          # Z-score threshold
+    n=3,  # Z-score threshold
 )
 ```
 
@@ -855,9 +853,9 @@ Create sliding window sequences.
 from demand_forecast.utils import create_timeseries
 
 x_seq, cat_seq, y_seq = create_timeseries(
-    X=features,      # [T, F] or [T]
+    X=features,  # [T, F] or [T]
     cat=categories,  # [T]
-    y=targets,       # [T]
+    y=targets,  # [T]
     window=52,
     n_out=16,
     shift=0,

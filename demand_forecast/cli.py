@@ -219,6 +219,39 @@ def predict(
         logger.info(f"Plots saved to {actual_plot_dir}")
 
 
+@app.command("generate-sales")
+def generate_sales(
+    products: Path = typer.Option(
+        ..., "--products", exists=True, dir_okay=False, help="Product CSV or CSV.gz"
+    ),
+    output: Path = typer.Option(..., "--output", "-o", help="Output sales CSV"),
+    start: str = typer.Option("2024-10-17", "--start", help="First sales date (YYYY-MM-DD)"),
+    end: str = typer.Option("2026-10-16", "--end", help="Last sales date (YYYY-MM-DD)"),
+    seed: int = typer.Option(42, "--seed", help="Random seed"),
+    promo_share: float = typer.Option(
+        0.10, "--promo-share", min=0.0, max=1.0, help="Share of calendar days on promotion"
+    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable debug logging"),
+):
+    """Generate daily synthetic sales using real catalogue IDs and prices."""
+    configure_logging("DEBUG" if verbose else "INFO")
+    logger = logging.getLogger(__name__)
+
+    import pandas as pd
+
+    from demand_forecast.synthetic.generator import PRODUCT_COLUMNS, generate_product_sales
+
+    try:
+        catalogue = pd.read_csv(products, usecols=PRODUCT_COLUMNS, dtype={"id": str})
+        sales = generate_product_sales(catalogue, start, end, seed, promo_share)
+    except (ValueError, OSError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    sales.to_csv(output, index=False, date_format="%Y-%m-%d", float_format="%.2f")
+    logger.info("Saved %d sales rows to %s", len(sales), output)
+
+
 @app.command("generate-data")
 def generate_data(
     output: Path = typer.Argument(..., help="Output CSV path"),

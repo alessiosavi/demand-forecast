@@ -59,11 +59,11 @@ Pydantic-based configuration with full validation:
 
 ```python
 class Settings(BaseModel):
-    data: DataConfig           # Input paths, column names
+    data: DataConfig  # Input paths, column names
     timeseries: TimeSeriesConfig  # Window, horizon, test size
-    model: ModelConfig         # Architecture hyperparameters
-    training: TrainingConfig   # Epochs, batch size, LR
-    output: OutputConfig       # Model/cache directories
+    model: ModelConfig  # Architecture hyperparameters
+    training: TrainingConfig  # Epochs, batch size, LR
+    output: OutputConfig  # Model/cache directories
     seed: int
     device: Optional[str]
     log_level: str
@@ -423,10 +423,7 @@ class ModelWrapper(nn.Module):
 
     def __init__(self, n: int, model_type: str = "standard", **kwargs):
         model_class = MODEL_REGISTRY[model_type]
-        self.models = nn.ModuleDict({
-            f"{i}": model_class(**kwargs)
-            for i in range(n)
-        })
+        self.models = nn.ModuleDict({f"{i}": model_class(**kwargs) for i in range(n)})
 
     def forward(self, n, qty, past_time, future_time, sku, cats):
         return self.models[n](qty, past_time, future_time, sku, cats)
@@ -599,9 +596,7 @@ class Predictor:
 
 ```python
 def calculate_confidence_intervals(
-    predictions: np.ndarray,
-    actuals: np.ndarray,
-    confidence: float = 0.95
+    predictions: np.ndarray, actuals: np.ndarray, confidence: float = 0.95
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Calculate CI using historical residuals."""
 ```
