@@ -70,6 +70,7 @@ demand-forecast tune --config config.yaml --n-trials 50 --timeout 3600
 
 ```bash
 demand-forecast predict models/model.pt input_data.csv --config config.yaml --output predictions.csv
+# (predict and forecast require resample_period: W-MON, Monday weeks; see config.example.yaml)
 ```
 
 ## Model Architectures

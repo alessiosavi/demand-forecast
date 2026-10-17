@@ -22,7 +22,7 @@ data:
   sales_qty_column: "sales_qty"     # Source column to rename to quantity_column
 
   # Data preprocessing
-  resample_period: "1W"         # Resampling period: D (day), W (week), M (month), Y (year)
+  resample_period: "W-MON"      # Resampling period: D, W, M, Y or an anchored week such as W-MON (required by predict/forecast)
   max_zeros_ratio: 0.7          # Maximum allowed ratio of zero values per SKU (0.0-1.0)
 
   # Categorical encoding (optional - auto-detected if null)
