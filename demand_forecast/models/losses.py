@@ -9,7 +9,7 @@ def compute_loss(
     outputs: torch.Tensor,
     targets: torch.Tensor,
     criterion: nn.Module,
-    flatten: bool = True,
+    flatten: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute loss with optional flattening.
 

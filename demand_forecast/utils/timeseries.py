@@ -40,7 +40,7 @@ def create_timeseries(
         >>> y = np.arange(20).astype(np.float32)
         >>> x_seq, cat_seq, y_seq = create_timeseries(X, cat, y, window=5, n_out=2)
         >>> x_seq.shape
-        (13, 5)
+        (14, 5)
     """
     min_length = window + n_out + shift
     if len(x) < min_length:
@@ -51,7 +51,7 @@ def create_timeseries(
 
     _x, _cat, _y = [], [], []
 
-    for i in range(len(x) - (window + n_out + shift)):
+    for i in range(len(x) - (window + n_out + shift) + 1):
         _x.append(x[i : i + window])
         _cat.append(cat[i])
         _y.append(y[i + window + shift : i + window + shift + n_out])

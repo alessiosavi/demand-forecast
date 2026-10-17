@@ -125,10 +125,16 @@ def resample_series(
         # Build aggregation: sum for quantity, last for other columns
         agg = {col: "last" for col in _df.columns}
         agg[quantity_column] = "sum"
-        _series = _df.resample(resample_period).agg(agg)
+        options = {"closed": "left", "label": "left"} if resample_period == "W-MON" else {}
+        _series = _df.resample(resample_period, **options).agg(agg)
+        _series[sku_column] = _df[sku_column].iloc[0]
+        _series[store_column] = _df[store_column].iloc[0]
         series_list.append(_series)
 
     series = pd.concat(series_list).sort_index()
+    if resample_period == "W-MON":
+        first, last = complete_week_bounds(df.index)
+        series = series.loc[(series.index >= first) & (series.index <= last)]
 
     logger.info(
         f"Resampled {len(df)} entries ({df[sku_column].nunique()} SKUs) into {len(series)} entries"
@@ -181,18 +187,8 @@ def filter_skus(
         logger.info(f"Removing {mask.sum()} rows with missing categorical data")
         df = df[~mask].copy()
 
-    # Filter by quality criteria
-    entries_to_retain = (
-        df.groupby(filter_fields)
-        .filter(filter_group)[filter_fields]
-        .reset_index(drop=True)
-        .drop_duplicates()
-    )
-
     original_skus = df[sku_column].nunique()
-    index = df.index
-    df = df.merge(entries_to_retain, on=filter_fields, how="inner")
-    df.index = index
+    df = df.groupby(filter_fields, group_keys=False).filter(filter_group)
 
     filtered_skus = df[sku_column].nunique()
     logger.info(f"Filtered from {original_skus} to {filtered_skus} SKUs")
@@ -240,3 +236,32 @@ def scale_by_group(
     df[scaled_column] = df.groupby(group_column)[quantity_column].transform(scale_group)
 
     return df
+
+
+def complete_week_bounds(dates: pd.DatetimeIndex) -> tuple[pd.Timestamp, pd.Timestamp]:
+    """Return Monday labels wholly covered by the observed daily date range."""
+    start, end = dates.min().normalize(), dates.max().normalize()
+    first = start + pd.Timedelta(days=(-start.weekday()) % 7)
+    last = end - pd.Timedelta(days=end.weekday())
+    if end.weekday() != 6:
+        last -= pd.Timedelta(weeks=1)
+    if first > last:
+        raise ValueError("Sales history contains no complete Monday weeks")
+    return first, last
+
+
+def catalogue_weekly_grid(sales: pd.DataFrame, products: pd.DataFrame, cfg) -> pd.DataFrame:
+    """Zero-fill every catalogue SKU using global daily coverage, then attach static data."""
+    first, last = complete_week_bounds(sales.index)
+    weeks = pd.date_range(first, last, freq="W-MON", name=cfg.date_column)
+    ids = products[cfg.product_key_column]
+    index = pd.MultiIndex.from_product([ids, weeks], names=[cfg.sku_column, cfg.date_column])
+    selected = sales[sales[cfg.sku_column].isin(ids)]
+    qty = selected.groupby([cfg.sku_column, pd.Grouper(freq="W-MON", closed="left", label="left")])[
+        cfg.quantity_column
+    ].sum()
+    grid = qty.reindex(index, fill_value=0).reset_index()
+    static = products.rename(columns={cfg.product_key_column: cfg.sku_column})
+    grid = grid.merge(static, on=cfg.sku_column, how="left", validate="many_to_one")
+    grid[cfg.store_column or "store_id"] = "store"
+    return grid.set_index(cfg.date_column)

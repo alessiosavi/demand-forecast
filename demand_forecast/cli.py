@@ -15,6 +15,95 @@ app = typer.Typer(
 
 
 @app.command()
+def forecast(
+    config: Path = typer.Option(..., "--config", exists=True, dir_okay=False),
+    products: Path = typer.Option(..., "--products", exists=True, dir_okay=False),
+    sales: Path = typer.Option(..., "--sales", exists=True, dir_okay=False),
+    out_dir: Path = typer.Option(..., "--out-dir"),
+    holdout_from: str | None = typer.Option(None, "--holdout-from"),
+    trials: int | None = typer.Option(
+        None, "--trials", min=0, help="Override YAML tuning.n_trials (hackathon.yaml: 12)"
+    ),
+    timeout: int | None = typer.Option(
+        None, "--timeout", min=1, help="Override YAML tuning.timeout (hackathon.yaml: 900 seconds)"
+    ),
+    max_epochs: int | None = typer.Option(
+        None, "--max-epochs", min=1, help="Override YAML training.num_epochs (hackathon.yaml: 60)"
+    ),
+    budget_seconds: float | None = typer.Option(
+        None, "--budget-seconds", min=0.001, help="Override YAML budget_seconds (default: 2700)"
+    ),
+    k: int | None = typer.Option(
+        None, "--k", min=1, help="Override YAML data.k (hackathon.yaml: 1)"
+    ),
+    device: str | None = typer.Option(None, "--device", help="cpu or cuda (also ROCm)"),
+    max_products: int | None = typer.Option(
+        None, "--max-products", min=1, help="Deterministic debug catalogue subset"
+    ),
+    seed: int | None = typer.Option(
+        None, "--seed", min=0, help="Override YAML seed (hackathon.yaml: 42)"
+    ),
+    expect_origins: str | None = typer.Option(
+        None,
+        "--expect-origins",
+        metavar="HOLDOUT,FUTURE",
+        help="Require these holdout and future origins (comma-separated ISO dates)",
+    ),
+    preprocess_only: bool = typer.Option(
+        False, "--preprocess-only", help="Time both preprocessing stages without training"
+    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+):
+    """Tune, select, refit and export honest weekly store forecasts."""
+    import time
+    from datetime import date
+
+    started = time.monotonic()
+    configure_logging("DEBUG" if verbose else "INFO")
+    from demand_forecast.config.settings import Settings
+    from demand_forecast.core.forecast_run import run_forecast
+
+    try:
+        settings = Settings.from_yaml(config)
+        if device not in (None, "cpu", "cuda"):
+            raise ValueError("--device must be cpu or cuda")
+        settings.data.products_path = products
+        settings.data.input_path = sales
+        if k is not None:
+            settings.data.k = k
+        settings.device = device or settings.device
+        if seed is not None:
+            settings.seed = seed
+        if holdout_from:
+            settings.timeseries.holdout_from = date.fromisoformat(holdout_from)
+        if trials is not None:
+            settings.tuning.n_trials = trials
+        if timeout is not None:
+            settings.tuning.timeout = timeout
+        if max_epochs is not None:
+            settings.training.num_epochs = max_epochs
+        if budget_seconds is not None:
+            settings.budget_seconds = budget_seconds
+        expected = None
+        if expect_origins is not None:
+            try:
+                holdout, future = expect_origins.split(",")
+                expected = (date.fromisoformat(holdout), date.fromisoformat(future))
+            except ValueError as exc:
+                raise ValueError("--expect-origins requires HOLDOUT,FUTURE as ISO dates") from exc
+        run_forecast(
+            settings,
+            out_dir,
+            max_products=max_products,
+            expect_origins=expected,
+            preprocess_only=preprocess_only,
+            started=started,
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
+@app.command()
 def train(
     config: Path = typer.Option(..., "--config", "-c", help="Path to YAML configuration file"),
     data_path: Path | None = typer.Option(
@@ -174,7 +263,7 @@ def predict(
     ),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable debug logging"),
 ):
-    """Generate predictions with confidence intervals."""
+    """Generate weekly point forecasts in original quantity units."""
     configure_logging("DEBUG" if verbose else "INFO")
     logger = logging.getLogger(__name__)
 
@@ -318,7 +407,7 @@ def preprocess(
         df,
         resample_period=cfg.resample_period,
         sku_column=cfg.sku_column,
-        store_column=cfg.store_column,
+        store_column=cfg.store_column or "store_id",
         quantity_column=cfg.quantity_column,
     )
 

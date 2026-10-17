@@ -15,7 +15,7 @@ def load_sales_data(
     date_column: str = "date",
     sku_column: str = "sku",
     quantity_column: str = "qty",
-    store_column: str = "store_id",
+    store_column: str | None = "store_id",
     product_id_column: str | None = "product_id",
     sales_qty_column: str | None = "sales_qty",
 ) -> pd.DataFrame:
@@ -60,7 +60,10 @@ def load_sales_data(
         df.rename(columns=rename_map, inplace=True)
 
     # Validate required columns
-    required_columns = [date_column, sku_column, quantity_column, store_column]
+    store_column = store_column or "store_id"
+    if store_column not in df.columns:
+        df[store_column] = "store"
+    required_columns = [date_column, sku_column, quantity_column]
     missing_columns = [col for col in required_columns if col not in df.columns]
     if missing_columns:
         raise DataValidationError(f"Missing required columns: {missing_columns}")

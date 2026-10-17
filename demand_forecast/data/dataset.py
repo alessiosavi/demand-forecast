@@ -1,212 +1,125 @@
-"""PyTorch Dataset classes for demand forecasting."""
+"""Explicit dated forecast windows and PyTorch batches."""
 
-import logging
-from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
-from typing import Any
+from typing import NamedTuple
 
 import numpy as np
 import pandas as pd
 import torch
-from sklearn.model_selection import train_test_split
 from torch.utils.data import Dataset
 
-from demand_forecast.utils.timeseries import create_timeseries
+from demand_forecast.utils.time_features import calculate_time_features
 
-logger = logging.getLogger(__name__)
+
+class WindowData(NamedTuple):
+    x: np.ndarray
+    future_time: np.ndarray
+    cat_codes: np.ndarray
+    cont: np.ndarray
+    y: np.ndarray
+    origins: np.ndarray
+
+    def select(self, mask):
+        return WindowData(*(value[mask] for value in self))
 
 
 class DemandDataset(Dataset):
-    """PyTorch Dataset for demand forecasting time series.
-
-    Attributes:
-        raw_dataset: Array of time series sequences.
-        cat_dataset: Array of categorical data per sequence.
-        y: Array of target values.
-        encoded_categorical_features: List of encoded categorical column names.
-    """
+    """Inputs and targets with calendars explicitly supplied from target dates."""
 
     def __init__(
         self,
-        raw_dataset: np.ndarray,
-        cat_dataset: np.ndarray,
-        y: np.ndarray,
-        encoded_categorical_features: list[str],
-        n_out: int | None = None,
+        raw_dataset,
+        cat_dataset,
+        y,
+        encoded_categorical_features,
+        n_out=None,
+        future_time=None,
+        cont=None,
     ):
-        """Initialize the dataset.
-
-        Args:
-            raw_dataset: Array of input sequences, shape (N, window, features).
-            cat_dataset: Array of categorical data, shape (N,).
-            y: Array of target sequences, shape (N, n_out).
-            encoded_categorical_features: List of encoded categorical column names.
-            n_out: Forecast horizon length (inferred from y if not provided).
-        """
         self.raw_dataset = raw_dataset
         self.cat_dataset = cat_dataset
-        self.encoded_categorical_features = encoded_categorical_features
         self.y = y
-        self.n_out = n_out if n_out is not None else y.shape[1] if len(y.shape) > 1 else 1
+        self.encoded_categorical_features = encoded_categorical_features
+        self.n_out = n_out or y.shape[1]
+        if future_time is None:
+            raise ValueError("future_time from the target dates is required")
+        self.future_time = future_time
+        self.cont = cont if cont is not None else np.empty((len(y), 0), dtype=np.float32)
 
-    def __len__(self) -> int:
-        """Return the number of samples."""
-        return len(self.raw_dataset)
+    def __len__(self):
+        return len(self.y)
 
-    def __getitem__(self, idx: int) -> dict[str, Any]:
-        """Get a sample by index.
-
-        Args:
-            idx: Sample index.
-
-        Returns:
-            Dictionary with sequence, target, and categorical data.
-        """
+    def __getitem__(self, idx):
         return {
             "sequence": self.raw_dataset[idx],
-            "y": self.y[idx],
             "categorical_data": self.cat_dataset[idx],
+            "y": self.y[idx],
+            "future_time": self.future_time[idx],
+            "cont": self.cont[idx],
         }
 
-    def collate_fn(self, batch: list[dict[str, Any]]) -> dict[str, Any]:
-        """Custom collate function for batching.
-
-        Args:
-            batch: List of samples from __getitem__.
-
-        Returns:
-            Batched tensors ready for model input.
-        """
-        # Quantity features
-        qty = torch.as_tensor(
-            np.asarray([x["sequence"][:, 0] for x in batch], dtype=np.float32),
-            dtype=torch.float32,
-        ).unsqueeze(-1)
-
-        # SKU indices
-        skus = torch.as_tensor(
-            np.asarray([x["sequence"][:, 1][0] for x in batch], dtype=np.int32),
-            dtype=torch.int32,
-        )
-
-        # Past time features (columns 2-5)
-        past_time = torch.as_tensor(
-            np.asarray([x["sequence"][:, 2:6] for x in batch], dtype=np.float32),
-            dtype=torch.float32,
-        )
-
-        # Future time features (columns 6+, first n_out steps)
-        # Use the last n_out rows of the future time feature columns
-        future_time = torch.as_tensor(
-            np.asarray([x["sequence"][-self.n_out :, 6:] for x in batch], dtype=np.float32),
-            dtype=torch.float32,
-        )
-
-        # Target values
-        y = torch.as_tensor(
-            np.asarray([x["y"] for x in batch], dtype=np.float32),
-            dtype=torch.float32,
-        )
-
-        # Categorical features
-        cats: dict[str, list] = defaultdict(list)
-        for entry in batch:
-            v = dict(zip(self.encoded_categorical_features, entry["categorical_data"]))
-            for k, val in v.items():
-                cats[k].append(val)
-
-        # Convert to tensors - embeddings require long integer indices
-        cats_tensor = {}
-        for k, v in cats.items():
-            arr = np.asarray(v)
-            # Convert to int for embedding lookup (handles bool, float, int)
-            if arr.dtype == np.bool_ or arr.dtype == bool:
-                arr = arr.astype(np.int64)
-            elif not np.issubdtype(arr.dtype, np.integer):
-                arr = arr.astype(np.int64)
-            cats_tensor[k] = torch.as_tensor(arr, dtype=torch.long)
-
+    def collate_fn(self, batch):
+        x = torch.as_tensor(np.asarray([row["sequence"] for row in batch]), dtype=torch.float32)
+        cats = np.asarray([row["categorical_data"] for row in batch])
         return {
-            "qty": qty,
-            "sku": skus,
-            "past_time": past_time,
-            "future_time": future_time,
-            "y": y,
-            "cats": cats_tensor,
+            "qty": x[:, :, :1],
+            "sku": x[:, 0, 1].long(),
+            "past_time": x[:, :, 2:6],
+            "future_time": torch.as_tensor(
+                np.asarray([row["future_time"] for row in batch]), dtype=torch.float32
+            ),
+            "cats": {
+                name: torch.as_tensor(cats[:, i], dtype=torch.long)
+                for i, name in enumerate(self.encoded_categorical_features)
+            },
+            "cont": torch.as_tensor(
+                np.asarray([row["cont"] for row in batch]), dtype=torch.float32
+            ),
+            "y": torch.as_tensor(np.asarray([row["y"] for row in batch]), dtype=torch.float32),
         }
 
 
 def create_time_series_data(
-    series: pd.DataFrame,
-    series_features: list[str],
-    encoded_categorical_features: list[str],
-    test_size: float = 0.2,
-    window: int = 52,
-    n_out: int = 16,
-    store_column: str = "store_id",
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Create time series datasets from grouped data.
+    series,
+    series_features,
+    encoded_categorical_features,
+    window=52,
+    n_out=16,
+    store_column="store_id",
+    target_end_max=None,
+    continuous_features=(),
+):
+    """Create all complete windows with last target <= target_end_max (inclusive).
 
-    Args:
-        series: DataFrame with time series data, grouped by SKU and store.
-        series_features: List of feature column names.
-        encoded_categorical_features: List of encoded categorical column names.
-        test_size: Fraction of data to use for testing.
-        window: Lookback window size.
-        n_out: Forecast horizon.
-        store_column: Name of the store column.
-
-    Returns:
-        Tuple of (train_x, train_y, train_cat, test_x, test_y, test_cat) arrays.
+    Returns x, target calendars, integer categories, continuous statics, y and origins.
+    There is deliberately no random or overlapping-window train/test split here.
     """
-    ts_train_x, ts_train_cat, ts_train_y = [], [], []
-    ts_test_x, ts_test_cat, ts_test_y = [], [], []
-
-    grouped = series.groupby(["sku_code", store_column])
-
-    def process_group(_series: pd.DataFrame, window: int, n_out: int) -> tuple[np.ndarray, ...]:
-        """Process a single SKU-store group."""
-        # Categorical data are the same for all timesteps, take first row
-        categorical_data = (
-            _series[encoded_categorical_features]
-            .iloc[0]
-            .apply(lambda x: np.asarray(x, dtype=np.bool_))
-            .values
-        )
-
-        _ts, _cat, _y = create_timeseries(
-            _series[series_features].values,
-            [categorical_data] * len(_series),
-            _series["qty_scaled"].values,
-            window=window,
-            n_out=n_out,
-        )
-
-        return train_test_split(_ts, _cat, _y, test_size=test_size, shuffle=False)
-
-    # Process groups in parallel
-    results = []
-    with ThreadPoolExecutor() as executor:
-        for idx, (sku, _series) in enumerate(grouped):
-            results.append(executor.submit(process_group, _series, window, n_out))
-
-    # Collect results
-    for future in results:
-        _ts_train, _ts_test, _cat_train, _cat_test, _y_train, _y_test = future.result()
-        ts_train_x.extend(_ts_train)
-        ts_test_x.extend(_ts_test)
-        ts_train_cat.extend(_cat_train)
-        ts_test_cat.extend(_cat_test)
-        ts_train_y.extend(_y_train)
-        ts_test_y.extend(_y_test)
-
-    logger.info(f"Created time series: {len(ts_train_x)} train, {len(ts_test_x)} test samples")
-
-    return (
-        np.asarray(ts_train_x),
-        np.asarray(ts_train_y),
-        np.asarray(ts_train_cat),
-        np.asarray(ts_test_x),
-        np.asarray(ts_test_y),
-        np.asarray(ts_test_cat),
+    xs, futures, cats, conts, ys, origins = [], [], [], [], [], []
+    for _, group in series.groupby(["sku_code", store_column], sort=True):
+        group = group.sort_index()
+        if group.index.has_duplicates:
+            raise ValueError("Duplicate dates in a SKU/store series")
+        values = group[series_features].to_numpy(dtype=np.float32)
+        targets = group["qty_scaled"].to_numpy(dtype=np.float32)
+        calendar = calculate_time_features(group.index).astype(np.float32)
+        categories = group[list(encoded_categorical_features)].to_numpy(dtype=np.int64)
+        continuous = group[list(continuous_features)].to_numpy(dtype=np.float32)
+        for i in range(len(group) - window - n_out + 1):
+            start, end = i + window, i + window + n_out
+            if target_end_max is not None and group.index[end - 1] > pd.Timestamp(target_end_max):
+                continue
+            xs.append(values[i:start])
+            futures.append(calendar[start:end])
+            # Static attributes are taken from the last input, never the target block.
+            cats.append(categories[start - 1])
+            conts.append(continuous[start - 1])
+            ys.append(targets[start:end])
+            origins.append(group.index[start].to_datetime64())
+    count = len(xs)
+    return WindowData(
+        np.asarray(xs, dtype=np.float32).reshape(count, window, len(series_features)),
+        np.asarray(futures, dtype=np.float32).reshape(count, n_out, 4),
+        np.asarray(cats, dtype=np.int64).reshape(count, len(encoded_categorical_features)),
+        np.asarray(conts, dtype=np.float32).reshape(count, len(continuous_features)),
+        np.asarray(ys, dtype=np.float32).reshape(count, n_out),
+        np.asarray(origins, dtype="datetime64[ns]"),
     )

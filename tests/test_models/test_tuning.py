@@ -244,7 +244,7 @@ class TestSuggestHyperparameters:
 
         study = optuna.create_study()
         trial = study.ask()
-        space = SearchSpace()
+        space = SearchSpace(use_decomposition=True)
 
         params = suggest_hyperparameters(trial, space, model_type="advanced")
 

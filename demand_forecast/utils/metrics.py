@@ -41,3 +41,18 @@ def init_metrics() -> dict[str, torchmetrics.Metric]:
 
     logger.info(f"Initialized {len(metrics)} regression metrics")
     return metrics
+
+
+def wape(actual, forecast) -> float | None:
+    """Absolute error / actual demand, as a ratio; undefined for zero total demand."""
+    import numpy as np
+
+    actual, forecast = np.asarray(actual, dtype=float), np.asarray(forecast, dtype=float)
+    if (
+        actual.shape != forecast.shape
+        or not np.isfinite(actual).all()
+        or not np.isfinite(forecast).all()
+    ):
+        raise ValueError("WAPE requires matching, finite observations")
+    denominator = float(actual.sum())
+    return float(np.abs(actual - forecast).sum() / denominator) if denominator else None

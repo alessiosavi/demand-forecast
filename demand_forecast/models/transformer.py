@@ -49,6 +49,7 @@ class AdvancedDemandForecastModel(nn.Module):
         n_out: int,
         max_past_len: int = 100,
         max_future_len: int = 50,
+        cont_features_dim: int = 0,
         # New parameters for improved architecture
         use_rope: bool = False,
         use_pre_layernorm: bool = False,
@@ -106,6 +107,10 @@ class AdvancedDemandForecastModel(nn.Module):
 
         # Total static embedding dimension
         total_cat_emb_dim = cat_emb_dims * len(cat_features_dim) + sku_emb_dim
+
+        self.cont_proj = nn.Linear(cont_features_dim, cat_emb_dims) if cont_features_dim else None
+        if self.cont_proj is not None:
+            total_cat_emb_dim += cat_emb_dims
 
         # Projection layers
         self.static_proj = nn.Linear(total_cat_emb_dim, d_model)
@@ -195,6 +200,7 @@ class AdvancedDemandForecastModel(nn.Module):
         future_time: torch.Tensor,
         sku: torch.Tensor,
         cats: dict[str, torch.Tensor],
+        cont: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         """Forward pass.
@@ -212,14 +218,16 @@ class AdvancedDemandForecastModel(nn.Module):
         # SKU Embedding
         sku_emb = self.sku_embedding(sku)
 
-        # Categorical Embeddings (max pooling over vocabulary)
-        cat_embs = [
-            torch.max(emb(cats[name]), dim=1)[0] for name, emb in self.cat_embeddings.items()
-        ]
-        cat_embs = torch.cat(cat_embs, dim=1)
-
-        # Combined static features
-        static_emb = torch.cat([sku_emb, cat_embs], dim=1)
+        static_parts = [sku_emb]
+        for name, emb in self.cat_embeddings.items():
+            codes = cats[name]
+            embedded = emb(codes.long())
+            static_parts.append(embedded if codes.ndim == 1 else embedded.max(dim=1).values)
+        if self.cont_proj is not None:
+            if cont is None:
+                raise ValueError("Continuous static features are required by this model")
+            static_parts.append(self.cont_proj(cont))
+        static_emb = torch.cat(static_parts, dim=1)
         static = self.static_proj(static_emb)  # [batch_size, d_model]
 
         # Encoder: Process past time-series

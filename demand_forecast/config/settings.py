@@ -1,5 +1,6 @@
 """Pydantic configuration models for demand forecasting."""
 
+from datetime import date
 from pathlib import Path
 from typing import Literal
 
@@ -10,14 +11,27 @@ class DataConfig(BaseModel):
     """Data loading and preprocessing configuration."""
 
     input_path: Path = Field(..., description="Path to input CSV/Parquet file")
-    resample_period: str = Field("1W", pattern=r"^\d*[DWMY]$", description="Resampling period")
+    resample_period: str = Field(
+        "1W", pattern=r"^\d*[DWMY](-[A-Z]{3})?$", description="Resampling period"
+    )
     max_zeros_ratio: float = Field(
         0.7, ge=0.0, le=1.0, description="Maximum ratio of zero values per SKU"
     )
     date_column: str = Field("date", description="Name of date column")
     sku_column: str = Field("sku", description="Name of SKU column")
     quantity_column: str = Field("qty", description="Name of quantity column")
-    store_column: str = Field("store_id", description="Name of store column")
+    store_column: str | None = Field("store_id", description="Name of store column")
+
+    products_path: Path | None = None
+    product_key_column: str = "id"
+    product_categorical: list[str] = Field(
+        default_factory=lambda: ["category", "subcategory", "gender", "brand"]
+    )
+    product_continuous: list[str] = Field(default_factory=lambda: ["price"])
+    filter_sparse_skus: bool = True
+    scaling_group: Literal["sku", "cluster"] = "cluster"
+    clip_outliers: bool = True
+    k: int = Field(1, ge=1)
 
     # Column mapping for renaming (optional)
     product_id_column: str | None = Field(
@@ -50,6 +64,8 @@ class TimeSeriesConfig(BaseModel):
 
     window: int = Field(52, ge=1, description="Lookback window in periods")
     n_out: int = Field(16, ge=1, description="Forecast horizon in periods")
+    holdout_from: date | None = None
+    validation_periods: int = Field(16, ge=1)
     test_size: float = Field(0.2, ge=0.0, lt=1.0, description="Test set ratio")
 
 
@@ -132,7 +148,7 @@ class TrainingConfig(BaseModel):
     early_stop_min_delta: float = Field(1.0, ge=0, description="Minimum improvement for early stop")
     num_workers: int = Field(0, ge=0, description="DataLoader workers (0=main process)")
     pin_memory: bool = Field(True, description="Pin memory for CUDA")
-    flatten_loss: bool = Field(True, description="Use flattened loss (sum reduction)")
+    flatten_loss: bool = Field(False, description="Use flattened loss (sum reduction)")
 
 
 class OutputConfig(BaseModel):
@@ -149,7 +165,7 @@ class TuningConfig(BaseModel):
     """Hyperparameter tuning configuration."""
 
     enabled: bool = Field(False, description="Enable hyperparameter tuning")
-    n_trials: int = Field(50, ge=1, description="Number of Optuna trials")
+    n_trials: int = Field(50, ge=0, description="Number of Optuna trials")
     timeout: int | None = Field(None, ge=1, description="Timeout in seconds (None = no limit)")
     direction: Literal["minimize", "maximize"] = Field(
         "minimize", description="Optimization direction"
@@ -176,6 +192,7 @@ class Settings(BaseModel):
     tuning: TuningConfig = Field(default_factory=TuningConfig)
     output: OutputConfig = Field(default_factory=OutputConfig)
     seed: int = Field(42, ge=0, description="Random seed for reproducibility")
+    budget_seconds: float = Field(2700, ge=0.001, description="Cooperative forecast command budget")
     device: str | None = Field(None, description="Device (cpu, cuda, mps). Auto-detect if None")
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = Field(
         "INFO", description="Logging level"
