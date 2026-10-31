@@ -226,3 +226,51 @@ class Settings(BaseModel):
 
         with open(path, "w") as f:
             yaml.dump(self.model_dump(mode="json"), f, default_flow_style=False)
+
+
+class DatasetConfig(BaseModel):
+    """Dataset source, column roles, and preprocessing configuration."""
+
+    source: Literal["long", "fev"] = "long"
+    path: Path | None = None
+    id_columns: list[str]
+    timestamp_column: str = "timestamp"
+    target: str
+    target_support: Literal["nonnegative", "real"]
+    known_dynamic: list[str] = Field(default_factory=list)
+    past_dynamic: list[str] = Field(default_factory=list)
+    static_path: Path | None = None
+    static_categorical: list[str] = Field(default_factory=list)
+    static_numeric: list[str] = Field(default_factory=list)
+    freq: str | None = None
+    missing_target: Literal["zero", "nan"] = "zero"
+    duplicates: Literal["error", "sum"] = "error"
+    resample: str | None = None
+
+
+class ForecastConfig(BaseModel):
+    """Forecast horizon, quantile levels, and context configuration."""
+
+    horizon: int = Field(ge=1)
+    quantiles: list[float] = Field(
+        default_factory=lambda: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+    )
+    max_context: int = 512
+    min_context: int = 1
+
+    @field_validator("quantiles")
+    @classmethod
+    def validate_quantiles(cls, v: list[float]) -> list[float]:
+        """Require increasing quantiles inside (0, 1), including the median."""
+        if any(not 0 < q < 1 for q in v):
+            raise ValueError("Quantiles must be strictly between 0 and 1")
+        if any(left >= right for left, right in zip(v, v[1:])):
+            raise ValueError("Quantiles must be strictly increasing")
+        if 0.5 not in v:
+            raise ValueError("Quantiles must contain 0.5")
+        return v
+
+    @property
+    def median_index(self) -> int:
+        """Return the index of the median quantile."""
+        return self.quantiles.index(0.5)

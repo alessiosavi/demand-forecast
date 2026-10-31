@@ -2,6 +2,9 @@
 
 from pathlib import Path
 
+import pytest
+from pydantic import ValidationError
+
 from demand_forecast.config import (
     DataConfig,
     ModelConfig,
@@ -121,3 +124,33 @@ class TestSettings:
 
         assert loaded.seed == original.seed
         assert loaded.data.resample_period == original.data.resample_period
+
+
+def test_dataset_config_requires_target_support():
+    from demand_forecast.config import DatasetConfig
+
+    with pytest.raises(ValidationError, match="target_support"):
+        DatasetConfig(id_columns=["id"], target="y")
+
+
+def test_forecast_config_quantiles():
+    from demand_forecast.config import ForecastConfig
+
+    for quantiles in (
+        [0.1, 0.9],
+        [0.9, 0.5, 0.1],
+        [0.1, 0.5, 0.5, 0.9],
+        [0.0, 0.5, 0.9],
+        [0.1, 0.5, 1.0],
+        [-0.1, 0.5, 0.9],
+        [0.1, 0.5, 1.1],
+        [float("nan"), 0.5],
+        [0.5, float("inf")],
+        [],
+    ):
+        with pytest.raises(ValidationError):
+            ForecastConfig(horizon=4, quantiles=quantiles)
+
+    assert ForecastConfig(horizon=4).median_index == 4
+    assert ForecastConfig(horizon=4, quantiles=[0.1, 0.5, 0.9]).median_index == 1
+    assert ForecastConfig(horizon=4, quantiles=[0.5]).median_index == 0
