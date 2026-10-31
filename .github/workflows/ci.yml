@@ -124,6 +124,14 @@ jobs:
       - name: Build package
         run: python -m build
 
+      - name: Check installed wheel without bench outside the checkout
+        run: |
+          python -m venv /tmp/wheelenv
+          /tmp/wheelenv/bin/pip install dist/*.whl
+          cd /tmp
+          /tmp/wheelenv/bin/demand-forecast --help
+          /tmp/wheelenv/bin/python -c "from demand_forecast.bench.specs import load_task_specs; assert len(load_task_specs('weekly')) == 7"
+
       - name: Check package
         run: twine check dist/*
 

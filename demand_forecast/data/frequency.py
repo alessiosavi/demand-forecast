@@ -80,6 +80,14 @@ def resolve_freq(indexes: list[pd.DatetimeIndex], pinned: str | None) -> pd.offs
 def _requires_midnight(offset: pd.offsets.BaseOffset) -> bool:
     if isinstance(offset, pd.offsets.Tick):
         return offset.nanos >= pd.Timedelta(days=1).value
+    if type(offset) is pd.DateOffset and {
+        "hours",
+        "minutes",
+        "seconds",
+        "microseconds",
+        "nanoseconds",
+    }.intersection(offset.kwds):
+        return False
     return not isinstance(offset, (pd.offsets.BusinessHour, pd.offsets.CustomBusinessHour))
 
 
