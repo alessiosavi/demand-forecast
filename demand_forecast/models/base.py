@@ -102,7 +102,7 @@ class ForecastModel(nn.Module):
             [
                 batch.target.unsqueeze(-1),
                 batch.observed.to(batch.target.dtype).unsqueeze(-1),
-                batch.enc_cov,
+                batch.enc_cov.masked_fill(~batch.enc_cov_mask, 0),
                 batch.enc_cov_mask.to(batch.enc_cov.dtype),
             ],
             dim=-1,
@@ -110,7 +110,8 @@ class ForecastModel(nn.Module):
 
     def decoder_inputs(self, batch: Batch) -> Tensor:
         """Concatenate known-future covariates and their float masks."""
-        return torch.cat([batch.dec_cov, batch.dec_cov_mask.to(batch.dec_cov.dtype)], dim=-1)
+        values = batch.dec_cov.masked_fill(~batch.dec_cov_mask, 0)
+        return torch.cat([values, batch.dec_cov_mask.to(batch.dec_cov.dtype)], dim=-1)
 
     def static_vector(self, batch: Batch) -> Tensor:
         """Embed all categorical columns, append [num, num_mask], then project.

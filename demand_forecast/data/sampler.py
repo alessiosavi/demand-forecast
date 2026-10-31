@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Iterator
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 
 import numpy as np
 import pandas as pd
@@ -126,6 +126,37 @@ def _items_array(panel: Panel, items: Iterable[tuple[int, int]]) -> np.ndarray:
     if np.any(items < 0) or np.any(items[:, 0] >= len(panel)):
         raise ValueError("items contain an invalid series index or origin position")
     return items
+
+
+def align_to_origin(panel: Panel, items: Iterable[tuple[int, int]]) -> Panel:
+    """Extend ragged histories to nonnegative origin positions without mutation.
+
+    Only affected series are copied. Gaps contain NaN targets and past-only
+    covariates, while known covariates retain all available values. This anchors
+    both context and future features at the requested origin in ``make_batch``.
+    Callers clamp positions before a series' start to zero for empty context.
+    """
+    aligned = panel
+    for i, pos in _items_array(panel, items):
+        i, pos = int(i), int(pos)
+        series = aligned.series[i]
+        length = series.history_length
+        if pos <= length:
+            continue
+        if aligned is panel:
+            aligned = replace(panel, series=list(panel.series))
+        target = np.full(pos, np.nan, dtype=np.float64)
+        target[:length] = series.target[:length]
+        dynamic = dict(series.dynamic)
+        for name in panel.roles.past_dynamic:
+            values = np.full(pos, np.nan, dtype=np.float64)
+            source = series.dynamic.get(name)
+            if source is not None:
+                end = min(length, len(source))
+                values[:end] = source[:end]
+            dynamic[name] = values
+        aligned.series[i] = replace(series, target=target, dynamic=dynamic, history_length=pos)
+    return aligned
 
 
 def _dynamic_values(

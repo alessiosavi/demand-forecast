@@ -1,0 +1,38 @@
+# Run from the repository root. Generate inputs with:
+# demand-forecast generate-data data/example --format long --products 6 --days 60 \
+#   --freq W-SUN --start 2022-01-02 --seed 0
+# Full training belongs on Colab:
+# demand-forecast train --config configs/example-long.yaml --out runs/example
+# demand-forecast forecast --bundle runs/example/bundle \
+#   --config configs/example-long.yaml --origin 2023-02-26 --out forecasts.csv
+# Future promo values may be appended with null target/oil; absent promo is masked.
+data:
+  source: long
+  path: data/example/long.csv
+  id_columns: [id]
+  timestamp_column: timestamp
+  target: target
+  target_support: nonnegative
+  known_dynamic: [promo]
+  past_dynamic: [oil]
+  static_path: data/example/static.csv
+  static_categorical: [cat]
+  static_numeric: []
+  freq: W-SUN
+  missing_target: zero
+  duplicates: error
+  resample: null
+forecast:
+  horizon: 4
+  quantiles: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+  max_context: 512
+  min_context: 1
+model:
+  family: v2
+training:
+  refit: none
+tuning:
+  enabled: false
+seed: 0
+device: null
+log_level: INFO

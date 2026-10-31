@@ -104,6 +104,26 @@ def test_input_channels_projections_and_padding_mask(spec29, panel29, encoder29)
     torch.testing.assert_close(model(poisoned), model(batch))
 
 
+def test_masked_covariate_values_do_not_change_outputs(spec29, batch_future_nan, batch_short):
+    model = ForecastModel(spec29, ToyBackbone(16)).eval()
+    padded = batch_short.clone()
+    # Include a missing covariate at a real step: padding alone is already
+    # ignored by ToyBackbone and would not catch missing encoder-cell masking.
+    assert padded.padding[0, -1] and (~padded.padding).any()
+    padded.enc_cov[0, -1, -1] = 0.0
+    padded.enc_cov_mask[0, -1, -1] = False
+
+    for batch, values_name, mask_name in (
+        (batch_future_nan, "dec_cov", "dec_cov_mask"),
+        (padded, "enc_cov", "enc_cov_mask"),
+    ):
+        masked = ~getattr(batch, mask_name)
+        assert masked.any()
+        poisoned = batch.clone()
+        getattr(poisoned, values_name).masked_fill_(masked, 7.0)
+        torch.testing.assert_close(model(poisoned), model(batch), rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("use_vsn", [False, True])
 def test_statics_and_gradients_reach_the_forecast(spec29, batch29, use_vsn):
     model = ForecastModel(replace(spec29, use_vsn=use_vsn), ToyBackbone(16))

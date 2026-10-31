@@ -1,141 +1,167 @@
-"""Tests for configuration module."""
+"""Configuration migration and validation of the public v2 schema."""
 
+from dataclasses import asdict
 from pathlib import Path
 
 import pytest
+import yaml
 from pydantic import ValidationError
 
 from demand_forecast.config import (
-    DataConfig,
+    DatasetConfig,
+    ForecastConfig,
     ModelConfig,
     Settings,
-    TimeSeriesConfig,
     TrainingConfig,
+    TuningConfig,
 )
+from tests.helpers.run_config import settings_with
+
+MINIMAL_YAML = """
+data:
+  path: data/long.csv
+  id_columns: [id]
+  target: y
+  target_support: nonnegative
+forecast:
+  horizon: 4
+"""
+LEGACY_HACKATHON_YAML = """
+data:
+  catalogue_path: data/products.csv
+  input_path: data/sales.csv
+  resample_period: W-MON
+timeseries:
+  window: 52
+  n_out: 13
+output:
+  model_dir: models
+"""
 
 
-class TestDataConfig:
-    """Tests for DataConfig."""
-
-    def test_default_values(self, tmp_path: Path):
-        """Test default configuration values."""
-        config = DataConfig(input_path=tmp_path / "data.csv")
-
-        assert config.resample_period == "1W"
-        assert config.max_zeros_ratio == 0.7
-        assert config.date_column == "date"
-        assert config.sku_column == "sku"
-
-    def test_custom_values(self, tmp_path: Path):
-        """Test custom configuration values."""
-        config = DataConfig(
-            input_path=tmp_path / "data.csv",
-            resample_period="1D",
-            max_zeros_ratio=0.5,
-        )
-
-        assert config.resample_period == "1D"
-        assert config.max_zeros_ratio == 0.5
+def test_settings_schema():
+    with pytest.raises(ValidationError):
+        Settings(**yaml.safe_load(LEGACY_HACKATHON_YAML))
+    with pytest.raises(ValidationError, match="patch"):
+        ModelConfig(use_patch_embedding=True)
+    settings = Settings(**yaml.safe_load(MINIMAL_YAML))
+    assert ModelConfig().d_model == 64 and settings.training.refit == "none"
+    assert settings.seed == 0 and settings.device is None
+    assert settings.data.path == Path("data/long.csv")
 
 
-class TestTimeSeriesConfig:
-    """Tests for TimeSeriesConfig."""
+def test_model_defaults_match_standard_backbone():
+    from demand_forecast.models.v2 import V2_STANDARD
 
-    def test_default_values(self):
-        """Test default configuration values."""
-        config = TimeSeriesConfig()
-
-        assert config.window == 52
-        assert config.n_out == 16
-        assert config.test_size == 0.2
-
-    def test_custom_values(self):
-        """Test custom configuration values."""
-        config = TimeSeriesConfig(window=26, n_out=8, test_size=0.3)
-
-        assert config.window == 26
-        assert config.n_out == 8
-        assert config.test_size == 0.3
+    config = ModelConfig()
+    assert config.backbone_kwargs() == asdict(V2_STANDARD)
+    assert config.cat_emb_dim == 16
+    assert config.family == "v2"
+    assert not config.use_patch_embedding and not config.use_decomposition
 
 
-class TestModelConfig:
-    """Tests for ModelConfig."""
-
-    def test_default_values(self):
-        """Test default configuration values."""
-        config = ModelConfig()
-
-        assert config.d_model == 256
-        assert config.nhead == 8
-        assert config.num_encoder_layers == 4
-
-    def test_d_model_divisible_by_nhead(self):
-        """Test that d_model is divisible by nhead."""
-        config = ModelConfig(d_model=256, nhead=8)
-        assert config.d_model % config.nhead == 0
+@pytest.mark.parametrize(
+    ("options", "message"),
+    [
+        ({"use_decomposition": True}, "decomposition"),
+        ({"d_model": 14, "nhead": 4}, "divisible"),
+        ({"d_model": 12, "nhead": 4}, "even"),
+        ({"family": "standard"}, "family"),
+        ({"num_encoder_layers": 0}, "num_encoder_layers"),
+    ],
+)
+def test_model_invalid_options(options, message):
+    with pytest.raises(ValidationError, match=message):
+        ModelConfig(**options)
 
 
-class TestTrainingConfig:
-    """Tests for TrainingConfig."""
+def test_training_defaults_match_trainer():
+    from demand_forecast.core.training import TrainConfig
 
-    def test_default_values(self):
-        """Test default configuration values."""
-        config = TrainingConfig()
-
-        assert config.num_epochs == 10
-        assert config.batch_size == 128
-        assert config.learning_rate == 1e-5
+    config = TrainingConfig()
+    assert config.model_dump(exclude={"refit", "min_train_history"}) == asdict(TrainConfig())
+    assert config.min_train_history is None and config.refit == "none"
+    assert "seed" not in TrainingConfig.model_fields
 
 
-class TestSettings:
-    """Tests for Settings."""
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("base_steps", 0),
+        ("batch_size", 0),
+        ("learning_rate", 0),
+        ("warmup_steps", -1),
+        ("checkpoint_every", 0),
+        ("patience", 0),
+        ("eval_every", 0),
+        ("min_train_history", 0),
+    ],
+)
+def test_training_invalid_options(field, value):
+    with pytest.raises(ValidationError, match=field):
+        TrainingConfig(**{field: value})
 
-    def test_from_dict(self, tmp_path: Path):
-        """Test creating settings from dictionary."""
-        data = {
-            "data": {"input_path": str(tmp_path / "data.csv")},
-            "seed": 123,
-        }
-        settings = Settings.model_validate(data)
 
-        assert settings.seed == 123
-        assert settings.data.input_path == tmp_path / "data.csv"
+def test_unknown_legacy_controls_are_rejected():
+    with pytest.raises(ValidationError, match="timeseries"):
+        Settings(**yaml.safe_load(MINIMAL_YAML), timeseries={"window": 10})
+    with pytest.raises(ValidationError, match="model_type"):
+        ModelConfig(model_type="advanced")
+    with pytest.raises(ValidationError, match="seed"):
+        TrainingConfig(seed=7)
 
-    def test_default_device(self, tmp_path: Path):
-        """Test default device detection."""
-        settings = Settings(
-            data=DataConfig(input_path=tmp_path / "data.csv"),
-        )
 
-        # Device should be None (auto-detect) by default
-        assert settings.device is None
+def test_yaml_roundtrip(tmp_path):
+    original = Settings(**yaml.safe_load(MINIMAL_YAML), seed=999)
+    path = tmp_path / "config.yaml"
+    original.to_yaml(path)
+    assert Settings.from_yaml(path) == original
 
-    def test_yaml_roundtrip(self, tmp_path: Path):
-        """Test saving and loading from YAML."""
-        original = Settings(
-            data=DataConfig(input_path=tmp_path / "data.csv"),
-            seed=999,
-        )
 
-        yaml_path = tmp_path / "config.yaml"
-        original.to_yaml(yaml_path)
+@pytest.mark.parametrize("path", ["config.example.yaml", "configs/example-long.yaml"])
+def test_example_configs(path):
+    settings = Settings.from_yaml(Path(__file__).resolve().parents[1] / path)
+    assert settings.data.source == "long"
+    assert settings.model == ModelConfig()
+    assert settings.training == TrainingConfig()
 
-        loaded = Settings.from_yaml(yaml_path)
 
-        assert loaded.seed == original.seed
-        assert loaded.data.resample_period == original.data.resample_period
+def test_legacy_tuning_settings_preserved():
+    # The Pydantic schema and the live legacy tuner have separate configs.
+    from demand_forecast.core.tuning import HyperparameterTuner
+
+    assert HyperparameterTuner is not None
+    assert TuningConfig().model_dump() == {
+        "enabled": False,
+        "n_trials": 50,
+        "timeout": None,
+        "direction": "minimize",
+        "metric": "mse",
+        "pruner": "median",
+        "sampler": "tpe",
+        "study_name": "demand_forecast_tuning",
+        "storage": None,
+        "n_jobs": 1,
+        "epochs_per_trial": 5,
+        "early_stop_patience": 2,
+    }
+    assert TuningConfig(n_trials=0).n_trials == 0
+
+
+def test_refit_full_is_explicitly_unimplemented(tmp_path):
+    from demand_forecast.core.run import train_from_settings
+
+    with pytest.raises(NotImplementedError, match="refit=full arrives with the phase-4 plan"):
+        train_from_settings(settings_with(refit="full"), tmp_path)
+    assert not list(tmp_path.iterdir())
 
 
 def test_dataset_config_requires_target_support():
-    from demand_forecast.config import DatasetConfig
-
     with pytest.raises(ValidationError, match="target_support"):
         DatasetConfig(id_columns=["id"], target="y")
 
 
 def test_forecast_config_quantiles():
-    from demand_forecast.config import ForecastConfig
-
     for quantiles in (
         [0.1, 0.9],
         [0.9, 0.5, 0.1],
@@ -150,7 +176,6 @@ def test_forecast_config_quantiles():
     ):
         with pytest.raises(ValidationError):
             ForecastConfig(horizon=4, quantiles=quantiles)
-
     assert ForecastConfig(horizon=4).median_index == 4
     assert ForecastConfig(horizon=4, quantiles=[0.1, 0.5, 0.9]).median_index == 1
     assert ForecastConfig(horizon=4, quantiles=[0.5]).median_index == 0

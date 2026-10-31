@@ -157,6 +157,23 @@ def test_business_hour_grids_preserve_time_of_day(freq):
     assert index[0] == pd.Timestamp("2023-01-02 09:00")
 
 
+@pytest.mark.parametrize("unit", ["hours", "minutes", "seconds", "microseconds", "nanoseconds"])
+def test_generic_subday_offsets_preserve_time_of_day(unit):
+    freq = pd.DateOffset(**{unit: 4})
+    index = pd.date_range("2023-01-01 13:00", periods=3, freq=freq)
+    validate_on_grid(index, freq, "subday")
+    assert steps_between(index[0], index[-1], freq) == 2
+
+
+def test_generic_daily_offset_requires_midnight():
+    freq = pd.DateOffset(days=1)
+    validate_on_grid(pd.date_range("2023-01-01", periods=3, freq=freq), freq, "daily")
+    index = pd.date_range("2023-01-01 13:00", periods=3, freq=freq)
+    with pytest.raises(GridError) as exc:
+        validate_on_grid(index, freq, "daily")
+    assert exc.value.timestamp == index[0]
+
+
 @pytest.mark.parametrize(
     "freq,start,off_grid",
     [

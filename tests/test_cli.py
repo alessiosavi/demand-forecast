@@ -1,8 +1,7 @@
 """Tests for CLI commands."""
 
-import json
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pandas as pd
 import pytest
@@ -197,310 +196,318 @@ class TestGenerateSalesCommand:
         assert not output.exists()
 
 
-class TestTrainCommand:
-    """Tests for train command."""
+def test_train_then_forecast_cli(tmp_path):
+    from demand_forecast.synthetic.generator import generate_long_panel
+    from tests.helpers.run_config import write_cfg
 
-    def test_train_missing_config(self):
-        """Test train command fails without config."""
-        result = runner.invoke(app, ["train"])
-        assert result.exit_code != 0
+    long, static = generate_long_panel(
+        6, 60, "W-SUN", "2022-01-02", ("promo",), ("oil",), ("cat",), 0
+    )
+    write_cfg(tmp_path, long, static, horizon=4, base_steps=30, d_model=16)
+    result = runner.invoke(
+        app, ["train", "--config", str(tmp_path / "cfg.yaml"), "--out", str(tmp_path / "run")]
+    )
+    assert result.exit_code == 0, (result.output, result.exception)
+    assert (tmp_path / "run/bundle/manifest.json").exists()
+    result = runner.invoke(
+        app,
+        [
+            "forecast",
+            "--bundle",
+            str(tmp_path / "run/bundle"),
+            "--config",
+            str(tmp_path / "cfg.yaml"),
+            "--origin",
+            "2023-02-26",
+            "--out",
+            str(tmp_path / "f.csv"),
+        ],
+    )
+    assert result.exit_code == 0, (result.output, result.exception)
+    df = pd.read_csv(tmp_path / "f.csv")
+    assert len(df) == 6 * 4 and list(df.columns)[:3] == ["series_id", "origin", "timestamp"]
+    assert df["point"].equals(df["q0.5"])
+    assert df["origin"].eq("2023-02-26").all()
 
-    def test_train_config_not_found(self, tmp_path: Path):
-        """Test train command fails with non-existent config."""
-        result = runner.invoke(
-            app,
-            ["train", "--config", str(tmp_path / "nonexistent.yaml")],
+
+@pytest.fixture
+def run_settings(tmp_path):
+    from demand_forecast.config import Settings
+    from demand_forecast.synthetic.generator import generate_long_panel
+    from tests.helpers.run_config import write_cfg
+
+    long, static = generate_long_panel(
+        3, 32, "W-SUN", "2022-01-02", ("promo",), ("oil",), ("cat",), 0
+    )
+    return Settings.from_yaml(write_cfg(tmp_path, long, static, horizon=4, base_steps=8, d_model=8))
+
+
+def test_run_identity_canonical_json(run_settings):
+    import hashlib
+    import json
+
+    from demand_forecast.core.run import run_identity
+
+    origin = pd.Timestamp("2022-08-14")
+    task = {"name": "fixture", "horizon": 4}
+    payload = {
+        "settings": run_settings.model_dump(mode="json"),
+        "seed": 3,
+        "dataset_fingerprint": "data-hash",
+        "package_version": "2.0.0",
+        "origin": origin.isoformat(),
+        "task_definition": task,
+    }
+    expected = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    assert run_identity(run_settings, 3, "data-hash", "2.0.0", origin, task) == expected
+    assert (
+        run_identity(
+            run_settings,
+            3,
+            "data-hash",
+            "2.0.0",
+            origin.isoformat(),
+            dict(reversed(list(task.items()))),
         )
-        assert result.exit_code != 0
+        == expected
+    )
+    assert run_identity(run_settings, 3, "other", "2.0.0", origin, task) != expected
+    assert run_identity(run_settings, 3, "data-hash", "2.0.0", origin, None) != expected
+    assert (
+        run_identity(run_settings, 3, "data-hash", "2.0.0", origin + pd.Timedelta(weeks=1), task)
+        != expected
+    )
 
-    @patch("demand_forecast.core.pipeline.ForecastPipeline")
-    @patch("demand_forecast.config.settings.Settings")
-    def test_train_with_plot_flag(self, mock_settings, mock_pipeline, tmp_path: Path):
-        """Test train command with --plot flag."""
-        # Create mock config
-        config_path = tmp_path / "config.yaml"
-        config_path.write_text("data:\n  input_path: test.csv\n")
 
-        mock_settings_instance = MagicMock()
-        mock_settings_instance.output.model_dir = tmp_path / "models"
-        mock_settings.from_yaml.return_value = mock_settings_instance
+def test_train_seeds_before_build_and_saves_run_metadata(tmp_path, run_settings, monkeypatch):
+    import json
+    import random
 
-        mock_pipeline_instance = MagicMock()
-        mock_pipeline.return_value = mock_pipeline_instance
+    import numpy as np
+    import torch
 
-        runner.invoke(
-            app,
-            ["train", "--config", str(config_path), "--plot"],
+    from demand_forecast.core import run
+    from demand_forecast.core.bundle import load_bundle
+
+    seen = []
+    build = run.build_model
+
+    def capture(*args, **kwargs):
+        seen.append((torch.rand(1).item(), np.random.rand(), random.random()))
+        return build(*args, **kwargs)
+
+    monkeypatch.setattr(run, "build_model", capture)
+    bundle = run.train_from_settings(run_settings, tmp_path / "one")
+    random.seed(999)
+    np.random.seed(999)
+    torch.manual_seed(999)
+    second = run.train_from_settings(run_settings, tmp_path / "two")
+    assert seen[0] == seen[1]
+    loaded = load_bundle(bundle)
+    repeated = load_bundle(second)
+    for name, value in loaded.model.state_dict().items():
+        assert torch.equal(value, repeated.model.state_dict()[name]), name
+    info = json.loads((tmp_path / "one/run.json").read_text())
+    assert info["run_identity"] == loaded.manifest["run_identity"]
+    assert info["seed"] == run_settings.seed and info["resumed_from_step"] == 0
+    assert info["origin"] == "2022-08-14T00:00:00"
+    assert info["plan"]["train_upto"] == loaded.panel_metadata["training_cutoff"]
+    assert info["fit_result"]["steps"] == 8
+    assert info["timings"]["training_time_s"] > 0
+
+
+def test_train_encoder_uses_only_fit_ids(tmp_path, run_settings):
+    from demand_forecast.core.bundle import load_bundle
+    from demand_forecast.core.run import train_panel
+    from demand_forecast.data.loader_long import load_long
+
+    panel = load_long(run_settings.data)
+    # Only the validation block contains this series' target/past observations.
+    held_out = panel.series[-1]
+    held_out.target[:-4] = float("nan")
+    held_out.dynamic["oil"][:-4] = float("nan")
+    held_out.statics["cat"] = "validation-only"
+    bundle = load_bundle(
+        train_panel(
+            panel,
+            pd.Timestamp("2022-08-14"),
+            run_settings,
+            tmp_path / "run",
+            dataset_fingerprint="fit-only",
         )
-
-        # Check that train was called with plot=True
-        mock_pipeline_instance.train.assert_called_once()
-        call_kwargs = mock_pipeline_instance.train.call_args
-        assert call_kwargs[1]["plot"] is True
+    )
+    assert held_out.series_id not in bundle.encoder.vocabularies["__series__"]
+    assert "validation-only" not in bundle.encoder.vocabularies["cat"]
 
 
-class TestEvaluateCommand:
-    """Tests for evaluate command."""
+@pytest.mark.parametrize("resume_at", [0, 3])
+def test_train_panel_writes_bundle_when_stop_after_completes_budget(
+    tmp_path, run_settings, resume_at
+):
+    import json
 
-    def test_evaluate_missing_args(self):
-        """Test evaluate command fails without required args."""
-        result = runner.invoke(app, ["evaluate"])
-        assert result.exit_code != 0
+    import torch
 
-    @patch("demand_forecast.core.pipeline.ForecastPipeline")
-    @patch("demand_forecast.config.settings.Settings")
-    def test_evaluate_saves_metrics(self, mock_settings, mock_pipeline, tmp_path: Path):
-        """Test evaluate command saves metrics to file."""
-        # Create mock config
-        config_path = tmp_path / "config.yaml"
-        config_path.write_text("data:\n  input_path: test.csv\n")
+    from demand_forecast.core.bundle import load_bundle
+    from demand_forecast.core.run import train_panel
+    from demand_forecast.core.training import InterruptedRun
+    from demand_forecast.data.loader_long import load_long
 
-        mock_settings_instance = MagicMock()
-        mock_settings_instance.output.model_dir = tmp_path / "models"
-        mock_settings.from_yaml.return_value = mock_settings_instance
+    # Keep this check focused on budget completion, independently of validation scores.
+    run_settings.training.patience = 20
+    panel = load_long(run_settings.data)
+    out = tmp_path / "run"
+    args = (panel, pd.Timestamp("2022-08-14"), run_settings, out)
+    if resume_at:
+        with pytest.raises(InterruptedRun):
+            train_panel(*args, dataset_fingerprint="fixture", stop_after=resume_at)
+    bundle = train_panel(
+        *args,
+        dataset_fingerprint="fixture",
+        resume=bool(resume_at),
+        stop_after=8 - resume_at,
+    )
+    assert bundle == out / "bundle"
+    loaded = load_bundle(bundle)
+    report = json.loads((out / "run.json").read_text())
+    assert report["fit_result"]["stop_reason"] == "max_steps"
+    assert report["fit_result"]["steps"] == 8
+    assert report["resumed_from_step"] == resume_at
+    assert loaded.manifest["run"] == report
+    assert torch.load(out / "checkpoints/latest.pt", weights_only=False)["step"] == 8
 
-        mock_pipeline_instance = MagicMock()
-        mock_pipeline_instance.evaluate.return_value = {
-            "mse": 0.1,
-            "rmse": 0.316,
-            "mae": 0.2,
-            "mape": 5.0,
-            "r_squared": 0.95,
-            "correlation": 0.98,
-            "total_samples": 100,
-        }
-        mock_pipeline.return_value = mock_pipeline_instance
 
-        output_metrics = tmp_path / "metrics.json"
-        model_path = tmp_path / "model.pt"
-        model_path.touch()
-        data_path = tmp_path / "data.csv"
-        data_path.touch()
+def test_interrupted_run_resumes_exactly_and_reuses_bundle(tmp_path, run_settings, monkeypatch):
+    import json
 
-        result = runner.invoke(
-            app,
-            [
-                "evaluate",
-                str(model_path),
-                str(data_path),
-                "--config",
-                str(config_path),
-                "--output",
-                str(output_metrics),
-            ],
+    import torch
+
+    from demand_forecast.core import run
+    from demand_forecast.core.bundle import load_bundle
+    from demand_forecast.core.training import InterruptedRun
+    from demand_forecast.data.loader_long import load_long
+
+    panel = load_long(run_settings.data)
+    origin = pd.Timestamp("2022-08-14")
+    options = {"dataset_fingerprint": "fixture"}
+    with pytest.raises(InterruptedRun):
+        run.train_panel(panel, origin, run_settings, tmp_path / "split", stop_after=3, **options)
+    assert not (tmp_path / "split/bundle").exists()
+    checkpoint = torch.load(tmp_path / "split/checkpoints/latest.pt", weights_only=False)
+    assert checkpoint["step"] == 3
+    resumed = run.train_panel(
+        panel, origin, run_settings, tmp_path / "split", resume=True, **options
+    )
+    full = run.train_panel(panel, origin, run_settings, tmp_path / "full", **options)
+    resumed_bundle, full_bundle = load_bundle(resumed), load_bundle(full)
+    assert resumed_bundle.manifest["resumed_from_step"] == 3
+    for name, value in full_bundle.model.state_dict().items():
+        assert torch.equal(value, resumed_bundle.model.state_dict()[name]), name
+    metadata = json.loads((tmp_path / "split/run.json").read_text())
+    assert metadata["resumed_from_step"] == 3
+    before = {p: p.read_bytes() for p in (tmp_path / "split").rglob("*") if p.is_file()}
+    with patch.object(run.Trainer, "fit", side_effect=AssertionError("already trained")):
+        assert (
+            run.train_panel(panel, origin, run_settings, tmp_path / "split", resume=True, **options)
+            == resumed
         )
-
-        assert result.exit_code == 0
-        assert output_metrics.exists()
-
-        # Check metrics content
-        with open(output_metrics) as f:
-            metrics = json.load(f)
-        assert "mse" in metrics
-        assert "rmse" in metrics
-
-    @patch("demand_forecast.core.pipeline.ForecastPipeline")
-    @patch("demand_forecast.config.settings.Settings")
-    def test_evaluate_with_plot(self, mock_settings, mock_pipeline, tmp_path: Path):
-        """Test evaluate command with --plot flag."""
-        config_path = tmp_path / "config.yaml"
-        config_path.write_text("data:\n  input_path: test.csv\n")
-
-        mock_settings_instance = MagicMock()
-        mock_settings_instance.output.model_dir = tmp_path / "models"
-        mock_settings.from_yaml.return_value = mock_settings_instance
-
-        mock_pipeline_instance = MagicMock()
-        mock_pipeline_instance.evaluate.return_value = {
-            "mse": 0.1,
-            "rmse": 0.316,
-            "mae": 0.2,
-            "mape": 5.0,
-            "r_squared": 0.95,
-            "correlation": 0.98,
-            "total_samples": 100,
-        }
-        mock_pipeline.return_value = mock_pipeline_instance
-
-        model_path = tmp_path / "model.pt"
-        model_path.touch()
-        data_path = tmp_path / "data.csv"
-        data_path.touch()
-
-        runner.invoke(
-            app,
-            [
-                "evaluate",
-                str(model_path),
-                str(data_path),
-                "--config",
-                str(config_path),
-                "--plot",
-            ],
-        )
-
-        # Check that evaluate was called with plot=True
-        mock_pipeline_instance.evaluate.assert_called_once()
-        call_kwargs = mock_pipeline_instance.evaluate.call_args
-        assert call_kwargs[1]["plot"] is True
+    assert all(p.read_bytes() == content for p, content in before.items())
+    (tmp_path / "split/run.json").unlink()
+    with patch.object(run.Trainer, "fit", side_effect=AssertionError("already trained")):
+        run.train_panel(panel, origin, run_settings, tmp_path / "split", resume=True, **options)
+    assert json.loads((tmp_path / "split/run.json").read_text()) == metadata
 
 
-class TestPredictCommand:
-    """Tests for predict command."""
+@pytest.mark.parametrize("artifact", ["checkpoint", "bundle", "run"])
+def test_resume_checks_all_present_artifact_identities(tmp_path, run_settings, artifact):
+    import json
 
-    def test_predict_missing_args(self):
-        """Test predict command fails without required args."""
-        result = runner.invoke(app, ["predict"])
-        assert result.exit_code != 0
+    import torch
 
-    @patch("demand_forecast.core.pipeline.ForecastPipeline")
-    @patch("demand_forecast.config.settings.Settings")
-    def test_predict_saves_csv(self, mock_settings, mock_pipeline, tmp_path: Path):
-        """Test predict command saves predictions to CSV."""
-        import pandas as pd
+    from demand_forecast.core.run import train_from_settings
 
-        config_path = tmp_path / "config.yaml"
-        config_path.write_text("data:\n  input_path: test.csv\n")
-
-        mock_settings_instance = MagicMock()
-        mock_settings_instance.output.model_dir = tmp_path / "models"
-        mock_settings.from_yaml.return_value = mock_settings_instance
-
-        mock_pipeline_instance = MagicMock()
-        mock_pipeline_instance.predict.return_value = pd.DataFrame(
-            {
-                "sku": ["SKU1", "SKU2"],
-                "cluster": [0, 1],
-                "prediction": [100.0, 200.0],
-                "actual": [95.0, 205.0],
-                "lower_bound": [90.0, 190.0],
-                "upper_bound": [110.0, 210.0],
-            }
-        )
-        mock_pipeline.return_value = mock_pipeline_instance
-
-        model_path = tmp_path / "model.pt"
-        model_path.touch()
-        data_path = tmp_path / "data.csv"
-        data_path.touch()
-        output_csv = tmp_path / "predictions.csv"
-
-        result = runner.invoke(
-            app,
-            [
-                "predict",
-                str(model_path),
-                str(data_path),
-                "--config",
-                str(config_path),
-                "--output",
-                str(output_csv),
-            ],
-        )
-
-        assert result.exit_code == 0
-        assert output_csv.exists()
-
-    @patch("demand_forecast.core.pipeline.ForecastPipeline")
-    @patch("demand_forecast.config.settings.Settings")
-    def test_predict_with_confidence(self, mock_settings, mock_pipeline, tmp_path: Path):
-        """Test predict command with custom confidence level."""
-        import pandas as pd
-
-        config_path = tmp_path / "config.yaml"
-        config_path.write_text("data:\n  input_path: test.csv\n")
-
-        mock_settings_instance = MagicMock()
-        mock_settings_instance.output.model_dir = tmp_path / "models"
-        mock_settings.from_yaml.return_value = mock_settings_instance
-
-        mock_pipeline_instance = MagicMock()
-        mock_pipeline_instance.predict.return_value = pd.DataFrame(
-            {
-                "sku": ["SKU1"],
-                "prediction": [100.0],
-            }
-        )
-        mock_pipeline.return_value = mock_pipeline_instance
-
-        model_path = tmp_path / "model.pt"
-        model_path.touch()
-        data_path = tmp_path / "data.csv"
-        data_path.touch()
-        output_csv = tmp_path / "predictions.csv"
-
-        runner.invoke(
-            app,
-            [
-                "predict",
-                str(model_path),
-                str(data_path),
-                "--config",
-                str(config_path),
-                "--output",
-                str(output_csv),
-                "--confidence",
-                "0.90",
-            ],
-        )
-
-        # Check that predict was called with confidence=0.90
-        mock_pipeline_instance.predict.assert_called_once()
-        call_kwargs = mock_pipeline_instance.predict.call_args
-        assert call_kwargs[1]["confidence"] == 0.90
-
-    @patch("demand_forecast.core.pipeline.ForecastPipeline")
-    @patch("demand_forecast.config.settings.Settings")
-    def test_predict_with_plot(self, mock_settings, mock_pipeline, tmp_path: Path):
-        """Test predict command with --plot flag."""
-        import pandas as pd
-
-        config_path = tmp_path / "config.yaml"
-        config_path.write_text("data:\n  input_path: test.csv\n")
-
-        mock_settings_instance = MagicMock()
-        mock_settings_instance.output.model_dir = tmp_path / "models"
-        mock_settings.from_yaml.return_value = mock_settings_instance
-
-        mock_pipeline_instance = MagicMock()
-        mock_pipeline_instance.predict.return_value = pd.DataFrame(
-            {
-                "sku": ["SKU1"],
-                "prediction": [100.0],
-            }
-        )
-        mock_pipeline.return_value = mock_pipeline_instance
-
-        model_path = tmp_path / "model.pt"
-        model_path.touch()
-        data_path = tmp_path / "data.csv"
-        data_path.touch()
-        output_csv = tmp_path / "predictions.csv"
-
-        runner.invoke(
-            app,
-            [
-                "predict",
-                str(model_path),
-                str(data_path),
-                "--config",
-                str(config_path),
-                "--output",
-                str(output_csv),
-                "--plot",
-            ],
-        )
-
-        # Check that predict was called with plot=True
-        mock_pipeline_instance.predict.assert_called_once()
-        call_kwargs = mock_pipeline_instance.predict.call_args
-        assert call_kwargs[1]["plot"] is True
+    out = tmp_path / "run"
+    train_from_settings(run_settings, out)
+    if artifact == "checkpoint":
+        path = out / "checkpoints/latest.pt"
+        content = torch.load(path, weights_only=False)
+        content["run_identity"] = "wrong"
+        torch.save(content, path)
+    else:
+        path = out / ("bundle/manifest.json" if artifact == "bundle" else "run.json")
+        content = json.loads(path.read_text())
+        content["run_identity"] = "wrong"
+        path.write_text(json.dumps(content))
+    with pytest.raises(ValueError, match="run identity mismatch"):
+        train_from_settings(run_settings, out, resume=True)
 
 
-class TestPreprocessCommand:
-    """Tests for preprocess command."""
+@pytest.mark.parametrize("change", ["settings", "long", "static"])
+def test_resume_rejects_changed_inputs(tmp_path, run_settings, change):
+    from demand_forecast.core.run import train_from_settings
 
-    def test_preprocess_missing_args(self):
-        """Test preprocess command fails without required args."""
-        result = runner.invoke(app, ["preprocess"])
-        assert result.exit_code != 0
+    out = tmp_path / "run"
+    train_from_settings(run_settings, out)
+    if change == "settings":
+        run_settings.seed += 1
+    else:
+        path = run_settings.data.path if change == "long" else run_settings.data.static_path
+        path.write_text(path.read_text() + "\n")
+    with pytest.raises(ValueError, match="run identity mismatch"):
+        train_from_settings(run_settings, out, resume=True)
+
+
+@pytest.mark.parametrize("missing", [False, True])
+def test_train_no_training_data_still_saves_fallback_bundle(tmp_path, run_settings, missing):
+    import json
+
+    import numpy as np
+
+    from demand_forecast.core.run import forecast_from_bundle, train_from_settings
+
+    frame = pd.read_csv(run_settings.data.path).groupby("id", sort=False).head(1)
+    frame["target"] = np.nan if missing else 6.0
+    frame["oil"] = np.nan if missing else 1.0
+    frame.to_csv(run_settings.data.path, index=False)
+    out = tmp_path / "run"
+    bundle = train_from_settings(run_settings, out)
+    report = json.loads((out / "run.json").read_text())
+    assert report["fit_result"]["steps"] == 0
+    assert report["fit_result"]["stop_reason"] == "no_training_data"
+    forecasts = forecast_from_bundle(
+        bundle, run_settings, pd.Timestamp("2022-01-09"), tmp_path / "nested/f.csv"
+    )
+    assert (forecasts.filter(regex="^q").to_numpy() == (0.0 if missing else 6.0)).all()
+    assert len(forecasts) == 12
+
+
+def test_train_cli_resume_and_errors(tmp_path, run_settings):
+    args = ["train", "--config", str(tmp_path / "cfg.yaml"), "--out", str(tmp_path / "run")]
+    assert runner.invoke(app, args).exit_code == 0
+    with patch(
+        "demand_forecast.core.run.Trainer.fit", side_effect=AssertionError("already trained")
+    ):
+        result = runner.invoke(app, [*args, "--resume"])
+    assert result.exit_code == 0, result.output
+    run_settings.training.refit = "full"
+    run_settings.to_yaml(tmp_path / "cfg.yaml")
+    result = runner.invoke(app, args)
+    assert result.exit_code != 0 and "phase-4" in result.output
+    result = runner.invoke(
+        app,
+        [
+            "forecast",
+            "--config",
+            str(tmp_path / "cfg.yaml"),
+            "--bundle",
+            str(tmp_path / "run/bundle"),
+            "--origin",
+            "2022-08-15",
+            "--out",
+            str(tmp_path / "bad.csv"),
+        ],
+    )
+    assert result.exit_code != 0 and "off the" in result.output
+    assert not (tmp_path / "bad.csv").exists()

@@ -2,493 +2,176 @@
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Code style: ruff](https://img.shields.io/badge/code%20style-ruff-000000.svg)](https://github.com/astral-sh/ruff)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A production-ready demand forecasting system using state-of-the-art Transformer neural networks. Predicts SKU-level demand with confidence intervals, supporting multiple time series clustering, categorical feature embeddings, and advanced architectures including TFT, PatchTST, and lightweight models for CPU deployment.
+Version 2.0.0 provides quantile forecasting for long-format panels: explicit data
+roles, frequency-aware sampling, a shared `v2` model and trainer, portable bundles,
+and optional fev evaluation. Predictions include every input series, with finite
+fallbacks for insufficient histories and ordered quantiles in original units.
 
-## Features
+## Quick start
 
-- **Multiple Model Architectures**:
-  - **Standard**: Transformer encoder-decoder with optional improvements (RoPE, Pre-LN, FiLM, stochastic depth)
-  - **Advanced (V2)**: Research-grade model with TFT-style variable selection, PatchTST embeddings, and quantile forecasting
-  - **Lightweight**: CPU-optimized models (TCN, MLP-Mixer) for edge deployment with ONNX export
-- **Hyperparameter Tuning**: Optuna integration for automated hyperparameter optimization
-- **Multi-Cluster Training**: Automatic time series clustering with separate models per cluster
-- **Categorical Embeddings**: Dynamic embedding layers for product attributes (color, size, category, etc.)
-- **Uncertainty Quantification**: Quantile forecasting and confidence intervals
-- **CLI Interface**: Easy-to-use command-line tools for training, evaluation, tuning, and prediction
-- **Configurable Pipeline**: YAML-based configuration for all hyperparameters
-- **Production Ready**: Proper logging, error handling, type hints, and comprehensive test suite
-
-## Quick Start
-
-### Installation
+Install from this checkout with Python 3.10+ and generate a small weekly panel:
 
 ```bash
-# Clone the repository
-git clone https://github.com/alessiosavi/demand-forecast.git
-cd demand-forecast
-
-# Install in development mode
 pip install -e ".[dev]"
-
-# For ONNX export support (lightweight models)
-pip install -e ".[deploy]"
+demand-forecast generate-data /tmp/dfc-example --format long \
+  --products 6 --days 60 --freq W-SUN --start 2022-01-02 --seed 0
 ```
 
-### Generate Sample Data
-
-```bash
-demand-forecast generate-data sample_data.csv --products 50 --stores 10 --days 730
-```
-
-### Train a Model
-
-```bash
-# Copy and customize the example configuration
-cp config.example.yaml config.yaml
-
-# Train the standard model
-demand-forecast train --config config.yaml
-
-# Train with advanced model
-demand-forecast train --config config.yaml --model-type advanced
-
-# Train with lightweight model for CPU deployment
-demand-forecast train --config config.yaml --model-type lightweight
-```
-
-### Hyperparameter Tuning
-
-```bash
-# Run Optuna hyperparameter tuning
-demand-forecast tune --config config.yaml --n-trials 50 --timeout 3600
-```
-
-### Generate Predictions
-
-```bash
-demand-forecast predict models/model.pt input_data.csv --config config.yaml --output predictions.csv
-# (predict and forecast require resample_period: W-MON, Monday weeks; see config.example.yaml)
-```
-
-## Model Architectures
-
-### Standard Model (`AdvancedDemandForecastModel`)
-
-Classic Transformer encoder-decoder with optional modern improvements:
-
-| Feature | Description |
-|---------|-------------|
-| **RoPE** | Rotary Position Embeddings for better sequence modeling |
-| **Pre-LayerNorm** | Improved training stability |
-| **FiLM Conditioning** | Feature-wise Linear Modulation for static features |
-| **Stochastic Depth** | Regularization through random layer dropping |
-| **Improved Head** | GELU activation in output projection |
-
-### Advanced Model V2 (`AdvancedDemandForecastModelV2`)
-
-Research-grade architecture combining state-of-the-art techniques:
-
-- **Variable Selection Networks (VSN)**: TFT-style feature importance learning
-- **Gated Residual Networks (GRN)**: Enhanced information flow
-- **Patch Embedding**: PatchTST-style time series tokenization
-- **Series Decomposition**: Autoformer-style trend/seasonality separation
-- **Quantile Output**: Probabilistic forecasting with uncertainty
-
-### Lightweight Models
-
-CPU-optimized architectures for edge deployment:
-
-| Model | Description | Parameters |
-|-------|-------------|------------|
-| `LightweightDemandModel` | TCN + FiLM conditioning | < 1M |
-| `LightweightMixerModel` | MLP-Mixer architecture | < 500K |
-
-Features:
-- ONNX export for optimized inference
-- TorchScript compilation
-- INT8 quantization support
-
-## Architecture Overview
-
-```text
-demand_forecast/
-├── cli.py                 # Typer CLI commands
-├── config/settings.py     # Pydantic configuration models
-├── core/
-│   ├── pipeline.py        # Main orchestration
-│   ├── trainer.py         # Training loop with callbacks
-│   ├── evaluator.py       # Validation and metrics
-│   └── tuning.py          # Optuna hyperparameter tuning
-├── data/
-│   ├── loader.py          # Data loading with validation
-│   ├── preprocessor.py    # Scaling, filtering, resampling
-│   ├── feature_engineering.py  # Categorical encoding
-│   └── dataset.py         # PyTorch Dataset
-├── models/
-│   ├── transformer.py     # Standard model with improvements
-│   ├── transformer_v2.py  # Advanced research-grade model
-│   ├── lightweight.py     # CPU-optimized models
-│   ├── components.py      # Reusable building blocks
-│   ├── losses.py          # Loss functions (Huber, quantile, SMAPE)
-│   └── wrapper.py         # Multi-cluster ModelWrapper + factory
-├── inference/
-│   ├── predictor.py       # Prediction wrapper
-│   └── confidence.py      # Confidence interval calculation
-└── utils/                 # Utilities (clustering, metrics, etc.)
-```
-
-## Configuration
-
-The system is configured via YAML files. See `config.example.yaml` for all options:
+Save this as `/tmp/dfc-example/config.yaml`. This is a tiny CPU smoke configuration
+(16-wide model, at most 30 optimizer steps); real training belongs on the GPU host
+or Colab with a separately agreed budget.
 
 ```yaml
 data:
-  input_path: "sales_data.csv"
-  resample_period: "1W"        # Weekly aggregation
-  max_zeros_ratio: 0.7         # Filter sparse SKUs
-
-timeseries:
-  window: 52                   # 52-week lookback
-  n_out: 16                    # 16-week forecast horizon
-
+  source: long
+  path: /tmp/dfc-example/long.csv
+  static_path: /tmp/dfc-example/static.csv
+  id_columns: [id]
+  timestamp_column: timestamp
+  target: target
+  target_support: nonnegative
+  known_dynamic: [promo]
+  past_dynamic: [oil]
+  static_categorical: [cat]
+  freq: W-SUN
+forecast:
+  horizon: 4
+  max_context: 64
 model:
-  model_type: "standard"       # standard, advanced, or lightweight
-  d_model: 256                 # Transformer dimension
-  nhead: 8                     # Attention heads
-  num_encoder_layers: 4
-  num_decoder_layers: 4
-  dropout: 0.3
-  # Optional improvements
-  use_rope: false              # Rotary Position Embeddings
-  use_pre_layernorm: false     # Pre-LN for stability
-  use_film_conditioning: false # FiLM for static features
-  stochastic_depth_rate: 0.0   # Stochastic depth regularization
-
+  family: v2
+  d_model: 16
+  nhead: 2
+  num_encoder_layers: 1
+  num_decoder_layers: 1
+  dim_feedforward: 32
+  hidden_continuous_size: 16
+  cat_emb_dim: 4
 training:
-  num_epochs: 10
-  batch_size: 128
-  learning_rate: 0.00001
-  early_stop_patience: 3
-
-tuning:
-  enabled: false
-  n_trials: 50
-  timeout: 3600                # 1 hour timeout
-  metric: "mse"                # Optimize MSE
-  sampler: "tpe"               # TPE sampler
+  base_steps: 30
+  batch_size: 8
+  warmup_steps: 2
+  amp: false
+seed: 3
+device: cpu
 ```
 
-## CLI Commands
-
-| Command | Description |
-|---------|-------------|
-| `train` | Train the demand forecasting model |
-| `evaluate` | Evaluate a trained model on test data |
-| `predict` | Generate predictions with confidence intervals |
-| `tune` | Run Optuna hyperparameter tuning |
-| `generate-data` | Generate synthetic sales data for testing |
-| `preprocess` | Preprocess raw data and save as Parquet |
-| `version` | Show version information |
-
-### Common Options
-
-All commands support `--verbose` (`-v`) for debug logging.
-
-**Training with visualization:**
-```bash
-demand-forecast train --config config.yaml --plot --plot-dir plots/training
-```
-
-**Hyperparameter tuning:**
-```bash
-demand-forecast tune --config config.yaml --n-trials 100 --metric mae
-```
-
-**Evaluation with metrics export:**
-```bash
-demand-forecast evaluate models/model.pt data.csv --config config.yaml \
-    --output metrics.json --plot
-```
-
-**Prediction with confidence intervals and plots:**
-```bash
-demand-forecast predict models/model.pt data.csv --config config.yaml \
-    --output predictions.csv --confidence 0.95 --plot
-```
-
-Run `demand-forecast --help` for detailed usage information.
-
-## Hyperparameter Tuning
-
-The system includes Optuna integration for automated hyperparameter optimization:
-
-```python
-from demand_forecast.core.tuning import HyperparameterTuner, TuningConfig, SearchSpace
-
-# Define search space
-search_space = SearchSpace(
-    d_model=[64, 128, 256],
-    nhead=[4, 8],
-    num_layers=(1, 6),
-    dropout=(0.1, 0.5),
-    learning_rate=(1e-5, 1e-3),
-)
-
-# Configure tuning
-config = TuningConfig(
-    n_trials=50,
-    timeout=3600,
-    metric="mse",
-    direction="minimize",
-)
-
-# Run tuning
-tuner = HyperparameterTuner(config, search_space)
-best_params = tuner.tune(train_data, val_data)
-```
-
-Or use the convenience function:
-
-```python
-from demand_forecast.core.tuning import quick_tune
-
-best_params = quick_tune(
-    train_dataloader=train_dl,
-    val_dataloader=val_dl,
-    n_trials=20,
-)
-```
-
-## Model Details
-
-### Transformer Encoder-Decoder
-
-The model uses a Transformer architecture optimized for time series:
-
-1. **Static Embeddings**: SKU and categorical features are embedded and projected
-2. **Encoder**: Processes historical sales with positional encoding
-3. **Decoder**: Generates forecasts with causal masking and cross-attention
-4. **Multi-Cluster**: Separate model per cluster for heterogeneous demand patterns
-
-### New Components
-
-| Component | Description |
-|-----------|-------------|
-| `RotaryPositionEmbedding` | RoPE for better long-range dependencies |
-| `GatedResidualNetwork` | TFT-style gated residual connections |
-| `VariableSelectionNetwork` | Learnable feature importance |
-| `PatchEmbedding` | PatchTST-style time series tokenization |
-| `SeriesDecomposition` | Autoformer trend/seasonality separation |
-| `FiLMConditioning` | Feature-wise Linear Modulation |
-| `TemporalConvNet` | Dilated causal convolutions |
-| `InterpretableMultiHeadAttention` | TFT-style interpretable attention |
-
-### Loss Functions
-
-- **HuberLoss**: Robust to outliers (default)
-- **QuantileLoss**: For probabilistic forecasting
-- **CombinedForecastLoss**: Huber + quantile + decomposition
-- **SMAPELoss**: Symmetric MAPE for percentage errors
-- **MASELoss**: Mean Absolute Scaled Error
-
-### Clustering
-
-Time series are clustered using K-means on TSFresh meta-features. The optimal K is selected via the elbow method with Davies-Bouldin Index validation.
-
-## Development
-
-### Setup Development Environment
+Train, then forecast from the first timestamp after the generated history:
 
 ```bash
-# Install with dev dependencies
-pip install -e ".[dev]"
+demand-forecast train --config /tmp/dfc-example/config.yaml --out /tmp/dfc-example/run
+demand-forecast forecast --bundle /tmp/dfc-example/run/bundle \
+  --config /tmp/dfc-example/config.yaml --origin 2023-02-26 \
+  --out /tmp/dfc-example/forecasts.csv
+demand-forecast version
+```
 
-# Install pre-commit hooks
-pre-commit install
+Training writes `bundle/`, `checkpoints/`, and `run.json`. Add `--resume` to the
+same training command to reuse a matching run; changed settings or inputs fail
+identity checks. Forecast CSVs contain `series_id`, `origin`, `timestamp`,
+`q0.1` through `q0.9`, and `point` (the median, `q0.5`). Supply known covariates
+for future timestamps in the long CSV when available; missing values are masked.
+Set `target_support: real` for signed targets. Paths in YAML resolve from the
+working directory.
 
-# Run tests
-pytest
+## fev evaluation
 
-# Run linting
+Task definitions can be read without the benchmark dependencies. Running the
+benchmark commands requires the optional extra:
+
+```bash
+pip install -e ".[dev,bench]"
+demand-forecast fev --help
+```
+
+The seven official weekly tasks run on Colab; see the
+[Colab workflow](docs/colab.md) and [frozen protocol](docs/protocol.md).
+Prepare `fev-config.yaml` using the [Settings schema](demand_forecast/config/settings.py)
+with the agreed model and training budget. The runner derives data roles, horizon
+and quantiles from each task. On that host:
+
+```bash
+demand-forecast fev baseline --tasks weekly --out-dir fev-results
+demand-forecast fev run --tasks weekly --config fev-config.yaml \
+  --policy first_window --out-dir fev-results --resume
+demand-forecast fev leaderboard fev-results/summaries.csv
+```
+
+`--tasks` also accepts comma-separated task names or a local task YAML. Baselines
+skip completed tasks; model runs with `--resume` reuse matching bundles and saved
+windows. Local end-to-end tests use only fixture data. `training.refit: full`
+and `--policy per_window` are deferred to phase 4 and currently rejected.
+
+## Commands
+
+| Command | Purpose |
+| --- | --- |
+| `train --config ... --out ... [--resume]` | Train and save a bundle |
+| `forecast --bundle ... --config ... --origin ... --out ...` | Export quantile forecasts |
+| `fev baseline` / `fev run` / `fev leaderboard` | Evaluate and compare fev summaries |
+| `generate-data` | Generate synthetic sales or long-format panels |
+| `generate-sales` | Generate sales from a product catalogue |
+| `version` | Print the installed package version |
+
+Use `demand-forecast <command> --help` for options. Model selection, tuning,
+clustering, general benchmarking and export integrations beyond the current `v2`
+path are covered by the phase-4 plan.
+
+## Package modules
+
+The current implementation is organized as follows (paths are under `demand_forecast/`):
+
+| Modules | Responsibility |
+| --- | --- |
+| `cli.py`, `config/settings.py` | Commands and validated settings |
+| `data/panel.py`, `data/frequency.py` | Ragged series, roles, grids and calendar features |
+| `data/loader_long.py`, `data/loader_fev.py` | Long-format and fev input adapters |
+| `data/encoders.py`, `data/scaling.py`, `data/sampler.py` | Static encoding, sample normalization and masked batches |
+| `models/base.py`, `models/heads.py`, `models/v2.py`, `models/registry.py` | Shared model contract, monotone quantiles and the v2 backbone |
+| `models/components.py`, `models/losses.py` | Building blocks and losses, including retained legacy classes |
+| `core/validation.py`, `core/training.py`, `core/evaluation.py`, `metrics.py` | Inner validation, training and quantile metrics |
+| `core/run.py`, `core/bundle.py`, `core/exceptions.py` | Run orchestration, persistence and errors |
+| `inference/predictor.py` | Bundle-based forecasts in original units |
+| `bench/specs.py`, `bench/baselines.py`, `bench/run.py` | Optional fev task definitions, baseline and runner |
+| `synthetic/generator.py` | Synthetic panels and sales |
+| `utils/checkpoint.py`, `utils/device.py`, `utils/memory.py`, `utils/outliers.py`, `utils/timeseries.py`, `utils/visualization.py` | Shared utilities |
+
+`models/wrapper.py`, `models/transformer.py`, `models/transformer_v2.py`,
+`models/lightweight.py`, `core/tuning.py`, and `utils/clustering.py` remain on the
+legacy contract until the phase-4 plan. Their imports and tests are retained;
+`data/feature_engineering.py` and legacy loss classes also remain available.
+The current `v2` CLI uses `models/v2.py`.
+
+## Development and latency
+
+```bash
+python -m pytest -q --no-cov
 ruff check .
-mypy demand_forecast/
+ruff format --check .
+python scripts/latency.py --bundle /tmp/dfc-example/run/bundle
 ```
 
-### Running Tests
+CI runs the full suite both with `.[dev,bench]` and in a fresh `.[dev]` environment,
+where bench tests skip. It also installs a built wheel outside the checkout and
+checks CLI help and the packaged weekly task definitions without the bench extra.
 
-```bash
-# Run all tests
-pytest
-
-# Run with coverage
-pytest --cov=demand_forecast
-
-# Run specific test categories
-pytest tests/test_models/           # Model tests
-pytest tests/test_models/test_tuning.py  # Tuning tests
-```
-
-### Project Structure
-
-```
-demand-forecast/
-├── demand_forecast/       # Main package
-├── tests/                 # Test suite
-│   ├── test_models/       # Model and tuning tests
-│   ├── test_core/         # Core module tests
-│   └── test_utils/        # Utility tests
-├── docs/                  # Documentation
-├── config.example.yaml    # Example configuration
-├── pyproject.toml         # Project metadata
-└── Makefile              # Development commands
-```
+The latency script generates 512 synthetic series matching the bundle's roles
+and frequency, prepares one batch, performs five warmups and averages 20
+`model.predict` calls on one CPU thread. It prints ms/batch and ms/series; loading
+and batch preparation are excluded. Override `--n-series` or `--repeats` as needed.
+Tiny-bundle timings are smoke measurements, not standard-model benchmark results.
 
 ## Documentation
 
-- [Architecture Guide](docs/ARCHITECTURE.md) - System design and component details
-- [API Reference](docs/API.md) - Module and class documentation
-- [Configuration Guide](docs/CONFIGURATION.md) - All configuration options
-- [Quick Start Guide](docs/QUICKSTART.md) - Step-by-step tutorial
-- [Development Guide](docs/DEVELOPMENT.md) - Contributing and development setup
+- [Design and migration specification](docs/superpowers/specs/2026-10-30-fev-bench-v2-design.md)
+- [Implementation plan for phases 0–3](docs/superpowers/plans/2026-10-31-fev-core-v2.md)
+- [Architecture pointers](docs/ARCHITECTURE.md)
+- [Configuration pointers](docs/CONFIGURATION.md)
+- [Settings schema](demand_forecast/config/settings.py)
 
-## Requirements
+A full documentation rewrite is planned for phase 5. Other guides may still
+describe the retired store-specific pipeline; use this quick start and the schema
+for current commands and settings.
 
-- Python 3.10+
-- PyTorch 2.0+
-- Optuna 3.0+ (for hyperparameter tuning)
-- CUDA (optional, for GPU acceleration)
-
-See `pyproject.toml` for complete dependency list.
-
-## License
-
-MIT License - see [LICENSE](LICENSE) for details.
-
-## Citation
-
-If you use this software in your research, please cite:
-
-```bibtex
-@software{demand_forecast,
-  title = {Demand Forecast: Transformer-based Time Series Forecasting},
-  year = {2025},
-  url = {https://github.com/alessiosavi/demand-forecast}
-}
-```
-
-## Acknowledgments
-
-- Built with [PyTorch](https://pytorch.org/)
-- Hyperparameter tuning with [Optuna](https://optuna.org/)
-- Configuration via [Pydantic](https://docs.pydantic.dev/)
-- CLI powered by [Typer](https://typer.tiangolo.com/)
-- Feature extraction with [TSFresh](https://tsfresh.readthedocs.io/)
-
-## Weekly store forecasts
-
-```bash
-demand-forecast forecast --config configs/hackathon.yaml \
-  --products products.csv.gz --sales sales.csv --out-dir forecast-run --device cuda \
-  --expect-origins 2026-06-22,2026-10-12
-```
-
-`predict` (and `forecast`) require `resample_period: W-MON` (Monday weeks). Use a new output directory for each run. The command exports the exact catalogue × 16
-Monday weeks as `holdout_predictions.csv` and `forecasts.csv`, plus `run.json`,
-`plots/` and `artifacts/`. Quantities are non-negative weekly units, rounded to two
-decimals. `wape_holdout` is a percentage (100 × Σ|actual − forecast| / Σactual) computed from
-the exported holdout file and reported once per run; `wape_naive_last8` is the same
-score for a flat last-8-weeks baseline. Compare configurations on `wape_validation`,
-the pre-holdout validation WAPE in weekly units, also expressed as a percentage.
-It uses the selection model and scalers before refitting; `wape_validation_naive_last8`
-uses only the eight weeks before validation. The corresponding 16-week predictions
-are saved as `artifacts/validation_predictions.csv` with the same four columns.
-Static features are integer category codes and standardized log1p(price).
-
-Selection preprocessing is fitted strictly before the validation block; refit
-preprocessing and training use only pre-holdout data. Future predictions use the
-latest `window` complete weeks as model inputs with the pre-holdout fitted model/scalers.
-Within one execution of the command, no holdout values choose model parameters
-or epochs. Refit retains the selection run's maximum-epoch learning-rate schedule.
-This command supports four model families: the standard transformer, the advanced
-transformer, and the lightweight TCN and MLP-Mixer models. Saved artifacts include
-the fitted preprocessing state and resolved settings, which must be used together
-when reloading.
-
-`--trials`, `--timeout`, `--max-epochs`, `--k`, `--seed` and `--budget-seconds`
-override YAML only when supplied. The hackathon configs use 12 trials, a 900-second
-tuning timeout, at most 60 selection epochs, k=1, seed=42 and a top-level
-`budget_seconds: 2700`. `--expect-origins HOLDOUT,FUTURE` optionally checks derived
-origins against the supplied ISO dates before training; the CLI has no fixed store dates.
-
-`--max-products 60 --trials 2 --max-epochs 2 --timeout 120 --device cpu` is a debug
-run; omit `--max-products` for the full catalogue. `--preprocess-only` times both
-preprocessing stages without training. `--budget-seconds 2700` is a cooperative
-budget: tuning checks it each epoch, and selection/refit finish their current
-epoch before stopping. Each stage runs at least one epoch to export a trained
-model; preprocessing and report generation can also exceed the budget. The run
-records `budget_exceeded`, `best_epoch` and `refit_epochs_completed` explicitly.
-Zero completed trials fall back to the fixed base configuration.
-
-## Running on AMD GPUs (ROCm)
-
-Install a PyTorch ROCm wheel first, then this package in the same environment:
-
-```bash
-pip install torch --index-url https://download.pytorch.org/whl/rocm6.4
-pip install -e .
-# Equivalent: make install-rocm
-```
-
-ROCm uses the same `torch.cuda` code path: pass `--device cuda`. The run metadata
-reports `rocm` when `torch.version.hip` is set. GPU validation for this run is
-scoped to CUDA only and is performed separately from the local CPU checks;
-ROCm hardware validation is pending. There is no ROCm Docker image.
-
-## Benchmark
-
-Train all four families on the **same generated sales file and seed**, with equal per-model
-caps, then compare them with last-eight-week mean and seasonal-naive (exactly 52 weeks earlier):
-
-```bash
-demand-forecast benchmark --config configs/benchmark-w26.yaml \
-  --products products.csv.gz --sales sales.csv --out-dir benchmark \
-  --models standard,advanced,lightweight_tcn,lightweight_mixer --device cuda \
-  --expect-origins 2026-06-22,2026-10-12 --seed 42 --budget-seconds 2700
-```
-
-Run training on the GPU host. For a smoke run add `--max-products 40 --trials 1 --max-epochs 1`
-and use a separate output directory. `--max-epochs` caps both selection and trial epochs here.
-Repeat the original command with `--compare-only` to rebuild the report and redraw each model's
-`plots/holdout_prediction_quality.png` from saved predictions without training. This works on CPU-only
-machines with the original `--device cuda` option; no model is loaded or run.
-Inputs, product sets, origins, seed and protocol must match; relocated input paths are allowed
-only when their hashes match. Use a new empty output directory for each training run.
-
-Outputs: `benchmark.json`, `benchmark.md` (performance and holdout error metrics tables), eight comparison plots under
-`plots/`, and full model artifacts under `models/<name>/`, including `run.json`,
-`validation_predictions.csv`, `holdout_predictions.csv`, `forecasts.csv` and saved models.
-`benchmark_request.json` freezes settings, search spaces and example products before training.
-Rankings use **validation WAPE only**; holdout is reported, never used for selection. Incomplete
-refits, zero completed tuning trials and failures are visible and excluded from ranking.
-All scores pool aligned product-weeks in original units. MAE/RMSE (units per product-week), R² and Pearson
-correlation are reported for every model and baseline, with both validation and holdout values in JSON.
-WAPE/bias are null for zero total demand; MAE/RMSE remain defined. R² is null for constant actuals;
-correlation is null for either constant series or fewer than two observations.
-
-Holdout quality plots show WAPE (`n/a` for zero total demand). New standardized-target quality plots
-omit percentage metrics and are labelled standardized. Existing per-epoch snapshots retain their old
-MAPE labels: their predictions were not saved, so compare-only cannot redraw them.
-
-Every family uses point MSE on standardized targets and the same learning-rate, dropout and
-weight-decay ranges. Capacity choices are transformer width 64/128, TCN width 32/64 (depth 3),
-or Mixer hidden width 64/128. V2's auxiliary quantile/decomposition output heads are untrained;
-Mixer does not use future calendar features. Equal caps do not imply equal completed work.
-The standard constructor settings match `hackathon-w26.yaml`; freeze this config before the GPU
-run and do not tune it using the previously observed standard holdout score.
-
-Timing separates training (tuning + selection + refit), whole forecast pipeline (pandas preparation,
-batching, transfer and inverse scaling), and network latency (5 warmups, mean of 20 synchronized
-forward passes on 512 fixed holdout inputs, cycled for smaller catalogues, with device recorded).
+MIT License; see [LICENSE](LICENSE) and [third-party notices](THIRD_PARTY_NOTICES.md).

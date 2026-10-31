@@ -17,6 +17,7 @@ from demand_forecast.models import (
     LightweightDemandModel,
     LightweightMixerModel,
 )
+from demand_forecast.models.components import InterpretableMultiHeadAttention
 from demand_forecast.models.wrapper import ModelWrapper, create_model
 
 # Test configuration
@@ -605,3 +606,107 @@ class TestCreateModel:
         """Test that invalid type raises error."""
         with pytest.raises(ValueError):
             create_model("invalid_type", **base_model_kwargs)
+
+
+@pytest.mark.parametrize("use_rope", [False, True])
+@pytest.mark.parametrize("tgt_len", [3, 5, 7])
+def test_masked_keys_do_not_influence_output_and_all_masked_rows_are_finite(use_rope, tgt_len):
+    attn = InterpretableMultiHeadAttention(8, 2, 0.0, use_rope=use_rope).eval()
+    with torch.no_grad():
+        attn.out_proj.bias.fill_(1.0)
+    q = torch.randn(1, tgt_len, 8)
+    k1 = torch.randn(1, 5, 8)
+    k2 = k1.clone()
+    k2[:, :2] = 99.0
+    mask = torch.tensor([[True, True, False, False, False]])
+
+    output, weights = attn(q, k1, k1, return_attention=True, key_padding_mask=mask)
+    changed, changed_weights = attn(q, k2, k2, return_attention=True, key_padding_mask=mask)
+    torch.testing.assert_close(output, changed)
+    torch.testing.assert_close(weights, changed_weights)
+    assert output.shape == (1, tgt_len, 8)
+    assert weights.shape == (1, 2, tgt_len, 5)
+    assert torch.count_nonzero(weights[..., :2]) == 0
+    torch.testing.assert_close(weights.sum(dim=-1), torch.ones(1, 2, tgt_len))
+
+    output, weights = attn(q, k1, k1, return_attention=True, key_padding_mask=torch.ones_like(mask))
+    assert torch.isfinite(output).all() and torch.isfinite(weights).all()
+    assert torch.count_nonzero(output) == 0
+    assert torch.count_nonzero(weights) == 0
+
+
+@pytest.mark.parametrize("use_rope", [False, True])
+@pytest.mark.parametrize("per_head_mask", [False, True])
+def test_key_padding_mask_composes_with_additive_attention_mask(use_rope, per_head_mask):
+    attn = InterpretableMultiHeadAttention(8, 2, 0.0, use_rope=use_rope).eval()
+    q = torch.randn(2, 3, 8)
+    k = torch.randn(2, 5, 8)
+    v = torch.randn(2, 5, 8)
+    padding_mask = torch.tensor(
+        [[True, True, False, False, False], [False, False, False, False, False]]
+    )
+    attn_mask = torch.tensor(
+        [
+            [0.0, 0.0, -torch.inf, -torch.inf, -torch.inf],
+            [0.2, -0.4, -torch.inf, 0.7, -0.6],
+            [-torch.inf, -torch.inf, -torch.inf, -torch.inf, -torch.inf],
+        ]
+    )
+    if per_head_mask:
+        attn_mask = attn_mask.expand(2, 2, 3, 5).clone()
+        attn_mask[:, 1, 1] = -torch.inf
+
+    output, weights = attn(q, k, v, attn_mask, True, key_padding_mask=padding_mask)
+    combined_mask = attn_mask.expand(2, 2, 3, 5).clone()
+    combined_mask.masked_fill_(padding_mask[:, None, None, :], -torch.inf)
+    expected_output, expected_weights = attn(q, k, v, combined_mask, True)
+    torch.testing.assert_close(output, expected_output)
+    torch.testing.assert_close(weights, expected_weights)
+    assert torch.isfinite(output).all() and torch.isfinite(weights).all()
+    assert torch.count_nonzero(output[0, 0]) == 0
+    assert torch.count_nonzero(output[:, 2]) == 0
+    assert torch.count_nonzero(weights[0, :, :, :2]) == 0
+    torch.testing.assert_close(weights[1, :, 0].sum(dim=-1), torch.ones(2))
+    if per_head_mask:
+        assert torch.count_nonzero(weights[:, 1, 1]) == 0
+        assert torch.count_nonzero(output[:, 1]) > 0
+
+
+@pytest.mark.parametrize("use_rope", [False, True])
+def test_masked_attention_has_finite_gradients(use_rope):
+    attn = InterpretableMultiHeadAttention(8, 2, 0.0, use_rope=use_rope)
+    q = torch.randn(2, 3, 8, requires_grad=True)
+    k = torch.randn(2, 5, 8, requires_grad=True)
+    v = torch.randn(2, 5, 8, requires_grad=True)
+    mask = torch.tensor([[True, True, True, True, True], [True, True, False, False, False]])
+    attn_mask = torch.zeros(3, 5)
+    attn_mask[0, 2:] = -torch.inf
+
+    output, weights = attn(q, k, v, attn_mask, True, key_padding_mask=mask)
+    (output.square().sum() + weights.square().sum()).backward()
+    for tensor in (q, k, v, *attn.parameters()):
+        assert tensor.grad is not None and torch.isfinite(tensor.grad).all()
+    assert torch.count_nonzero(q.grad[0]) == 0
+    assert torch.count_nonzero(q.grad[1, 0]) == 0
+    assert torch.count_nonzero(k.grad[mask]) == 0
+    assert torch.count_nonzero(v.grad[mask]) == 0
+    assert torch.count_nonzero(v.grad[~mask]) > 0
+
+
+@pytest.mark.parametrize("use_rope", [False, True])
+def test_attention_preserves_legacy_positional_arguments_and_return_attention(use_rope):
+    attn = InterpretableMultiHeadAttention(8, 2, 0.0, use_rope=use_rope).eval()
+    q, k, v = (torch.randn(2, 5, 8) for _ in range(3))
+    attn_mask = torch.randn(5, 5)
+
+    output, weights = attn(q, k, v, attn_mask, True)
+    unmasked_output, unmasked_weights = attn(
+        q, k, v, attn_mask, True, key_padding_mask=torch.zeros(2, 5, dtype=torch.bool)
+    )
+    torch.testing.assert_close(output, unmasked_output)
+    torch.testing.assert_close(weights, unmasked_weights)
+    assert output.shape == (2, 5, 8)
+    assert weights.shape == (2, 2, 5, 5)
+    default_output, default_weights = attn(q, k, v, attn_mask)
+    torch.testing.assert_close(default_output, output)
+    assert default_weights is None
