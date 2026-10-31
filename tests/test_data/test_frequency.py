@@ -216,6 +216,26 @@ def test_steps_between_and_grid_range():
 
 
 @pytest.mark.parametrize(
+    "freq,start,end,width",
+    [
+        ("D", "2023-03-25", "2023-03-29", 10),
+        ("h", "2023-03-26 00:30", "2023-03-26 05:30", 12),
+    ],
+)
+def test_daily_and_hourly_grid_operations_do_not_warn(freq, start, end, width):
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        index = grid_range(pd.Timestamp(start, tz="Europe/Rome"), 5, freq)
+        assert index[-1] == pd.Timestamp(end, tz="Europe/Rome")
+        assert steps_between(index[0], index[-1], freq) == 4
+        assert steps_between(index[-1], index[0], freq) == -4
+        validate_on_grid(index, freq, "dst")
+        features = calendar_features(index, freq)
+        assert features.shape == (5, width) and features.dtype == np.float32
+        assert np.isfinite(features).all()
+
+
+@pytest.mark.parametrize(
     "freq,start,end,steps",
     [
         ("MS", "2023-01-01", "2023-04-01", 3),

@@ -55,6 +55,54 @@ def assert_state_equal(actual, expected):
 
 
 @pytest.mark.parametrize(
+    "capability,expected",
+    [
+        ((7, 5), torch.float16),
+        ((8, 0), torch.bfloat16),
+        ((8, 6), torch.bfloat16),
+        ((9, 0), torch.bfloat16),
+    ],
+)
+def test_amp_dtype_for_uses_native_bf16_rule(monkeypatch, capability, expected):
+    from demand_forecast.core.training import amp_dtype_for
+
+    devices = []
+
+    def get_capability(device):
+        devices.append(device)
+        return capability
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", get_capability)
+    device = torch.device("cuda", 1)
+    assert amp_dtype_for(device) is expected
+    assert devices == [device]
+    assert amp_dtype_for(cpu) is None
+    assert devices == [device]
+
+
+def test_resolve_amp_wiring(monkeypatch):
+    from demand_forecast.core.training import resolve_amp
+
+    def unexpected_query(*args):
+        pytest.fail("disabled AMP queried CUDA capability")
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", unexpected_query)
+    assert resolve_amp(True, cpu) == (False, torch.float16, False)
+    assert resolve_amp(False, torch.device("cuda")) == (False, torch.float16, False)
+    devices = []
+
+    def get_capability(device):
+        devices.append(device)
+        return (7, 5) if device.index == 1 else (8, 0)
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", get_capability)
+    device = torch.device("cuda", 1)
+    assert resolve_amp(True, device) == (True, torch.float16, True)
+    assert devices == [device] and devices[0].index == 1
+    assert resolve_amp(True, torch.device("cuda")) == (True, torch.bfloat16, False)
+
+
+@pytest.mark.parametrize(
     "base_steps,n_series,eval_every,expected",
     [(3000, 118, 200, (500, 100)), (3000, 30490, 200, (12000, 200)), (60, 3, 200, (60, 12))],
 )

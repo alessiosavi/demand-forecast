@@ -107,7 +107,8 @@ without improvement exceeding the relative tolerance 0.002.
 One epoch draws exactly one origin per series: a permutation determined by `(seed,
 epoch)`, then a uniform draw among that series' eligible origins. `Settings.seed=0`
 is the single seed, set for Python, numpy and torch before model construction. Use
-AMP on CUDA (bf16 when supported, otherwise fp16 with GradScaler), disabled on CPU.
+AMP on CUDA (bf16 when natively supported, i.e. compute capability ≥ 8.0;
+otherwise fp16 with GradScaler), disabled on CPU.
 
 ## Selection, short histories and fallbacks
 
@@ -155,7 +156,7 @@ checkpoint and extends its context through inner validation at inference time.
 
 ## Persistence and execution evidence
 
-The new trainer must persist model, optimizer, scheduler, scaler, RNG states, sampler
+The trainer persists model, optimizer, scheduler, scaler, RNG states, sampler
 position, step, history, best state/score/step and patience counter. Resume restores RNG
 states after construction without reseeding. Checkpoints, bundles and saved predictions
 carry a SHA-256 run identity over canonical JSON of settings, seed, dataset fingerprint,
@@ -165,8 +166,9 @@ package version, resolved origin, and the task definition (`name`, `horizon`,
 artifacts are recomputed. A session interruption saves `checkpoints/latest.pt`, returns
 `stop_reason="interrupted"`, and raises `InterruptedRun` before writing a bundle.
 
-These trainer guarantees arrive in later tasks. PR 0's profiler (`--resume`) and
-baseline (automatic resume) save after each completed task, keyed by task name (and
+These trainer guarantees are implemented, including the `train` and `fev run` CLI
+paths since PR #23. PR 0's profiler (`--resume`) and baseline (automatic resume)
+save after each completed task, keyed by task name (and
 model for baselines). They do not validate training run identities or checkpoint a
 partially completed task. Use a new output directory whenever code, task definitions,
 role profiles or data change. Preserve the dataset cache between resumed sessions.
