@@ -16,6 +16,60 @@ fev_app = typer.Typer(help="Run fev benchmarks and compare evaluation summaries.
 app.add_typer(fev_app, name="fev")
 
 
+@app.command("train")
+def train(
+    config: Path = typer.Option(
+        ..., "--config", exists=True, dir_okay=False, help="Long-panel settings YAML"
+    ),
+    out: Path = typer.Option(..., "--out", help="Run directory for bundle and checkpoints"),
+    resume: bool = typer.Option(False, "--resume", help="Resume a matching run"),
+):
+    """Train a quantile model and save its bundle and run report."""
+    import yaml
+
+    from demand_forecast.config import Settings
+    from demand_forecast.core.run import train_from_settings
+    from demand_forecast.core.training import InterruptedRun
+
+    try:
+        settings = Settings.from_yaml(config)
+        configure_logging(settings.log_level)
+        bundle = train_from_settings(settings, out, resume=resume)
+    except (ValueError, OSError, ImportError, NotImplementedError, yaml.YAMLError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    except InterruptedRun as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"Bundle saved to {bundle}")
+
+
+@app.command("forecast")
+def forecast(
+    bundle: Path = typer.Option(
+        ..., "--bundle", exists=True, file_okay=False, help="Trained bundle directory"
+    ),
+    config: Path = typer.Option(
+        ..., "--config", exists=True, dir_okay=False, help="Long-panel settings YAML"
+    ),
+    origin: str = typer.Option(..., "--origin", help="First forecast timestamp (ISO format)"),
+    out: Path = typer.Option(..., "--out", help="Output forecast CSV"),
+):
+    """Forecast from a saved bundle using the declared long-panel inputs."""
+    import pandas as pd
+    import yaml
+
+    from demand_forecast.config import Settings
+    from demand_forecast.core.run import forecast_from_bundle
+
+    try:
+        settings = Settings.from_yaml(config)
+        configure_logging(settings.log_level)
+        forecast_from_bundle(bundle, settings, pd.Timestamp(origin), out)
+    except (ValueError, OSError, ImportError, yaml.YAMLError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    typer.echo(f"Forecasts saved to {out}")
+
+
 @fev_app.command("baseline")
 def fev_baseline(
     tasks: str = typer.Option(
