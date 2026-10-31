@@ -1,5 +1,7 @@
 """Resumable model and reference forecasts with official fev evaluation."""
 
+import json
+import logging
 import time
 from collections.abc import Iterable
 from pathlib import Path
@@ -11,6 +13,14 @@ import pandas as pd
 
 from demand_forecast.bench.specs import FevTaskSpec, dataset_fingerprint
 from demand_forecast.config import DatasetConfig, ForecastConfig, Settings
+
+logger = logging.getLogger(__name__)
+DIAGNOSTIC_DTYPES = {
+    "inference_time_s": np.float64,
+    "fallback_no_context": np.int64,
+    "fallback_undefined_scale": np.int64,
+    "device": str,
+}
 
 
 def settings_for_task(spec: FevTaskSpec, base: Settings, freq: str) -> Settings:
@@ -76,12 +86,30 @@ def _check_prediction_identity(saved, identity: str) -> None:
         raise ValueError("run identity mismatch")
 
 
-def _save_predictions(path: Path, ids: list[str], arrays: np.ndarray, identity: str) -> None:
+def prediction_diagnostics(saved) -> dict | None:
+    """Read scalar diagnostics; legacy windows remain unknown, never zero."""
+    if not all(key in saved for key in DIAGNOSTIC_DTYPES):
+        return None
+    return {key: saved[key].item() for key in DIAGNOSTIC_DTYPES}
+
+
+def _save_predictions(
+    path: Path, ids: list[str], arrays: np.ndarray, identity: str, diagnostics: dict
+) -> None:
     """Publish a complete window so an interrupted write leaves it missing."""
     with NamedTemporaryFile(dir=path.parent, suffix=".npz", delete=False) as stream:
         temporary_path = Path(stream.name)
         try:
-            np.savez(stream, ids=np.asarray(ids, dtype=str), arrays=arrays, identity=identity)
+            np.savez(
+                stream,
+                ids=np.asarray(ids, dtype=str),
+                arrays=arrays,
+                identity=identity,
+                **{
+                    key: np.asarray(diagnostics[key], dtype=dtype)
+                    for key, dtype in DIAGNOSTIC_DTYPES.items()
+                },
+            )
             stream.close()
             temporary_path.replace(path)
         finally:
@@ -100,11 +128,11 @@ def run_fev(
     """Train once per task, extend context per window, and replace summary rows.
 
     Resume validates saved identities and computes only missing artifacts.
-    Timings cover this invocation: the call to train_panel (including bundle
-    reuse on resume) and forecasts actually computed, excluding bundle loading.
+    Timings come from persisted trainer and prediction measurements, including
+    earlier sessions. Fully verified completed tasks retain their summary row.
     """
     from demand_forecast import __version__
-    from demand_forecast.core.run import run_identity, train_panel
+    from demand_forecast.core.run import resolve_device, run_identity, train_panel
     from demand_forecast.data.loader_fev import item_ids, panel_from_window
     from demand_forecast.inference.predictor import Predictor
 
@@ -128,21 +156,31 @@ def run_fev(
         definition = spec.task_definition()
         task_dir = out_dir / spec.name
         predictions = []
-        training_time_s = inference_time_s = 0.0
+        diagnostics_per_window = []
+        skipped = False
         for index, window in enumerate(task.iter_windows()):
             past, future = window.get_input_data()
+            started = time.perf_counter()
             panel = panel_from_window(past, future, spec, task.freq)
+            logger.info(
+                "panel: task=%s window=%d series=%d build_s=%.1f",
+                spec.name,
+                index,
+                len(panel.series),
+                time.perf_counter() - started,
+            )
             origin = window_origin(future, spec.timestamp_column)
             if index == 0:
                 identity = run_identity(
                     task_settings, task_settings.seed, fp, __version__, origin, definition
                 )
+                logger.info("identity: task=%s %s", spec.name, identity)
                 if resume:
                     # Check even later windows before doing any training or inference.
                     for prediction_path in task_dir.glob("window_*.npz"):
                         with np.load(prediction_path, allow_pickle=False) as saved:
                             _check_prediction_identity(saved, identity)
-                started = time.perf_counter()
+                reused = resume and (task_dir / "bundle/manifest.json").exists()
                 train_panel(
                     panel,
                     origin,
@@ -153,21 +191,61 @@ def run_fev(
                     resume=resume,
                     stop_after=stop_after,
                 )
-                training_time_s = time.perf_counter() - started
+                report = json.loads((task_dir / "run.json").read_text(encoding="utf-8"))
+                cumulative = report["timings"].get("cumulative", {})
+                training_time_s = (
+                    sum(cumulative[key] for key in ("train_s", "eval_s", "checkpoint_s"))
+                    if all(
+                        cumulative.get(key) is not None
+                        for key in ("train_s", "eval_s", "checkpoint_s")
+                    )
+                    else None
+                )
+                rows = summaries.loc[
+                    (summaries.task == spec.name) & (summaries.model_name == model_name)
+                ]
+                if reused and len(rows) == 1 and rows.iloc[0].get("run_identity") == identity:
+                    complete = True
+                    for i in range(spec.num_windows):
+                        saved_path = task_dir / f"window_{i}.npz"
+                        if not saved_path.exists():
+                            complete = False
+                            break
+                        with np.load(saved_path, allow_pickle=False) as saved:
+                            _check_prediction_identity(saved, identity)
+                            if prediction_diagnostics(saved) is None:
+                                complete = False
+                    if complete:
+                        print(f"Skipping completed task {spec.name}", flush=True)
+                        skipped = True
+                        break
             prediction_path = task_dir / f"window_{index}.npz"
             if resume and prediction_path.exists():
                 with np.load(prediction_path, allow_pickle=False) as saved:
                     _check_prediction_identity(saved, identity)
                     ids, arrays = saved["ids"].tolist(), saved["arrays"]
+                    diagnostics = prediction_diagnostics(saved)
             else:
-                predictor = Predictor.from_bundle(task_dir / "bundle")
-                started = time.perf_counter()
-                ids, arrays = predictor.forecast_arrays(panel, origin)
-                inference_time_s += time.perf_counter() - started
-                _save_predictions(prediction_path, ids, arrays, identity)
+                predictor = Predictor.from_bundle(
+                    task_dir / "bundle", device=resolve_device(settings)
+                )
+                ids, arrays, diagnostics = predictor.forecast_with_diagnostics(panel, origin)
+                _save_predictions(prediction_path, ids, arrays, identity, diagnostics)
+            diagnostics_per_window.append(diagnostics)
             predictions.append(
                 predictions_for_fev(ids, arrays, item_ids(panel), task.quantile_levels)
             )
+        if skipped:
+            continue
+
+        def diagnostic_sum(key):
+            return (
+                sum(d[key] for d in diagnostics_per_window)
+                if all(d is not None for d in diagnostics_per_window)
+                else None
+            )
+
+        devices = {d["device"] for d in diagnostics_per_window if d is not None}
         summary = {
             "task": spec.name,
             **task.evaluation_summary(
@@ -175,7 +253,21 @@ def run_fev(
                 model_name=model_name,
                 trained_on_this_dataset=False,
                 training_time_s=training_time_s,
-                inference_time_s=inference_time_s,
+                inference_time_s=diagnostic_sum("inference_time_s"),
+                extra_info={
+                    "run_identity": identity,
+                    "fallback_no_context": diagnostic_sum("fallback_no_context"),
+                    "fallback_undefined_scale": diagnostic_sum("fallback_undefined_scale"),
+                    "inference_device": ",".join(sorted(devices))
+                    if all(d is not None for d in diagnostics_per_window)
+                    else "unknown",
+                    "resolved_max_steps": report.get("resolved_budget", {}).get("max_steps"),
+                    "n_fit_ids": report.get("n_fit_ids"),
+                    "n_val_items": report.get("n_val_items"),
+                    "nonfinite_losses": cumulative.get("nonfinite_losses"),
+                    "sessions": cumulative.get("sessions"),
+                },
+                per_quantile_scores=True,
             ),
         }
         summaries = summaries.loc[

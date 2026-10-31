@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -28,7 +29,7 @@ class Predictor:
     def forecast(self, panel: Panel, origin: pd.Timestamp, batch_size: int = 512) -> pd.DataFrame:
         """Return one row per series and forecast step, with median point forecasts."""
         origin = pd.Timestamp(origin)
-        ids, values = self._forecast_arrays(panel, origin, batch_size)
+        ids, values, _ = self.forecast_with_diagnostics(panel, origin, batch_size)
         cfg = self.bundle.forecast_cfg
         data = {
             "series_id": np.repeat(ids, cfg.horizon),
@@ -42,12 +43,16 @@ class Predictor:
 
     def forecast_arrays(self, panel: Panel, origin: pd.Timestamp) -> tuple[list[str], np.ndarray]:
         """Return ids in input order and original-unit quantiles of shape (N, H, Q)."""
-        return self._forecast_arrays(panel, pd.Timestamp(origin), 512)
+        ids, arrays, _ = self.forecast_with_diagnostics(panel, origin)
+        return ids, arrays
 
     @torch.no_grad()
-    def _forecast_arrays(
-        self, panel: Panel, origin: pd.Timestamp, batch_size: int
-    ) -> tuple[list[str], np.ndarray]:
+    def forecast_with_diagnostics(
+        self, panel: Panel, origin: pd.Timestamp, batch_size: int = 512
+    ) -> tuple[list[str], np.ndarray, dict]:
+        """Forecast every item, measuring fallback counts and inference wall time."""
+        started = time.perf_counter()
+        origin = pd.Timestamp(origin)
         metadata = self.bundle.panel_metadata
         if origin < pd.Timestamp(metadata["earliest_origin"]):
             raise ValueError("origin before earliest permissible origin")
@@ -78,6 +83,12 @@ class Predictor:
         predictions = np.empty((len(ids), cfg.horizon, len(cfg.quantiles)), dtype=np.float32)
         model = self.bundle.model
         model.eval()
+        diagnostics = {
+            "fallback_no_context": 0,
+            "fallback_undefined_scale": 0,
+            "n_items": len(ids),
+            "device": str(model.fallback_level.device),
+        }
         for start in range(0, len(items), batch_size):
             batch = make_batch(
                 batch_panel,
@@ -86,6 +97,11 @@ class Predictor:
                 cfg.max_context,
                 self.bundle.encoder,
             ).to(model.fallback_level.device)
+            for name, flag in model.fallback_flags(batch).items():
+                diagnostics[f"fallback_{name}"] += int(flag.sum().item())
             # predict performs the single denormalisation and the model's fallbacks.
             predictions[start : start + batch.size] = model.predict(batch).cpu().numpy()
-        return ids, predictions
+        # Each .cpu().numpy() above waits for its CUDA output, so this includes
+        # device work and host transfer rather than only asynchronous launches.
+        diagnostics["inference_time_s"] = time.perf_counter() - started
+        return ids, predictions, diagnostics

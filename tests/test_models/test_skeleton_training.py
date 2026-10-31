@@ -54,3 +54,19 @@ def test_toy_model_reduces_pinball_loss():
     after = evaluation_loss()
     print(f"before={before:.9f}, after={after:.9f}, ratio={after / before:.9f}")
     assert after < 0.75 * before and all(p.grad is not None for p in model.head.parameters())
+
+
+def test_fallback_flags_are_disjoint_and_cover_ineligible_contexts():
+    panel = synthetic_panel(n_series=3, length=20, freq="W-SUN", seed=1, signal="seasonal_promo")
+    panel.series[0].target[:] = np.nan
+    panel.series[1].target[:] = 6
+    enc = StaticEncoder().fit(panel, [s.series_id for s in panel.series])
+    batch = make_batch(panel, [(i, 16) for i in range(3)], 4, 32, enc)
+    model = ForecastModel(
+        ModelSpec.from_panel(panel, enc, ForecastConfig(horizon=4), 16, 4), ToyBackbone(16)
+    )
+    flags = model.fallback_flags(batch)
+    assert flags["no_context"].tolist() == [True, False, False]
+    assert flags["undefined_scale"].tolist() == [False, True, False]
+    prediction = model.predict(batch)
+    assert torch.all(prediction[0] == 0) and torch.all(prediction[1] == 6)
