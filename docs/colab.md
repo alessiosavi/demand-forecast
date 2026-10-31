@@ -248,6 +248,8 @@ trainer's exact interruption/resume acceptance test.
 
 ## 4. Neural-run template (requires phase-5 authorization)
 
+For the labelled quick, non-protocol run on the seven weekly tasks, follow [prompt 02](colab/prompts/02-quick-validation.md).
+
 `fev run` and the new `train` command have been implemented since PR #23. This is
 **not an executable step for prompt 00**. A frozen model run still requires separate
 phase-5 authorization, a reviewed config, and passing interruption/resume trial,
