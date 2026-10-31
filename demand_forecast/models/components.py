@@ -519,6 +519,8 @@ class InterpretableMultiHeadAttention(nn.Module):
         value: torch.Tensor,
         attn_mask: torch.Tensor | None = None,
         return_attention: bool = False,
+        *,
+        key_padding_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Forward pass.
 
@@ -526,13 +528,15 @@ class InterpretableMultiHeadAttention(nn.Module):
             query: Query tensor of shape (batch, tgt_len, d_model).
             key: Key tensor of shape (batch, src_len, d_model).
             value: Value tensor of shape (batch, src_len, d_model).
-            attn_mask: Optional attention mask.
+            attn_mask: Optional additive attention mask, broadcastable to attention scores.
             return_attention: Whether to return attention weights.
+            key_padding_mask: Boolean mask of shape (batch, src_len); True masks a key.
 
         Returns:
             Tuple of (output, attention_weights).
             - output: Shape (batch, tgt_len, d_model)
             - attention_weights: Shape (batch, nhead, tgt_len, src_len) or None
+            Fully masked query rows have zero output and attention weights.
         """
         batch_size, tgt_len, _ = query.shape
         src_len = key.shape[1]
@@ -545,15 +549,23 @@ class InterpretableMultiHeadAttention(nn.Module):
         # Apply RoPE if enabled
         if self.use_rope and self.rope is not None:
             cos, sin = self.rope(max(tgt_len, src_len))
-            q, k = apply_rotary_pos_emb(q, k, cos[:tgt_len], sin[:src_len])
+            # Query and key sequences may have different lengths in cross-attention.
+            q, _ = apply_rotary_pos_emb(q, q, cos[:tgt_len], sin[:tgt_len])
+            k, _ = apply_rotary_pos_emb(k, k, cos[:src_len], sin[:src_len])
 
         # Scaled dot-product attention
         attn_scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
 
         if attn_mask is not None:
             attn_scores = attn_scores + attn_mask
+        if key_padding_mask is not None:
+            attn_scores = attn_scores.masked_fill(key_padding_mask[:, None, None, :], -torch.inf)
 
+        # Avoid softmax(-inf, ..., -inf), including NaNs in its backward pass.
+        all_masked = torch.isneginf(attn_scores).all(dim=-1, keepdim=True)
+        attn_scores = attn_scores.masked_fill(all_masked, 0.0)
         attn_weights = F.softmax(attn_scores, dim=-1)
+        attn_weights = attn_weights.masked_fill(all_masked, 0.0)
         attn_weights_dropped = self.dropout(attn_weights)
 
         # Apply attention to values
@@ -564,6 +576,8 @@ class InterpretableMultiHeadAttention(nn.Module):
             attn_output.transpose(1, 2).contiguous().view(batch_size, tgt_len, self.d_model)
         )
         output = self.out_proj(attn_output)
+        # Suppress the projection bias only when every head has no available key.
+        output = output.masked_fill(all_masked.all(dim=1), 0.0)
 
         if return_attention:
             return output, attn_weights
