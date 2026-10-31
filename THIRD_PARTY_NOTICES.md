@@ -1,6 +1,6 @@
 # Third-party notices
 
-## fev seasonal-naive baseline and weekly task definitions
+## fev seasonal-naive baseline, weekly task definitions, and metrics
 
 `demand_forecast/bench/baselines.py` is adapted from fev's
 `models/statsforecast/model.py` at tag `v0.10.0`:
@@ -18,8 +18,15 @@ entries from fev's `benchmarks/fev_bench/tasks.yaml` at tag `v0.10.0`:
 https://github.com/autogluon/fev/blob/v0.10.0/benchmarks/fev_bench/tasks.yaml
 
 The entries are selected and reordered for the weekly benchmark. Their fields
-and formatting are unchanged. The upstream notice and license below apply to
-both the baseline port and these task definitions.
+and formatting are unchanged.
+
+`demand_forecast/metrics.py` is adapted from fev's `src/fev/metrics.py` at tag
+`v0.10.0`: https://github.com/autogluon/fev/blob/v0.10.0/src/fev/metrics.py
+The port uses a univariate NumPy API, supports ragged histories and quiet empty
+reductions, and adds interval diagnostics and a median-based summary.
+
+The upstream notice and license below apply to the baseline port, task
+definitions, and metrics port.
 
 Upstream NOTICE (https://github.com/autogluon/fev/blob/v0.10.0/NOTICE):
 
