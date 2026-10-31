@@ -219,9 +219,9 @@ def calendar_features(index: pd.DatetimeIndex, freq: str | pd.offsets.BaseOffset
     components = _calendar_components(to_offset(freq))
     fields = {
         "hour": index.hour,
-        "dow": index.dayofweek,
+        "dow": index.day_of_week,
         "dom": index.day,
-        "doy": index.dayofyear,
+        "doy": index.day_of_year,
         "woy": index.isocalendar().week,
         "month": index.month,
         "quarter": index.quarter,
