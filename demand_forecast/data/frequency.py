@@ -80,19 +80,7 @@ def resolve_freq(indexes: list[pd.DatetimeIndex], pinned: str | None) -> pd.offs
 def _requires_midnight(offset: pd.offsets.BaseOffset) -> bool:
     if isinstance(offset, pd.offsets.Tick):
         return offset.nanos >= pd.Timedelta(days=1).value
-    return isinstance(
-        offset,
-        (
-            pd.offsets.Day,
-            pd.offsets.Week,
-            pd.offsets.MonthBegin,
-            pd.offsets.MonthEnd,
-            pd.offsets.QuarterBegin,
-            pd.offsets.QuarterEnd,
-            pd.offsets.YearBegin,
-            pd.offsets.YearEnd,
-        ),
-    )
+    return not isinstance(offset, (pd.offsets.BusinessHour, pd.offsets.CustomBusinessHour))
 
 
 def validate_on_grid(
@@ -189,7 +177,17 @@ def _calendar_components(offset: pd.offsets.BaseOffset) -> list[tuple[str, int]]
         return daily
     if isinstance(offset, pd.offsets.Tick):
         return [("hour", 24), *daily] if offset.nanos < pd.Timedelta(days=1).value else daily
-    if isinstance(offset, (pd.offsets.MonthBegin, pd.offsets.MonthEnd)):
+    if isinstance(
+        offset,
+        (
+            pd.offsets.MonthBegin,
+            pd.offsets.MonthEnd,
+            pd.offsets.BusinessMonthBegin,
+            pd.offsets.BusinessMonthEnd,
+            pd.offsets.CustomBusinessMonthBegin,
+            pd.offsets.CustomBusinessMonthEnd,
+        ),
+    ):
         return [("month", 12), ("quarter", 4)]
     return [("month", 12)]
 
