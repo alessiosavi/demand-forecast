@@ -54,6 +54,120 @@ def assert_state_equal(actual, expected):
     assert all(torch.equal(actual[k], v) for k, v in expected.items())
 
 
+def test_fit_prepares_validation_once(
+    tmp_path, monkeypatch, fresh, panel_long, plan_long, encoder_long, caplog
+):
+    from demand_forecast.core import training
+
+    prepare = training.prepare_validation
+    calls = []
+
+    def capture(panel, items, *args, **kwargs):
+        calls.append(items.copy())
+        return prepare(panel, items, *args, **kwargs)
+
+    monkeypatch.setattr(training, "prepare_validation", capture)
+    plan = replace(plan_long, val_items=plan_long.val_items[[1, 5, 7]])
+    cfg = TrainConfig(base_steps=4, batch_size=8, amp=False)
+    forecast = ForecastConfig(horizon=4)
+    with caplog.at_level("INFO"):
+        Trainer(fresh(), cfg, cpu, RUN_ID, SEED).fit(
+            panel_long, plan, forecast, encoder_long, checkpoint_dir=tmp_path, stop_after=2
+        )
+    assert len(calls) == 1
+    assert "validation prepared: items=3 batches=1 bytes=" in caplog.text
+    Trainer(fresh(), cfg, cpu, RUN_ID, SEED).fit(
+        panel_long, plan, forecast, encoder_long, checkpoint_dir=tmp_path, resume=True
+    )
+    assert len(calls) == 2
+    for items in calls:
+        np.testing.assert_array_equal(items, plan.val_items)
+    for skipped in (
+        replace(plan, exception=True),
+        replace(plan, val_items=np.array([], dtype=int)),
+    ):
+        Trainer(fresh(), cfg, cpu, RUN_ID, SEED).fit(panel_long, skipped, forecast, encoder_long)
+    assert len(calls) == 2
+
+
+def test_fit_matches_reference_path(fresh, panel_long, plan_long, encoder_long):
+    from tests.helpers.reference_batch import reference_evaluate
+
+    cfg = TrainConfig(base_steps=6, batch_size=8, warmup_steps=2, patience=10, amp=False)
+    forecast = ForecastConfig(horizon=4)
+    optimized = Trainer(fresh(), cfg, cpu, RUN_ID, SEED).fit(
+        panel_long, plan_long, forecast, encoder_long
+    )
+    reference = Trainer(fresh(), cfg, cpu, RUN_ID, SEED).fit(
+        panel_long, plan_long, forecast, encoder_long, evaluate_fn=reference_evaluate
+    )
+    np.testing.assert_equal(optimized.history, reference.history)
+    assert_state_equal(optimized.best_state, reference.best_state)
+    assert (optimized.best_step, optimized.stop_reason) == (
+        reference.best_step,
+        reference.stop_reason,
+    )
+
+
+def test_fit_custom_evaluate_fn_keeps_old_call(
+    monkeypatch, fresh, panel_long, plan_long, encoder_long
+):
+    from demand_forecast.core import training
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("custom evaluator must not prepare validation")
+
+    monkeypatch.setattr(training, "prepare_validation", forbidden)
+    model, forecast, calls = fresh(), ForecastConfig(horizon=4), []
+
+    def custom(*args):
+        calls.append(args)
+        return {"SQL": 1.0}
+
+    result = Trainer(model, TrainConfig(base_steps=2, amp=False), cpu, RUN_ID, SEED).fit(
+        panel_long, plan_long, forecast, encoder_long, evaluate_fn=custom
+    )
+    assert len(calls) == 2 and result.best_score == 1.0
+    for args in calls:
+        assert len(args) == 8
+        assert args[0] is model and args[1] is panel_long and args[2] is plan_long.val_items
+        assert args[3:6] == (plan_long.val_origin, 4, forecast.max_context)
+        assert args[6] is encoder_long and args[7] is forecast.quantiles
+
+
+def test_prepare_time_charged_once(
+    tmp_path, monkeypatch, fresh, panel_long, plan_long, encoder_long
+):
+    from demand_forecast.core import training
+
+    now = [0.0]
+    prepare, score = training.prepare_validation, training.evaluate_prepared
+    monkeypatch.setattr(training.time, "perf_counter", lambda: now[0])
+
+    def timed_prepare(*args, **kwargs):
+        result = prepare(*args, **kwargs)
+        now[0] += 7.0
+        return result
+
+    def timed_score(*args, **kwargs):
+        result = score(*args, **kwargs)
+        now[0] += 3.0
+        return result
+
+    monkeypatch.setattr(training, "prepare_validation", timed_prepare)
+    monkeypatch.setattr(training, "evaluate_prepared", timed_score)
+    cfg, forecast = TrainConfig(base_steps=4, amp=False), ForecastConfig(horizon=4)
+    first = Trainer(fresh(), cfg, cpu, RUN_ID, SEED).fit(
+        panel_long, plan_long, forecast, encoder_long, checkpoint_dir=tmp_path, stop_after=2
+    )
+    assert first.timings["eval_s"] == 13.0
+    resumed = Trainer(fresh(), cfg, cpu, RUN_ID, SEED).fit(
+        panel_long, plan_long, forecast, encoder_long, checkpoint_dir=tmp_path, resume=True
+    )
+    assert resumed.timings["eval_s"] == 26.0
+    assert [row["eval_s"] for row in resumed.telemetry] == [3.0] * 4
+
+
 @pytest.mark.parametrize(
     "capability,expected",
     [

@@ -18,7 +18,7 @@ import numpy as np
 import torch
 
 from demand_forecast.config.settings import ForecastConfig
-from demand_forecast.core.evaluation import evaluate
+from demand_forecast.core.evaluation import evaluate, evaluate_prepared, prepare_validation
 from demand_forecast.core.validation import ValidationPlan
 from demand_forecast.data.encoders import StaticEncoder
 from demand_forecast.data.frequency import grid_range
@@ -227,6 +227,22 @@ class Trainer:
         if not len(origins):
             return self._result("no_training_data")
 
+        prepared = None
+        if evaluate_fn is evaluate and not plan.exception and len(plan.val_items):
+            prepare_started = time.perf_counter()
+            prepared = prepare_validation(
+                panel, plan.val_items, plan.val_origin, horizon, max_context, encoder
+            )
+            build_s = time.perf_counter() - prepare_started
+            self.timings["eval_s"] += build_s
+            logger.info(
+                "validation prepared: items=%d batches=%d bytes=%d build_s=%.1f",
+                len(plan.val_items),
+                len(prepared.batches),
+                prepared.nbytes,
+                build_s,
+            )
+
         quantiles = torch.tensor(forecast_cfg.quantiles, device=self.device)
         self.model.train()
         session_steps = 0
@@ -263,16 +279,19 @@ class Trainer:
                     self.step % self.eval_every == 0 or self.step == self.max_steps
                 ):
                     eval_started = time.perf_counter()
-                    metrics = evaluate_fn(
-                        self.model,
-                        panel,
-                        plan.val_items,
-                        plan.val_origin,
-                        horizon,
-                        max_context,
-                        encoder,
-                        forecast_cfg.quantiles,
-                    )
+                    if prepared is not None:
+                        metrics = evaluate_prepared(self.model, prepared, forecast_cfg.quantiles)
+                    else:
+                        metrics = evaluate_fn(
+                            self.model,
+                            panel,
+                            plan.val_items,
+                            plan.val_origin,
+                            horizon,
+                            max_context,
+                            encoder,
+                            forecast_cfg.quantiles,
+                        )
                     record.update(metrics)
                     self._select_best(float(metrics["SQL"]))
                     self.model.train()
