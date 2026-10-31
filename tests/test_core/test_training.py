@@ -740,3 +740,214 @@ def test_evaluate_handles_an_item_ending_before_origin_without_mutating_panel(
     assert np.isfinite(result["SQL"])
     assert panel.series[1].length == original.length
     np.testing.assert_equal(panel.series[1].target, original.target)
+
+
+def test_timing_categories_sum_with_controlled_clock(
+    tmp_path, monkeypatch, fresh, panel_long, plan_long, encoder_long
+):
+    from demand_forecast.core import training
+
+    now = [0.0]
+    monkeypatch.setattr(training.time, "perf_counter", lambda: now[0])
+    batches = training.WindowSampler.batches
+    save = torch.save
+
+    def timed_batches(self, size):
+        for batch in batches(self, size):
+            now[0] += 2.0
+            yield batch
+
+    def timed_save(*args, **kwargs):
+        now[0] += 5.0
+        return save(*args, **kwargs)
+
+    def timed_eval(*args):
+        now[0] += 3.0
+        return {"SQL": 1.0}
+
+    monkeypatch.setattr(training.WindowSampler, "batches", timed_batches)
+    monkeypatch.setattr(torch, "save", timed_save)
+    cfg = TrainConfig(base_steps=4, batch_size=8, amp=False, checkpoint_every=2)
+    trainer = Trainer(fresh(), cfg, cpu, RUN_ID, SEED)
+    result = trainer.fit(
+        panel_long,
+        plan_long,
+        ForecastConfig(horizon=4),
+        encoder_long,
+        checkpoint_dir=tmp_path,
+        stop_after=2,
+        evaluate_fn=timed_eval,
+    )
+    assert result.timings == {
+        "train_s": 4.0,
+        "eval_s": 6.0,
+        "checkpoint_s": 5.0,
+        "sessions": 1,
+        "peak_cuda_mem_bytes": 0,
+        "nonfinite_losses": 0,
+    }
+    resumed = Trainer(fresh(), cfg, cpu, RUN_ID, SEED).fit(
+        panel_long,
+        plan_long,
+        ForecastConfig(horizon=4),
+        encoder_long,
+        checkpoint_dir=tmp_path,
+        resume=True,
+        evaluate_fn=timed_eval,
+    )
+    assert resumed.timings["train_s"] == 8.0
+    assert resumed.timings["eval_s"] == 12.0
+    assert resumed.timings["checkpoint_s"] == 10.0
+    assert resumed.timings["sessions"] == 2
+    assert [r["train_s_per_step"] for r in resumed.telemetry] == [2.0] * 4
+    assert [r["elapsed_s"] for r in resumed.telemetry] == [5.0, 10.0, 20.0, 25.0]
+    assert all(
+        set(r) == {"step", "elapsed_s", "train_s_per_step", "eval_s", "peak_cuda_mem_bytes"}
+        for r in resumed.telemetry
+    )
+
+
+def test_nonfinite_losses_counter_is_cumulative(
+    tmp_path, monkeypatch, fresh29, panel29, plan29, encoder29
+):
+    from demand_forecast.core import training
+
+    loss_fn = training.pinball_loss
+
+    def nonfinite_loss(*args):
+        loss, count = loss_fn(*args)
+        return loss + loss.new_tensor(float("nan")), count
+
+    monkeypatch.setattr(training, "pinball_loss", nonfinite_loss)
+    cfg = TrainConfig(base_steps=4, batch_size=8, amp=False)
+    first = Trainer(fresh29(), cfg, cpu, RUN_ID, SEED).fit(
+        panel29,
+        plan29,
+        ForecastConfig(horizon=13),
+        encoder29,
+        checkpoint_dir=tmp_path,
+        stop_after=2,
+    )
+    assert first.timings["nonfinite_losses"] == 2
+    second = Trainer(fresh29(), cfg, cpu, RUN_ID, SEED).fit(
+        panel29,
+        plan29,
+        ForecastConfig(horizon=13),
+        encoder29,
+        checkpoint_dir=tmp_path,
+        resume=True,
+    )
+    assert second.timings["nonfinite_losses"] == 4
+
+
+def test_telemetry_without_validation(tmp_path, fresh29, panel29, plan29, encoder29):
+    import json
+
+    result = Trainer(fresh29(), TrainConfig(base_steps=2, amp=False), cpu, RUN_ID, SEED).fit(
+        panel29,
+        plan29,
+        ForecastConfig(horizon=13),
+        encoder29,
+        checkpoint_dir=tmp_path,
+    )
+    assert result.telemetry == []
+    progress = json.loads((tmp_path / "progress.json").read_text())
+    assert progress["exception"] is True
+    assert progress["step"] == 2
+    assert progress["telemetry_tail"] == []
+
+
+def test_fit_logs_budget_and_evaluations(
+    caplog, tmp_path, fresh, panel_long, plan_long, encoder_long
+):
+    import logging
+
+    with caplog.at_level(logging.INFO):
+        Trainer(fresh(), TrainConfig(base_steps=2, amp=False), cpu, RUN_ID, SEED).fit(
+            panel_long,
+            plan_long,
+            ForecastConfig(horizon=4),
+            encoder_long,
+            checkpoint_dir=tmp_path,
+        )
+    for message in (
+        "fit: max_steps=2 eval_every=1",
+        "eval: step=1/2 inner_SQL=",
+        "checkpoint: step=2 path=",
+        "fit done: stop_reason=max_steps steps=2",
+    ):
+        assert message in caplog.text
+
+
+def test_cuda_peak_sampling_is_monotone_without_cuda(monkeypatch, fresh):
+    trainer = Trainer(fresh(), TrainConfig(amp=False), cpu, RUN_ID, SEED)
+    trainer.device = torch.device("cuda:1")
+    peaks = iter([8, 4, 12])
+    seen = []
+
+    def peak(device):
+        seen.append(device)
+        return next(peaks)
+
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", peak)
+    trainer._sample_peak()
+    trainer._sample_peak()
+    assert trainer.timings["peak_cuda_mem_bytes"] == 8
+    trainer._sample_peak()
+    assert trainer.timings["peak_cuda_mem_bytes"] == 12
+    assert seen == [torch.device("cuda:1")] * 3
+
+
+def test_cuda_session_reset_and_sampling_points_without_gpu(
+    tmp_path, monkeypatch, fresh, panel_long, plan_long, encoder_long
+):
+    from contextlib import nullcontext
+
+    from demand_forecast.core import training
+    from demand_forecast.data.sampler import Batch
+
+    trainer = Trainer(fresh(), TrainConfig(base_steps=2, amp=False), cpu, RUN_ID, SEED)
+    trainer.device = torch.device("cuda:1")
+    tensor, move = torch.tensor, Batch.to
+    # Exercise CUDA telemetry while all actual tensor work stays on the CPU.
+    monkeypatch.setattr(torch, "tensor", lambda *a, **kw: tensor(*a, **{**kw, "device": cpu}))
+    monkeypatch.setattr(Batch, "to", lambda self, device: move(self, cpu))
+    monkeypatch.setattr(torch, "autocast", lambda *a, **kw: nullcontext())
+    calls = []
+    copy = training.deepcopy
+
+    def copy_state(value):
+        if isinstance(value, dict) and any(isinstance(v, torch.Tensor) for v in value.values()):
+            calls.append(("copy", trainer.device))
+        return copy(value)
+
+    monkeypatch.setattr(training, "deepcopy", copy_state)
+    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda d: calls.append(("reset", d)))
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda d: calls.append(("sync", d)))
+    monkeypatch.setattr(
+        torch.cuda, "max_memory_allocated", lambda d: calls.append(("peak", d)) or 123
+    )
+    result = trainer.fit(
+        panel_long,
+        plan_long,
+        ForecastConfig(horizon=4),
+        encoder_long,
+        checkpoint_dir=tmp_path,
+        evaluate_fn=lambda *a: {"SQL": 1.0},
+    )
+    assert calls == [
+        (name, trainer.device)
+        for name in (
+            "copy",
+            "reset",
+            "copy",
+            "sync",
+            "peak",
+            "sync",
+            "peak",
+            "peak",
+            "copy",
+            "peak",
+        )
+    ]
+    assert result.timings["peak_cuda_mem_bytes"] == 123
