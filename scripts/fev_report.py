@@ -224,6 +224,11 @@ def build_report(
                 **{key: budget.get(key) for key in ("max_steps", "eval_every")},
                 "n_fit_ids": report.get("n_fit_ids"),
                 "n_val_items": report.get("n_val_items"),
+                **{
+                    key: report[key]
+                    for key in ("val_items_max", "n_val_items_eligible")
+                    if key in report
+                },
                 "exception": report.get("plan", {}).get("exception"),
                 **{
                     key: fit.get(key) for key in ("steps", "best_step", "best_score", "stop_reason")

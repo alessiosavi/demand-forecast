@@ -58,6 +58,7 @@ class TrainConfig:
     rel_tol: float = 0.002
     amp: bool = True
     checkpoint_every: int = 200
+    max_steps_cap: int | None = None
 
 
 @dataclass
@@ -72,11 +73,17 @@ class FitResult:
     telemetry: list[dict]
 
 
-def resolve_budget(base_steps: int, n_series: int, eval_every: int) -> tuple[int, int]:
-    """Scale steps by panel size, retaining small budgets used by CPU tests."""
+def resolve_budget(
+    base_steps: int, n_series: int, eval_every: int, max_steps_cap: int | None = None
+) -> tuple[int, int]:
+    """Scale and clip steps, optionally cap them, then resolve evaluation frequency."""
     if base_steps < 1 or n_series < 0 or eval_every < 1:
         raise ValueError("base_steps and eval_every must be positive; n_series must be nonnegative")
+    if max_steps_cap is not None and max_steps_cap < 1:
+        raise ValueError("max_steps_cap must be positive")
     max_steps = int(np.clip(base_steps * n_series / 2000, min(500, base_steps), 4 * base_steps))
+    if max_steps_cap is not None:
+        max_steps = min(max_steps, max_steps_cap)
     return max_steps, min(eval_every, max(max_steps // 5, 1))
 
 
@@ -163,7 +170,7 @@ class Trainer:
         self.plan = plan
         horizon, max_context = forecast_cfg.horizon, forecast_cfg.max_context
         self.max_steps, self.eval_every = resolve_budget(
-            self.cfg.base_steps, len(plan.fit_ids), self.cfg.eval_every
+            self.cfg.base_steps, len(plan.fit_ids), self.cfg.eval_every, self.cfg.max_steps_cap
         )
         self.warmup_steps = self.cfg.warmup_steps
         fit_ids = set(plan.fit_ids)

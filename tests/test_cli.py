@@ -250,8 +250,12 @@ def test_run_identity_canonical_json(run_settings):
 
     origin = pd.Timestamp("2022-08-14")
     task = {"name": "fixture", "horizon": 4}
+    settings = run_settings.model_dump(mode="json")
+    for key in ("max_steps_cap", "val_items_max"):
+        if settings["training"][key] is None:
+            del settings["training"][key]
     payload = {
-        "settings": run_settings.model_dump(mode="json"),
+        "settings": settings,
         "seed": 3,
         "dataset_fingerprint": "data-hash",
         "package_version": "2.0.0",

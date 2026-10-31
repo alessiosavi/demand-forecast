@@ -20,7 +20,7 @@ from demand_forecast import __version__
 from demand_forecast.config import Settings
 from demand_forecast.core.bundle import load_bundle, save_bundle
 from demand_forecast.core.training import InterruptedRun, TrainConfig, Trainer
-from demand_forecast.core.validation import plan_inner_validation
+from demand_forecast.core.validation import plan_inner_validation, subsample_validation
 from demand_forecast.data.encoders import StaticEncoder
 from demand_forecast.data.frequency import grid_range, validate_on_grid
 from demand_forecast.data.loader_long import load_long
@@ -30,6 +30,15 @@ from demand_forecast.models.base import ModelSpec
 from demand_forecast.models.registry import build_model
 
 logger = logging.getLogger(__name__)
+
+
+def _identity_settings(settings: Settings) -> dict:
+    """Preserve legacy identities by omitting only unset quick-validation controls."""
+    payload = settings.model_dump(mode="json")
+    for key in ("max_steps_cap", "val_items_max"):
+        if payload["training"][key] is None:
+            payload["training"].pop(key)
+    return payload
 
 
 def run_identity(
@@ -42,7 +51,7 @@ def run_identity(
 ) -> str:
     """Hash canonical configuration, data, software and resolved training boundary."""
     payload = {
-        "settings": settings.model_dump(mode="json"),
+        "settings": _identity_settings(settings),
         "seed": seed,
         "dataset_fingerprint": dataset_fingerprint,
         "package_version": package_version,
@@ -156,11 +165,15 @@ def train_panel(
     plan = plan_inner_validation(
         panel, origin, settings.forecast.horizon, settings.training.min_train_history
     )
+    eligible = plan
+    plan = subsample_validation(plan, settings.training.val_items_max, settings.seed)
     logger.info(
-        "plan: train_upto=%s val_origin=%s exception=%s",
+        "plan: train_upto=%s val_origin=%s exception=%s val_items=%d/%d",
         plan.train_upto,
         plan.val_origin,
         plan.exception,
+        len(plan.val_items),
+        len(eligible.val_items),
     )
     encoder = StaticEncoder().fit(panel, plan.fit_ids)
     spec = ModelSpec.from_panel(
@@ -168,7 +181,9 @@ def train_panel(
     )
     backbone_kwargs = settings.model.backbone_kwargs()
     model = build_model(settings.model.family, spec, backbone_kwargs)
-    cfg = TrainConfig(**settings.training.model_dump(exclude={"refit", "min_train_history"}))
+    cfg = TrainConfig(
+        **settings.training.model_dump(exclude={"refit", "min_train_history", "val_items_max"})
+    )
     device = resolve_device(settings)
     trainer = Trainer(model, cfg, device, identity, settings.seed)
     fit_started = time.perf_counter()
@@ -201,6 +216,8 @@ def train_panel(
         "resolved_budget": {"max_steps": trainer.max_steps, "eval_every": trainer.eval_every},
         "n_fit_ids": len(plan.fit_ids),
         "n_val_items": len(plan.val_items),
+        "val_items_max": settings.training.val_items_max,
+        "n_val_items_eligible": len(eligible.val_items),
         "amp_dtype": str(trainer.amp_dtype).removeprefix("torch.") if trainer.amp else None,
         "telemetry": result.telemetry,
         "plan": {

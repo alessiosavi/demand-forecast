@@ -110,6 +110,8 @@ class TrainingConfig(BaseModel):
     checkpoint_every: int = Field(200, ge=1)
     refit: Literal["none", "full"] = "none"
     min_train_history: int | None = Field(None, ge=1)
+    max_steps_cap: int | None = Field(None, ge=1)
+    val_items_max: int | None = Field(None, ge=1)
 
 
 class TuningConfig(BaseModel):

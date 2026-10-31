@@ -15,6 +15,7 @@ from typer.testing import CliRunner
 fev = pytest.importorskip("fev")
 pytestmark = pytest.mark.bench
 
+from demand_forecast import __version__  # noqa: E402
 from demand_forecast.bench.run import (  # noqa: E402
     predictions_for_fev,
     resolved_origin,
@@ -25,7 +26,9 @@ from demand_forecast.bench.run import (  # noqa: E402
 )
 from demand_forecast.bench.specs import dataset_fingerprint  # noqa: E402
 from demand_forecast.cli import app  # noqa: E402
-from demand_forecast.core.training import InterruptedRun  # noqa: E402
+from demand_forecast.config import Settings  # noqa: E402
+from demand_forecast.core.run import run_identity  # noqa: E402
+from demand_forecast.core.training import InterruptedRun, Trainer  # noqa: E402
 from demand_forecast.core.validation import plan_inner_validation  # noqa: E402
 from demand_forecast.data.loader_fev import item_ids, panel_from_window  # noqa: E402
 from demand_forecast.data.panel import Panel  # noqa: E402
@@ -114,27 +117,105 @@ def test_offline_fev_task_end_to_end_with_resume_and_replacement(tmp_path, monke
     assert seen == []
 
 
+@pytest.mark.parametrize(
+    "config,expected",
+    [
+        ("tiny", "0109546d94a7e19ca25a3d8e427e46af981b5f04ee5a5ca772cc610d0397e03a"),
+        ("frozen", "576741a436a27e53d0643128fc79169f9ccf0a1906c5141eed60c71f7c0a0250"),
+    ],
+)
+def test_aligned_fixture_identity_pinned_at_67d4bd7(tmp_path, config, expected):
+    spec = fixture_spec(write_fev_fixture(tmp_path))
+    settings = (
+        tiny_settings(base_steps=20, d_model=16)
+        if config == "tiny"
+        else Settings.from_yaml(
+            Path(__file__).resolve().parents[2] / "configs/fev-v2-standard.yaml"
+        )
+    )
+    task = spec.to_task()
+    fingerprint = dataset_fingerprint(task)
+    _, future = task.get_window(0).get_input_data()
+    origin = resolved_origin(window_origins(future, spec.id_column, spec.timestamp_column))
+    assert (
+        run_identity(
+            settings_for_task(spec, settings, task.freq),
+            settings.seed,
+            fingerprint,
+            __version__,
+            origin,
+            spec.task_definition(),
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize("quick", [False, True])
 def test_interrupted_training_before_first_bundle_resumes_and_changed_config_is_rejected(
     tmp_path,
+    monkeypatch,
+    capsys,
+    quick,
 ):
     spec = fixture_spec(write_fev_fixture(tmp_path))
     out = tmp_path / "out"
     settings = tiny_settings(base_steps=40, d_model=16)
+    if quick:
+        settings.training.max_steps_cap = 21
+        settings.training.val_items_max = 2
+    seen = []
+    fit = Trainer.fit
+
+    def capture(trainer, panel, plan, *args, **kwargs):
+        seen.append(plan.val_items.tolist())
+        return fit(trainer, panel, plan, *args, **kwargs)
+
+    monkeypatch.setattr(Trainer, "fit", capture)
     with pytest.raises(InterruptedRun):
         run_fev([spec], settings, out, stop_after=15)
     assert not (out / spec.name / "bundle").exists()
     assert torch.load(out / spec.name / "checkpoints/latest.pt", weights_only=False)["step"] == 15
+    interrupted_progress = json.loads((out / spec.name / "checkpoints/progress.json").read_text())
+    if quick:
+        assert interrupted_progress["max_steps"] == 21
+        assert interrupted_progress["n_val_items"] == 2
     full = run_fev([spec], settings, tmp_path / "ref")
     resumed = run_fev([spec], settings, out, resume=True)
     assert resumed.SQL.iloc[0] == pytest.approx(full.SQL.iloc[0])
     manifest = json.loads((out / spec.name / "bundle/manifest.json").read_text())
     assert manifest["resumed_from_step"] == 15
+    assert len(seen) == 3 and seen[0] == seen[1] == seen[2]
+    report = json.loads((out / spec.name / "run.json").read_text())
+    reference = json.loads((tmp_path / "ref" / spec.name / "run.json").read_text())
+    assert report["plan"]["val_items"] == reference["plan"]["val_items"] == seen[0]
+    assert report["fit_result"] == reference["fit_result"]
+    if quick:
+        assert report["val_items_max"] == report["n_val_items"] == 2
+        assert report["n_val_items_eligible"] == 6
+        assert report["resolved_budget"] == {"max_steps": 21, "eval_every": 4}
+        assert report["fit_result"]["steps"] <= 21
+        assert seen[0] == sorted(
+            np.random.default_rng(settings.seed).choice(6, size=2, replace=False).tolist()
+        )
+    else:
+        assert report["val_items_max"] is None
+        assert report["n_val_items"] == report["n_val_items_eligible"] == 6
     for index in range(spec.num_windows):
         with (
             np.load(tmp_path / "ref" / spec.name / f"window_{index}.npz") as expected,
             np.load(out / spec.name / f"window_{index}.npz") as actual,
         ):
             np.testing.assert_array_equal(actual["arrays"], expected["arrays"])
+    before = file_states(out)
+    run_fev([spec], settings, out, resume=True)
+    assert f"Skipping completed task {spec.name}" in capsys.readouterr().out
+    assert file_states(out) == before
+    assert len(seen) == 3
+    for field in ("max_steps_cap", "val_items_max"):
+        changed = settings.model_copy(deep=True)
+        setattr(changed.training, field, (getattr(settings.training, field) or 1) + 1)
+        with pytest.raises(ValueError, match="run identity mismatch"):
+            run_fev([spec], changed, out, resume=True)
     with pytest.raises(ValueError, match="identity"):
         run_fev([spec], tiny_settings(base_steps=40, d_model=8), out, resume=True)
     with pytest.raises(ValueError, match="identity"):
@@ -540,7 +621,8 @@ def test_cli_run_accepts_custom_tasks_and_profiles(tmp_path):
     assert bundle.manifest["run"]["fit_result"]["stop_reason"] == "max_steps"
 
 
-def test_cli_run_interrupt_resume_policy_and_missing_bench(tmp_path, monkeypatch):
+@pytest.mark.parametrize("quick", [False, True])
+def test_cli_run_interrupt_resume_policy_and_missing_bench(tmp_path, monkeypatch, quick):
     from dataclasses import asdict
 
     spec = fixture_spec(
@@ -554,7 +636,11 @@ def test_cli_run_interrupt_resume_policy_and_missing_bench(tmp_path, monkeypatch
     tasks = tmp_path / "tasks.yaml"
     tasks.write_text(yaml.safe_dump({"tasks": [definition]}))
     config = tmp_path / "cfg.yaml"
-    tiny_settings(base_steps=10, d_model=8).to_yaml(config)
+    settings = tiny_settings(base_steps=10, d_model=8)
+    if quick:
+        settings.training.max_steps_cap = 7
+        settings.training.val_items_max = 2
+    settings.to_yaml(config)
     out = tmp_path / "out"
     args = [
         "fev",
@@ -574,10 +660,22 @@ def test_cli_run_interrupt_resume_policy_and_missing_bench(tmp_path, monkeypatch
     stopped = runner.invoke(app, [*args, "--stop-after", "3"])
     assert stopped.exit_code == 1 and "interrupted at step 3" in stopped.output
     assert not (out / spec.name / "bundle").exists()
+    if quick:
+        progress = json.loads((out / spec.name / "checkpoints/progress.json").read_text())
+        assert progress["max_steps"] == 7 and progress["n_val_items"] == 2
     resumed = runner.invoke(app, [*args, "--resume"])
     assert resumed.exit_code == 0, (resumed.output, resumed.exception)
     summary = pd.read_csv(out / "summaries.csv")
     assert summary.model_name.tolist() == ["cli-model"] and np.isfinite(summary.SQL.iloc[0])
+    if quick:
+        report = json.loads((out / spec.name / "run.json").read_text())
+        assert report["resolved_budget"]["max_steps"] == 7
+        assert report["n_val_items"] == report["val_items_max"] == 2
+        assert report["n_val_items_eligible"] == 6
+    before = file_states(out)
+    skipped = runner.invoke(app, [*args, "--resume"])
+    assert skipped.exit_code == 0 and f"Skipping completed task {spec.name}" in skipped.output
+    assert file_states(out) == before
     unimplemented = runner.invoke(app, [*args, "--policy", "per_window"])
     assert unimplemented.exit_code == 2
     assert "per_window arrives with the phase-4 plan" in unimplemented.output

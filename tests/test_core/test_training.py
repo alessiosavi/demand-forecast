@@ -110,6 +110,29 @@ def test_resolve_budget_examples(base_steps, n_series, eval_every, expected):
     assert resolve_budget(base_steps, n_series, eval_every) == expected
 
 
+@pytest.mark.parametrize(
+    "args,expected",
+    [
+        ((3000, 118, 200, None), (500, 100)),
+        ((3000, 30490, 200, None), (12000, 200)),
+        ((60, 3, 200, None), (60, 12)),
+        ((3000, 30490, 200, 300), (300, 60)),
+        ((3000, 30490, 50, 300), (300, 50)),
+        ((3000, 118, 200, 300), (300, 60)),
+        ((3000, 118, 200, 10000), (500, 100)),
+        ((60, 3, 200, 1), (1, 1)),
+    ],
+)
+def test_resolve_budget_cap_applies_after_clip_and_before_eval_rule(args, expected):
+    assert resolve_budget(*args) == expected
+
+
+@pytest.mark.parametrize("cap", [0, -1])
+def test_resolve_budget_rejects_nonpositive_cap(cap):
+    with pytest.raises(ValueError, match="max_steps_cap"):
+        resolve_budget(3000, 118, 200, cap)
+
+
 @pytest.mark.parametrize("scores,best_step", [([1.0, 0.9], 40), ([1.0, 1.1], 20)])
 @pytest.mark.parametrize("stop_after", [None, 40])
 def test_early_stop_and_absolute_best_restoration(
@@ -147,10 +170,17 @@ def test_early_stop_and_absolute_best_restoration(
 
 @pytest.mark.parametrize("exception", [False, True])
 @pytest.mark.parametrize("resume_at", [0, 2])
+@pytest.mark.parametrize("cap", [None, 6])
 def test_stop_after_at_remaining_budget_completes(
-    tmp_path, fresh, panel_long, plan_long, encoder_long, exception, resume_at
+    tmp_path, fresh, panel_long, plan_long, encoder_long, exception, resume_at, cap
 ):
-    cfg = TrainConfig(base_steps=6, batch_size=8, patience=10, amp=False)
+    cfg = TrainConfig(
+        base_steps=6 if cap is None else 20,
+        max_steps_cap=cap,
+        batch_size=8,
+        patience=10,
+        amp=False,
+    )
     plan = replace(plan_long, exception=exception)
     forecast = ForecastConfig(horizon=4)
 
