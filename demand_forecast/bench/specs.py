@@ -45,6 +45,19 @@ class FevTaskSpec:
         if not set(self.categorical_statics) <= set(self.static_columns):
             raise ValueError("categorical_statics must be a subset of static_columns")
 
+    def task_definition(self) -> dict:
+        """Return the evaluation boundaries included in a model run's identity."""
+        return {
+            "name": self.name,
+            "horizon": self.horizon,
+            "num_windows": self.num_windows,
+            "initial_cutoff": self.initial_cutoff,
+            "window_step_size": self.window_step_size,
+            "min_context_length": self.min_context_length,
+            "seasonality": self.seasonality,
+            "quantile_levels": list(self.quantile_levels),
+        }
+
     def to_task(self) -> fev.Task:  # noqa: F821 -- optional import stays local.
         """Construct the pinned fev task without loading its dataset."""
         try:
@@ -62,6 +75,12 @@ class FevTaskSpec:
         if local_path is not None:
             values["dataset_config"] = None
         return fev.Task(**values)
+
+
+def dataset_fingerprint(task) -> str:
+    """Isolate fev 0.10.0's private fingerprint attribute behind one adapter."""
+    task.load_full_dataset()
+    return task._dataset_fingerprint
 
 
 def _local_path(dataset_path: str | Path) -> Path | None:

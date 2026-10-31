@@ -70,6 +70,50 @@ def forecast(
     typer.echo(f"Forecasts saved to {out}")
 
 
+@fev_app.command("run")
+def fev_run(
+    tasks: str = typer.Option(
+        "weekly", "--tasks", help="weekly, comma-separated names, or task YAML"
+    ),
+    config: Path = typer.Option(
+        ..., "--config", exists=True, dir_okay=False, help="Model and training settings YAML"
+    ),
+    policy: str = typer.Option("first_window", "--policy", help="first_window or per_window"),
+    out_dir: Path = typer.Option(..., "--out-dir", help="Directory for bundles and summaries.csv"),
+    resume: bool = typer.Option(False, "--resume", help="Resume matching runs and missing windows"),
+    model_name: str | None = typer.Option(None, "--model-name", help="Model label in summaries"),
+    stop_after: int | None = typer.Option(
+        None, "--stop-after", min=1, help="Interrupt training at this step, saving a checkpoint"
+    ),
+):
+    """Evaluate model forecasts on fev tasks, reusing each task's first-window bundle."""
+    import yaml
+
+    from demand_forecast.bench.run import run_fev
+    from demand_forecast.bench.specs import load_task_specs
+    from demand_forecast.config import Settings
+    from demand_forecast.core.training import InterruptedRun
+
+    try:
+        settings = Settings.from_yaml(config)
+        configure_logging(settings.log_level)
+        run_fev(
+            load_task_specs(tasks),
+            settings,
+            out_dir,
+            policy=policy,
+            resume=resume,
+            model_name=model_name,
+            stop_after=stop_after,
+        )
+    except (ValueError, OSError, ImportError, NotImplementedError, yaml.YAMLError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    except InterruptedRun as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"Summaries saved to {out_dir / 'summaries.csv'}")
+
+
 @fev_app.command("baseline")
 def fev_baseline(
     tasks: str = typer.Option(
