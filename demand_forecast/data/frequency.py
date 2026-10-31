@@ -5,6 +5,9 @@ import re
 import numpy as np
 import pandas as pd
 
+DAY_NS = pd.Timedelta(1, "D").value
+HOUR_NS = pd.Timedelta(1, "h").value
+
 
 class GridError(ValueError):
     """An unresolved frequency or an observation outside its series' grid."""
@@ -47,9 +50,9 @@ def seasonal_period(freq: str | pd.offsets.BaseOffset) -> int:
     """
     offset = to_offset(freq)
     if isinstance(offset, (pd.offsets.Tick, pd.offsets.Day)):
-        if offset.nanos == pd.Timedelta(days=1).value:
+        if offset.nanos == DAY_NS:
             return 7
-        if offset.nanos == pd.Timedelta(hours=1).value:
+        if offset.nanos == HOUR_NS:
             return 24
     elif isinstance(offset, (pd.offsets.MonthBegin, pd.offsets.MonthEnd)) and offset.n == 1:
         return 12
@@ -79,7 +82,7 @@ def resolve_freq(indexes: list[pd.DatetimeIndex], pinned: str | None) -> pd.offs
 
 def _requires_midnight(offset: pd.offsets.BaseOffset) -> bool:
     if isinstance(offset, pd.offsets.Tick):
-        return offset.nanos >= pd.Timedelta(days=1).value
+        return offset.nanos >= DAY_NS
     if type(offset) is pd.DateOffset and {
         "hours",
         "minutes",
@@ -142,7 +145,7 @@ def steps_between(a: pd.Timestamp, b: pd.Timestamp, freq: str | pd.offsets.BaseO
         # across DST. Handle it before Tick for consistent pandas 2/3 behavior.
         days = offset.n * (7 if isinstance(offset, pd.offsets.Week) else 1)
         steps, remainder = divmod(
-            b.tz_localize(None) - a.tz_localize(None), pd.Timedelta(days=days)
+            b.tz_localize(None) - a.tz_localize(None), pd.Timedelta(days, "D")
         )
     elif isinstance(offset, pd.offsets.Tick):
         steps, remainder = divmod(b - a, pd.Timedelta(offset.nanos, unit="ns"))
@@ -184,7 +187,7 @@ def _calendar_components(offset: pd.offsets.BaseOffset) -> list[tuple[str, int]]
     if isinstance(offset, pd.offsets.Day):
         return daily
     if isinstance(offset, pd.offsets.Tick):
-        return [("hour", 24), *daily] if offset.nanos < pd.Timedelta(days=1).value else daily
+        return [("hour", 24), *daily] if offset.nanos < DAY_NS else daily
     if isinstance(
         offset,
         (
