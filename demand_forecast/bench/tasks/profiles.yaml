@@ -1,0 +1,22 @@
+# Static roles and target support supplement the unmodified fev task definitions.
+m5_1W:
+  target_support: nonnegative
+  categorical_statics: [item_id, dept_id, cat_id, store_id, state_id]
+favorita_stores_1W:
+  target_support: nonnegative
+  categorical_statics: [store_nbr, family, city, state, type, cluster]
+rossmann_1W:
+  target_support: nonnegative
+  categorical_statics: [Store, StoreType, Assortment, Promo2, PromoInterval]
+rohlik_sales_1W:
+  target_support: nonnegative
+  categorical_statics: [product_unique_id, name, L1_category_name_en, L2_category_name_en, L3_category_name_en, L4_category_name_en, warehouse]
+walmart:
+  target_support: nonnegative
+  categorical_statics: [Store, Dept, Type]
+hermes:
+  target_support: nonnegative
+  categorical_statics: [country, category]
+hierarchical_sales_1W:
+  target_support: nonnegative
+  categorical_statics: []

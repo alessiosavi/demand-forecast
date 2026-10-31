@@ -1,0 +1,203 @@
+# Frozen fev protocol
+
+This is the preregistered protocol for the new core path. Exact values come from the
+[implementation plan's Global Constraints](superpowers/plans/2026-10-31-fev-core-v2.md),
+with model and evaluation semantics from the [design, §§5–7](superpowers/specs/2026-10-30-fev-bench-v2-design.md).
+The plan takes precedence where the earlier design differs. PR 0 supplies profiling,
+seasonal-naive baselines and this specification; it does not implement the new trainer.
+**Phase 5 owns all real-data profiling, baselines and model runs on Colab.** Local
+verification uses synthetic fixtures only. No real-data results are claimed here.
+
+## Tasks and scores
+
+Use the seven definitions pinned to `fev==0.10.0` in
+[`fev_bench_weekly.yaml`](../demand_forecast/bench/tasks/fev_bench_weekly.yaml).
+Supplementary roles and required target support come from
+[`profiles.yaml`](../demand_forecast/bench/tasks/profiles.yaml); all seven declare
+`target_support: nonnegative`.
+
+| Task | Horizon H | Windows | Seasonality m |
+| --- | ---: | ---: | ---: |
+| m5_1W | 13 | 1 | 1 |
+| favorita_stores_1W | 13 | 10 | 1 |
+| rossmann_1W | 13 | 8 | 1 |
+| rohlik_sales_1W | 8 | 1 | 1 |
+| walmart | 39 | 1 | 1 |
+| hermes | 52 | 1 | 1 |
+| hierarchical_sales_1W | 13 | 10 | 1 |
+
+Keep every official cutoff, horizon, item and window. Rohlik uses the pinned initial
+cutoff `2023-12-15` and `min_context_length: 8`; do not replace these with inferred
+splits. Do not filter series, clip outliers, round forecasts or silently change anchors.
+
+Quantiles are `[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]`, strictly increasing and
+inside (0, 1). Point predictions are the median. Train with doubled pinball in the
+sample's affine frame, over observed labels of loss-eligible samples. Select on exact
+SQL in original units, with fev's seasonal denominator and exclusion rule. Report SQL,
+MASE, WAPE and WQL (the latter two with `epsilon=1.0`), plus per-knot pinball and 80%
+interval coverage/width when the new evaluator exists. Excluded contributions and
+fallbacks must be counted; exclusions never remove required forecasts.
+
+The reference is the vendored fev seasonal-naive implementation with
+`statsforecast==2.0.1`. Official summaries use `trained_on_this_dataset=False`.
+The leaderboard uses `baseline_model="seasonal_naive"` and 1,000 bootstrap resamples.
+Published-score comparability requires matching task definitions, dataset fingerprints,
+forecast counts and implementations, with a stated numerical tolerance. Matching a
+published number alone is not evidence of parity.
+
+## Standard v2 configuration and budget
+
+These values are frozen for the new `ModelConfig`; they are not a configuration for
+the legacy CLI still present in PR 0.
+
+```yaml
+seed: 0
+model:
+  family: v2
+  d_model: 64
+  nhead: 4
+  num_encoder_layers: 2
+  num_decoder_layers: 2
+  dim_feedforward: 256
+  dropout: 0.1
+  cat_emb_dim: 16
+  use_patch_embedding: false
+  use_decomposition: false
+forecast:
+  max_context: 512
+  min_context: 1
+  quantiles: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+training:
+  refit: none
+  base_steps: 3000
+  eval_every: 200
+  patience: 5
+  rel_tol: 0.002
+  learning_rate: 0.001
+  weight_decay: 0.01
+  warmup_steps: 100
+  grad_clip: 1.0
+  batch_size: 128
+```
+
+Horizon comes from the task. `use_patch_embedding=True` and `use_decomposition=True`
+are rejected for `v2`. The monotone head uses `width_factor=2.0`; arithmetic uses
+`min_scale=1e-6` only after eligibility is established. Defaults are
+`missing_target: zero`, `duplicates: error`, and no clustering. Target support is
+required; it has no default. Seasonal periods are weekly 1, daily 7, hourly 24,
+monthly 12, otherwise 1, with the task's explicit seasonality used for fev scoring.
+
+The frozen budget function is:
+
+```text
+resolve_budget(base_steps, n_series, eval_every) -> (max_steps, eval_every)
+max_steps = int(clip(base_steps * n_series / 2000,
+                     min(500, base_steps), 4 * base_steps))
+eval_every = min(eval_every, max(max_steps // 5, 1))
+```
+
+`n_series = len(plan.fit_ids)`, the number of items with an observation in the permitted
+fit split. Examples: `(3000, 118, 200) -> (500, 100)`;
+`(3000, 30490, 200) -> (12000, 200)`; `(60, 3, 200) -> (60, 12)`.
+Use AdamW with linear warm-up over 100 steps, then cosine decay to zero at `max_steps`.
+Evaluate every resolved `eval_every` and at the final step when validation is available.
+Restore the absolute best checkpoint. Early stopping fires after five evaluations
+without improvement exceeding the relative tolerance 0.002.
+
+One epoch draws exactly one origin per series: a permutation determined by `(seed,
+epoch)`, then a uniform draw among that series' eligible origins. `Settings.seed=0`
+is the single seed, set for Python, numpy and torch before model construction. Use
+AMP on CUDA (bf16 when supported, otherwise fp16 with GradScaler), disabled on CPU.
+
+## Selection, short histories and fallbacks
+
+**Benchmark windows are never used for configuration selection, early stopping,
+tuning or ablation decisions.** Full-history profile statistics are diagnostic only;
+they include held-out values and must not guide those choices either.
+
+For forecast origin `origin` (the first future timestamp), inner validation is the last
+H steps strictly before it: `[origin - H * step, origin)`. Learned vocabularies, static
+preprocessing and any clustering are fitted before that block. An item contributes to
+validation only if it has at least `min_train_history = H + 8` observed values before
+the validation origin, positive finite seasonal-naive scale over that past, and at
+least one observed validation label. Use only these eligible items for validation.
+
+If no item qualifies, the **short-history exception** uses the standard configuration
+and the resolved fixed budget, fits on all available past before `origin`, and performs
+no local early stopping or validation selection. Keep the final state. This also
+covers long but constant or entirely missing histories with no eligible validation
+contribution. Neither horizons nor official item coverage may be reduced.
+
+When the permitted training split yields no origin (for example, singleton-only or
+all-missing panels), return `FitResult(steps=0, stop_reason="no_training_data")` with
+the initial model state and still save the inference bundle. The training-split
+observed median supplies `fallback_level`, or 0.0 if no observation exists.
+
+Forecast fallbacks are deterministic, finite and logged:
+
+- No observed context: all quantiles are zero for `nonnegative`; for `real`, use the
+  training split's observed median, or zero if none exists.
+- Zero or undefined seasonal scale: empirical quantiles of the observed context.
+- Otherwise: denormalize the sorted quantiles using the context median and full-past
+  seasonal scale. Clamp at zero only for explicitly declared `nonnegative` support.
+
+Standard training uses `max_context=512`. Optional future tuning may consider
+`[2H, max(64, 2H), 256, 512]`, deduplicated with a cap of 512. Selection remains on
+inner validation only; no tuning is authorized by prompt 00. Phase 4 owns tuning,
+`refit: full` and `per_window`; preregister any later tuning trial/time budget before
+running it. Other families and `dhf` need their own reviewed configurations.
+
+The frozen policy is **`first_window`**, one seed (0). Train/select once on the first
+window's available past; reuse that bundle and learned preprocessing for later
+windows. Context extends with newly available observations, and deterministic context
+statistics update without remapping embedding ids. `refit: none` keeps the selected
+checkpoint and extends its context through inner validation at inference time.
+
+## Persistence and execution evidence
+
+The new trainer must persist model, optimizer, scheduler, scaler, RNG states, sampler
+position, step, history, best state/score/step and patience counter. Resume restores RNG
+states after construction without reseeding. Checkpoints, bundles and saved predictions
+carry a SHA-256 run identity over canonical JSON of settings, seed, dataset fingerprint,
+package version, resolved origin, and the task definition (`name`, `horizon`,
+`num_windows`, `initial_cutoff`, `window_step_size`, `min_context_length`, `seasonality`,
+`quantile_levels`). Mismatches raise `ValueError("run identity mismatch")`; only missing
+artifacts are recomputed. A session interruption saves `checkpoints/latest.pt`, returns
+`stop_reason="interrupted"`, and raises `InterruptedRun` before writing a bundle.
+
+These trainer guarantees arrive in later tasks. PR 0's profiler (`--resume`) and
+baseline (automatic resume) save after each completed task, keyed by task name (and
+model for baselines). They do not validate training run identities or checkpoint a
+partially completed task. Use a new output directory whenever code, task definitions,
+role profiles or data change. Preserve the dataset cache between resumed sessions.
+
+Phase 5 must record the immutable code SHA, dependency lock, dataset revisions and
+fingerprints, task definitions, seed, policy, budgets, hardware/dtype, failures,
+fallback/exclusion counts, timings and measured peak RAM/VRAM. An interruption/resume
+trial precedes the frozen model run, and no frozen v2 score is viewed before the
+phase-5 prerequisites pass. Use [the Colab template](colab.md) and
+[prompt 00](colab/prompts/00-profile-and-baselines.md) for the first profiling/baseline
+session. No Timestral weights are downloaded.
+
+## Profile CSV contract
+
+`python scripts/profile_fev.py --tasks weekly --out profile.csv` writes the following
+columns in order. Selectors also accept comma-separated task names or a task YAML;
+`--profiles roles.yaml` supplies the required roles for custom tasks. `--resume`
+preserves completed rows and adds missing tasks. Without it, selected tasks replace
+the output as they complete. Loading errors stop the command and preserve completed rows.
+
+| Column | Definition |
+| --- | --- |
+| task | Task name from `FevTaskSpec`. |
+| n_series | Number of items in fev's full preprocessed dataset, before window filtering. |
+| length_min, length_median, length_max | Full target-history lengths in time steps, including missing targets. |
+| anchor_weekday | Pandas `weekday()` of the first timestamp of fev's first item (id-sorted): Monday 0 through Sunday 6. This is not an anchor-distribution check. |
+| nan_share, negative_share, zero_share | Counts of missing, negative and zero target values, each divided by **all** target values, including missing values. |
+| zero_scale_items | Items whose full-history `mean(abs(y[t] - y[t-m]))` is zero or undefined/non-finite; m is the task's seasonality. Missing lag pairs are omitted, and no valid pair means undefined. |
+| eligible_items_first_window | Items returned in fev's first window with past length at least `min_context_length` and positive finite scale computed on that window's past alone. This is not the inner-validation eligibility test. An empty first window gives zero. |
+| static_nan_share | Missing cells across all declared static columns and full-dataset items, numeric and categorical; 0.0 when there are no static columns. |
+
+The seven tasks are univariate. For custom multivariate tasks, shares cover all target
+columns, and scale pools observed lag differences across target columns within each
+item; item counts still count dataset rows. Profiles never train or evaluate a model.

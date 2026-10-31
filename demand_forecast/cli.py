@@ -12,6 +12,50 @@ app = typer.Typer(
     help="Demand Forecasting with Transformer Neural Networks",
     add_completion=False,
 )
+fev_app = typer.Typer(help="Run fev benchmarks and compare evaluation summaries.")
+app.add_typer(fev_app, name="fev")
+
+
+@fev_app.command("baseline")
+def fev_baseline(
+    tasks: str = typer.Option(
+        "weekly", "--tasks", help="weekly, comma-separated names, or task YAML"
+    ),
+    out_dir: Path = typer.Option(..., "--out-dir", help="Directory for resumable summaries.csv"),
+    profiles: Path | None = typer.Option(
+        None, "--profiles", exists=True, dir_okay=False, help="Override task role profiles YAML"
+    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable debug logging"),
+):
+    """Evaluate seasonal naive, skipping tasks already saved in the output directory."""
+    from demand_forecast.bench.run import run_baseline
+    from demand_forecast.bench.specs import load_task_specs
+
+    configure_logging("DEBUG" if verbose else "INFO")
+    try:
+        run_baseline(load_task_specs(tasks, profiles), out_dir)
+    except (ValueError, FileNotFoundError, ImportError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    typer.echo(f"Summaries saved to {out_dir / 'summaries.csv'}")
+
+
+@fev_app.command("leaderboard")
+def fev_leaderboard(
+    summaries_csv: Path = typer.Argument(
+        ..., exists=True, dir_okay=False, help="CSV of fev evaluation summaries"
+    ),
+    baseline: str = typer.Option(
+        "seasonal_naive", "--baseline", help="Reference model for relative skill scores"
+    ),
+):
+    """Show the official fev leaderboard with bootstrap confidence intervals."""
+    from demand_forecast.bench.run import leaderboard
+
+    try:
+        board = leaderboard(summaries_csv, baseline=baseline)
+    except (ValueError, FileNotFoundError, ImportError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    typer.echo(board.to_string())
 
 
 @app.command()
