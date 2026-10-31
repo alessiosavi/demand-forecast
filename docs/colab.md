@@ -111,9 +111,10 @@ test "$(git rev-parse HEAD)" = "$FEV_SHA"
 export HF_HOME="$FEV_DRIVE_ROOT/hf"
 python -m pip install -e ".[bench]" 2>&1 | tee "$FEV_RUN_DIR/install-$FEV_SESSION.log"
 python -m pip freeze > "$FEV_RUN_DIR/environment-$FEV_SESSION.txt"
-git rev-parse HEAD > "$FEV_RUN_DIR/commit.txt"
+mkdir -p "$FEV_RUN_DIR/provenance-$FEV_SHA"
+git rev-parse HEAD > "$FEV_RUN_DIR/provenance-$FEV_SHA/commit.txt"
 cp docs/protocol.md demand_forecast/bench/tasks/fev_bench_weekly.yaml \
-  demand_forecast/bench/tasks/profiles.yaml "$FEV_RUN_DIR/"
+  demand_forecast/bench/tasks/profiles.yaml "$FEV_RUN_DIR/provenance-$FEV_SHA/"
 python scripts/profile_fev.py --help
 demand-forecast fev baseline --help
 demand-forecast fev leaderboard --help
@@ -126,11 +127,12 @@ floors, these versions satisfy the requirements and the install keeps them. Do n
 downgrade NumPy or upgrade unrelated preinstalled packages around conflicts, and do
 not download Timestral weights.
 
-If the install log shows **numpy, pandas, pyarrow or torch being replaced**, do ONE
-**Runtime > Restart session and run all** before any other cell. On that rerun the
-installation should leave those versions in place; investigate repeated replacements.
-Always keep this restart-check cell immediately after the install cell. It only
-raises on a mismatch, so it does not loop after a restart. Version equality detects
+On a **fresh VM** always do ONE **Runtime > Restart session and run all** after the first
+editable install: the kernel processes the editable install's `.pth`/finder only at
+interpreter start, so in-kernel `import demand_forecast` fails until then. On the rerun the
+second install must leave every version in place (with a lock, an empty `pip freeze` diff).
+Keep the restart-check cell immediately after the install cell; it only raises on a
+numpy/torch version mismatch, so it never loops after the restart. Version equality detects
 stale imports, **not ABI compatibility**; import or execution failures remain fatal.
 
 ```python
@@ -427,9 +429,10 @@ Before ending each session, verify the following are actually readable on Drive:
 
 - `profile.csv` and `summaries.csv`, with partial completion explicitly marked;
 - `leaderboard.txt`, per-session command logs, tracebacks and timing/RSS measurements;
-- `commit.txt`, frozen protocol, task YAML, role profiles, per-session `run-*.json`,
-  resolved `environment-*.txt`, raw `pip-check-*.txt`, and dataset revisions/fingerprints
-  when available;
+- `provenance-$FEV_SHA/commit.txt`, `provenance-$FEV_SHA/protocol.md`,
+  `provenance-$FEV_SHA/fev_bench_weekly.yaml`, `provenance-$FEV_SHA/profiles.yaml`
+  for each producing SHA; per-session `run-*.json`, resolved `environment-*.txt`,
+  raw `pip-check-*.txt`, and dataset revisions/fingerprints when available;
 - the executed `.ipynb`, copied/exported from Colab (`Colab Notebooks/`) into the same
   Drive run folder;
 - for future training only: `checkpoints/`, `bundle/`, `window_*.npz`, `run.json`,
@@ -449,7 +452,7 @@ Scope/status: profile + seasonal_naive only; complete / partial / failed.
 Code SHA, UTC sessions, Drive folder, notebook path:
 Python/dependency versions and environment file; GPU/VRAM/RAM, CUDA/dtype:
 Exact commands and exit codes; tasks completed / failed / still pending:
-Profile table: all 12 documented columns, one row per task.
+Profile table: all 13 documented columns, one row per task.
 Baseline table: task, SQL, MASE, WAPE, WQL, num_forecasts,
                 dataset_fingerprint, training_time_s, inference_time_s.
 Recovery evidence: CSVs before/after rerun; completed tasks skipped; interrupted task:

@@ -36,6 +36,19 @@ def test_profile_task_on_fixture(tmp_path):
     assert set(row) == set(profiler.PROFILE_COLUMNS) - {"task"}
 
 
+def test_profile_counts_distinct_first_window_origins(tmp_path):
+    aligned = profile_task(fixture_spec(write_fev_fixture(tmp_path / "a")))
+    ragged = profile_task(
+        fixture_spec(
+            write_fev_fixture(tmp_path / "b", lengths=(40, 38, 40, 28, 38, 40)),
+            num_windows=1,
+        )
+    )
+    assert aligned["distinct_origins_first_window"] == 1
+    assert ragged["distinct_origins_first_window"] == 3
+    assert profiler.PROFILE_COLUMNS[-1] == "distinct_origins_first_window"
+
+
 def test_profile_counts_full_histories_but_eligibility_uses_first_past(tmp_path):
     import pyarrow as pa
     import pyarrow.parquet as pq
@@ -103,12 +116,14 @@ def test_profile_uses_declared_columns_and_first_timestamp(tmp_path):
     )
     assert result["anchor_weekday"] == 2
     assert result["eligible_items_first_window"] == 6
+    assert result["distinct_origins_first_window"] == 1
 
 
 def test_profile_empty_first_window_has_zero_eligible_items(tmp_path):
     result = profile_task(fixture_spec(write_fev_fixture(tmp_path), min_context_length=100))
     assert result["n_series"] == 6
     assert result["eligible_items_first_window"] == 0
+    assert result["distinct_origins_first_window"] == 0
 
 
 def test_profile_resume_preserves_completed_tasks_after_interruption(tmp_path, monkeypatch):
@@ -144,7 +159,7 @@ def test_profile_resume_preserves_completed_tasks_after_interruption(tmp_path, m
     assert output.read_bytes() == before
 
 
-def test_profile_cli_with_local_yaml(tmp_path):
+def _profile_cli_command(tmp_path):
     spec = fixture_spec(write_fev_fixture(tmp_path))
     definition = asdict(spec)
     profiles = tmp_path / "profiles.yaml"
@@ -172,9 +187,27 @@ def test_profile_cli_with_local_yaml(tmp_path):
         str(output),
         "--resume",
     ]
+    return output, command
+
+
+def test_profile_cli_with_local_yaml(tmp_path):
+    output, command = _profile_cli_command(tmp_path)
     result = subprocess.run(command, capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr
     frame = pd.read_csv(output)
     assert frame.columns.tolist() == profiler.PROFILE_COLUMNS
     assert frame["task"].tolist() == ["fixture"]
     assert frame["eligible_items_first_window"].tolist() == [6]
+
+
+def test_resume_rejects_twelve_column_profile_and_leaves_it_unchanged(tmp_path):
+    output, command = _profile_cli_command(tmp_path)
+    columns = profiler.PROFILE_COLUMNS[:12]
+    pd.DataFrame([{"task": "fixture", **dict.fromkeys(columns[1:], 0)}], columns=columns).to_csv(
+        output, index=False
+    )
+    before = output.read_bytes()
+    result = subprocess.run(command, capture_output=True, text=True)
+    assert result.returncode != 0
+    assert "invalid profile CSV: expected profile columns and unique task names" in result.stderr
+    assert output.read_bytes() == before

@@ -1,7 +1,9 @@
 import json
 import shutil
+import subprocess
 import sys
-from dataclasses import replace
+from dataclasses import asdict, replace
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -15,19 +17,34 @@ pytestmark = pytest.mark.bench
 
 from demand_forecast.bench.run import (  # noqa: E402
     predictions_for_fev,
+    resolved_origin,
+    run_baseline,
     run_fev,
     settings_for_task,
-    window_origin,
+    window_origins,
 )
 from demand_forecast.bench.specs import dataset_fingerprint  # noqa: E402
 from demand_forecast.cli import app  # noqa: E402
 from demand_forecast.core.training import InterruptedRun  # noqa: E402
+from demand_forecast.core.validation import plan_inner_validation  # noqa: E402
+from demand_forecast.data.loader_fev import item_ids, panel_from_window  # noqa: E402
+from demand_forecast.data.panel import Panel  # noqa: E402
+from demand_forecast.inference.predictor import Predictor  # noqa: E402
 from tests.helpers.fev_fixture import write_fev_fixture  # noqa: E402
 from tests.helpers.fev_spec import fixture_spec  # noqa: E402
 from tests.helpers.settings import tiny_settings  # noqa: E402
 
 Q9 = [i / 10 for i in range(1, 10)]
 ARR = np.arange(2 * 3 * 9, dtype=float).reshape(2, 3, 9)
+RAGGED = (40, 38, 40, 28, 38, 40)
+
+
+def file_states(directory: Path) -> dict[Path, tuple[bytes, int]]:
+    return {
+        path: (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in directory.rglob("*")
+        if path.is_file()
+    }
 
 
 def test_predictions_for_fev_reorders_and_fails_on_missing():
@@ -51,9 +68,9 @@ def test_offline_fev_task_end_to_end_with_resume_and_replacement(tmp_path, monke
     seen = []
     forecast = Predictor.forecast_with_diagnostics
 
-    def capture(predictor, panel, origin):
+    def capture(predictor, panel, origin, batch_size=512):
         seen.append((origin, [series.history_length for series in panel.series]))
-        return forecast(predictor, panel, origin)
+        return forecast(predictor, panel, origin, batch_size)
 
     monkeypatch.setattr(Predictor, "forecast_with_diagnostics", capture)
     first = run_fev([spec], settings, out)
@@ -177,13 +194,154 @@ def test_settings_for_task_copies_base_and_all_roles(tmp_path):
     assert spec.quantile_levels == [0.1, 0.5, 0.9]
 
 
-def test_window_origin_requires_one_shared_origin_and_accepts_custom_column():
-    rows = [{"timestamp": ["2023-01-01"]}, {"timestamp": ["2023-01-01"]}]
-    assert window_origin(rows) == pd.Timestamp("2023-01-01")
-    assert window_origin([{"date": ["2023-01-01"]}], "date") == pd.Timestamp("2023-01-01")
-    rows[1]["timestamp"] = ["2023-01-08"]
-    with pytest.raises(ValueError, match="windows with item-specific origins are not supported"):
-        window_origin(rows)
+def test_window_origins_are_per_item_and_resolved_origin_is_latest():
+    rows = [
+        {"item_id": "a", "timestamp": ["2023-01-01", "2023-01-08"]},
+        {"item_id": "b", "timestamp": ["2022-12-25", "2023-01-01"]},
+    ]
+    origins = window_origins(rows, "item_id")
+    assert origins == {"a": pd.Timestamp("2023-01-01"), "b": pd.Timestamp("2022-12-25")}
+    assert resolved_origin(origins) == pd.Timestamp("2023-01-01")
+    assert window_origins([{"id": 1, "date": ["2023-01-01"]}], "id", "date") == {
+        "1": pd.Timestamp("2023-01-01")
+    }
+    with pytest.raises(ValueError, match="^empty future rows for item a$"):
+        window_origins([{"item_id": "a", "timestamp": []}], "item_id")
+    with pytest.raises(ValueError, match="^window has no items$"):
+        resolved_origin({})
+    with pytest.raises(ValueError, match="^duplicate future series id$"):
+        window_origins([rows[0], rows[0]], "item_id")
+
+
+def test_ragged_ends_forecast_each_item_at_its_own_origin(tmp_path, capsys, caplog):
+    spec = fixture_spec(write_fev_fixture(tmp_path, lengths=RAGGED), num_windows=1)
+    settings = tiny_settings(base_steps=20, d_model=16)
+    out = tmp_path / "run"
+    with caplog.at_level("INFO", logger="demand_forecast.bench.run"):
+        summaries = run_fev([spec], settings, out)
+    task = spec.to_task()
+    past, future = task.get_window(0).get_input_data()
+    panel = panel_from_window(past, future, spec, task.freq)
+    origins = window_origins(future, spec.id_column, spec.timestamp_column)
+    latest, earliest = max(origins.values()), min(origins.values())
+    assert len(set(origins.values())) == 3
+    assert (
+        f"origins: task=fixture window=0 distinct=3 earliest={earliest} latest={latest}"
+        in caplog.text
+    )
+    plan = plan_inner_validation(panel, latest, spec.horizon, settings.training.min_train_history)
+    assert sorted(panel.series[i].series_id for i in plan.val_items) == ["0", "1", "2", "4", "5"]
+    assert earliest < plan.train_upto
+    report = json.loads((out / spec.name / "run.json").read_text())
+    assert pd.Timestamp(report["origin"]) == latest
+    assert pd.Timestamp(report["earliest_origin"]) == earliest
+    assert report["n_val_items"] == 5 < len(panel)
+    assert report["fit_result"]["stop_reason"] == "max_steps"
+    with np.load(out / spec.name / "window_0.npz", allow_pickle=False) as saved:
+        ids, arrays = saved["ids"].tolist(), saved["arrays"]
+    assert ids == item_ids(panel)
+    predictor = Predictor.from_bundle(out / spec.name / "bundle")
+    for origin in sorted(set(origins.values())):
+        members = [key for key in ids if origins[key] == origin]
+        group = Panel(
+            [panel.series[panel.index_of(key)] for key in members],
+            panel.roles,
+            panel.freq,
+            panel.seasonal_period,
+            panel.target_support,
+        )
+        gids, expected, _ = predictor.forecast_with_diagnostics(group, origin)
+        assert gids == members
+        np.testing.assert_array_equal(arrays[[ids.index(key) for key in members]], expected)
+    single = replace(panel, series=[panel.series[panel.index_of("3")]])
+    _, alone, _ = predictor.forecast_with_diagnostics(single, origins["3"])
+    np.testing.assert_allclose(arrays[ids.index("3")], alone[0], rtol=0, atol=1e-5)
+    assert summaries.loc[0, "num_forecasts"] == len(RAGGED)
+    assert summaries.loc[0, "max_distinct_origins"] == 3
+    before = file_states(out)
+    run_fev([spec], settings, out, resume=True)
+    assert f"Skipping completed task {spec.name}" in capsys.readouterr().out
+    assert file_states(out) == before
+
+
+def test_ragged_run_passes_fev_report(tmp_path):
+    spec = fixture_spec(write_fev_fixture(tmp_path, lengths=RAGGED), num_windows=1)
+    out = tmp_path / "run"
+    run_baseline([spec], out)
+    run_fev([spec], tiny_settings(base_steps=20, d_model=16), out)
+    definition = asdict(spec)
+    profiles = {
+        spec.name: {key: definition.pop(key) for key in ("target_support", "categorical_statics")}
+    }
+    tasks_path, profiles_path = tmp_path / "tasks.yaml", tmp_path / "profiles.yaml"
+    tasks_path.write_text(yaml.safe_dump({"tasks": [definition]}))
+    profiles_path.write_text(yaml.safe_dump(profiles))
+    report_path = tmp_path / "report.md"
+    process = subprocess.run(
+        [
+            sys.executable,
+            str(Path(__file__).resolve().parents[2] / "scripts/fev_report.py"),
+            "--run-dir",
+            str(out),
+            "--tasks",
+            str(tasks_path),
+            "--profiles",
+            str(profiles_path),
+            "--baseline",
+            "seasonal_naive",
+            "--out",
+            str(report_path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert process.returncode == 0, process.stdout + process.stderr
+    assert "Complete" in report_path.read_text()
+
+
+def test_resume_accepts_legacy_run_directory_without_new_keys(tmp_path, capsys):
+    spec = fixture_spec(write_fev_fixture(tmp_path))
+    settings = tiny_settings(base_steps=20, d_model=16)
+    out = tmp_path / "run"
+    run_fev([spec], settings, out)
+    report_path = out / spec.name / "run.json"
+    report = json.loads(report_path.read_text())
+    del report["earliest_origin"]
+    report_path.write_text(json.dumps(report))
+    manifest_path = out / spec.name / "bundle/manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    del manifest["run"]["earliest_origin"]
+    manifest_path.write_text(json.dumps(manifest))
+    summary_path = out / "summaries.csv"
+    summaries = pd.read_csv(summary_path).drop(columns="max_distinct_origins")
+    if "extra_info" in summaries:
+
+        def strip_origins(value):
+            extra_info = json.loads(value)
+            extra_info.pop("max_distinct_origins", None)
+            return json.dumps(extra_info)
+
+        summaries["extra_info"] = summaries["extra_info"].map(strip_origins)
+    summaries.to_csv(summary_path, index=False)
+    before = file_states(out)
+    legacy_row = pd.read_csv(summary_path, float_precision="round_trip")
+    run_fev([spec], settings, out, resume=True)
+    assert f"Skipping completed task {spec.name}" in capsys.readouterr().out
+    assert file_states(out) == before
+
+    new_spec = fixture_spec(write_fev_fixture(tmp_path / "new"), name="new")
+    mixed = run_fev([spec, new_spec], settings, out, resume=True)
+    assert f"Skipping completed task {spec.name}" in capsys.readouterr().out
+    assert file_states(out / spec.name) == {
+        path: state for path, state in before.items() if path.is_relative_to(out / spec.name)
+    }
+    retained = mixed.loc[mixed.task == spec.name].reset_index(drop=True)
+    pd.testing.assert_frame_equal(
+        retained.drop(columns="max_distinct_origins"), legacy_row, check_exact=True
+    )
+    assert retained.max_distinct_origins.isna().all()
+    assert mixed.loc[mixed.task == new_spec.name, "max_distinct_origins"].tolist() == [1]
 
 
 def test_fingerprint_loads_dataset_and_task_definition_is_complete(tmp_path):
@@ -325,11 +483,11 @@ def test_later_window_unseen_id_uses_unchanged_encoder_with_custom_columns(tmp_p
     forecast = Predictor.forecast_with_diagnostics
     encoders, codes = [], []
 
-    def capture(predictor, panel, origin):
+    def capture(predictor, panel, origin, batch_size=512):
         encoder = predictor.bundle.encoder
         encoders.append(encoder.to_json())
         codes.append({s.series_id: encoder.transform(s)[0]["__series__"] for s in panel.series})
-        ids, arrays, diagnostics = forecast(predictor, panel, origin)
+        ids, arrays, diagnostics = forecast(predictor, panel, origin, batch_size)
         # Exercise the runner's alignment, with forecasts deliberately out of order.
         return ids[::-1], arrays[::-1], diagnostics
 
