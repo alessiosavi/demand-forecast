@@ -2,6 +2,8 @@
 
 from demand_forecast.config.settings import (
     DataConfig,
+    DatasetConfig,
+    ForecastConfig,
     ModelConfig,
     OutputConfig,
     Settings,
@@ -13,6 +15,8 @@ from demand_forecast.config.settings import (
 __all__ = [
     "Settings",
     "DataConfig",
+    "DatasetConfig",
+    "ForecastConfig",
     "TimeSeriesConfig",
     "ModelConfig",
     "TrainingConfig",
