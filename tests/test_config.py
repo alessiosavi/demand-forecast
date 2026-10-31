@@ -179,3 +179,21 @@ def test_forecast_config_quantiles():
     assert ForecastConfig(horizon=4).median_index == 4
     assert ForecastConfig(horizon=4, quantiles=[0.1, 0.5, 0.9]).median_index == 1
     assert ForecastConfig(horizon=4, quantiles=[0.5]).median_index == 0
+
+
+def test_frozen_fev_standard_config_matches_protocol():
+    import re
+
+    root = Path(__file__).resolve().parents[1]
+    protocol = (root / "docs/protocol.md").read_text()
+    frozen = yaml.safe_load(re.search(r"```yaml\n(.*?)\n```", protocol, re.DOTALL).group(1))
+    settings = Settings.from_yaml(root / "configs/fev-v2-standard.yaml")
+    actual = settings.model_dump()
+    for key, expected in frozen.items():
+        if isinstance(expected, dict):
+            assert {name: actual[key][name] for name in expected} == expected
+        else:
+            assert actual[key] == expected
+    assert settings.model.d_model == 64 and settings.training.base_steps == 3000
+    assert settings.seed == 0 and settings.device is None and settings.training.amp
+    assert settings.training.checkpoint_every == 200

@@ -31,11 +31,11 @@ artifacts on Google Drive. Never run the seven tasks on my local machine.
    Set `FEV_SHA` to the filled-in SHA and `FEV_SESSION` to a UTC session timestamp.
    Set these in the notebook's `os.environ` so shell cells inherit them. Set
    `HF_HOME=$FEV_DRIVE_ROOT/hf`, `HF_HUB_CACHE=$HF_HOME/hub` and
-   `HF_DATASETS_CACHE=$HF_HOME/datasets` before importing fev or datasets. Keep the
+   `HF_DATASETS_CACHE=/content/hf-datasets` before importing fev or datasets. Keep the
    Hub cache on Drive across sessions. This account had about 0.7 GiB free after
    the cache (Hub 43 MB, datasets 427 MB); remeasure and record both cache paths.
-   When space is tight, `HF_DATASETS_CACHE` may use `/content/hf-datasets`, which
-   is regenerable. Use the default pinned task sources.
+   The datasets cache on local disk is regenerable after a runtime reset; use Drive
+   for it only when explicitly instructed. Use the default pinned task sources.
 3. In `/content`, run `git clone https://github.com/alessiosavi/demand-forecast` if
    absent, enter `/content/demand-forecast`, then `git checkout <SHA>`. Verify the full
    `git rev-parse HEAD` equals the supplied SHA. Check for unexpected local changes
