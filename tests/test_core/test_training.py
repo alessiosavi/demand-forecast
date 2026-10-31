@@ -63,8 +63,9 @@ def test_resolve_budget_examples(base_steps, n_series, eval_every, expected):
 
 
 @pytest.mark.parametrize("scores,best_step", [([1.0, 0.9], 40), ([1.0, 1.1], 20)])
+@pytest.mark.parametrize("stop_after", [None, 40])
 def test_early_stop_and_absolute_best_restoration(
-    scores, best_step, fresh, panel_long, plan_long, encoder_long
+    scores, best_step, stop_after, tmp_path, fresh, panel_long, plan_long, encoder_long
 ):
     cfg = TrainConfig(
         base_steps=120, eval_every=20, patience=1, rel_tol=1.0, batch_size=16, amp=False
@@ -79,7 +80,13 @@ def test_early_stop_and_absolute_best_restoration(
         return {"SQL": score}
 
     r = Trainer(model, cfg, cpu, RUN_ID, SEED).fit(
-        panel_long, plan_long, ForecastConfig(horizon=4), encoder_long, evaluate_fn=fake_eval
+        panel_long,
+        plan_long,
+        ForecastConfig(horizon=4),
+        encoder_long,
+        checkpoint_dir=tmp_path,
+        stop_after=stop_after,
+        evaluate_fn=fake_eval,
     )
     assert r.stop_reason == "early_stop" and r.steps == 40 and r.best_step == best_step
     assert r.best_score == min(scores)
@@ -87,6 +94,51 @@ def test_early_stop_and_absolute_best_restoration(
     assert_state_equal(r.best_state, states[min(scores)])
     assert len(r.history) == 40
     assert [h["step"] for h in r.history if "SQL" in h] == [20, 40]
+    assert torch.load(tmp_path / "latest.pt", weights_only=False)["step"] == 40
+
+
+@pytest.mark.parametrize("exception", [False, True])
+@pytest.mark.parametrize("resume_at", [0, 2])
+def test_stop_after_at_remaining_budget_completes(
+    tmp_path, fresh, panel_long, plan_long, encoder_long, exception, resume_at
+):
+    cfg = TrainConfig(base_steps=6, batch_size=8, patience=10, amp=False)
+    plan = replace(plan_long, exception=exception)
+    forecast = ForecastConfig(horizon=4)
+
+    def fake_eval(*args):
+        assert not exception
+        return {"SQL": 1.0}
+
+    if resume_at:
+        stopped = Trainer(fresh(), cfg, cpu, RUN_ID, SEED).fit(
+            panel_long,
+            plan,
+            forecast,
+            encoder_long,
+            checkpoint_dir=tmp_path,
+            stop_after=resume_at,
+            evaluate_fn=fake_eval,
+        )
+        assert stopped.stop_reason == "interrupted" and stopped.steps == resume_at
+
+    model = fresh()
+    result = Trainer(model, cfg, cpu, RUN_ID, SEED).fit(
+        panel_long,
+        plan,
+        forecast,
+        encoder_long,
+        checkpoint_dir=tmp_path,
+        resume=bool(resume_at),
+        stop_after=6 - resume_at,
+        evaluate_fn=fake_eval,
+    )
+    assert result.stop_reason == ("exception_budget" if exception else "max_steps")
+    assert result.steps == 6 and result.best_step == (6 if exception else 1)
+    assert_state_equal(model.state_dict(), result.best_state)
+    saved = torch.load(tmp_path / "latest.pt", weights_only=False)
+    assert saved["step"] == 6
+    assert_state_equal(saved["best_state"], result.best_state)
 
 
 def test_exception_plan_trains_fixed_budget_without_validation(

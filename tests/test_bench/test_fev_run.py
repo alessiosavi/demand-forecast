@@ -341,6 +341,47 @@ def test_later_window_unseen_id_uses_unchanged_encoder_with_custom_columns(tmp_p
     assert all(codes[0][key] == codes[1][key] for key in codes[0])
 
 
+def test_cli_run_accepts_custom_tasks_and_profiles(tmp_path):
+    from dataclasses import asdict
+
+    from demand_forecast.core.bundle import load_bundle
+
+    spec = fixture_spec(write_fev_fixture(tmp_path))
+    definition = asdict(spec)
+    del definition["target_support"], definition["categorical_statics"]
+    tasks = tmp_path / "tasks.yaml"
+    tasks.write_text(yaml.safe_dump({"tasks": [definition]}))
+    profiles = tmp_path / "profiles.yaml"
+    profiles.write_text("fixture:\n  target_support: real\n  categorical_statics: [cat]\n")
+    config = tmp_path / "cfg.yaml"
+    tiny_settings(base_steps=2, d_model=8).to_yaml(config)
+    out = tmp_path / "out"
+    result = CliRunner().invoke(
+        app,
+        [
+            "fev",
+            "run",
+            "--tasks",
+            str(tasks),
+            "--profiles",
+            str(profiles),
+            "--config",
+            str(config),
+            "--out-dir",
+            str(out),
+            "--stop-after",
+            "2",
+        ],
+    )
+    assert result.exit_code == 0, (result.output, result.exception)
+    summary = pd.read_csv(out / "summaries.csv")
+    assert summary.task.tolist() == ["fixture"] and np.isfinite(summary.SQL.iloc[0])
+    bundle = load_bundle(out / "fixture/bundle")
+    assert bundle.dataset_cfg.target_support == "real"
+    assert bundle.dataset_cfg.static_categorical == ["cat"]
+    assert bundle.manifest["run"]["fit_result"]["stop_reason"] == "max_steps"
+
+
 def test_cli_run_interrupt_resume_policy_and_missing_bench(tmp_path, monkeypatch):
     from dataclasses import asdict
 
