@@ -1,6 +1,6 @@
 # Third-party notices
 
-## fev seasonal-naive baseline
+## fev seasonal-naive baseline and weekly task definitions
 
 `demand_forecast/bench/baselines.py` is adapted from fev's
 `models/statsforecast/model.py` at tag `v0.10.0`:
@@ -12,6 +12,14 @@ and exposes the number of workers (default 1). It retains the upstream
 1,000-observation context cap but never reduces the task's seasonal period.
 It also preserves fractional interval levels for custom quantiles and fills
 missing input values only in the target column.
+
+`demand_forecast/bench/tasks/fev_bench_weekly.yaml` contains seven unmodified
+entries from fev's `benchmarks/fev_bench/tasks.yaml` at tag `v0.10.0`:
+https://github.com/autogluon/fev/blob/v0.10.0/benchmarks/fev_bench/tasks.yaml
+
+The entries are selected and reordered for the weekly benchmark. Their fields
+and formatting are unchanged. The upstream notice and license below apply to
+both the baseline port and these task definitions.
 
 Upstream NOTICE (https://github.com/autogluon/fev/blob/v0.10.0/NOTICE):
 
