@@ -6,6 +6,26 @@ pytestmark = pytest.mark.bench
 from tests.helpers.fev_fixture import fixture_task, write_fev_fixture  # noqa: E402
 
 
+def test_ragged_fixture_round_trips_through_fev(tmp_path):
+    import pyarrow.parquet as pq
+
+    lengths = (40, 38, 40, 28, 38, 40)
+    parquet = write_fev_fixture(tmp_path, lengths=lengths)
+    for i, row in enumerate(pq.read_table(parquet).to_pylist()):
+        assert all(len(row[name]) == lengths[i] for name in ("timestamp", "target", "promo", "oil"))
+    task = fixture_task(parquet, num_windows=1)
+    past, future = task.get_window(0).get_input_data()
+    assert [len(row["timestamp"]) for row in past] == [length - 4 for length in lengths]
+    assert [len(row["timestamp"]) for row in future] == [4] * 6
+    assert len({row["timestamp"][0] for row in future}) == 3
+
+
+@pytest.mark.parametrize("lengths", [(40, 38), (40, 38, 40, 41, 38, 40)])
+def test_fixture_rejects_invalid_lengths(tmp_path, lengths):
+    with pytest.raises(ValueError):
+        write_fev_fixture(tmp_path, lengths=lengths)
+
+
 def test_fixture_round_trips_through_fev(tmp_path):
     parquet = write_fev_fixture(tmp_path)
     task = fixture_task(parquet)

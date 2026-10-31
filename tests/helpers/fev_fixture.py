@@ -1,5 +1,6 @@
 """Small, reproducible local datasets for fev integration tests."""
 
+from collections.abc import Sequence
 from pathlib import Path
 
 import numpy as np
@@ -11,6 +12,7 @@ def write_fev_fixture(
     *,
     n_series: int = 6,
     length: int = 40,
+    lengths: Sequence[int] | None = None,
     freq: str = "W-SUN",
     start: str = "2022-01-02",
     known: tuple[str, ...] = ("promo",),
@@ -23,12 +25,15 @@ def write_fev_fixture(
     The zero count is rounded to the nearest observation per series. The
     promotion indicator is ``promo`` when present, otherwise the first known
     covariate. Randomness is local to this call and controlled by ``seed``.
+    ``lengths`` optionally trims each generated series to its own length.
     """
     try:
         import datasets
     except ImportError as exc:
         raise ImportError("install demand-forecast[bench]") from exc
 
+    if lengths is not None and (len(lengths) != n_series or any(n > length for n in lengths)):
+        raise ValueError("lengths must have n_series entries, each at most length")
     rng = np.random.default_rng(seed)
     timestamps = pd.date_range(start, periods=length, freq=freq).to_numpy()
     features = datasets.Features(
@@ -59,6 +64,9 @@ def write_fev_fixture(
                 **{name: "A" if index % 2 == 0 else "B" for name in statics},
             }
         )
+        if lengths is not None:
+            for name in ("timestamp", "target", *known, *past):
+                rows[-1][name] = rows[-1][name][: lengths[index]]
 
     directory.mkdir(parents=True, exist_ok=True)
     parquet = directory / "data.parquet"

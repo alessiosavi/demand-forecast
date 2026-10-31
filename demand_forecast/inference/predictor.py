@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -45,6 +46,53 @@ class Predictor:
         """Return ids in input order and original-unit quantiles of shape (N, H, Q)."""
         ids, arrays, _ = self.forecast_with_diagnostics(panel, origin)
         return ids, arrays
+
+    def forecast_per_item_origins(
+        self, panel: Panel, origins: Mapping[str, pd.Timestamp], batch_size: int = 512
+    ) -> tuple[list[str], np.ndarray, dict]:
+        """Group items by origin, returning forecasts in the original panel order.
+
+        Early-ending items are forecast for calendar periods that other items'
+        available past (and selection labels) already cover. No item's own future
+        is used: fev truncates each item at its own cutoff and the loader reads only
+        known covariates from future rows. This equals the information set fev gives
+        every model and is not an out-of-time test for those items. The bundle's
+        earliest permissible origin is a global floor, not a per-item guarantee.
+        """
+        started = time.perf_counter()
+        if not isinstance(batch_size, (int, np.integer)) or batch_size < 1:
+            raise ValueError("batch_size must be a positive integer")
+        groups = {}
+        ids = [series.series_id for series in panel.series]
+        for index, key in enumerate(ids):
+            if key not in origins:
+                raise ValueError(f"missing origin for item {key}")
+            groups.setdefault(pd.Timestamp(origins[key]), []).append(index)
+        positions = {key: index for index, key in enumerate(ids)}
+        cfg = self.bundle.forecast_cfg
+        predictions = np.empty((len(ids), cfg.horizon, len(cfg.quantiles)), dtype=np.float32)
+        diagnostics = {
+            "fallback_no_context": 0,
+            "fallback_undefined_scale": 0,
+            "n_items": 0,
+            "device": str(self.bundle.model.fallback_level.device),
+            "n_origins": len(groups),
+        }
+        for origin, indices in groups.items():
+            group = Panel(
+                [panel.series[index] for index in indices],
+                panel.roles,
+                panel.freq,
+                panel.seasonal_period,
+                panel.target_support,
+            )
+            group_ids, arrays, diag = self.forecast_with_diagnostics(group, origin, batch_size)
+            predictions[[positions[key] for key in group_ids]] = arrays
+            for key in ("fallback_no_context", "fallback_undefined_scale", "n_items"):
+                diagnostics[key] += diag[key]
+            diagnostics["device"] = diag["device"]
+        diagnostics["inference_time_s"] = time.perf_counter() - started
+        return ids, predictions, diagnostics
 
     @torch.no_grad()
     def forecast_with_diagnostics(
