@@ -1,259 +1,91 @@
-"""Prediction wrapper for demand forecasting models."""
+"""Panel forecasts in original units using a portable inference bundle."""
 
-import logging
+from __future__ import annotations
+
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn as nn
 
-from demand_forecast.data.preprocessor import ScalerManager
-from demand_forecast.inference.confidence import calculate_confidence_intervals
-from demand_forecast.utils.checkpoint import load_checkpoint
-
-logger = logging.getLogger(__name__)
-
-
-@dataclass
-class PredictionResult:
-    """Result of prediction."""
-
-    predictions: np.ndarray
-    flatten_predictions: np.ndarray
-    skus: list[str]
-    lower_bounds: np.ndarray | None = None
-    upper_bounds: np.ndarray | None = None
-    confidence: float = 0.95
+from demand_forecast.core.bundle import Bundle, load_bundle
+from demand_forecast.data.frequency import grid_range, steps_between, to_offset, validate_on_grid
+from demand_forecast.data.panel import Panel, Roles
+from demand_forecast.data.sampler import align_to_origin, make_batch
 
 
 @dataclass
 class Predictor:
-    """Predictor for generating demand forecasts.
+    """Serve every input series, including unseen ids and fallback-only histories."""
 
-    Handles inference, inverse scaling, and confidence intervals.
-
-    Attributes:
-        model: Trained model.
-        scaler_manager: Scalers for inverse transformation.
-        sku_index_to_name: Mapping from indices to SKU names.
-        device: Computation device.
-    """
-
-    model: nn.Module
-    scaler_manager: ScalerManager | None = None
-    sku_index_to_name: dict[int, str] | None = None
-    device: torch.device | None = None
-
-    def __post_init__(self):
-        """Initialize predictor."""
-        if self.device is None:
-            self.device = torch.device("cpu")
-        self.model.to(self.device)
-        self.model.eval()
-
-    def predict_batch(
-        self,
-        batch: dict[str, torch.Tensor],
-        cluster_id: str,
-        return_confidence: bool = True,
-        confidence_level: float = 0.95,
-        validation_targets: torch.Tensor | None = None,
-    ) -> PredictionResult:
-        """Generate predictions for a batch.
-
-        Args:
-            batch: Batch of input data.
-            cluster_id: Cluster model to use.
-            return_confidence: Whether to compute confidence intervals.
-            confidence_level: Confidence level for intervals.
-            validation_targets: Optional targets for confidence calculation.
-
-        Returns:
-            PredictionResult with predictions and optional intervals.
-        """
-        qty = batch["qty"].to(self.device)
-        past_time = batch["past_time"].to(self.device)
-        future_time = batch["future_time"].to(self.device)
-        sku = batch["sku"].to(self.device)
-        cats = {
-            key: value.to(dtype=torch.int32, device=self.device)
-            for key, value in batch["cats"].items()
-        }
-
-        with torch.no_grad():
-            outputs = self.model(cluster_id, qty, past_time, future_time, sku, cats)
-
-        predictions = outputs.cpu().numpy()
-        flatten_predictions = predictions.sum(axis=-1) if predictions.ndim > 1 else predictions
-
-        # Get SKU names
-        sku_indices = batch["sku"].cpu().numpy()
-        if self.sku_index_to_name:
-            sku_names = [self.sku_index_to_name.get(idx, f"sku_{idx}") for idx in sku_indices]
-        else:
-            sku_names = [f"sku_{idx}" for idx in sku_indices]
-
-        # Calculate confidence intervals if requested
-        lower_bounds = None
-        upper_bounds = None
-
-        if return_confidence and validation_targets is not None:
-            targets = validation_targets.cpu().numpy()
-            flatten_targets = targets.sum(axis=-1) if targets.ndim > 1 else targets
-
-            lower_bounds, upper_bounds = calculate_confidence_intervals(
-                flatten_predictions, flatten_targets, confidence_level
-            )
-            lower_bounds = lower_bounds.numpy()
-            upper_bounds = upper_bounds.numpy()
-
-        return PredictionResult(
-            predictions=predictions,
-            flatten_predictions=flatten_predictions,
-            skus=sku_names,
-            lower_bounds=lower_bounds,
-            upper_bounds=upper_bounds,
-            confidence=confidence_level,
-        )
-
-    def predict_dataloader(
-        self,
-        dataloader: Any,
-        confidence_level: float = 0.95,
-    ) -> PredictionResult:
-        """Generate predictions for an entire dataloader.
-
-        Args:
-            dataloader: RoundRobin iterator of batches.
-            confidence_level: Confidence level for intervals.
-
-        Returns:
-            Combined PredictionResult for all batches.
-        """
-        all_predictions = []
-        all_flatten_predictions = []
-        all_skus = []
-        all_targets = []
-
-        for item in dataloader:
-            cluster_id = list(item.keys())[0]
-            batch = item[cluster_id]
-
-            result = self.predict_batch(batch, cluster_id, return_confidence=False)
-
-            all_predictions.extend(result.predictions)
-            all_flatten_predictions.extend(result.flatten_predictions)
-            all_skus.extend(result.skus)
-
-            if "y" in batch:
-                all_targets.extend(batch["y"].cpu().numpy())
-
-        # Combine results
-        predictions = np.array(all_predictions)
-        flatten_predictions = np.array(all_flatten_predictions)
-
-        # Calculate confidence intervals
-        lower_bounds = None
-        upper_bounds = None
-
-        if all_targets:
-            targets = np.array(all_targets)
-            flatten_targets = targets.sum(axis=-1) if targets.ndim > 1 else targets
-
-            lower_bounds, upper_bounds = calculate_confidence_intervals(
-                torch.from_numpy(flatten_predictions),
-                torch.from_numpy(flatten_targets),
-                confidence_level,
-            )
-            lower_bounds = lower_bounds.numpy()
-            upper_bounds = upper_bounds.numpy()
-
-        return PredictionResult(
-            predictions=predictions,
-            flatten_predictions=flatten_predictions,
-            skus=all_skus,
-            lower_bounds=lower_bounds,
-            upper_bounds=upper_bounds,
-            confidence=confidence_level,
-        )
-
-    def inverse_scale(
-        self,
-        predictions: np.ndarray,
-        cluster_id: str,
-    ) -> np.ndarray:
-        """Inverse scale predictions to original values.
-
-        Args:
-            predictions: Scaled predictions.
-            cluster_id: Cluster ID for scaler lookup.
-
-        Returns:
-            Predictions in original scale.
-        """
-        if self.scaler_manager is None:
-            logger.warning("No scaler manager available, returning raw predictions")
-            return predictions
-
-        return self.scaler_manager.inverse_transform(cluster_id, predictions)
-
-    def to_dataframe(
-        self,
-        result: PredictionResult,
-        include_confidence: bool = True,
-    ) -> pd.DataFrame:
-        """Convert prediction result to DataFrame.
-
-        Args:
-            result: Prediction result.
-            include_confidence: Whether to include confidence bounds.
-
-        Returns:
-            DataFrame with predictions.
-        """
-        data = {
-            "sku": result.skus,
-            "prediction": result.flatten_predictions,
-        }
-
-        if include_confidence and result.lower_bounds is not None:
-            data["lower_bound"] = result.lower_bounds
-            data["upper_bound"] = result.upper_bounds
-            data["confidence"] = result.confidence
-
-        return pd.DataFrame(data)
+    bundle: Bundle
 
     @classmethod
-    def from_checkpoint(
-        cls,
-        model_path: Path,
-        scaler_path: Path | None = None,
-        device: torch.device | None = None,
-    ) -> "Predictor":
-        """Load predictor from checkpoint.
+    def from_bundle(cls, directory: Path | str, device: torch.device | str = "cpu") -> Predictor:
+        return cls(load_bundle(directory, device=device))
 
-        Args:
-            model_path: Path to saved model.
-            scaler_path: Path to saved scalers.
-            device: Computation device.
+    def forecast(self, panel: Panel, origin: pd.Timestamp, batch_size: int = 512) -> pd.DataFrame:
+        """Return one row per series and forecast step, with median point forecasts."""
+        origin = pd.Timestamp(origin)
+        ids, values = self._forecast_arrays(panel, origin, batch_size)
+        cfg = self.bundle.forecast_cfg
+        data = {
+            "series_id": np.repeat(ids, cfg.horizon),
+            "origin": origin,
+            "timestamp": np.tile(grid_range(origin, cfg.horizon, panel.freq), len(ids)),
+        }
+        flat = values.reshape(len(ids) * cfg.horizon, len(cfg.quantiles))
+        data.update({f"q{q}": flat[:, i] for i, q in enumerate(cfg.quantiles)})
+        data["point"] = flat[:, cfg.median_index]
+        return pd.DataFrame(data)
 
-        Returns:
-            Initialized Predictor.
-        """
-        if device is None:
-            device = torch.device("cpu")
+    def forecast_arrays(self, panel: Panel, origin: pd.Timestamp) -> tuple[list[str], np.ndarray]:
+        """Return ids in input order and original-unit quantiles of shape (N, H, Q)."""
+        return self._forecast_arrays(panel, pd.Timestamp(origin), 512)
 
-        model = load_checkpoint(model_path, map_location=device)
-
-        scaler_manager = None
-        if scaler_path and scaler_path.exists():
-            scaler_manager = ScalerManager.load(scaler_path)
-
-        return cls(
-            model=model,
-            scaler_manager=scaler_manager,
-            device=device,
+    @torch.no_grad()
+    def _forecast_arrays(
+        self, panel: Panel, origin: pd.Timestamp, batch_size: int
+    ) -> tuple[list[str], np.ndarray]:
+        metadata = self.bundle.panel_metadata
+        if origin < pd.Timestamp(metadata["earliest_origin"]):
+            raise ValueError("origin before earliest permissible origin")
+        if not isinstance(batch_size, (int, np.integer)) or batch_size < 1:
+            raise ValueError("batch_size must be a positive integer")
+        roles = Roles(
+            **{
+                key: value if key == "target" else tuple(value)
+                for key, value in metadata["roles"].items()
+            }
         )
+        if to_offset(panel.freq) != to_offset(metadata["freq"]):
+            raise ValueError("panel frequency does not match bundle")
+        if panel.roles != roles:
+            raise ValueError("panel roles do not match bundle")
+        if panel.target_support != metadata["target_support"]:
+            raise ValueError("panel target_support does not match bundle")
+        if panel.seasonal_period != metadata["seasonal_period"]:
+            raise ValueError("panel seasonal_period does not match bundle")
+        validate_on_grid(pd.DatetimeIndex([origin]), panel.freq, "forecast origin")
+        cfg = self.bundle.forecast_cfg
+        ids = [series.series_id for series in panel.series]
+        items = [
+            (i, max(steps_between(series.start, origin, panel.freq), 0))
+            for i, series in enumerate(panel.series)
+        ]
+        batch_panel = align_to_origin(panel, items)
+        predictions = np.empty((len(ids), cfg.horizon, len(cfg.quantiles)), dtype=np.float32)
+        model = self.bundle.model
+        model.eval()
+        for start in range(0, len(items), batch_size):
+            batch = make_batch(
+                batch_panel,
+                items[start : start + batch_size],
+                cfg.horizon,
+                cfg.max_context,
+                self.bundle.encoder,
+            ).to(model.fallback_level.device)
+            # predict performs the single denormalisation and the model's fallbacks.
+            predictions[start : start + batch.size] = model.predict(batch).cpu().numpy()
+        return ids, predictions

@@ -6,13 +6,11 @@
 #   from demand_forecast.utils.clustering import find_best_k
 
 __all__ = [
-    "calculate_time_features",
     "load_checkpoint",
     "remove_outliers",
     "find_best_k",
     "ClusterResult",
     "collect_garbage",
-    "init_metrics",
     "create_timeseries",
     "plot_model",
     "plot_clustering",
@@ -34,18 +32,10 @@ def __getattr__(name: str):
         from demand_forecast.utils.memory import collect_garbage
 
         return collect_garbage
-    elif name == "init_metrics":
-        from demand_forecast.utils.metrics import init_metrics
-
-        return init_metrics
     elif name == "remove_outliers":
         from demand_forecast.utils.outliers import remove_outliers
 
         return remove_outliers
-    elif name == "calculate_time_features":
-        from demand_forecast.utils.time_features import calculate_time_features
-
-        return calculate_time_features
     elif name == "create_timeseries":
         from demand_forecast.utils.timeseries import create_timeseries
 

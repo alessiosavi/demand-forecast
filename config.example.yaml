@@ -1,125 +1,70 @@
-# Demand Forecast Configuration
-# ==============================
-# Copy this file to config.yaml and customize as needed.
-# All fields with defaults are optional - only 'input_path' is required.
-
-# =============================================================================
-# DATA CONFIGURATION
-# =============================================================================
+# Long-format inputs: one row per (id, timestamp), with explicit column roles.
+# Paths are relative to the working directory. See configs/example-long.yaml
+# for a synthetic-data example. Use full training budgets on Colab.
 data:
-  # Path to input data file (CSV or Parquet) - REQUIRED
-  input_path: "data/sales_data.csv"
-
-  # Column names in the OUTPUT data (after renaming)
-  date_column: "date"           # Name of the date column
-  sku_column: "sku"             # Name of the SKU/product identifier column
-  quantity_column: "qty"        # Name of the quantity/sales column
-  store_column: "store_id"      # Name of the store identifier column
-
-  # Column mapping for renaming (optional, set to null to disable renaming)
-  # If your data already has the correct column names, set these to null
-  product_id_column: "product_id"   # Source column to rename to sku_column
-  sales_qty_column: "sales_qty"     # Source column to rename to quantity_column
-
-  # Data preprocessing
-  resample_period: "W-MON"      # Resampling period: D, W, M, Y or an anchored week such as W-MON (required by predict/forecast)
-  max_zeros_ratio: 0.7          # Maximum allowed ratio of zero values per SKU (0.0-1.0)
-
-  # Categorical encoding (optional - auto-detected if null)
-  categorical_columns: null     # List of columns to encode, e.g., ["color", "size", "category"]
-  onehot_columns: null          # Subset to encode with OneHot, e.g., ["store_id", "is_promo_day"]
-
-# =============================================================================
-# TIME SERIES CONFIGURATION
-# =============================================================================
-timeseries:
-  window: 52                    # Lookback window in periods (e.g., 52 weeks = 1 year)
-  n_out: 16                     # Forecast horizon in periods (e.g., 16 weeks = ~4 months)
-  test_size: 0.2                # Fraction of data for testing (0.0-1.0)
-
-# =============================================================================
-# MODEL ARCHITECTURE CONFIGURATION
-# =============================================================================
+  source: long
+  path: data/long.csv
+  id_columns: [id]
+  timestamp_column: timestamp
+  target: target
+  target_support: nonnegative  # Required: nonnegative | real
+  known_dynamic: [promo]      # May extend through the forecast horizon
+  past_dynamic: [oil]         # Context only
+  static_path: data/static.csv
+  static_categorical: [cat]
+  static_numeric: []
+  freq: W-SUN                 # null infers a common frequency from the panel
+  missing_target: zero        # zero | nan; explicit NaNs remain unobserved
+  duplicates: error          # error | sum
+  resample: null
+forecast:
+  horizon: 13
+  quantiles: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+  max_context: 512
+  min_context: 1
 model:
-  # Model type selection
-  model_type: "standard"        # Options: "standard", "advanced", "lightweight"
-
-  # Embedding dimensions
-  sku_emb_dim: 32               # SKU embedding dimension
-  cat_emb_dims: 32              # Categorical embedding dimension
-
-  # Transformer architecture (for standard and advanced models)
-  d_model: 256                  # Transformer model dimension
-  nhead: 8                      # Number of attention heads (d_model must be divisible by nhead)
-  num_encoder_layers: 4         # Number of encoder layers
-  num_decoder_layers: 4         # Number of decoder layers
-  dim_feedforward: 2048         # Feedforward network dimension
-  dropout: 0.3                  # Dropout rate (0.0-1.0)
-
-  # Standard model improvements (only for model_type="standard")
-  use_rope: false               # Use Rotary Position Embeddings
-  use_pre_layernorm: false      # Use Pre-LayerNorm for training stability
-  use_film_conditioning: false  # Use FiLM for static feature conditioning
-  use_improved_head: false      # Use improved output head with GELU activation
-  stochastic_depth_rate: 0.0    # Stochastic depth drop rate for regularization (0.0-1.0)
-
-  # Advanced model parameters (only for model_type="advanced")
-  use_quantiles: false          # Enable quantile output for uncertainty estimation
-  num_quantiles: 3              # Number of quantile outputs
-  quantiles: null               # Specific quantile values, e.g., [0.1, 0.5, 0.9]
-  use_decomposition: false      # Enable trend/seasonality decomposition
-  decomposition_kernel: 25      # Kernel size for decomposition (must be >= 3)
-  patch_size: 4                 # Patch size for PatchTST-style embedding
-  use_patch_embedding: true     # Use patch embedding
-  hidden_continuous_size: 64    # Hidden size for continuous variable processing
-
-  # Lightweight model parameters (only for model_type="lightweight")
-  lightweight_variant: "tcn"    # Options: "tcn", "mixer"
-  tcn_channels: [32, 64, 64]    # TCN channel sizes per layer
-  tcn_kernel_size: 3            # TCN convolution kernel size (must be >= 2)
-
-# =============================================================================
-# TRAINING CONFIGURATION
-# =============================================================================
+  family: v2
+  d_model: 64
+  nhead: 4
+  num_encoder_layers: 2
+  num_decoder_layers: 2
+  dim_feedforward: 256
+  dropout: 0.1
+  cat_emb_dim: 16
+  hidden_continuous_size: 64
+  stochastic_depth_rate: 0.0
+  use_rope: true
+  use_patch_embedding: false  # true is unsupported by v2
+  use_decomposition: false    # true is unsupported by v2
 training:
-  num_epochs: 10                # Number of training epochs
-  batch_size: 128               # Batch size for training
-  learning_rate: 0.00001        # Learning rate (1e-5)
-  weight_decay: 0.01            # Weight decay for AdamW optimizer
-  early_stop_patience: 3        # Epochs without improvement before stopping
-  early_stop_min_delta: 1.0     # Minimum improvement threshold for early stopping
-  num_workers: 0                # DataLoader workers (0=single process, safer for debugging)
-  pin_memory: true              # Pin memory for faster GPU transfers
-  flatten_loss: true            # Use flattened loss (sum over forecast horizon)
-
-# =============================================================================
-# HYPERPARAMETER TUNING CONFIGURATION (Optuna)
-# =============================================================================
+  base_steps: 3000
+  batch_size: 128
+  learning_rate: 0.001
+  weight_decay: 0.01
+  warmup_steps: 100
+  grad_clip: 1.0
+  eval_every: 200
+  patience: 5
+  rel_tol: 0.002
+  amp: true                  # CUDA only; disabled automatically on CPU
+  checkpoint_every: 200
+  refit: none                # full is reserved for phase 4
+  min_train_history: null     # null means horizon + 8
+# Legacy Optuna settings are retained; train does not tune (phase 4).
 tuning:
-  enabled: false                # Enable hyperparameter tuning
-  n_trials: 50                  # Number of optimization trials
-  timeout: null                 # Timeout in seconds (null=no limit)
-  direction: "minimize"         # Optimization direction: "minimize" or "maximize"
-  metric: "mse"                 # Metric to optimize: "mse", "mae", or "loss"
-  pruner: "median"              # Optuna pruner: "median", "hyperband", or "none"
-  sampler: "tpe"                # Optuna sampler: "tpe", "random", or "cmaes"
-  study_name: "demand_forecast_tuning"  # Study name for Optuna
-  storage: null                 # SQLite path for persistence (null=in-memory)
-  n_jobs: 1                     # Parallel jobs (-1=all cores)
-  epochs_per_trial: 5           # Epochs per trial during tuning
-  early_stop_patience: 2        # Early stopping patience per trial
-
-# =============================================================================
-# OUTPUT CONFIGURATION
-# =============================================================================
-output:
-  model_dir: "models"           # Directory to save trained models
-  cache_dir: "dataset"          # Directory for dataset cache
-  metafeatures_path: "metafeatures.csv"  # Path to cache extracted metafeatures
-
-# =============================================================================
-# GLOBAL SETTINGS
-# =============================================================================
-seed: 42                        # Random seed for reproducibility
-device: null                    # Device: "cpu", "cuda", "mps", or null (auto-detect)
-log_level: "INFO"               # Logging level: "DEBUG", "INFO", "WARNING", "ERROR"
+  enabled: false
+  n_trials: 50
+  timeout: null
+  direction: minimize
+  metric: mse
+  pruner: median
+  sampler: tpe
+  study_name: demand_forecast_tuning
+  storage: null
+  n_jobs: 1
+  epochs_per_trial: 5
+  early_stop_patience: 2
+seed: 0
+# null chooses CUDA when available, otherwise CPU; an explicit device overrides it.
+device: null
+log_level: INFO
