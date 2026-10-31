@@ -1,5 +1,20 @@
 # Third-party notices
 
+## Timestral monotone quantile head
+
+`monotone_quantiles` in `demand_forecast/models/heads.py` is ported unchanged
+from Timestral's `src/timestral/model.py` at commit `a534bdb` ("Timestral release"):
+https://github.com/mistralai/timestral
+https://github.com/mistralai/timestral/blob/a534bdb/src/timestral/model.py
+
+The local module adds a linear projection wrapper (`MonotoneQuantileHead`).
+No Timestral weights are included or used.
+
+Timestral is licensed under Apache-2.0; its upstream license is at
+https://github.com/mistralai/timestral/blob/a534bdb/LICENSE.
+The Apache-2.0 license text reproduced in the fev section below also applies
+to this port.
+
 ## fev seasonal-naive baseline, weekly task definitions, and metrics
 
 `demand_forecast/bench/baselines.py` is adapted from fev's
