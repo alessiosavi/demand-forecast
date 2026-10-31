@@ -80,6 +80,9 @@ def fev_run(
     ),
     policy: str = typer.Option("first_window", "--policy", help="first_window or per_window"),
     out_dir: Path = typer.Option(..., "--out-dir", help="Directory for bundles and summaries.csv"),
+    profiles: Path | None = typer.Option(
+        None, "--profiles", exists=True, dir_okay=False, help="Override task role profiles YAML"
+    ),
     resume: bool = typer.Option(False, "--resume", help="Resume matching runs and missing windows"),
     model_name: str | None = typer.Option(None, "--model-name", help="Model label in summaries"),
     stop_after: int | None = typer.Option(
@@ -98,7 +101,7 @@ def fev_run(
         settings = Settings.from_yaml(config)
         configure_logging(settings.log_level)
         run_fev(
-            load_task_specs(tasks),
+            load_task_specs(tasks, profiles),
             settings,
             out_dir,
             policy=policy,

@@ -342,6 +342,43 @@ def test_train_encoder_uses_only_fit_ids(tmp_path, run_settings):
     assert "validation-only" not in bundle.encoder.vocabularies["cat"]
 
 
+@pytest.mark.parametrize("resume_at", [0, 3])
+def test_train_panel_writes_bundle_when_stop_after_completes_budget(
+    tmp_path, run_settings, resume_at
+):
+    import json
+
+    import torch
+
+    from demand_forecast.core.bundle import load_bundle
+    from demand_forecast.core.run import train_panel
+    from demand_forecast.core.training import InterruptedRun
+    from demand_forecast.data.loader_long import load_long
+
+    # Keep this check focused on budget completion, independently of validation scores.
+    run_settings.training.patience = 20
+    panel = load_long(run_settings.data)
+    out = tmp_path / "run"
+    args = (panel, pd.Timestamp("2022-08-14"), run_settings, out)
+    if resume_at:
+        with pytest.raises(InterruptedRun):
+            train_panel(*args, dataset_fingerprint="fixture", stop_after=resume_at)
+    bundle = train_panel(
+        *args,
+        dataset_fingerprint="fixture",
+        resume=bool(resume_at),
+        stop_after=8 - resume_at,
+    )
+    assert bundle == out / "bundle"
+    loaded = load_bundle(bundle)
+    report = json.loads((out / "run.json").read_text())
+    assert report["fit_result"]["stop_reason"] == "max_steps"
+    assert report["fit_result"]["steps"] == 8
+    assert report["resumed_from_step"] == resume_at
+    assert loaded.manifest["run"] == report
+    assert torch.load(out / "checkpoints/latest.pt", weights_only=False)["step"] == 8
+
+
 def test_interrupted_run_resumes_exactly_and_reuses_bundle(tmp_path, run_settings, monkeypatch):
     import json
 

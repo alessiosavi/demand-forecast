@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import shutil
 import subprocess
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import pandas as pd
 import torch
@@ -89,47 +92,65 @@ def save_bundle(
 
     Caller provenance, including seed, run identity and input hashes, is retained.
     Measured artifact fields and the selection cutoff are always written here.
+    All artifacts are staged before publication; a failed publication rename
+    restores the previous bundle.
     """
     directory = Path(directory)
-    directory.mkdir(parents=True, exist_ok=True)
-    cutoff = pd.Timestamp(training_cutoff).isoformat()
-    torch.save(model.state_dict(), directory / "model.pt")
-    _write_json(
-        directory / "config.json",
-        {
-            "family": family,
-            "backbone_kwargs": backbone_kwargs,
-            "forecast": forecast_cfg.model_dump(mode="json"),
-            "dataset": dataset_cfg.model_dump(mode="json") if dataset_cfg is not None else None,
-            "model_spec": asdict(model.spec),
-        },
-    )
-    _write_json(directory / "encoder.json", encoder.to_json())
-    _write_json(
-        directory / "panel.json",
-        {
-            "freq": to_offset(panel.freq).freqstr,
-            "seasonal_period": panel.seasonal_period,
-            "target_support": panel.target_support,
-            "roles": asdict(panel.roles),
-            "training_cutoff": cutoff,
-            "earliest_origin": pd.Timestamp(earliest_origin).isoformat(),
-            "fallback_level": model.fallback_level.item(),
-        },
-    )
-    _write_json(
-        directory / "manifest.json",
-        {
-            "seed": None,
-            **manifest,
-            "bundle_version": BUNDLE_VERSION,
-            "package_version": __version__,
-            "git_sha": _git_sha(),
-            "selection_used_labels_until": cutoff,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "sha256": {name: _sha256(directory / name) for name in _ARTIFACTS},
-        },
-    )
+    directory.parent.mkdir(parents=True, exist_ok=True)
+    if directory.exists() and not directory.is_dir():
+        raise NotADirectoryError(f"Bundle path is not a directory: {directory}")
+    with TemporaryDirectory(dir=directory.parent, prefix=f"{directory.name}.tmp-") as name:
+        temporary = Path(name)
+        cutoff = pd.Timestamp(training_cutoff).isoformat()
+        torch.save(model.state_dict(), temporary / "model.pt")
+        _write_json(
+            temporary / "config.json",
+            {
+                "family": family,
+                "backbone_kwargs": backbone_kwargs,
+                "forecast": forecast_cfg.model_dump(mode="json"),
+                "dataset": dataset_cfg.model_dump(mode="json") if dataset_cfg is not None else None,
+                "model_spec": asdict(model.spec),
+            },
+        )
+        _write_json(temporary / "encoder.json", encoder.to_json())
+        _write_json(
+            temporary / "panel.json",
+            {
+                "freq": to_offset(panel.freq).freqstr,
+                "seasonal_period": panel.seasonal_period,
+                "target_support": panel.target_support,
+                "roles": asdict(panel.roles),
+                "training_cutoff": cutoff,
+                "earliest_origin": pd.Timestamp(earliest_origin).isoformat(),
+                "fallback_level": model.fallback_level.item(),
+            },
+        )
+        _write_json(
+            temporary / "manifest.json",
+            {
+                "seed": None,
+                **manifest,
+                "bundle_version": BUNDLE_VERSION,
+                "package_version": __version__,
+                "git_sha": _git_sha(),
+                "selection_used_labels_until": cutoff,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "sha256": {name: _sha256(temporary / name) for name in _ARTIFACTS},
+            },
+        )
+        backup = None
+        if directory.exists():
+            backup = temporary.with_name(f"{temporary.name}.old")
+            os.replace(directory, backup)
+        try:
+            os.replace(temporary, directory)
+        except OSError:
+            if backup is not None:
+                os.replace(backup, directory)
+            raise
+        if backup is not None:
+            shutil.rmtree(backup)
 
 
 def load_bundle(directory: Path | str, device: torch.device | str = "cpu") -> Bundle:

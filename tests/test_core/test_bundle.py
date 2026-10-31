@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import os
 import pickle
 import subprocess
 import sys
@@ -159,6 +160,79 @@ def test_bundle_metadata_configs_state_and_weights_only_load(
     for name, expected in tiny_v2_trained.state_dict().items():
         assert torch.equal(state[name], expected)
     assert all(t.device.type == "cpu" for t in state.values())
+
+
+@pytest.mark.parametrize("failure", [None, "manifest", "publish"])
+def test_bundle_replacement_publishes_only_complete_artifacts(
+    bundle_dir,
+    tiny_v2_trained,
+    forecast29,
+    encoder29,
+    panel29,
+    cutoff29,
+    origin29,
+    monkeypatch,
+    failure,
+):
+    from demand_forecast.core import bundle
+
+    before = {p.name: p.read_bytes() for p in bundle_dir.iterdir()}
+    original = load_bundle(bundle_dir)
+    tiny_v2_trained.fallback_level.add_(7.0)
+    write_json = bundle._write_json
+    replace_directory = os.replace
+    publish_failed = False
+
+    def fail_manifest(path, value):
+        if path.name == "manifest.json":
+            raise OSError("manifest write failed")
+        write_json(path, value)
+
+    def fail_publish(source, target):
+        nonlocal publish_failed
+        if target == bundle_dir and not publish_failed:
+            publish_failed = True
+            raise OSError("publish failed")
+        replace_directory(source, target)
+
+    if failure == "manifest":
+        monkeypatch.setattr(bundle, "_write_json", fail_manifest)
+    elif failure == "publish":
+        monkeypatch.setattr(os, "replace", fail_publish)
+
+    def save():
+        save_bundle(
+            bundle_dir,
+            model=tiny_v2_trained,
+            family="v2",
+            backbone_kwargs=asdict(tiny_v2_trained.backbone.cfg),
+            forecast_cfg=forecast29,
+            dataset_cfg=None,
+            encoder=encoder29,
+            panel=panel29,
+            training_cutoff=cutoff29,
+            earliest_origin=origin29,
+            manifest={"run_identity": "replacement"},
+        )
+
+    if failure:
+        with pytest.raises(OSError, match=failure):
+            save()
+        assert {p.name: p.read_bytes() for p in bundle_dir.iterdir()} == before
+    else:
+        save()
+
+    loaded = load_bundle(bundle_dir)
+    expected_model = original.model if failure else tiny_v2_trained
+    for name, value in expected_model.state_dict().items():
+        assert torch.equal(loaded.model.state_dict()[name], value)
+    if failure:
+        assert loaded.manifest == original.manifest
+    else:
+        assert loaded.manifest["run_identity"] == "replacement"
+    for name, digest in loaded.manifest["sha256"].items():
+        assert hashlib.sha256((bundle_dir / name).read_bytes()).hexdigest() == digest
+    assert not list(bundle_dir.parent.glob("*.tmp-*"))
 
 
 def test_forecast_dataframe_batches_and_aligned_origins(bundle_dir, origin29, monkeypatch):

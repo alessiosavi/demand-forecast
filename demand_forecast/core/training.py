@@ -221,10 +221,10 @@ class Trainer:
                     self.step % self.cfg.checkpoint_every == 0 or finished or interrupted
                 ):
                     self.checkpoint(checkpoint_path)
-                if interrupted:
-                    return self._result("interrupted")
                 if finished:
                     break
+                if interrupted:
+                    return self._result("interrupted")
 
         reason = (
             "exception_budget"
