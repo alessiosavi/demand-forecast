@@ -49,13 +49,13 @@ def test_offline_fev_task_end_to_end_with_resume_and_replacement(tmp_path, monke
     settings = tiny_settings(base_steps=20, d_model=16)
     out = tmp_path / "out"
     seen = []
-    forecast = Predictor.forecast_arrays
+    forecast = Predictor.forecast_with_diagnostics
 
     def capture(predictor, panel, origin):
         seen.append((origin, [series.history_length for series in panel.series]))
         return forecast(predictor, panel, origin)
 
-    monkeypatch.setattr(Predictor, "forecast_arrays", capture)
+    monkeypatch.setattr(Predictor, "forecast_with_diagnostics", capture)
     first = run_fev([spec], settings, out)
     assert np.isfinite(first.SQL.iloc[0])
     assert first.num_forecasts.iloc[0] == 12
@@ -263,7 +263,7 @@ def test_resume_rejects_each_stale_artifact_before_recomputation(tmp_path, monke
         pytest.fail("identity checks must happen before training or inference")
 
     monkeypatch.setattr(run, "build_model", forbidden)
-    monkeypatch.setattr(Predictor, "forecast_arrays", forbidden)
+    monkeypatch.setattr(Predictor, "forecast_with_diagnostics", forbidden)
     with pytest.raises(ValueError, match="^run identity mismatch$"):
         run_fev([spec], settings, out, resume=True)
     assert before == {path: path.read_bytes() for path in out.rglob("*") if path.is_file()}
@@ -322,18 +322,18 @@ def test_later_window_unseen_id_uses_unchanged_encoder_with_custom_columns(tmp_p
     custom = tmp_path / "custom.parquet"
     dataset.to_parquet(custom)
     spec = fixture_spec(custom, id_column="item", timestamp_column="date", target="sales")
-    forecast = Predictor.forecast_arrays
+    forecast = Predictor.forecast_with_diagnostics
     encoders, codes = [], []
 
     def capture(predictor, panel, origin):
         encoder = predictor.bundle.encoder
         encoders.append(encoder.to_json())
         codes.append({s.series_id: encoder.transform(s)[0]["__series__"] for s in panel.series})
-        ids, arrays = forecast(predictor, panel, origin)
+        ids, arrays, diagnostics = forecast(predictor, panel, origin)
         # Exercise the runner's alignment, with forecasts deliberately out of order.
-        return ids[::-1], arrays[::-1]
+        return ids[::-1], arrays[::-1], diagnostics
 
-    monkeypatch.setattr(Predictor, "forecast_arrays", capture)
+    monkeypatch.setattr(Predictor, "forecast_with_diagnostics", capture)
     result = run_fev([spec], tiny_settings(base_steps=2, d_model=8), tmp_path / "out")
     assert np.isfinite(result.SQL.iloc[0]) and result.num_forecasts.iloc[0] == 11
     assert encoders[0] == encoders[1]
@@ -426,3 +426,190 @@ def test_cli_run_interrupt_resume_policy_and_missing_bench(tmp_path, monkeypatch
     monkeypatch.setitem(sys.modules, "fev", None)
     unavailable = runner.invoke(app, args)
     assert unavailable.exit_code == 2 and "install demand-forecast[bench]" in unavailable.output
+
+
+@pytest.fixture
+def completed_task(tmp_path):
+    spec = fixture_spec(write_fev_fixture(tmp_path))
+    settings = tiny_settings(base_steps=4, d_model=8)
+    out = tmp_path / "out"
+    run_fev([spec], settings, out)
+    return spec, settings, out
+
+
+def test_resume_of_completed_task_skips_without_fit(completed_task, monkeypatch, capsys):
+    from hashlib import sha256
+
+    from demand_forecast.core.training import Trainer
+
+    spec, settings, out = completed_task
+    before = sha256((out / "summaries.csv").read_bytes()).hexdigest()
+    monkeypatch.setattr(Trainer, "fit", lambda *a, **k: pytest.fail("unexpected fit"))
+    run_fev([spec], settings, out, resume=True)
+    assert f"Skipping completed task {spec.name}" in capsys.readouterr().out
+    assert sha256((out / "summaries.csv").read_bytes()).hexdigest() == before
+
+
+def _assert_rows_rebuilt_from_persisted_timings(completed_task, mode, capsys):
+    spec, settings, out = completed_task
+    path = out / "summaries.csv"
+    original = pd.read_csv(path)
+    row = original.assign(run_identity="stale", SQL=-99)
+    if mode == "duplicate":
+        row = pd.concat([original, original.assign(SQL=-98)])
+    elif mode == "deleted":
+        row = original.iloc[:0]
+    row.to_csv(path, index=False)
+    rebuilt = run_fev([spec], settings, out, resume=True)
+    assert "Skipping completed task" not in capsys.readouterr().out
+    assert len(rebuilt) == 1 and rebuilt.SQL.iloc[0] == pytest.approx(original.SQL.iloc[0])
+    report = json.loads((out / spec.name / "run.json").read_text())
+    assert rebuilt.run_identity.iloc[0] == report["run_identity"]
+    timing = report["timings"]["cumulative"]
+    assert rebuilt.training_time_s.iloc[0] == sum(
+        timing[k] for k in ("train_s", "eval_s", "checkpoint_s")
+    )
+    durations = []
+    for i in range(spec.num_windows):
+        with np.load(out / spec.name / f"window_{i}.npz", allow_pickle=False) as data:
+            durations.append(float(data["inference_time_s"]))
+    assert rebuilt.inference_time_s.iloc[0] == sum(durations)
+
+
+def test_completed_task_with_stale_identity_row_is_recomputed(completed_task, capsys):
+    _assert_rows_rebuilt_from_persisted_timings(completed_task, "stale", capsys)
+
+
+def test_duplicate_rows_are_replaced_not_skipped(completed_task, capsys):
+    _assert_rows_rebuilt_from_persisted_timings(completed_task, "duplicate", capsys)
+
+
+def test_deleted_row_is_rebuilt_from_persisted_timings(completed_task, capsys):
+    _assert_rows_rebuilt_from_persisted_timings(completed_task, "deleted", capsys)
+
+
+def test_legacy_npz_without_diagnostics_reports_unknown(completed_task, capsys):
+    spec, settings, out = completed_task
+    path = out / spec.name / "window_1.npz"
+    with np.load(path, allow_pickle=False) as data:
+        legacy = {key: data[key] for key in ("ids", "arrays", "identity")}
+    np.savez(path, **legacy)
+    before = path.read_bytes()
+    rebuilt = run_fev([spec], settings, out, resume=True)
+    assert "Skipping completed task" not in capsys.readouterr().out
+    for key in ("inference_time_s", "fallback_no_context", "fallback_undefined_scale"):
+        assert pd.isna(rebuilt[key].iloc[0])
+    assert path.read_bytes() == before
+
+
+def test_npz_carries_fallback_counts(tmp_path):
+    from datasets import Dataset
+
+    parquet = write_fev_fixture(tmp_path)
+    data = Dataset.from_parquet(str(parquet))
+
+    def fallback_rows(row):
+        if row["id"] in ("0", "1"):
+            row["target"] = [np.nan if row["id"] == "0" else 6.0] * len(row["target"])
+        return row
+
+    data.map(fallback_rows).to_parquet(parquet)
+    spec = fixture_spec(parquet)
+    result = run_fev([spec], tiny_settings(base_steps=2, d_model=8), tmp_path / "out")
+    for i in range(spec.num_windows):
+        with np.load(tmp_path / "out" / spec.name / f"window_{i}.npz", allow_pickle=False) as data:
+            assert data["fallback_no_context"].item() == 1
+            assert data["fallback_undefined_scale"].item() >= 1
+            for key in (
+                "inference_time_s",
+                "fallback_no_context",
+                "fallback_undefined_scale",
+                "device",
+            ):
+                assert data[key].shape == () and data[key].dtype.kind in "fiuU"
+            assert data["inference_time_s"].dtype == np.float64
+            assert data["fallback_no_context"].dtype == np.int64
+    assert result.fallback_no_context.iloc[0] == 2
+
+
+def test_extra_info_columns_present_and_baseline_rows_nan(completed_task):
+    from demand_forecast.bench.run import run_baseline
+
+    spec, settings, out = completed_task
+    result = run_baseline([spec], out)
+    keys = [
+        "run_identity",
+        "fallback_no_context",
+        "fallback_undefined_scale",
+        "inference_device",
+        "resolved_max_steps",
+        "n_fit_ids",
+        "n_val_items",
+        "nonfinite_losses",
+        "sessions",
+    ]
+    model = result.loc[result.model_name == "demand-forecast-v2"].iloc[0]
+    baseline = result.loc[result.model_name == "seasonal_naive"].iloc[0]
+    assert model[keys].notna().all()
+    assert baseline[keys].isna().all()
+    assert all(f"SQL[{q}]" in result for q in Q9)
+
+
+def test_run_fev_uses_settings_device(tmp_path, monkeypatch):
+    from demand_forecast.core import run
+    from demand_forecast.inference.predictor import Predictor
+
+    spec = fixture_spec(write_fev_fixture(tmp_path))
+    settings = tiny_settings(base_steps=2, d_model=8)
+    seen = []
+    load = Predictor.from_bundle
+    monkeypatch.setattr(run, "resolve_device", lambda settings: torch.device("cpu:0"))
+
+    def capture(path, device="cpu"):
+        seen.append(device)
+        return load(path, device="cpu")
+
+    monkeypatch.setattr(Predictor, "from_bundle", capture)
+    run_fev([spec], settings, tmp_path / "out")
+    assert seen and all(device == torch.device("cpu:0") for device in seen)
+
+
+@pytest.mark.parametrize("artifact", ["bundle/manifest.json", "window_1.npz"])
+def test_completed_task_with_mismatched_artifact_identity_raises(completed_task, artifact):
+    spec, settings, out = completed_task
+    path = out / spec.name / artifact
+    if path.suffix == ".json":
+        data = json.loads(path.read_text())
+        data["run_identity"] = "foreign"
+        path.write_text(json.dumps(data))
+    else:
+        with np.load(path, allow_pickle=False) as saved:
+            data = dict(saved)
+        np.savez(path, **{**data, "identity": "foreign"})
+    with pytest.raises(ValueError, match="^run identity mismatch$"):
+        run_fev([spec], settings, out, resume=True)
+
+
+def test_npz_publication_failure_leaves_no_partial_file(tmp_path, monkeypatch):
+    from demand_forecast.bench.run import _save_predictions
+
+    def fail(stream, **kwargs):
+        stream.write(b"partial archive")
+        raise OSError("injected failure")
+
+    monkeypatch.setattr(np, "savez", fail)
+    with pytest.raises(OSError, match="injected failure"):
+        _save_predictions(
+            tmp_path / "window_0.npz",
+            ["a"],
+            np.zeros((1, 4, 9)),
+            "identity",
+            {
+                "inference_time_s": 0.1,
+                "fallback_no_context": 0,
+                "fallback_undefined_scale": 0,
+                "device": "cpu",
+                "n_items": 1,
+            },
+        )
+    assert list(tmp_path.iterdir()) == []

@@ -177,7 +177,8 @@ Phase 5 must record the immutable code SHA, dependency lock, dataset revisions a
 fingerprints, task definitions, seed, policy, budgets, hardware/dtype, failures,
 fallback/exclusion counts, timings and measured peak RAM/VRAM. An interruption/resume
 trial precedes the frozen model run, and no frozen v2 score is viewed before the
-phase-5 prerequisites pass. Use [the Colab template](colab.md) and
+phase-5 prerequisites pass. Phase-5 evidence includes `checkpoints/progress.json`, per-window
+NPZ diagnostics and the tables produced by `scripts/fev_report.py`. Use [the Colab template](colab.md) and
 [prompt 00](colab/prompts/00-profile-and-baselines.md) for the first profiling/baseline
 session. No Timestral weights are downloaded.
 

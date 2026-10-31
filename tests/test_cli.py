@@ -511,3 +511,50 @@ def test_train_cli_resume_and_errors(tmp_path, run_settings):
     )
     assert result.exit_code != 0 and "off the" in result.output
     assert not (tmp_path / "bad.csv").exists()
+
+
+def test_stop_after_writes_progress_json_and_resume_accumulates_timings(tmp_path, run_settings):
+    import json
+
+    from demand_forecast.core.run import train_panel
+    from demand_forecast.core.training import InterruptedRun
+    from demand_forecast.data.loader_long import load_long
+
+    panel = load_long(run_settings.data)
+    origin = panel.timestamps(0)[-1] + pd.tseries.frequencies.to_offset(panel.freq)
+    out = tmp_path / "timed"
+    with pytest.raises(InterruptedRun):
+        train_panel(panel, origin, run_settings, out, dataset_fingerprint="fixture", stop_after=3)
+    progress = json.loads((out / "checkpoints/progress.json").read_text())
+    assert progress["step"] == 3 and progress["timings"]["sessions"] == 1
+    assert not (out / "run.json").exists()
+    train_panel(panel, origin, run_settings, out, dataset_fingerprint="fixture", resume=True)
+    report = json.loads((out / "run.json").read_text())
+    assert report["resolved_budget"] == {"max_steps": 8, "eval_every": 1}
+    assert report["timings"]["cumulative"]["sessions"] == 2
+    assert report["timings"]["cumulative"]["train_s"] >= progress["timings"]["train_s"] > 0
+    assert len(report["telemetry"]) == report["fit_result"]["steps"]
+    assert report["n_fit_ids"] == 3 and report["n_val_items"] == 3
+    assert report["amp_dtype"] is None
+    assert report["fit_result"]["nonfinite_losses"] == 0
+
+
+def test_run_json_serialises_nonfinite_as_null(tmp_path):
+    import json
+
+    from demand_forecast.core.run import _write_run
+
+    path = tmp_path / "run.json"
+    _write_run(
+        path,
+        {
+            "telemetry": [{"score": float("nan"), "duration": float("inf")}],
+            "negative": -float("inf"),
+            "finite": 1.0,
+        },
+    )
+    assert json.loads(path.read_text()) == {
+        "telemetry": [{"score": None, "duration": None}],
+        "negative": None,
+        "finite": 1.0,
+    }

@@ -266,6 +266,160 @@ temporary-file replacement; a bundle is approximately 4 bytes/parameter, multipl
 by 2 while staging. Add one uncompressed npz per window (items × quantiles × horizon
 × float32, plus ids), and space for logs/notebooks. These are planning estimates;
 measure actual artifacts and leave space for all retained tasks before training.
+Model size depends on the fitted series and static vocabularies: with the standard
+16-dimensional categorical embeddings, each fitted series adds 16 embedding weights.
+Count actual parameters and measure checkpoint/bundle sizes in the trial.
+
+Keep dataset pinning online and verify it in every session. Before **any dataset load**,
+compare `HfApi().dataset_info("autogluon/fev_datasets").sha` and the `main` target from
+`HfApi().list_repo_refs("autogluon/fev_datasets", repo_type="dataset")` with the experiment's
+recorded Hub commit in `dataset-manifest.json`; on the first session record the commit.
+Both must agree; stop before loading if either differs. After the first load, record
+the cached parquet paths, sizes and parquet sha256 manifest, checking hashes against
+the LFS pointers at that commit; re-verify the manifest after the first load of every
+later session. A changed fingerprint also fails run-identity verification on resume.
+Do not enable offline mode: `datasets` 4.0.0 cannot rebuild an empty
+`/content/hf-datasets` cache from the Hub snapshot in that mode. Keep the original
+task dataset paths: overriding them changes the task definition in `summaries.csv`
+and prevents comparison with published fev tasks. This rule preserves both online
+cache regeneration and verification of the bytes actually used.
+
+Launch long commands detached from a Python cell. `%%bash` displays output only after
+the cell finishes. Add a fresh UTC launch timestamp to the session log, script and
+status paths so a relaunch in the same runtime retains earlier evidence; keep the
+returned process handle. The script's `EXIT` trap records the **raw command status**
+(0 success, 1 for the deliberate `--stop-after` interruption). `Popen` already sends
+stdout and stderr to the log, so the script body must not use `tee` on that same log.
+
+```python
+import os
+import shlex
+import subprocess
+from datetime import datetime, timezone
+from pathlib import Path
+
+run_dir = Path(os.environ["FEV_RUN_DIR"])
+session = os.environ["FEV_SESSION"]
+launch = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+log = run_dir / f"fev-run-{session}-{launch}.log"
+script = Path("/content") / f"fev-run-{session}-{launch}.sh"
+assert not log.exists() and not Path(f"{log}.exit").exists(), "Use a fresh launch log"
+command = shlex.join(
+    [
+        "/usr/bin/time",
+        "-v",
+        "demand-forecast",
+        "fev",
+        "run",
+        "--tasks",
+        "weekly",
+        "--config",
+        "configs/fev-v2-standard.yaml",
+        "--policy",
+        "first_window",
+        "--out-dir",
+        str(run_dir),
+        "--resume",
+    ]
+)
+body = (
+    "set -euo pipefail\n"
+    f"LOG={shlex.quote(str(log))}\n"
+    "trap 'echo $? > \"$LOG.exit\"' EXIT\n"
+    "cd /content/demand-forecast\n"
+    f"{command}\n"
+)
+temporary = script.with_suffix(".tmp")
+temporary.write_text(body)
+temporary.replace(script)
+with log.open("a") as stream:
+    process = subprocess.Popen(
+        ["bash", str(script)],
+        stdout=stream,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+print({"pid": process.pid, "log": str(log), "status": f"{log}.exit"})
+```
+
+The generated script contains `trap 'echo $? > "$LOG.exit"' EXIT`. Poll in short cells
+every few minutes with `tail -n 5 <log>` and read `<log>.exit` when it appears. An absent
+status after a VM reset means unknown/interrupted, never success. Check the raw status
+against the expected result afterwards; for an interruption trial assert it equals 1.
+Use the task order authorized by the executing prompt instead of `weekly` when specified.
+Both the launcher and poller use `start_new_session=True` to isolate their process
+groups from the kernel's interrupt/restart signals. Poll the printed log and `.exit`
+paths independently of the Python handle, including after a kernel restart. To
+deliberately stop training, signal its process group:
+
+```python
+import signal
+
+os.killpg(process.pid, signal.SIGINT)
+```
+
+For a short, foreground interruption check, preserve the command's exit status through
+the logging pipeline and assert the expected 1 without killing the cell prematurely:
+
+```bash
+set -euo pipefail
+cd /content/demand-forecast
+LOG="$TRIAL/interrupt-$FEV_SESSION.log"
+set +e
+/usr/bin/time -v demand-forecast fev run --tasks hierarchical_sales_1W \
+  --config configs/fev-v2-standard.yaml --policy first_window \
+  --out-dir "$TRIAL" --stop-after 120 2>&1 | tee -a "$LOG"
+rc=${PIPESTATUS[0]}
+set -e
+test "$rc" -eq 1
+```
+
+Start the GPU memory poller in a Python cell before launching training, and keep its
+handle. The maximum in this log is sampled once per second, distinct from the trainer's
+peak allocated tensor memory in `progress.json` and `run.json`. Give the poller its own
+UTC launch timestamp and stream to local disk; copy the log to Drive at session end.
+
+```python
+from datetime import datetime, timezone
+
+poller_launch = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+vram_log = Path("/content") / f"vram-{session}-{poller_launch}.log"
+with vram_log.open("w") as stream:
+    poller = subprocess.Popen(
+        [
+            "nvidia-smi",
+            "--query-gpu=timestamp,memory.used",
+            "--format=csv,noheader,nounits",
+            "-lms",
+            "1000",
+        ],
+        stdout=stream,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+print({"poller_pid": poller.pid, "vram_log": str(vram_log)})
+```
+
+Run this end-of-session cell to stop the poller and publish its completed log on Drive:
+
+```python
+import shutil
+import signal
+
+if poller.poll() is None:
+    os.killpg(poller.pid, signal.SIGINT)
+poller.wait(timeout=10)
+vram_copy = run_dir / vram_log.name
+temporary = vram_copy.with_suffix(".tmp")
+shutil.copy2(vram_log, temporary)
+temporary.replace(vram_copy)
+print({"vram_copy": str(vram_copy), "bytes": vram_copy.stat().st_size})
+```
+
+A VM reset loses the uncopied local tail; direct Drive streaming also risks losing
+the unflushed tail. Only copies already completed on Drive are durable evidence.
+Preserve the sampled maximum, `/usr/bin/time -v` peak RSS, progress files, NPZ diagnostics
+and the report from `scripts/fev_report.py` with the run artifacts.
 
 ## 5. Copy-back checklist and paste-back report
 

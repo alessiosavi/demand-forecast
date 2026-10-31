@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import math
 import os
 import random
+import time
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+from zipfile import ZipFile
 
 import numpy as np
 import torch
@@ -22,6 +26,19 @@ from demand_forecast.data.panel import Panel
 from demand_forecast.data.sampler import WindowSampler, build_origins
 from demand_forecast.models.base import ForecastModel
 from demand_forecast.models.losses import pinball_loss
+
+logger = logging.getLogger(__name__)
+
+
+def _empty_timings() -> dict:
+    return dict(
+        train_s=0.0,
+        eval_s=0.0,
+        checkpoint_s=0.0,
+        sessions=0,
+        peak_cuda_mem_bytes=0,
+        nonfinite_losses=0,
+    )
 
 
 class InterruptedRun(RuntimeError):  # noqa: N818 - public interruption signal from the run protocol
@@ -51,6 +68,8 @@ class FitResult:
     steps: int
     history: list[dict]
     stop_reason: str
+    timings: dict
+    telemetry: list[dict]
 
 
 def resolve_budget(base_steps: int, n_series: int, eval_every: int) -> tuple[int, int]:
@@ -96,6 +115,8 @@ class Trainer:
         self.device = torch.device(device)
         self.model = model.to(self.device)
         self.cfg, self.run_identity, self.seed = cfg, run_identity, seed
+        self.timings = _empty_timings()
+        self.telemetry: list[dict] = []
         self.amp, self.amp_dtype, use_scaler = resolve_amp(cfg.amp, self.device)
         # Retain compatibility with installations exposing only the CUDA scaler API.
         if hasattr(torch.amp, "GradScaler"):
@@ -138,6 +159,8 @@ class Trainer:
         if checkpoint_dir is None and (stop_after is not None or resume):
             checkpoint_dir = Path("checkpoints")
         checkpoint_path = Path(checkpoint_dir) / "latest.pt" if checkpoint_dir is not None else None
+        self.progress_path = checkpoint_path.with_name("progress.json") if checkpoint_path else None
+        self.plan = plan
         horizon, max_context = forecast_cfg.horizon, forecast_cfg.max_context
         self.max_steps, self.eval_every = resolve_budget(
             self.cfg.base_steps, len(plan.fit_ids), self.cfg.eval_every
@@ -177,8 +200,23 @@ class Trainer:
         self.history: list[dict] = []
         self.best_score: float | None = None
         self.best_state = deepcopy(self.model.state_dict())
+        self.timings, self.telemetry = _empty_timings(), []
+        self._last_eval_step, self._last_eval_train_s = 0, 0.0
         if resume and checkpoint_path is not None and checkpoint_path.exists():
             self.resume(checkpoint_path)
+        self.timings["sessions"] += 1
+        if self.device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(self.device)
+        logger.info(
+            "fit: max_steps=%d eval_every=%d fit_ids=%d val_items=%d origins=%d device=%s amp=%s",
+            self.max_steps,
+            self.eval_every,
+            len(plan.fit_ids),
+            len(plan.val_items),
+            len(origins),
+            self.device,
+            self.amp_dtype if self.amp else None,
+        )
         if not len(origins):
             return self._result("no_training_data")
 
@@ -190,6 +228,7 @@ class Trainer:
         ):
             if self.sampler.position == len(self.sampler):
                 self.sampler.set_epoch(self.sampler.epoch + 1)
+            train_started = time.perf_counter()
             for batch in self.sampler.batches(self.cfg.batch_size):
                 batch = batch.to(self.device)
                 self.optimizer.zero_grad(set_to_none=True)
@@ -210,10 +249,13 @@ class Trainer:
                 self.step += 1
                 session_steps += 1
                 record = {"step": self.step, "loss": float(loss.detach().item())}
+                self.timings["train_s"] += time.perf_counter() - train_started
+                self.timings["nonfinite_losses"] += int(not math.isfinite(record["loss"]))
                 self.history.append(record)
                 if not plan.exception and (
                     self.step % self.eval_every == 0 or self.step == self.max_steps
                 ):
+                    eval_started = time.perf_counter()
                     metrics = evaluate_fn(
                         self.model,
                         panel,
@@ -227,6 +269,46 @@ class Trainer:
                     record.update(metrics)
                     self._select_best(float(metrics["SQL"]))
                     self.model.train()
+                    if self.device.type == "cuda":
+                        # Include any asynchronous best-state copies in evaluation
+                        # time instead of charging them to the next optimizer step.
+                        torch.cuda.synchronize(self.device)
+                    eval_s = time.perf_counter() - eval_started
+                    self.timings["eval_s"] += eval_s
+                    self._sample_peak()
+                    train_s_per_step = (self.timings["train_s"] - self._last_eval_train_s) / (
+                        self.step - self._last_eval_step
+                    )
+                    elapsed_s = sum(
+                        self.timings[key] for key in ("train_s", "eval_s", "checkpoint_s")
+                    )
+                    self.telemetry.append(
+                        {
+                            "step": self.step,
+                            "elapsed_s": elapsed_s,
+                            "train_s_per_step": train_s_per_step,
+                            "eval_s": eval_s,
+                            "peak_cuda_mem_bytes": self.timings["peak_cuda_mem_bytes"],
+                        }
+                    )
+                    self._last_eval_step, self._last_eval_train_s = (
+                        self.step,
+                        self.timings["train_s"],
+                    )
+                    logger.info(
+                        "eval: step=%d/%d inner_SQL=%.4f best=%.4f@%d patience=%d "
+                        "train_s_per_step=%.4f eval_s=%.1f elapsed_s=%.0f peak_cuda_mem_MiB=%d",
+                        self.step,
+                        self.max_steps,
+                        metrics["SQL"],
+                        self.best_score if self.best_score is not None else float("nan"),
+                        self.best_step,
+                        self.patience_counter,
+                        train_s_per_step,
+                        eval_s,
+                        elapsed_s,
+                        self.timings["peak_cuda_mem_bytes"] // 2**20,
+                    )
                 finished = self.step == self.max_steps or (
                     not plan.exception and self.patience_counter >= self.cfg.patience
                 )
@@ -242,6 +324,7 @@ class Trainer:
                     break
                 if interrupted:
                     return self._result("interrupted")
+                train_started = time.perf_counter()
 
         reason = (
             "exception_budget"
@@ -264,17 +347,52 @@ class Trainer:
             self.best_state = deepcopy(self.model.state_dict())
 
     def _result(self, reason: str) -> FitResult:
+        best_state = deepcopy(self.best_state)
+        self._sample_peak()
+        self._write_progress()
+        logger.info("fit done: stop_reason=%s steps=%d", reason, self.step)
         return FitResult(
-            best_state=deepcopy(self.best_state),
+            best_state=best_state,
             best_score=self.best_score,
             best_step=self.best_step,
             steps=self.step,
             history=deepcopy(self.history),
             stop_reason=reason,
+            timings=deepcopy(self.timings),
+            telemetry=deepcopy(self.telemetry),
         )
+
+    def _sample_peak(self) -> None:
+        if self.device.type == "cuda":
+            self.timings["peak_cuda_mem_bytes"] = max(
+                self.timings["peak_cuda_mem_bytes"], torch.cuda.max_memory_allocated(self.device)
+            )
+
+    def _write_progress(self) -> None:
+        from demand_forecast.core.run import _write_run
+
+        if self.progress_path is not None:
+            _write_run(
+                self.progress_path,
+                {
+                    "run_identity": self.run_identity,
+                    "step": self.step,
+                    "max_steps": self.max_steps,
+                    "eval_every": self.eval_every,
+                    "n_fit_ids": len(self.plan.fit_ids),
+                    "n_val_items": len(self.plan.val_items),
+                    "exception": self.plan.exception,
+                    "device": str(self.device),
+                    "amp_dtype": str(self.amp_dtype).removeprefix("torch.") if self.amp else None,
+                    "timings": self.timings,
+                    "telemetry_tail": self.telemetry[-3:],
+                },
+            )
 
     def checkpoint(self, path: Path) -> None:
         """Atomically save the live training state, including all RNG streams."""
+        started = time.perf_counter()
+        self._sample_peak()
         state = {
             "run_identity": self.run_identity,
             "step": self.step,
@@ -298,6 +416,10 @@ class Trainer:
             "max_steps": self.max_steps,
             "eval_every": self.eval_every,
             "warmup_steps": self.warmup_steps,
+            "timings": self.timings,
+            "telemetry": self.telemetry,
+            "last_eval_step": self._last_eval_step,
+            "last_eval_train_s": self._last_eval_train_s,
         }
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -305,9 +427,19 @@ class Trainer:
             temporary = Path(file.name)
         try:
             torch.save(state, temporary)
+            # The footer includes this write's measured serialization duration.
+            # Footer/rename/progress publication are excluded: a file cannot
+            # contain the duration of its own final publication. torch.load
+            # ignores this member; resume reads it as the authoritative timings.
+            self.timings["checkpoint_s"] += time.perf_counter() - started
+            with ZipFile(temporary, "a") as archive:
+                root = archive.namelist()[0].split("/")[0]
+                archive.writestr(f"{root}/timings.json", json.dumps(self.timings, allow_nan=False))
             os.replace(temporary, path)
         finally:
             temporary.unlink(missing_ok=True)
+        self._write_progress()
+        logger.info("checkpoint: step=%d path=%s", self.step, path)
 
     def resume(self, path: Path) -> None:
         """Restore a checkpoint after fit has constructed optimizer and sampler."""
@@ -332,6 +464,15 @@ class Trainer:
             "warmup_steps",
         ):
             setattr(self, name, state[name])
+        self.timings.update(state.get("timings", {}))
+        with ZipFile(path) as archive:
+            root = archive.namelist()[0].split("/")[0]
+            member = f"{root}/timings.json"
+            if member in archive.namelist():
+                self.timings.update(json.loads(archive.read(member)))
+        self.telemetry = state.get("telemetry", [])
+        self._last_eval_step = state.get("last_eval_step", self.step)
+        self._last_eval_train_s = state.get("last_eval_train_s", self.timings["train_s"])
         # Restore last: model/optimizer/sampler construction must not consume
         # any part of the checkpoint's continuation stream.
         torch.set_rng_state(state["rng"]["torch"])
