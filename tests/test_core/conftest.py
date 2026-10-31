@@ -2,8 +2,11 @@
 
 from dataclasses import replace
 
+import numpy as np
 import pytest
 
+from demand_forecast.core.validation import plan_inner_validation
+from demand_forecast.data.encoders import StaticEncoder
 from demand_forecast.data.frequency import to_offset
 from tests.helpers.panels import weekly_panel
 
@@ -52,3 +55,97 @@ def panel_mixed():
 @pytest.fixture
 def origin_mixed(panel_mixed):
     return panel_mixed.timestamps(0)[-1] + panel_mixed.freq
+
+
+@pytest.fixture
+def panel_long():
+    panel = weekly_panel([80] * 20)
+    return replace(panel, freq=to_offset(panel.freq))
+
+
+@pytest.fixture
+def plan29(panel29, origin29):
+    return plan_inner_validation(panel29, origin29, 13)
+
+
+@pytest.fixture
+def plan8(panel8, origin8):
+    return plan_inner_validation(panel8, origin8, 8)
+
+
+@pytest.fixture
+def plan_long(panel_long):
+    origin = panel_long.timestamps(0)[-1] + panel_long.freq
+    return plan_inner_validation(panel_long, origin, 4)
+
+
+@pytest.fixture
+def plan_cl(panel_constant_long, origin_cl):
+    return plan_inner_validation(panel_constant_long, origin_cl, 4)
+
+
+@pytest.fixture
+def encoder29(panel29, plan29):
+    return StaticEncoder().fit(panel29, plan29.fit_ids)
+
+
+@pytest.fixture
+def encoder8(panel8, plan8):
+    return StaticEncoder().fit(panel8, plan8.fit_ids)
+
+
+@pytest.fixture
+def encoder_long(panel_long, plan_long):
+    return StaticEncoder().fit(panel_long, plan_long.fit_ids)
+
+
+@pytest.fixture
+def encoder_cl(panel_constant_long, plan_cl):
+    return StaticEncoder().fit(panel_constant_long, plan_cl.fit_ids)
+
+
+@pytest.fixture
+def panel_singletons():
+    panel = weekly_panel([1, 1])
+    panel.series[0].target[:] = 5.0
+    panel.series[1].target[:] = 7.0
+    return replace(panel, freq=to_offset(panel.freq))
+
+
+@pytest.fixture
+def plan_singletons(panel_singletons):
+    origin = panel_singletons.series[0].start + panel_singletons.freq
+    return plan_inner_validation(panel_singletons, origin, 4)
+
+
+@pytest.fixture
+def encoder_singletons(panel_singletons, plan_singletons):
+    return StaticEncoder().fit(panel_singletons, plan_singletons.fit_ids)
+
+
+@pytest.fixture
+def panel_all_missing():
+    panel = weekly_panel([8, 8])
+    for series in panel.series:
+        series.target[:] = np.nan
+    return replace(panel, freq=to_offset(panel.freq))
+
+
+@pytest.fixture
+def cutoff_am(panel_all_missing):
+    return panel_all_missing.timestamps(0)[-1]
+
+
+@pytest.fixture
+def origin_am(panel_all_missing, cutoff_am):
+    return cutoff_am + panel_all_missing.freq
+
+
+@pytest.fixture
+def plan_all_missing(panel_all_missing, origin_am):
+    return plan_inner_validation(panel_all_missing, origin_am, 4)
+
+
+@pytest.fixture
+def encoder_all_missing(panel_all_missing, plan_all_missing):
+    return StaticEncoder().fit(panel_all_missing, plan_all_missing.fit_ids)
