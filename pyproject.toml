@@ -16,8 +16,6 @@ dependencies = [
     "tqdm>=4.65",
     "matplotlib>=3.7",
     "torchmetrics>=1.0",
-    "torchtnt>=0.2",
-    "setuptools<81",         # torchtnt imports pkg_resources (removed in setuptools 81+)
     "tsfresh>=0.20",
     "scipy>=1.10",
     "pyyaml>=6.0",

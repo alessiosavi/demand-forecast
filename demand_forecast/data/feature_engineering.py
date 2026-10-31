@@ -1,71 +1,12 @@
 """Feature engineering utilities."""
 
 import logging
-from dataclasses import dataclass, field
 from pathlib import Path
 
-import joblib
 import numpy as np
 import pandas as pd
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class CategoricalEncoder:
-    """Stage-fitted integer vocabularies (unknown=0) and log continuous features."""
-
-    encoders: dict[str, dict[str, int]] = field(default_factory=dict)
-    encoded_columns: list[str] = field(default_factory=list)
-    vocab_sizes: dict[str, int] = field(default_factory=dict)
-    continuous_stats: dict[str, tuple[float, float]] = field(default_factory=dict)
-
-    def fit(self, df, categorical_columns, continuous_columns=()):
-        self.encoders = {}
-        self.encoded_columns = []
-        self.vocab_sizes = {}
-        self.continuous_stats = {}
-        for column in categorical_columns:
-            values = sorted(df[column].dropna().astype(str).unique())
-            self.encoders[column] = {value: i + 1 for i, value in enumerate(values)}
-            encoded = f"encoded_{column}"
-            self.encoded_columns.append(encoded)
-            self.vocab_sizes[encoded] = len(values) + 1
-        for column in continuous_columns:
-            values = self._log_values(df[column])
-            self.continuous_stats[column] = (float(values.mean()), float(values.std()) or 1.0)
-        return self
-
-    @staticmethod
-    def _log_values(values):
-        values = np.asarray(values, dtype=float)
-        if not np.isfinite(values).all() or (values < 0).any():
-            raise ValueError("Continuous static features must be finite and non-negative")
-        return np.log1p(values)
-
-    def fit_transform(self, df, categorical_columns, onehot_columns=None):
-        self.fit(df, categorical_columns)
-        return self.transform(df)
-
-    def transform(self, df):
-        df = df.copy()
-        for column, mapping in self.encoders.items():
-            df[f"encoded_{column}"] = (
-                df[column].astype("string").map(mapping).fillna(0).astype("int64")
-            )
-        for column, (mean, std) in self.continuous_stats.items():
-            df[f"continuous_{column}"] = (self._log_values(df[column]) - mean) / std
-        return df
-
-    def get_encoded_columns(self):
-        return self.encoded_columns
-
-    def save(self, path):
-        joblib.dump(vars(self), path)
-
-    @classmethod
-    def load(cls, path):
-        return cls(**joblib.load(path))
 
 
 def extract_metafeatures(
