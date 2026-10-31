@@ -90,23 +90,100 @@ def test_fit_prepares_validation_once(
     assert len(calls) == 2
 
 
-def test_fit_matches_reference_path(fresh, panel_long, plan_long, encoder_long):
-    from tests.helpers.reference_batch import reference_evaluate
+def test_fit_matches_reference_path(monkeypatch, fresh, panel_long, plan_long, encoder_long):
+    from demand_forecast.data.sampler import WindowSampler
+    from tests.helpers.reference_batch import reference_batches, reference_evaluate
 
     cfg = TrainConfig(base_steps=6, batch_size=8, warmup_steps=2, patience=10, amp=False)
     forecast = ForecastConfig(horizon=4)
     optimized = Trainer(fresh(), cfg, cpu, RUN_ID, SEED).fit(
         panel_long, plan_long, forecast, encoder_long
     )
-    reference = Trainer(fresh(), cfg, cpu, RUN_ID, SEED).fit(
-        panel_long, plan_long, forecast, encoder_long, evaluate_fn=reference_evaluate
-    )
+    with monkeypatch.context() as patch:
+        patch.setattr(WindowSampler, "batches", reference_batches)
+        reference = Trainer(fresh(), cfg, cpu, RUN_ID, SEED).fit(
+            panel_long, plan_long, forecast, encoder_long, evaluate_fn=reference_evaluate
+        )
     np.testing.assert_equal(optimized.history, reference.history)
     assert_state_equal(optimized.best_state, reference.best_state)
     assert (optimized.best_step, optimized.stop_reason) == (
         reference.best_step,
         reference.stop_reason,
     )
+
+
+def test_reference_checkpoint_resumes_on_optimized_path(
+    tmp_path, monkeypatch, fresh, panel_long, plan_long, encoder_long
+):
+    from shutil import copyfile
+
+    from demand_forecast.data.sampler import WindowSampler
+    from tests.helpers.reference_batch import reference_batches, reference_evaluate
+
+    cfg = TrainConfig(base_steps=6, batch_size=8, warmup_steps=2, patience=10, amp=False)
+    forecast = ForecastConfig(horizon=4)
+    reference_dir, optimized_dir = tmp_path / "reference", tmp_path / "optimized"
+    optimized_dir.mkdir()
+    with monkeypatch.context() as patch:
+        patch.setattr(WindowSampler, "batches", reference_batches)
+        interrupted = Trainer(fresh(), cfg, cpu, RUN_ID, SEED).fit(
+            panel_long,
+            plan_long,
+            forecast,
+            encoder_long,
+            checkpoint_dir=reference_dir,
+            stop_after=2,
+            evaluate_fn=reference_evaluate,
+        )
+        assert interrupted.stop_reason == "interrupted"
+        copyfile(reference_dir / "latest.pt", optimized_dir / "latest.pt")
+        reference_trainer = Trainer(fresh(), cfg, cpu, RUN_ID, SEED)
+        reference = reference_trainer.fit(
+            panel_long,
+            plan_long,
+            forecast,
+            encoder_long,
+            checkpoint_dir=reference_dir,
+            resume=True,
+            evaluate_fn=reference_evaluate,
+        )
+    optimized_trainer = Trainer(fresh(), cfg, cpu, RUN_ID, SEED)
+    optimized = optimized_trainer.fit(
+        panel_long,
+        plan_long,
+        forecast,
+        encoder_long,
+        checkpoint_dir=optimized_dir,
+        resume=True,
+    )
+
+    def equal(actual, expected):
+        if isinstance(expected, torch.Tensor):
+            assert torch.equal(actual, expected)
+        elif isinstance(expected, dict):
+            assert actual.keys() == expected.keys()
+            for key in expected:
+                equal(actual[key], expected[key])
+        elif isinstance(expected, (list, tuple)):
+            assert len(actual) == len(expected)
+            for a, b in zip(actual, expected):
+                equal(a, b)
+        else:
+            np.testing.assert_equal(actual, expected)
+
+    for state in ("model", "optimizer", "scheduler", "scaler"):
+        equal(
+            getattr(optimized_trainer, state).state_dict(),
+            getattr(reference_trainer, state).state_dict(),
+        )
+    assert optimized_trainer.sampler.state() == reference_trainer.sampler.state()
+    for field in ("history", "best_state", "best_step", "best_score", "steps", "stop_reason"):
+        equal(getattr(optimized, field), getattr(reference, field))
+    # The saved model is the live optimizer pair; the returned model is best-state.
+    actual = torch.load(optimized_dir / "latest.pt", weights_only=False)
+    expected = torch.load(reference_dir / "latest.pt", weights_only=False)
+    for key in ("model", "optimizer", "scheduler", "scaler", "sampler", "rng", "patience_counter"):
+        equal(actual[key], expected[key])
 
 
 def test_fit_custom_evaluate_fn_keeps_old_call(
