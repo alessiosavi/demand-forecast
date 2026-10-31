@@ -418,3 +418,17 @@ def test_bundle_version_and_off_grid_origin_are_refused(bundle_dir, panel29, ori
     path.write_text(json.dumps(manifest))
     with pytest.raises(ValueError, match="Unsupported bundle version"):
         load_bundle(bundle_dir)
+
+
+def test_predictor_diagnostics_match_arrays(bundle_dir, panel29, origin29):
+    predictor = Predictor.from_bundle(bundle_dir)
+    ids, arrays = predictor.forecast_arrays(panel29, origin29)
+    actual_ids, actual, diagnostics = predictor.forecast_with_diagnostics(
+        panel29, origin29, batch_size=2
+    )
+    assert actual_ids == ids
+    np.testing.assert_allclose(actual, arrays, rtol=1e-5, atol=1e-5)
+    assert diagnostics["n_items"] == len(ids)
+    assert diagnostics["fallback_no_context"] == diagnostics["fallback_undefined_scale"] == 0
+    assert diagnostics["device"] == "cpu"
+    assert diagnostics["inference_time_s"] > 0

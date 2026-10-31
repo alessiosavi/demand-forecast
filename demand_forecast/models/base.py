@@ -145,14 +145,22 @@ class ForecastModel(nn.Module):
         )
         return self.head(hidden)
 
+    def fallback_flags(self, batch: Batch) -> dict[str, Tensor]:
+        """Disjoint item masks used by prediction and its diagnostics."""
+        return {
+            "no_context": ~batch.has_context,
+            "undefined_scale": batch.has_context & ~batch.eligible,
+        }
+
     @torch.no_grad()
     def predict(self, batch: Batch) -> Tensor:
         """Denormalise once, apply context/scale fallbacks, then enforce support."""
         quantiles = self(batch) * batch.scale[:, None, None] + batch.loc[:, None, None]
-        for row in torch.nonzero(batch.has_context & ~batch.eligible, as_tuple=True)[0]:
+        flags = self.fallback_flags(batch)
+        for row in torch.nonzero(flags["undefined_scale"], as_tuple=True)[0]:
             observed = batch.target[row, batch.observed[row]]
             values = observed * batch.scale[row] + batch.loc[row]
             quantiles[row] = torch.quantile(values, values.new_tensor(self.spec.quantiles))
         empty_level = 0.0 if self.spec.target_support == "nonnegative" else self.fallback_level
-        quantiles = torch.where(batch.has_context[:, None, None], quantiles, empty_level)
+        quantiles = torch.where(flags["no_context"][:, None, None], empty_level, quantiles)
         return quantiles.clamp_min(0) if self.spec.target_support == "nonnegative" else quantiles

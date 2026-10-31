@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import math
 import os
 import random
 import time
@@ -26,6 +28,8 @@ from demand_forecast.data.panel import Panel
 from demand_forecast.inference.predictor import Predictor
 from demand_forecast.models.base import ModelSpec
 from demand_forecast.models.registry import build_model
+
+logger = logging.getLogger(__name__)
 
 
 def run_identity(
@@ -50,7 +54,7 @@ def run_identity(
     ).hexdigest()
 
 
-def _device(settings: Settings) -> torch.device:
+def resolve_device(settings: Settings) -> torch.device:
     """Use the requested device, otherwise CUDA when available or CPU."""
     return torch.device(settings.device or ("cuda" if torch.cuda.is_available() else "cpu"))
 
@@ -58,6 +62,17 @@ def _device(settings: Settings) -> torch.device:
 def _check_refit(settings: Settings) -> None:
     if settings.training.refit == "full":
         raise NotImplementedError("refit=full arrives with the phase-4 plan")
+
+
+def _finite_json(value):
+    """Keep strict JSON while representing unavailable diagnostics as null."""
+    if isinstance(value, dict):
+        return {key: _finite_json(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_finite_json(item) for item in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
 
 
 def _write_run(path: Path, report: dict) -> None:
@@ -68,7 +83,7 @@ def _write_run(path: Path, report: dict) -> None:
     ) as stream:
         temporary = Path(stream.name)
         try:
-            stream.write(json.dumps(report, indent=2, allow_nan=False) + "\n")
+            stream.write(json.dumps(_finite_json(report), indent=2, allow_nan=False) + "\n")
             stream.close()
             os.replace(temporary, path)
         finally:
@@ -129,6 +144,12 @@ def train_panel(
     plan = plan_inner_validation(
         panel, origin, settings.forecast.horizon, settings.training.min_train_history
     )
+    logger.info(
+        "plan: train_upto=%s val_origin=%s exception=%s",
+        plan.train_upto,
+        plan.val_origin,
+        plan.exception,
+    )
     encoder = StaticEncoder().fit(panel, plan.fit_ids)
     spec = ModelSpec.from_panel(
         panel, encoder, settings.forecast, settings.model.d_model, settings.model.cat_emb_dim
@@ -136,7 +157,7 @@ def train_panel(
     backbone_kwargs = settings.model.backbone_kwargs()
     model = build_model(settings.model.family, spec, backbone_kwargs)
     cfg = TrainConfig(**settings.training.model_dump(exclude={"refit", "min_train_history"}))
-    device = _device(settings)
+    device = resolve_device(settings)
     trainer = Trainer(model, cfg, device, identity, settings.seed)
     fit_started = time.perf_counter()
     result = trainer.fit(
@@ -164,6 +185,11 @@ def train_panel(
         "task_definition": task_definition,
         "resumed_from_step": resumed_from_step,
         "device": str(device),
+        "resolved_budget": {"max_steps": trainer.max_steps, "eval_every": trainer.eval_every},
+        "n_fit_ids": len(plan.fit_ids),
+        "n_val_items": len(plan.val_items),
+        "amp_dtype": str(trainer.amp_dtype).removeprefix("torch.") if trainer.amp else None,
+        "telemetry": result.telemetry,
         "plan": {
             "train_upto": plan.train_upto.isoformat(),
             "val_origin": plan.val_origin.isoformat(),
@@ -176,10 +202,16 @@ def train_panel(
             "best_step": result.best_step,
             "best_score": result.best_score,
             "stop_reason": result.stop_reason,
+            "nonfinite_losses": result.timings["nonfinite_losses"],
         },
         # Session timings exclude serialization and earlier interrupted sessions.
-        "timings": {"setup_time_s": fit_started - started, "training_time_s": training_time_s},
+        "timings": {
+            "setup_time_s": fit_started - started,
+            "training_time_s": training_time_s,
+            "cumulative": result.timings,
+        },
     }
+    report = _finite_json(report)
     save_bundle(
         bundle_dir,
         model=model,
@@ -259,7 +291,7 @@ def forecast_from_bundle(
     """Load the declared long panel and write bundle forecasts in original units."""
     _require_long(settings)
     panel = load_long(settings.data)
-    predictor = Predictor.from_bundle(bundle_dir, device=_device(settings))
+    predictor = Predictor.from_bundle(bundle_dir, device=resolve_device(settings))
     forecasts = predictor.forecast(panel, pd.Timestamp(origin))
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
