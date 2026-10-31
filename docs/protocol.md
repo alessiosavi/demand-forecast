@@ -168,6 +168,15 @@ item's past is truncated at its own cutoff) and is not an out-of-time test for t
 Shared-origin windows are the special case with one origin. Prompt 00's profile reports
 `distinct_origins_first_window` per task.
 
+**Quick validation of the pipeline, NOT the protocol: scores from this config must never inform a configuration decision.**
+`configs/fev-v2-quick.yaml` caps every task at 300 optimizer steps (`max_steps_cap`),
+evaluates every 50 steps with patience 2 and scores at most 1,024 seeded validation
+items (`val_items_max`). It exists to exercise the pipeline on the seven tasks within
+one free Colab session. Its summaries carry `model_name demand-forecast-v2-quick` and
+a different run identity; its benchmark scores are reported only as a pipeline check
+and must never inform a configuration, early-stopping, tuning or ablation decision.
+The frozen configuration above is unchanged by these fields (both `null`).
+
 ## Persistence and execution evidence
 
 The trainer persists model, optimizer, scheduler, scaler, RNG states, sampler
