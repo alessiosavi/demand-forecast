@@ -1,6 +1,7 @@
 """Offline evidence reports: alignment, exclusions and strict completeness."""
 
 import importlib.util
+import json
 import shutil
 import subprocess
 import sys
@@ -160,6 +161,45 @@ def test_report_two_tasks_and_exclusions(report_run):
         )
         for q, loss in zip(spec.quantile_levels, np.mean(losses, axis=0), strict=True):
             assert float(knot_row[f"pinball_{q}"]) == pytest.approx(loss)
+
+
+@pytest.mark.parametrize("legacy", ["none", "first", "all"])
+def test_report_optional_validation_columns_and_legacy_runs(report_run, legacy):
+    specs, out, _, _ = report_run
+    for spec in specs:
+        path = out / spec.name / "run.json"
+        report = json.loads(path.read_text())
+        if legacy in ("all", spec.name):
+            report.pop("val_items_max", None)
+            report.pop("n_val_items_eligible", None)
+        else:
+            report["val_items_max"] = 2
+            report["n_val_items_eligible"] = 6
+        path.write_text(json.dumps(report))
+    rendered, issues = report_module().build_report(out, specs)
+    assert not issues
+    for row in table(rendered, "Training"):
+        if legacy == "all":
+            assert "val_items_max" not in row and "n_val_items_eligible" not in row
+        elif row["task"] == legacy:
+            assert row["val_items_max"] == row["n_val_items_eligible"] == "unknown"
+        else:
+            assert row["val_items_max"] == "2" and row["n_val_items_eligible"] == "6"
+
+
+def test_report_quick_model_name_and_validation_counts(report_run):
+    specs, out, _, _ = report_run
+    settings = tiny_settings(base_steps=10, d_model=8)
+    settings.training.max_steps_cap = 7
+    settings.training.val_items_max = 2
+    run_fev(specs, settings, out, model_name="demand-forecast-v2-quick")
+    process, rendered = invoke_report(report_run, "--model-name", "demand-forecast-v2-quick")
+    assert process.returncode == 0, process.stdout + process.stderr
+    for row in table(rendered, "Training"):
+        report = json.loads((out / row["task"] / "run.json").read_text())
+        assert row["val_items_max"] == row["n_val_items"] == "2"
+        assert int(row["n_val_items_eligible"]) == report["n_val_items_eligible"] > 2
+        assert row["max_steps"] == "7"
 
 
 def test_report_reordered_npz_ids_still_align(report_run):

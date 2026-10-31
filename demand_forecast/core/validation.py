@@ -1,6 +1,6 @@
 """Select an inner-validation split, or use all past for short histories."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 import pandas as pd
@@ -19,6 +19,14 @@ class ValidationPlan:
     val_items: np.ndarray
     exception: bool
     fit_ids: list[str]
+
+
+def subsample_validation(plan: ValidationPlan, max_items: int | None, seed: int) -> ValidationPlan:
+    """Limit validation items deterministically without changing the training split."""
+    if max_items is None or len(plan.val_items) <= max_items:
+        return plan
+    items = np.random.default_rng(seed).choice(plan.val_items, size=max_items, replace=False)
+    return replace(plan, val_items=np.sort(items))
 
 
 def plan_inner_validation(
