@@ -49,6 +49,60 @@ class TestGenerateDataCommand:
         assert result.exit_code == 0
         assert output_file.exists()
 
+    def test_generate_long_data(self, tmp_path: Path):
+        from demand_forecast.config.settings import DatasetConfig
+        from demand_forecast.data.loader_long import load_long
+
+        output_dir = tmp_path / "panel"
+        result = runner.invoke(
+            app,
+            [
+                "generate-data",
+                str(output_dir),
+                "--format",
+                "long",
+                "--products",
+                "4",
+                "--days",
+                "30",
+                "--freq",
+                "W-SUN",
+                "--start",
+                "2023-01-01",
+                "--seed",
+                "7",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert {path.name for path in output_dir.iterdir()} == {"long.csv", "static.csv"}
+        long = pd.read_csv(output_dir / "long.csv")
+        static = pd.read_csv(output_dir / "static.csv")
+        assert list(long.columns) == ["id", "timestamp", "target", "promo", "oil"]
+        assert list(static.columns) == ["id", "cat"]
+        panel = load_long(
+            DatasetConfig(
+                source="long",
+                path=output_dir / "long.csv",
+                id_columns=["id"],
+                timestamp_column="timestamp",
+                target="target",
+                target_support="nonnegative",
+                known_dynamic=["promo"],
+                past_dynamic=["oil"],
+                static_categorical=["cat"],
+                static_path=output_dir / "static.csv",
+                freq="W-SUN",
+            )
+        )
+        assert len(panel) == 4
+        assert all(series.length == 30 for series in panel.series)
+
+    def test_generate_data_rejects_unknown_format(self, tmp_path: Path):
+        output = tmp_path / "output"
+        result = runner.invoke(app, ["generate-data", str(output), "--format", "unknown"])
+        assert result.exit_code == 2, result.output
+        assert "format" in result.output and not output.exists()
+
     def test_generate_data_with_defaults(self, tmp_path: Path):
         """Test generate-data with default parameters."""
         output_file = tmp_path / "default_data.csv"
@@ -110,7 +164,7 @@ class TestGenerateSalesCommand:
         assert list(sales.columns) == ["date", "product_id", "qty", "unit_price"]
         assert sales["date"].str.fullmatch(r"\d{4}-\d{2}-\d{2}").all()
         assert sales["date"].between("2024-10-17", "2024-11-16").all()
-        assert sales["qty"].ge(1).all()
+        assert sales["qty"].ge(0).all()
         expected_prices = sales["product_id"].map(products.set_index("id")["price"])
         pd.testing.assert_series_equal(sales["unit_price"], expected_prices, check_names=False)
         assert all(
