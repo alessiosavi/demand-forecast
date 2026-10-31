@@ -24,6 +24,7 @@ PROFILE_COLUMNS = [
     "zero_scale_items",
     "eligible_items_first_window",
     "static_nan_share",
+    "distinct_origins_first_window",
 ]
 
 
@@ -40,7 +41,7 @@ def _seasonal_scale(target: np.ndarray, seasonality: int) -> float:
 
 
 def profile_task(spec: FevTaskSpec) -> dict[str, int | float]:
-    """Describe full histories and count scale-eligible items in fev's first window.
+    """Describe full histories, scale eligibility and first-window origin diversity.
 
     Target shares include missing values in their denominator. Scale calculations
     omit missing lag pairs; multivariate targets pool pairs within each item.
@@ -67,8 +68,9 @@ def profile_task(spec: FevTaskSpec) -> dict[str, int | float]:
         static_missing += sum(bool(pd.isna(row[column])) for column in task.static_columns)
 
     eligible = 0
+    distinct_origins = 0
     try:
-        past, _ = task.get_window(0).get_input_data()
+        past, future = task.get_window(0).get_input_data()
     except ValueError as exc:
         # fev rejects an entirely empty window instead of returning an empty
         # dataset. It still has a meaningful diagnostic count of zero.
@@ -78,6 +80,12 @@ def profile_task(spec: FevTaskSpec) -> dict[str, int | float]:
         ):
             raise
     else:
+        distinct_origins = len(
+            {
+                pd.Timestamp(row[task.timestamp_column][0])
+                for row in future.select_columns([task.timestamp_column]).with_format(None)
+            }
+        )
         for row in past.select_columns(task.target_columns).with_format(None):
             target = _targets(row, task.target_columns)
             scale = _seasonal_scale(target, task.seasonality)
@@ -98,6 +106,7 @@ def profile_task(spec: FevTaskSpec) -> dict[str, int | float]:
         "zero_scale_items": zero_scale,
         "eligible_items_first_window": eligible,
         "static_nan_share": static_missing / static_total if static_total else 0.0,
+        "distinct_origins_first_window": distinct_origins,
     }
 
 
