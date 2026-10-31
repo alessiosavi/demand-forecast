@@ -432,3 +432,63 @@ def test_predictor_diagnostics_match_arrays(bundle_dir, panel29, origin29):
     assert diagnostics["fallback_no_context"] == diagnostics["fallback_undefined_scale"] == 0
     assert diagnostics["device"] == "cpu"
     assert diagnostics["inference_time_s"] > 0
+
+
+@pytest.fixture
+def bundle_and_panel(bundle_dir, panel29, origin29):
+    return Predictor.from_bundle(bundle_dir), panel29, origin29
+
+
+def test_forecast_per_item_origins_matches_single_origin_when_shared(bundle_and_panel):
+    predictor, panel, origin = bundle_and_panel
+    ids, arrays, diag = predictor.forecast_with_diagnostics(panel, origin)
+    ids2, arrays2, diag2 = predictor.forecast_per_item_origins(panel, {key: origin for key in ids})
+    assert ids2 == ids
+    np.testing.assert_array_equal(arrays2, arrays)
+    for key in ("n_items", "fallback_no_context", "fallback_undefined_scale", "device"):
+        assert diag2[key] == diag[key]
+    assert diag2["n_origins"] == 1 and diag2["inference_time_s"] > 0
+
+
+def test_forecast_per_item_origins_rejects_missing_origin(bundle_and_panel):
+    predictor, panel, origin = bundle_and_panel
+    with pytest.raises(ValueError, match="^missing origin for item a$"):
+        predictor.forecast_per_item_origins(panel, {})
+    with pytest.raises(ValueError, match="^missing origin for item c$"):
+        predictor.forecast_per_item_origins(panel, {"a": origin, "b": origin})
+
+
+def test_forecast_per_item_origins_preserves_order_and_sums_fallbacks(
+    bundle_and_panel, monkeypatch
+):
+    predictor, panel, origin = bundle_and_panel
+    panel.series[0].target[:] = np.nan
+    panel.series[1].target[:] = 6.0
+    origins = {"a": origin + panel.freq, "b": origin, "c": origin + panel.freq}
+    forecast = predictor.forecast_with_diagnostics
+    expected = {}
+    totals = {"n_items": 0, "fallback_no_context": 0, "fallback_undefined_scale": 0}
+    for group_origin in (origin + panel.freq, origin):
+        group = replace(
+            panel, series=[s for s in panel.series if origins[s.series_id] == group_origin]
+        )
+        ids, arrays, diag = forecast(group, group_origin, batch_size=1)
+        expected.update(zip(ids, arrays))
+        for key in totals:
+            totals[key] += diag[key]
+    seen = []
+
+    def capture(group, group_origin, batch_size=512):
+        seen.append((group_origin, [s.series_id for s in group.series], batch_size))
+        ids, arrays, diag = forecast(group, group_origin, batch_size)
+        return ids[::-1], arrays[::-1], diag
+
+    monkeypatch.setattr(predictor, "forecast_with_diagnostics", capture)
+    ids, arrays, diag = predictor.forecast_per_item_origins(panel, origins, batch_size=1)
+    assert ids == ["a", "b", "c"]
+    np.testing.assert_array_equal(arrays, np.stack([expected[key] for key in ids]))
+    assert seen == [(origin + panel.freq, ["a", "c"], 1), (origin, ["b"], 1)]
+    assert {key: diag[key] for key in totals} == totals
+    assert totals == {"n_items": 3, "fallback_no_context": 1, "fallback_undefined_scale": 1}
+    assert diag["n_origins"] == 2 and diag["device"] == "cpu"
+    assert diag["inference_time_s"] > 0

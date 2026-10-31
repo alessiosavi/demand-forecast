@@ -3,7 +3,7 @@
 import json
 import logging
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Literal
@@ -49,12 +49,26 @@ def settings_for_task(spec: FevTaskSpec, base: Settings, freq: str) -> Settings:
     return settings
 
 
-def window_origin(future_data, timestamp_column: str = "timestamp") -> pd.Timestamp:
-    """Require a shared first future timestamp across all items in a window."""
-    origins = {pd.Timestamp(row[timestamp_column][0]) for row in future_data}
-    if len(origins) != 1:
-        raise ValueError("windows with item-specific origins are not supported")
-    return origins.pop()
+def window_origins(
+    future_data, id_column: str, timestamp_column: str = "timestamp"
+) -> dict[str, pd.Timestamp]:
+    """Read each item's first future timestamp, rejecting empty or duplicate rows."""
+    origins = {}
+    for row in future_data:
+        key = str(row[id_column])
+        if key in origins:
+            raise ValueError("duplicate future series id")
+        if len(row[timestamp_column]) == 0:
+            raise ValueError(f"empty future rows for item {key}")
+        origins[key] = pd.Timestamp(row[timestamp_column][0])
+    return origins
+
+
+def resolved_origin(origins: Mapping[str, pd.Timestamp]) -> pd.Timestamp:
+    """Use the latest item origin for window identity, validation and training."""
+    if not origins:
+        raise ValueError("window has no items")
+    return max(origins.values())
 
 
 def predictions_for_fev(
@@ -130,6 +144,12 @@ def run_fev(
     Resume validates saved identities and computes only missing artifacts.
     Timings come from persisted trainer and prediction measurements, including
     earlier sessions. Fully verified completed tasks retain their summary row.
+
+    Early-ending items are forecast for calendar periods that other items'
+    available past (and selection labels) already cover. No item's own future
+    is used: fev truncates each item at its own cutoff and the loader reads only
+    known covariates from future rows. This equals the information set fev gives
+    every model and is not an out-of-time test for those items.
     """
     from demand_forecast import __version__
     from demand_forecast.core.run import resolve_device, run_identity, train_panel
@@ -157,6 +177,7 @@ def run_fev(
         task_dir = out_dir / spec.name
         predictions = []
         diagnostics_per_window = []
+        max_distinct_origins = 0
         skipped = False
         for index, window in enumerate(task.iter_windows()):
             past, future = window.get_input_data()
@@ -169,7 +190,19 @@ def run_fev(
                 len(panel.series),
                 time.perf_counter() - started,
             )
-            origin = window_origin(future, spec.timestamp_column)
+            origins = window_origins(future, spec.id_column, spec.timestamp_column)
+            origin = resolved_origin(origins)
+            earliest = min(origins.values())
+            n_origins = len(set(origins.values()))
+            max_distinct_origins = max(max_distinct_origins, n_origins)
+            logger.info(
+                "origins: task=%s window=%d distinct=%d earliest=%s latest=%s",
+                spec.name,
+                index,
+                n_origins,
+                earliest,
+                origin,
+            )
             if index == 0:
                 identity = run_identity(
                     task_settings, task_settings.seed, fp, __version__, origin, definition
@@ -190,6 +223,7 @@ def run_fev(
                     task_definition=definition,
                     resume=resume,
                     stop_after=stop_after,
+                    earliest_origin=earliest,
                 )
                 report = json.loads((task_dir / "run.json").read_text(encoding="utf-8"))
                 cumulative = report["timings"].get("cumulative", {})
@@ -229,7 +263,7 @@ def run_fev(
                 predictor = Predictor.from_bundle(
                     task_dir / "bundle", device=resolve_device(settings)
                 )
-                ids, arrays, diagnostics = predictor.forecast_with_diagnostics(panel, origin)
+                ids, arrays, diagnostics = predictor.forecast_per_item_origins(panel, origins)
                 _save_predictions(prediction_path, ids, arrays, identity, diagnostics)
             diagnostics_per_window.append(diagnostics)
             predictions.append(
@@ -256,6 +290,7 @@ def run_fev(
                 inference_time_s=diagnostic_sum("inference_time_s"),
                 extra_info={
                     "run_identity": identity,
+                    "max_distinct_origins": max_distinct_origins,
                     "fallback_no_context": diagnostic_sum("fallback_no_context"),
                     "fallback_undefined_scale": diagnostic_sum("fallback_undefined_scale"),
                     "inference_device": ",".join(sorted(devices))

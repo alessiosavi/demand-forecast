@@ -100,17 +100,25 @@ def train_panel(
     task_definition: dict | None = None,
     resume: bool = False,
     stop_after: int | None = None,
+    earliest_origin: pd.Timestamp | None = None,
 ) -> Path:
     """Fit the permitted history, checkpoint interruptions and save the selected model.
 
     Resume checks every existing run/checkpoint/bundle identity, even when a
     completed bundle is reusable. The report is also retained in the manifest
     so an interruption between bundle and report writes needs no retraining.
+    ``earliest_origin`` defaults to ``origin`` and sets the bundle's global
+    permissible forecast floor, not a guarantee about any individual item's past.
     """
     _check_refit(settings)
     started = time.perf_counter()
     origin, out_dir = pd.Timestamp(origin), Path(out_dir)
     validate_on_grid(pd.DatetimeIndex([origin]), panel.freq, "training origin")
+    explicit_earliest_origin = earliest_origin is not None
+    earliest_origin = origin if earliest_origin is None else pd.Timestamp(earliest_origin)
+    validate_on_grid(pd.DatetimeIndex([origin, earliest_origin]), panel.freq, "earliest_origin")
+    if earliest_origin > origin:
+        raise ValueError("earliest_origin after origin")
     for series in panel.series:
         validate_on_grid(pd.DatetimeIndex([series.start, origin]), panel.freq, series.series_id)
     identity = run_identity(
@@ -134,6 +142,10 @@ def train_panel(
                     raise ValueError("run identity mismatch")
         if (bundle_dir / "manifest.json").exists():
             bundle = load_bundle(bundle_dir)
+            if explicit_earliest_origin and earliest_origin != pd.Timestamp(
+                bundle.panel_metadata["earliest_origin"]
+            ):
+                raise ValueError("bundle earliest_origin mismatch")
             if not report_path.exists():
                 _write_run(report_path, bundle.manifest["run"])
             return bundle_dir
@@ -182,6 +194,7 @@ def train_panel(
         "dataset_fingerprint": dataset_fingerprint,
         "package_version": __version__,
         "origin": origin.isoformat(),
+        "earliest_origin": earliest_origin.isoformat(),
         "task_definition": task_definition,
         "resumed_from_step": resumed_from_step,
         "device": str(device),
@@ -222,7 +235,7 @@ def train_panel(
         encoder=encoder,
         panel=panel,
         training_cutoff=plan.train_upto,
-        earliest_origin=origin,
+        earliest_origin=earliest_origin,
         manifest={
             "run_identity": identity,
             "seed": settings.seed,
