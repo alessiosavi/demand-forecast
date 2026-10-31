@@ -27,6 +27,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+bench = [
+    "fev==0.10.0",
+    "datasets<5",
+    "statsforecast==2.0.1",
+    "pyarrow<26",             # PyArrow 26 requires NumPy 2; keep compatible with numpy<2
+]
 dev = [
     "pytest>=7.4",
     "pytest-cov>=4.1",
@@ -70,6 +76,11 @@ target-version = "py310"
 select = ["E", "F", "I", "N", "W", "UP"]
 ignore = ["E501"]
 
+[tool.ruff.format]
+# Implementation plans contain illustrative snippets, not executable Python.
+exclude = ["docs/superpowers/plans/*.md"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-v --cov=demand_forecast --cov-report=term-missing"
+markers = ["bench: needs the bench extra"]

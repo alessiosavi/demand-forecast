@@ -79,10 +79,23 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev]"
+          pip install -e ".[dev,bench]"
 
-      - name: Run tests
+      - name: Check lint and formatting
+        run: |
+          ruff check .
+          ruff format --check .
+
+      - name: Run tests with bench
         run: python -m pytest -q --no-cov
+
+      - name: Install dev-only dependencies in a fresh venv
+        run: |
+          python -m venv "$RUNNER_TEMP/dfc-devonly"
+          "$RUNNER_TEMP/dfc-devonly/bin/python" -m pip install -e ".[dev]"
+
+      - name: Run tests without bench
+        run: '"$RUNNER_TEMP/dfc-devonly/bin/python" -m pytest -q --no-cov'
 
       # - name: Upload coverage to Codecov
       #   if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
