@@ -171,8 +171,8 @@ def generate_product_sales(
         )
     ]
     logger.info("Season profiles (products): %s", dict(Counter(profiles)))
-    day_of_year = dates.dayofyear.to_numpy()
-    weekday = np.where(dates.dayofweek < 4, 0.9, 1.25) / ((4 * 0.9 + 3 * 1.25) / 7)
+    day_of_year = dates.day_of_year.to_numpy()
+    weekday = np.where(dates.day_of_week < 4, 0.9, 1.25) / ((4 * 0.9 + 3 * 1.25) / 7)
     columns: dict[str, list[np.ndarray]] = {
         name: [] for name in ("date", "product_id", "qty", "unit_price")
     }
