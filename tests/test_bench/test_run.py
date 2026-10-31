@@ -32,7 +32,7 @@ def test_run_baseline_on_fixture_is_resumable(tmp_path, monkeypatch):
     assert {"skill_score_lower", "skill_score_upper"} <= set(board.columns)
 
 
-def test_run_persists_each_completed_task_and_preserves_other_models(tmp_path, monkeypatch):
+def test_run_persists_each_completed_task_and_preserves_other_models(tmp_path, monkeypatch, capsys):
     first_spec = fixture_spec(write_fev_fixture(tmp_path / "first"), name="first")
     second_spec = fixture_spec(write_fev_fixture(tmp_path / "second"), name="second")
     real_to_task = type(first_spec).to_task
@@ -46,12 +46,17 @@ def test_run_persists_each_completed_task_and_preserves_other_models(tmp_path, m
     out = tmp_path / "out"
     with pytest.raises(RuntimeError, match="interrupted"):
         run_baseline([first_spec, second_spec], out)
+    assert "Skipping completed task" not in capsys.readouterr().out
     saved = pd.read_csv(out / "summaries.csv", float_precision="round_trip")
     assert saved["task"].tolist() == ["first"]
     other_model = saved.assign(task="second", model_name="other")
     pd.concat([saved, other_model]).to_csv(out / "summaries.csv", index=False)
     monkeypatch.setattr(type(first_spec), "to_task", real_to_task)
     resumed = run_baseline([first_spec, second_spec, second_spec], out)
+    assert capsys.readouterr().out.splitlines() == [
+        "Skipping completed task first",
+        "Skipping completed task second",
+    ]
     assert list(zip(resumed["task"], resumed["model_name"], strict=True)) == [
         ("first", "seasonal_naive"),
         ("second", "other"),

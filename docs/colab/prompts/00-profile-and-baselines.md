@@ -1,7 +1,7 @@
 # Prompt 00 — profile the seven weekly tasks and run seasonal naive
 
-Paste the following instructions into the Claude agent in VS Code with the Colab
-extension. Fill `<SHA>` with a full public commit SHA containing Task 4. This prepares
+Paste the following instructions into a Claude session that can drive Colab
+(see `docs/colab.md`). Fill `<SHA>` with a full public commit SHA containing these fixes. This prepares
 the phase-5 real-data profiling/baseline session; it does not authorize a v2 run.
 
 ---
@@ -13,26 +13,46 @@ Colab free-tier kernel**, using the public repository
 measured results in the report format below, with a durable copy of the notebook and
 artifacts on Google Drive. Never run the seven tasks on my local machine.
 
-1. Confirm the notebook uses a hosted Colab kernel, Python ≥3.10, and `/content`.
+1. Build the notebook locally, upload it through Colab's **Upload notebook** dialog
+   at `colab.research.google.com` using Claude in Chrome, and run/read its cells there.
+   The VS Code Colab extension cannot execute cells from the agent. Ask the user to
+   click runtime changes: **Runtime > Change runtime type > T4 GPU**, Runtime version
+   **2026.07** (Python 3.12.13). The default image uses Python 3.13 since 2026-09-16;
+   `statsforecast==2.0.1` has no Python 3.13 wheel, so keep 2026.07 while pinned.
+   Confirm a hosted kernel and `/content`; assert `sys.version_info[:2] == (3, 12)`.
    Preflight GPU model/VRAM with `nvidia-smi`, host RAM and available disk/Drive space.
    Target a free T4 if assigned; record the actual device. CPU Colab is acceptable
    for these profiling/baseline commands. Assume the session can disconnect at any
    point; do not require a paid tier or promise uninterrupted runtime.
-2. Mount Drive at `/content/drive`. Use
+2. Mount Drive at `/content/drive`; the user must click the mount consent popup
+   (otherwise "mount failed" appears after about two minutes). Use
    `/content/drive/MyDrive/demand-forecast/runs/00-profile-and-baselines-<SHA>` as
    `FEV_RUN_DIR`, and `/content/drive/MyDrive/demand-forecast` as `FEV_DRIVE_ROOT`.
    Set `FEV_SHA` to the filled-in SHA and `FEV_SESSION` to a UTC session timestamp.
    Set these in the notebook's `os.environ` so shell cells inherit them. Set
    `HF_HOME=$FEV_DRIVE_ROOT/hf`, `HF_HUB_CACHE=$HF_HOME/hub` and
    `HF_DATASETS_CACHE=$HF_HOME/datasets` before importing fev or datasets. Keep the
-   cache on Drive across sessions. Use the default pinned task sources.
+   Hub cache on Drive across sessions. This account had about 0.7 GiB free after
+   the cache (Hub 43 MB, datasets 427 MB); remeasure and record both cache paths.
+   When space is tight, `HF_DATASETS_CACHE` may use `/content/hf-datasets`, which
+   is regenerable. Use the default pinned task sources.
 3. In `/content`, run `git clone https://github.com/alessiosavi/demand-forecast` if
    absent, enter `/content/demand-forecast`, then `git checkout <SHA>`. Verify the full
    `git rev-parse HEAD` equals the supplied SHA. Check for unexpected local changes
    before reusing a clone. Run `python -m pip install -e ".[bench]"`; retain the pinned
-   fev/statsforecast versions and the numpy constraint. Save `pip freeze`, install
-   logs, commit, protocol and the task/profile YAMLs to Drive. Restart the kernel and
-   rerun setup if an already imported numerical package changed during installation.
+   fev/statsforecast versions, `datasets<5` and `pyarrow<26`; do not downgrade NumPy.
+   Runtime 2026.07 has numpy 2.0.2, pandas 2.2.2, pyarrow 18.1.0, datasets 4.0.0 and
+   torch 2.11.0+cu128, which satisfy the revised requirements and remain installed.
+   Save `pip freeze`, install logs, commit, protocol and the task/profile YAMLs to Drive.
+   If the install log replaces numpy, pandas, pyarrow or torch, do ONE
+   **Runtime > Restart session and run all** before any other cell. Always include
+   the template's restart-check cell comparing `importlib.metadata.version(name)`
+   with imported `__version__` for numpy and torch; it only raises on mismatch.
+   Equality detects stale imports, not ABI compatibility. Then run
+   `python scripts/pip_check_closure.py --extras bench --report "$FEV_RUN_DIR/pip-check-$FEV_SESSION.txt"`.
+   Dependency complaints fail only if the declaring package is reachable from
+   `demand-forecast[bench]`; record other preinstalled packages' complaints without
+   upgrading them. Pip execution errors and import/execution failures remain fatal.
    Use the template's post-install torch preflight and per-session metadata cell.
 4. Check these actual interfaces before starting downloads:
 
@@ -86,7 +106,8 @@ directory if any input or code changes; task-level resume does not validate iden
    task-level recovery evidence, not neural-checkpoint recovery.
 7. Verify `profile.csv` and `summaries.csv` are readable in the Drive run folder.
    Copy back any locally written logs, metadata, timing/RSS evidence and leaderboard;
-   export/save the executed `.ipynb` there too. Preserve the HF cache on Drive. Record
+   copy/export the executed `.ipynb` from Colab's `Colab Notebooks/` there too.
+   Preserve the HF Hub cache on Drive; a datasets cache under `/content` is regenerable. Record
    dataset revisions from cache metadata if available, or label them unverified;
    keep fev's fingerprints from `summaries.csv`. Compare published baselines only if
    task definitions, fingerprints, forecast counts and implementation match, with a
@@ -114,7 +135,8 @@ Drive artifacts verified: profile.csv, summaries.csv, leaderboard, logs, metadat
 Warnings/failures and exact next-session commands if anything remains:
 ```
 
-Stop after profiling and seasonal-naive evaluation. Do not invoke the legacy training
-path, tune models, select a lookback from benchmark scores or download Timestral
-weights. `fev run --resume` belongs to a later implementation and a separate reviewed
-phase-5 model prompt. No model bundle is expected from this prompt.
+Stop after profiling and seasonal-naive evaluation. Do not train, tune models, select
+a lookback from benchmark scores or download Timestral weights. `train` and
+`fev run --resume` are implemented since PR #23, but training needs a separate reviewed
+phase-5 model prompt and authorization, with a dependency lock, interruption/resume
+trial and memory check before the frozen run. No model bundle is expected from this prompt.
