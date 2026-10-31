@@ -10,7 +10,7 @@ import torch
 from demand_forecast.data.encoders import StaticEncoder
 from demand_forecast.data.frequency import steps_between
 from demand_forecast.data.panel import Panel
-from demand_forecast.data.sampler import Batch, align_to_origin, make_batch
+from demand_forecast.data.sampler import Batch, BatchBuilder, align_to_origin
 from demand_forecast.metrics import summarize
 from demand_forecast.models.base import ForecastModel
 
@@ -56,6 +56,7 @@ def prepare_validation(
     y_true = np.full((len(positions), horizon), np.nan, dtype=np.float64)
     y_past = []
     batch_panel = align_to_origin(panel, positions)
+    builder = BatchBuilder(batch_panel, horizon, max_context, encoder)
     for row, (i, pos) in enumerate(positions):
         series = panel.series[i]
         target = series.target[: series.history_length]
@@ -64,9 +65,7 @@ def prepare_validation(
         y_past.append(target[:pos].copy())
 
     batches = tuple(
-        make_batch(
-            batch_panel, positions[start : start + batch_size], horizon, max_context, encoder
-        )
+        builder.build(positions[start : start + batch_size])
         for start in range(0, len(positions), batch_size)
     )
     return PreparedValidation(batches, y_true, tuple(y_past), panel.seasonal_period)

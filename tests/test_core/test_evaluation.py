@@ -93,3 +93,33 @@ def test_evaluate_prepared_restores_training_after_failure(validation_case, monk
     with pytest.raises(RuntimeError, match="prediction failed"):
         evaluation.evaluate_prepared(model, prepared, quantiles)
     assert model.training
+
+
+def test_preparation_reuses_builder_across_chunks_matches_reference(validation_case, monkeypatch):
+    from demand_forecast.data.sampler import BatchBuilder
+    from tests.helpers.reference_batch import reference_align_to_origin, reference_make_batch
+
+    model, quantiles, args = validation_case
+    panel, _, origin, horizon, context, encoder = args
+    items = np.tile([2, 0, 1], 171)
+    calls = []
+    original = BatchBuilder.__init__
+
+    def capture(self, *args, **kwargs):
+        calls.append(self)
+        original(self, *args, **kwargs)
+
+    monkeypatch.setattr(BatchBuilder, "__init__", capture)
+    prepared = evaluation.prepare_validation(panel, items, origin, horizon, context, encoder)
+    assert len(calls) == 1
+    positions = [(int(i), 6) for i in items]
+    aligned = reference_align_to_origin(panel, positions)
+    for start, batch in zip(range(0, len(items), 512), prepared.batches, strict=True):
+        assert_batches_equal(
+            batch,
+            reference_make_batch(
+                aligned, positions[start : start + 512], horizon, context, encoder
+            ),
+        )
+    expected = reference_evaluate(model, panel, items, origin, horizon, context, encoder, quantiles)
+    np.testing.assert_equal(evaluation.evaluate_prepared(model, prepared, quantiles), expected)
