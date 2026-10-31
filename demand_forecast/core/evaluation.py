@@ -1,7 +1,6 @@
 """Evaluate quantile forecasts in original units against complete past histories."""
 
 from collections.abc import Sequence
-from dataclasses import replace
 
 import numpy as np
 import pandas as pd
@@ -10,7 +9,7 @@ import torch
 from demand_forecast.data.encoders import StaticEncoder
 from demand_forecast.data.frequency import steps_between
 from demand_forecast.data.panel import Panel
-from demand_forecast.data.sampler import make_batch
+from demand_forecast.data.sampler import align_to_origin, make_batch
 from demand_forecast.metrics import summarize
 from demand_forecast.models.base import ForecastModel
 
@@ -37,22 +36,13 @@ def evaluate(
     y_true = np.full((len(positions), horizon), np.nan, dtype=np.float64)
     q_pred = np.empty((len(positions), horizon, len(quantiles)), dtype=np.float64)
     y_past = []
-    batch_panel = panel
+    batch_panel = align_to_origin(panel, positions)
     for row, (i, pos) in enumerate(positions):
         series = panel.series[i]
         target = series.target[: series.history_length]
         labels = target[pos : pos + horizon]
         y_true[row, : len(labels)] = labels
         y_past.append(target[:pos])
-        if pos > series.history_length:
-            # make_batch requires an origin within history. Represent a ragged
-            # item's gap to the common origin as missing past, without changing
-            # the caller's panel or inventing observations for metric scaling.
-            if batch_panel is panel:
-                batch_panel = replace(panel, series=list(panel.series))
-            extended = np.full(pos, np.nan, dtype=np.float64)
-            extended[: len(target)] = target
-            batch_panel.series[i] = replace(series, target=extended, history_length=pos)
 
     device = model.fallback_level.device
     model.eval()

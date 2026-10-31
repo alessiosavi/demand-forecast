@@ -1,13 +1,18 @@
 """Small panels and forecast origins for the new core training path."""
 
-from dataclasses import replace
+from dataclasses import asdict, replace
 
 import numpy as np
 import pytest
+import torch
 
+from demand_forecast.config.settings import ForecastConfig
+from demand_forecast.core.training import TrainConfig, Trainer
 from demand_forecast.core.validation import plan_inner_validation
 from demand_forecast.data.encoders import StaticEncoder
 from demand_forecast.data.frequency import to_offset
+from demand_forecast.models.base import ModelSpec
+from tests.helpers.models import build_v2
 from tests.helpers.panels import weekly_panel
 
 
@@ -149,3 +154,50 @@ def plan_all_missing(panel_all_missing, origin_am):
 @pytest.fixture
 def encoder_all_missing(panel_all_missing, plan_all_missing):
     return StaticEncoder().fit(panel_all_missing, plan_all_missing.fit_ids)
+
+
+@pytest.fixture
+def forecast29():
+    return ForecastConfig(horizon=13, max_context=64)
+
+
+@pytest.fixture
+def spec29(panel29, encoder29, forecast29):
+    return ModelSpec.from_panel(panel29, encoder29, forecast29, 16, 4)
+
+
+@pytest.fixture
+def cutoff29(plan29):
+    return plan29.train_upto
+
+
+@pytest.fixture
+def tiny_v2_trained(spec29, panel29, plan29, forecast29, encoder29):
+    torch.manual_seed(3)
+    model = build_v2(spec29)
+    result = Trainer(
+        model, TrainConfig(base_steps=30, batch_size=4, amp=False), "cpu", "test-run", 3
+    ).fit(panel29, plan29, forecast29, encoder29)
+    assert result.steps == 30
+    return model
+
+
+@pytest.fixture
+def bundle_dir(tmp_path, tiny_v2_trained, forecast29, encoder29, panel29, cutoff29, origin29):
+    from demand_forecast.core.bundle import save_bundle
+
+    directory = tmp_path / "bundle"
+    save_bundle(
+        directory,
+        model=tiny_v2_trained,
+        family="v2",
+        backbone_kwargs=asdict(tiny_v2_trained.backbone.cfg),
+        forecast_cfg=forecast29,
+        dataset_cfg=None,
+        encoder=encoder29,
+        panel=panel29,
+        training_cutoff=cutoff29,
+        earliest_origin=origin29,
+        manifest={"seed": 3, "run_identity": "test-run"},
+    )
+    return directory
