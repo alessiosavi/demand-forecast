@@ -466,18 +466,49 @@ def generate_sales(
 
 @app.command("generate-data")
 def generate_data(
-    output: Path = typer.Argument(..., help="Output CSV path"),
-    num_days: int = typer.Option(365 * 4, "--days", help="Number of days to generate"),
-    num_products: int = typer.Option(100, "--products", help="Number of products"),
-    num_stores: int = typer.Option(20, "--stores", help="Number of stores"),
+    output: Path = typer.Argument(..., help="Output CSV path, or directory for long format"),
+    num_days: int = typer.Option(
+        365 * 4, "--days", help="Number of days (grid steps in long format)"
+    ),
+    num_products: int = typer.Option(
+        100, "--products", help="Number of products (series in long format)"
+    ),
+    num_stores: int = typer.Option(20, "--stores", help="Number of stores (sales format only)"),
     seed: int = typer.Option(42, "--seed", help="Random seed"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable debug logging"),
+    output_format: str = typer.Option("sales", "--format", help="Output format: sales or long"),
+    freq: str = typer.Option("D", "--freq", help="Grid frequency (long format only)"),
+    start: str = typer.Option(
+        "2020-01-01", "--start", help="First timestamp on the grid (long format only)"
+    ),
 ):
-    """Generate synthetic sales data for testing."""
+    """Generate synthetic sales, or long.csv/static.csv with promo, oil and cat fields."""
     configure_logging("DEBUG" if verbose else "INFO")
     logger = logging.getLogger(__name__)
 
-    from demand_forecast.synthetic.generator import generate_sales_data
+    from demand_forecast.synthetic.generator import generate_long_panel, generate_sales_data
+
+    if output_format not in {"sales", "long"}:
+        raise typer.BadParameter("must be sales or long", param_hint="--format")
+    if output_format == "long":
+        try:
+            long, static = generate_long_panel(
+                n_series=num_products,
+                length=num_days,
+                freq=freq,
+                start=start,
+                known=("promo",),
+                past=("oil",),
+                statics=("cat",),
+                seed=seed,
+            )
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+        output.mkdir(parents=True, exist_ok=True)
+        long.to_csv(output / "long.csv", index=False)
+        static.to_csv(output / "static.csv", index=False)
+        logger.info("Generated %d rows, saved long.csv and static.csv to %s", len(long), output)
+        return
 
     logger.info(
         f"Generating {num_days} days of data for {num_products} products across {num_stores} stores"

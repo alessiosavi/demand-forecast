@@ -11,6 +11,8 @@ import pandas as pd
 from sklearn.datasets import make_regression
 from tqdm.auto import tqdm
 
+from demand_forecast.data.frequency import grid_range, validate_on_grid
+
 logger = logging.getLogger(__name__)
 
 PRODUCT_COLUMNS = ["id", "category", "subcategory", "price"]
@@ -129,12 +131,14 @@ def generate_product_sales(
     end: str | date,
     seed: int = 42,
     promo_share: float = 0.10,
+    emit_zero_rows: bool = True,
 ) -> pd.DataFrame:
-    """Generate positive daily sales for real catalogue IDs and prices.
+    """Generate non-negative daily sales for real catalogue IDs and prices.
 
     The inclusive calendar uses product-specific annual seasons, weekday demand,
-    inverse price-volume rates and multi-day promotions. Zero-quantity days are
-    omitted. All randomness comes from a local seeded NumPy generator.
+    inverse price-volume rates and multi-day promotions. Every calendar day is
+    emitted unless ``emit_zero_rows=False``, which omits zero-quantity days.
+    All randomness comes from a local seeded NumPy generator.
     """
     missing = set(PRODUCT_COLUMNS) - set(products.columns)
     if missing:
@@ -184,11 +188,11 @@ def generate_product_sales(
         base_rate = np.clip(30 / price**0.7, 0.15, 12) * rng.lognormal(0, 0.35)
         discounts, uplift = _promo_schedule(rng, len(dates), promo_share)
         qty = rng.poisson(base_rate * season * weekday * uplift).astype(np.int64)
-        positive = qty > 0
-        columns["date"].append(dates.to_numpy()[positive])
-        columns["product_id"].append(np.full(positive.sum(), product_id, dtype=object))
-        columns["qty"].append(qty[positive])
-        columns["unit_price"].append(np.round(price * (1 - discounts[positive]), 2))
+        keep = np.ones(len(dates), dtype=bool) if emit_zero_rows else qty > 0
+        columns["date"].append(dates.to_numpy()[keep])
+        columns["product_id"].append(np.full(keep.sum(), product_id, dtype=object))
+        columns["qty"].append(qty[keep])
+        columns["unit_price"].append(np.round(price * (1 - discounts[keep]), 2))
         profile_totals[profile] += int(qty.sum())
         promo_days += int(np.count_nonzero(discounts))
 
@@ -223,6 +227,86 @@ def generate_product_sales(
         },
     )
     return sales
+
+
+def inject_missing(frame: pd.DataFrame, fraction: float, seed: int = 0) -> pd.DataFrame:
+    """Drop ``round(len(frame) * fraction)`` rows uniformly without replacement.
+
+    Return a copy preserving the surviving rows' order, index and dtypes. The
+    input and process-global random state are unchanged.
+    """
+    if not 0 <= fraction <= 1:
+        raise ValueError("fraction must be between 0 and 1")
+    rng = np.random.default_rng(seed)
+    drop = rng.choice(len(frame), size=round(len(frame) * fraction), replace=False)
+    keep = np.ones(len(frame), dtype=bool)
+    keep[drop] = False
+    return frame.iloc[keep].copy()
+
+
+def generate_long_panel(
+    n_series: int,
+    length: int,
+    freq: str,
+    start: str,
+    known: tuple[str, ...],
+    past: tuple[str, ...],
+    statics: tuple[str, ...],
+    seed: int,
+    promo_uplift: float = 0.5,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Generate a complete non-negative panel and a static table on a pinned grid.
+
+    Each series has its own level and phase in a seven-step seasonal cycle
+    (weekly on a daily grid). A dynamic column named ``promo`` is a binary
+    indicator with 10% probability and adds ``promo_uplift`` to the target.
+    Other dynamics are continuous; statics are A/B categories except ``size``,
+    which is numeric. Randomness is local to ``seed``.
+    """
+    if n_series < 1 or length < 1:
+        raise ValueError("n_series and length must be positive")
+    names = ["id", "timestamp", "target", *known, *past, *statics]
+    if len(set(names)) != len(names):
+        raise ValueError("Role columns must be unique and cannot use id, timestamp or target")
+    if not np.isfinite(promo_uplift) or promo_uplift < 0:
+        raise ValueError("promo_uplift must be finite and non-negative")
+    start_time = pd.Timestamp(start)
+    validate_on_grid(pd.DatetimeIndex([start_time]), freq, "series_0")
+    dates = grid_range(start_time, length, freq)
+
+    rng = np.random.default_rng(seed)
+    ids = np.array([f"series_{i}" for i in range(n_series)])
+    level = rng.uniform(5, 20, size=(n_series, 1))
+    phase = rng.uniform(0, 2 * np.pi, size=(n_series, 1))
+    target = (level + 2 * np.sin(2 * np.pi * np.arange(length) / 7 + phase)).ravel()
+    dynamic = {}
+    for name in (*known, *past):
+        if name == "promo":
+            dynamic[name] = rng.binomial(1, 0.1, size=n_series * length)
+            target += promo_uplift * dynamic[name]
+        else:
+            dynamic[name] = rng.normal(size=n_series * length)
+
+    long = pd.DataFrame(
+        {
+            "id": np.repeat(ids, length),
+            "timestamp": np.tile(dates.to_numpy(), n_series),
+            "target": target,
+            **dynamic,
+        }
+    )
+    static = pd.DataFrame(
+        {
+            "id": ids,
+            **{
+                name: rng.uniform(1, 10, size=n_series)
+                if name == "size"
+                else rng.choice(["A", "B"], size=n_series)
+                for name in statics
+            },
+        }
+    )
+    return long, static
 
 
 def generate_sales_data(

@@ -336,3 +336,28 @@ class MASELoss(nn.Module):
 
         mase = mae / scale
         return mase.mean()
+
+
+def pinball_loss(
+    pred: torch.Tensor,
+    labels: torch.Tensor,
+    label_mask: torch.Tensor,
+    loss_eligible: torch.Tensor,
+    quantiles: torch.Tensor,
+) -> tuple[torch.Tensor, int]:
+    """Mean doubled pinball over observed, eligible cells and quantile knots.
+
+    Predictions have shape (B, H, Q), labels and their boolean mask (B, H),
+    boolean sample eligibility (B,), and quantiles (Q,). Predictions and labels
+    share the sample's normalised frame. The count is selected cells, not knots.
+    With no selected cell, return zero attached to the prediction graph.
+    """
+    selected = label_mask & loss_eligible[:, None]
+    n = int(selected.sum().item())
+    if n == 0:
+        return pred.sum() * 0.0, 0
+
+    # Select before arithmetic so excluded NaNs cannot contaminate gradients.
+    errors = labels[selected].unsqueeze(-1) - pred[selected]
+    losses = 2 * torch.maximum(quantiles * errors, (quantiles - 1) * errors)
+    return losses.mean(), n
