@@ -4,9 +4,45 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from demand_forecast.core.validation import plan_inner_validation
+from demand_forecast.core.validation import plan_inner_validation, subsample_validation
 from demand_forecast.data.frequency import grid_range
 from tests.helpers.panels import synthetic_panel, weekly_panel
+
+
+@pytest.fixture
+def plan_with_12_val_items():
+    panel = weekly_panel([40] * 18)
+    for series in panel.series[::3]:
+        series.target[:] = 6
+    return plan_inner_validation(panel, panel.timestamps(0, 41)[40], 4)
+
+
+def test_subsample_validation_is_seeded_sorted_and_noop_when_small(plan_with_12_val_items):
+    plan = plan_with_12_val_items
+    original = plan.val_items.copy()
+    assert len(original) == 12
+    for limit in (None, 12, 13):
+        assert subsample_validation(plan, limit, 0) is plan
+    a, b = subsample_validation(plan, 5, 0), subsample_validation(plan, 5, 0)
+    assert a is not plan
+    assert a.val_items.tolist() == b.val_items.tolist() and len(a.val_items) == 5
+    assert a.val_items.tolist() == sorted(a.val_items.tolist())
+    assert a.val_items.dtype == np.int64
+    assert set(a.val_items) <= set(plan.val_items)
+    assert subsample_validation(plan, 5, 1).val_items.tolist() != a.val_items.tolist()
+    assert (a.train_upto, a.val_origin, a.exception, a.fit_ids) == (
+        plan.train_upto,
+        plan.val_origin,
+        plan.exception,
+        plan.fit_ids,
+    )
+    np.testing.assert_array_equal(plan.val_items, original)
+
+
+def test_subsample_validation_preserves_short_history_exception(panel29, origin29):
+    plan = plan_inner_validation(panel29, origin29, 13)
+    assert plan.exception
+    assert subsample_validation(plan, 2, 0) is plan
 
 
 def test_rossmann_like_first_window_triggers_exception(panel29, origin29):

@@ -79,7 +79,9 @@ def test_training_defaults_match_trainer():
     from demand_forecast.core.training import TrainConfig
 
     config = TrainingConfig()
-    assert config.model_dump(exclude={"refit", "min_train_history"}) == asdict(TrainConfig())
+    assert config.model_dump(exclude={"refit", "min_train_history", "val_items_max"}) == asdict(
+        TrainConfig()
+    )
     assert config.min_train_history is None and config.refit == "none"
     assert "seed" not in TrainingConfig.model_fields
 
@@ -197,3 +199,27 @@ def test_frozen_fev_standard_config_matches_protocol():
     assert settings.model.d_model == 64 and settings.training.base_steps == 3000
     assert settings.seed == 0 and settings.device is None and settings.training.amp
     assert settings.training.checkpoint_every == 200
+
+
+def test_quick_config_differs_from_frozen_only_in_declared_fields():
+    root = Path(__file__).resolve().parents[1]
+    frozen = Settings.from_yaml(root / "configs/fev-v2-standard.yaml").model_dump()
+    quick = Settings.from_yaml(root / "configs/fev-v2-quick.yaml").model_dump()
+    assert quick["training"].pop("max_steps_cap") == 300
+    assert frozen["training"].pop("max_steps_cap") is None
+    assert quick["training"].pop("val_items_max") == 1024
+    assert frozen["training"].pop("val_items_max") is None
+    for key, values in {
+        "eval_every": (200, 50),
+        "patience": (5, 2),
+        "checkpoint_every": (200, 50),
+    }.items():
+        assert (frozen["training"].pop(key), quick["training"].pop(key)) == values
+    assert quick == frozen
+
+
+@pytest.mark.parametrize("field", ["max_steps_cap", "val_items_max"])
+@pytest.mark.parametrize("value", [0, -1])
+def test_training_config_rejects_nonpositive_quick_fields(field, value):
+    with pytest.raises(ValidationError, match=field):
+        TrainingConfig(**{field: value})
