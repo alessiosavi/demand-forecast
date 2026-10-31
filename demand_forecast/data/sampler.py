@@ -179,6 +179,149 @@ def _dynamic_values(
     return np.where(mask, values, 0).astype(np.float32), mask
 
 
+class BatchBuilder:
+    """Reuse grid/calendar and static features for a fixed panel and fitted encoder.
+
+    A builder belongs to one sampling/fit session. The panel's starts, history
+    lengths, statics and encoder must stay fixed during that session. Target and
+    dynamic reductions retain the reference's per-row slices and operation order.
+    Each build owns fresh buffers, so later batches cannot overwrite earlier ones.
+    """
+
+    def __init__(
+        self, panel: Panel, horizon: int, max_context: int, encoder: StaticEncoder
+    ) -> None:
+        _positive(horizon, "horizon")
+        _positive(max_context, "max_context")
+        self.panel, self.encoder = panel, encoder
+        self.horizon, self.max_context = horizon, max_context
+        self._lengths = {}
+        for series in panel.series:
+            # Timestamp equality compares instants, while calendar features use
+            # local time. Equal instants in different zones need separate grids.
+            key = (series.start, str(series.start.tz))
+            self._lengths[key] = max(self._lengths.get(key, 0), series.history_length)
+        self._grids = {}
+        self._statics = {}
+        self._cutoffs = {}
+
+    def _grid(self, key):
+        if key not in self._grids:
+            # Build at full length on first use: a short same-start series must
+            # not bound the label cut-off cached for a later, longer request.
+            grid = grid_range(key[0], self._lengths[key] + self.horizon, self.panel.freq)
+            self._grids[key] = grid, calendar_features(grid, self.panel.freq)
+        return self._grids[key]
+
+    def _label_limit(self, key, grid, label_upto):
+        cache_key = (key, label_upto)
+        if cache_key not in self._cutoffs:
+            # Preserve pandas comparison errors (including timezone mismatches).
+            # searchsorted alone accepts some values the reference rejects, and
+            # puts NaT at the end even though every <= NaT comparison is false.
+            grid[:0] <= label_upto
+            self._cutoffs[cache_key] = (
+                0 if pd.isna(label_upto) else int(grid.searchsorted(label_upto, side="right"))
+            )
+        return self._cutoffs[cache_key]
+
+    def build(
+        self, items: Iterable[tuple[int, int]], label_upto: pd.Timestamp | None = None
+    ) -> Batch:
+        """Build left-padded CPU tensors with the frozen per-row numeric semantics."""
+        panel, encoder = self.panel, self.encoder
+        horizon, max_context = self.horizon, self.max_context
+        items = _items_array(panel, items)
+        for i, origin in items:
+            if origin > panel.series[i].history_length:
+                raise ValueError("origin position exceeds series history_length")
+        size = len(items)
+        length = min(max_context, int(items[:, 1].max())) if size else 0
+        n_calendar = len(calendar_feature_names(panel.freq))
+        known = panel.roles.known_dynamic
+        dynamic = (*known, *panel.roles.past_dynamic)
+        n_enc, n_dec = n_calendar + len(dynamic), n_calendar + len(known)
+        arrays = dict(
+            target=np.zeros((size, length), dtype=np.float32),
+            observed=np.zeros((size, length), dtype=bool),
+            padding=np.zeros((size, length), dtype=bool),
+            enc_cov=np.zeros((size, length, n_enc), dtype=np.float32),
+            enc_cov_mask=np.zeros((size, length, n_enc), dtype=bool),
+            dec_cov=np.zeros((size, horizon, n_dec), dtype=np.float32),
+            dec_cov_mask=np.zeros((size, horizon, n_dec), dtype=bool),
+            num=np.zeros((size, encoder.n_numeric), dtype=np.float32),
+            num_mask=np.zeros((size, encoder.n_numeric), dtype=bool),
+            labels=np.zeros((size, horizon), dtype=np.float32),
+            label_mask=np.zeros((size, horizon), dtype=bool),
+            eligible=np.zeros(size, dtype=bool),
+            has_context=np.zeros(size, dtype=bool),
+            series_index=np.array(items[:, 0], dtype=np.int64, copy=True),
+            origin_pos=np.array(items[:, 1], dtype=np.int64, copy=True),
+        )
+        cat = {name: np.zeros(size, dtype=np.int64) for name in encoder.vocab_sizes}
+        # Keep torch's per-scalar float32 overflow checks, not NumPy's inf cast.
+        loc = torch.zeros(size, dtype=torch.float32)
+        scale = torch.ones(size, dtype=torch.float32)
+        for row, (i, origin) in enumerate(items):
+            i, origin = int(i), int(origin)
+            series = panel.series[i]
+            start = max(0, origin - max_context)
+            context_length = origin - start
+            dest = slice(length - context_length, length)
+            context = np.asarray(series.target[start:origin], dtype=np.float64)
+            frame = sample_frame(context, series.target[:origin], panel.seasonal_period)
+            observed = ~np.isnan(context)
+            arrays["target"][row, dest] = np.where(
+                observed, (context - frame.loc) / frame.scale, 0
+            ).astype(np.float32)
+            arrays["observed"][row, dest] = observed
+            arrays["padding"][row, dest] = True
+            loc[row], scale[row] = frame.loc, frame.scale
+            arrays["eligible"][row], arrays["has_context"][row] = frame.eligible, frame.has_context
+
+            key = (series.start, str(series.start.tz))
+            grid, full_calendar = self._grid(key)
+            calendar = full_calendar[start : origin + horizon]
+            arrays["enc_cov"][row, dest, :n_calendar] = calendar[:context_length]
+            arrays["dec_cov"][row, :, :n_calendar] = calendar[context_length:]
+            arrays["enc_cov_mask"][row, dest, :n_calendar] = True
+            arrays["dec_cov_mask"][row, :, :n_calendar] = True
+            for column, name in enumerate(dynamic, start=n_calendar):
+                is_known = column < n_dec
+                stop = origin + horizon if is_known else origin
+                values, mask = _dynamic_values(series.dynamic.get(name), start, origin, stop)
+                arrays["enc_cov"][row, dest, column] = values[:context_length]
+                arrays["enc_cov_mask"][row, dest, column] = mask[:context_length]
+                if is_known:
+                    arrays["dec_cov"][row, :, column] = values[context_length:]
+                    arrays["dec_cov_mask"][row, :, column] = mask[context_length:]
+
+            label_end = min(origin + horizon, series.history_length)
+            labels = np.asarray(series.target[origin:label_end], dtype=np.float64)
+            label_mask = ~np.isnan(labels)
+            if label_upto is not None:
+                cutoff = self._label_limit(key, grid, label_upto)
+                label_mask &= np.arange(origin, label_end) < cutoff
+            arrays["labels"][row, : len(labels)] = np.where(
+                label_mask, (labels - frame.loc) / frame.scale, 0
+            ).astype(np.float32)
+            arrays["label_mask"][row, : len(labels)] = label_mask
+            if i not in self._statics:
+                self._statics[i] = encoder.transform(series)
+            codes, num, num_mask = self._statics[i]
+            for name, code in codes.items():
+                cat[name][row] = code
+            arrays["num"][row] = num
+            arrays["num_mask"][row] = num_mask
+        arrays["loss_eligible"] = arrays["eligible"] & arrays["label_mask"].any(axis=1)
+        return Batch(
+            **{name: torch.from_numpy(values) for name, values in arrays.items()},
+            cat={name: torch.from_numpy(values) for name, values in cat.items()},
+            loc=loc,
+            scale=scale,
+        )
+
+
 def make_batch(
     panel: Panel,
     items: Iterable[tuple[int, int]],
@@ -187,94 +330,8 @@ def make_batch(
     encoder: StaticEncoder,
     label_upto: pd.Timestamp | None = None,
 ) -> Batch:
-    """Build left-padded CPU tensors without fitting any statistics on the future.
-
-    Target location uses the cropped context; target scale and dynamic feature
-    statistics use the whole past. Calendar sin/cos features keep their native
-    scale. Masked cells (including withheld labels) contain zero.
-    """
-    _positive(horizon, "horizon")
-    _positive(max_context, "max_context")
-    items = _items_array(panel, items)
-    for i, origin in items:
-        if origin > panel.series[i].history_length:
-            raise ValueError("origin position exceeds series history_length")
-    size = len(items)
-    length = min(max_context, int(items[:, 1].max())) if size else 0
-    n_calendar = len(calendar_feature_names(panel.freq))
-    known = panel.roles.known_dynamic
-    dynamic = (*known, *panel.roles.past_dynamic)
-    n_enc, n_dec = n_calendar + len(dynamic), n_calendar + len(known)
-    batch = Batch(
-        target=torch.zeros((size, length), dtype=torch.float32),
-        observed=torch.zeros((size, length), dtype=torch.bool),
-        padding=torch.zeros((size, length), dtype=torch.bool),
-        enc_cov=torch.zeros((size, length, n_enc), dtype=torch.float32),
-        enc_cov_mask=torch.zeros((size, length, n_enc), dtype=torch.bool),
-        dec_cov=torch.zeros((size, horizon, n_dec), dtype=torch.float32),
-        dec_cov_mask=torch.zeros((size, horizon, n_dec), dtype=torch.bool),
-        cat={name: torch.zeros(size, dtype=torch.long) for name in encoder.vocab_sizes},
-        num=torch.zeros((size, encoder.n_numeric), dtype=torch.float32),
-        num_mask=torch.zeros((size, encoder.n_numeric), dtype=torch.bool),
-        labels=torch.zeros((size, horizon), dtype=torch.float32),
-        label_mask=torch.zeros((size, horizon), dtype=torch.bool),
-        loc=torch.zeros(size, dtype=torch.float32),
-        scale=torch.ones(size, dtype=torch.float32),
-        eligible=torch.zeros(size, dtype=torch.bool),
-        has_context=torch.zeros(size, dtype=torch.bool),
-        loss_eligible=torch.zeros(size, dtype=torch.bool),
-        series_index=torch.tensor(items[:, 0], dtype=torch.long),
-        origin_pos=torch.tensor(items[:, 1], dtype=torch.long),
-    )
-    for row, (i, origin) in enumerate(items):
-        i, origin = int(i), int(origin)
-        series = panel.series[i]
-        start = max(0, origin - max_context)
-        context_length = origin - start
-        dest = slice(length - context_length, length)
-        context = np.asarray(series.target[start:origin], dtype=np.float64)
-        frame = sample_frame(context, series.target[:origin], panel.seasonal_period)
-        observed = ~np.isnan(context)
-        batch.target[row, dest] = torch.from_numpy(
-            np.where(observed, (context - frame.loc) / frame.scale, 0).astype(np.float32)
-        )
-        batch.observed[row, dest] = torch.from_numpy(observed)
-        batch.padding[row, dest] = True
-        batch.loc[row], batch.scale[row] = frame.loc, frame.scale
-        batch.eligible[row], batch.has_context[row] = frame.eligible, frame.has_context
-
-        grid = grid_range(series.start, origin + horizon, panel.freq)
-        calendar = torch.from_numpy(calendar_features(grid[start:], panel.freq))
-        batch.enc_cov[row, dest, :n_calendar] = calendar[:context_length]
-        batch.dec_cov[row, :, :n_calendar] = calendar[context_length:]
-        batch.enc_cov_mask[row, dest, :n_calendar] = True
-        batch.dec_cov_mask[row, :, :n_calendar] = True
-        for column, name in enumerate(dynamic, start=n_calendar):
-            is_known = column < n_dec
-            stop = origin + horizon if is_known else origin
-            values, mask = _dynamic_values(series.dynamic.get(name), start, origin, stop)
-            batch.enc_cov[row, dest, column] = torch.from_numpy(values[:context_length])
-            batch.enc_cov_mask[row, dest, column] = torch.from_numpy(mask[:context_length])
-            if is_known:
-                batch.dec_cov[row, :, column] = torch.from_numpy(values[context_length:])
-                batch.dec_cov_mask[row, :, column] = torch.from_numpy(mask[context_length:])
-
-        label_end = min(origin + horizon, series.history_length)
-        labels = np.asarray(series.target[origin:label_end], dtype=np.float64)
-        label_mask = ~np.isnan(labels)
-        if label_upto is not None:
-            label_mask &= grid[origin:label_end] <= label_upto
-        batch.labels[row, : len(labels)] = torch.from_numpy(
-            np.where(label_mask, (labels - frame.loc) / frame.scale, 0).astype(np.float32)
-        )
-        batch.label_mask[row, : len(labels)] = torch.from_numpy(label_mask)
-        codes, num, num_mask = encoder.transform(series)
-        for name, code in codes.items():
-            batch.cat[name][row] = code
-        batch.num[row] = torch.from_numpy(num)
-        batch.num_mask[row] = torch.from_numpy(num_mask)
-    batch.loss_eligible = batch.eligible & batch.label_mask.any(dim=1)
-    return batch
+    """Build one batch; retain a BatchBuilder to reuse features across calls."""
+    return BatchBuilder(panel, horizon, max_context, encoder).build(items, label_upto)
 
 
 class WindowSampler:
@@ -312,6 +369,7 @@ class WindowSampler:
         self.panel, self.encoder = panel, encoder
         self.horizon, self.max_context = horizon, max_context
         self.seed, self.label_upto = int(seed), label_upto
+        self.builder = BatchBuilder(panel, horizon, max_context, encoder)
         self.set_epoch(0)
 
     def __len__(self) -> int:
@@ -341,14 +399,10 @@ class WindowSampler:
         for item in self:
             items.append(item)
             if len(items) == batch_size:
-                yield make_batch(
-                    self.panel, items, self.horizon, self.max_context, self.encoder, self.label_upto
-                )
+                yield self.builder.build(items, self.label_upto)
                 items = []
         if items:
-            yield make_batch(
-                self.panel, items, self.horizon, self.max_context, self.encoder, self.label_upto
-            )
+            yield self.builder.build(items, self.label_upto)
 
     def state(self) -> dict:
         return {"epoch": self.epoch, "position": self.position}
