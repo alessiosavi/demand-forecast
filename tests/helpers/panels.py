@@ -6,6 +6,7 @@ from dataclasses import replace
 import numpy as np
 import pandas as pd
 
+from demand_forecast.data.frequency import seasonal_period, to_offset
 from demand_forecast.data.panel import Panel, Roles, Series
 
 
@@ -35,3 +36,12 @@ def series_with(panel: Panel, **overrides) -> Series:
     source = panel.series[0]
     series_id = overrides.pop("series_id", source.series_id)
     return replace(source, series_id=series_id, statics={**source.statics, **overrides})
+
+
+def synthetic_panel(n_series: int, length: int, freq: str, seed: int) -> Panel:
+    """Build a large deterministic panel directly, without frames or bench extras."""
+    rng = np.random.default_rng(seed)
+    start = to_offset(freq).rollforward(pd.Timestamp("2023-01-01"))
+    targets = rng.uniform(1, 20, size=(n_series, length)).astype(np.float32)
+    series = [Series(str(i), start, length, targets[i], {}, {}) for i in range(n_series)]
+    return Panel(series, Roles("y", (), (), (), ()), freq, seasonal_period(freq), "nonnegative")
