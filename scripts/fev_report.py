@@ -135,7 +135,7 @@ def _window_evidence(task, spec, task_dir, identity, issues):
             excluded_pairs += int((nonfinite & observed[..., None]).any(axis=(1, 2)).sum())
             excluded_cells += int((~observed).sum())
             excluded_sql += int(nonfinite.sum())
-        except (OSError, ValueError, KeyError, TypeError) as exc:
+        except (OSError, ValueError, KeyError, TypeError, RuntimeError) as exc:
             issues.append(f"{spec.name}: window_{index}.npz missing/invalid: {exc}")
             # Keep one entry per expected window, including partial runs.
             if len(diagnostics) <= index:
@@ -281,12 +281,14 @@ def build_report(
             if not isinstance(spec.target, str):
                 raise ValueError("report requires a univariate task")
             actual_fp = dataset_fingerprint(task)
+            # Guard the whole iteration, including failures creating or advancing
+            # task.iter_windows() outside the helper's per-window handler.
             window_rows, total, averaged, forecast_count = _window_evidence(
                 task, spec, task_dir, identity, issues
             )
             windows.extend(window_rows)
             diagnostics.append(total)
-        except (OSError, ValueError, KeyError) as exc:
+        except (OSError, ValueError, KeyError, RuntimeError) as exc:
             issues.append(f"{spec.name}: task could not be audited: {exc}")
         fp_ok = actual_fp is not None and all(
             row.get("dataset_fingerprint") == actual_fp
