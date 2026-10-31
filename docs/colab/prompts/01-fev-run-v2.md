@@ -34,7 +34,13 @@ never download Timestral weights, never edit `configs/fev-v2-standard.yaml`.
 - Long commands run detached from a Python cell with the template's launcher (docs/colab.md §4):
   a bash script with `set -euo pipefail` and `trap 'echo $? > "$LOG.exit"' EXIT` whose body runs
   the command WITHOUT `tee` (Popen already redirects: `subprocess.Popen(["bash", script],
-  stdout=open(LOG, "a"), stderr=subprocess.STDOUT)`); poll with short cells (`tail -n 5 "$LOG"`
+  stdout=open(LOG, "a"), stderr=subprocess.STDOUT, start_new_session=True)`); add a fresh UTC
+  launch timestamp to the log/script/`.exit` names, keeping the fresh-file assert so a relaunch
+  in the same runtime preserves earlier evidence. Isolate both the launcher and the poller
+  with `start_new_session=True` from the kernel's process-group interrupt/restart signals.
+  For a deliberate training stop, use `os.killpg(process.pid, signal.SIGINT)` after importing
+  `signal`. Poll the log/`.exit` paths independently of the Python handle, including after a
+  kernel restart; use short cells (`tail -n 5 "$LOG"`
   every few minutes; polling also keeps the runtime alive). `.exit` holds the raw command status
   (0 success; 1 for an expected interruption, asserted afterwards by the notebook); an absent
   `.exit` after a VM reset means "unknown/interrupted", not success. Colab has no background
@@ -53,16 +59,23 @@ never download Timestral weights, never edit `configs/fev-v2-standard.yaml`.
    `HF_HOME=$FEV_DRIVE_ROOT/hf`, `HF_HUB_CACHE=$FEV_DRIVE_ROOT/hf/hub` (Drive, reused from
    prompt 00), `HF_DATASETS_CACHE=/content/hf-datasets` (local, regenerable).
 3. Hardware (no repository code yet): `nvidia-smi` name/VRAM, `torch.cuda.get_device_capability(0)`
-   (expect `(7, 5)`), `/proc/meminfo` MemTotal and **MemAvailable** (expect ≈ 13.3 GB /
-   ≈ 9.8 GB), Drive and `/content` free bytes. Gates for later: `RSS_LIMIT = 0.8 × MemAvailable`,
-   `VRAM_LIMIT = 13 GiB`, Drive free ≥ 300 MB. Storage note: the model size depends on the
+   (expect `(7, 5)`), `/proc/meminfo` MemTotal and **MemAvailable**, whose kB values are KiB
+   (expect 13,286,924 kB = 12.67 GiB and 9,834,636 kB = 9.38 GiB), plus Drive and `/content`
+   free bytes. Compute `RSS_LIMIT` in kB as `0.8 × MemAvailable` (≈ 7.87 M kB ≈ 7.5 GiB)
+   and compare directly with `/usr/bin/time -v`'s `Maximum resident set size (kbytes)`;
+   no unit conversion. Other gates: `VRAM_LIMIT = 13 GiB`, Drive free ≥ 300 MB.
+   Storage note: the model size depends on the
    fitted vocabularies (16 embedding weights per fitted series plus statics): m5 ≈ 0.8 M
    parameters → checkpoint ≈ 13 MB (×2 while replacing), bundle ≈ 3 MB; smaller tasks less;
    float32 npz per window ≈ 50 MB in total (hermes 19 MB, m5 14 MB, favorita 7 MB); measure the
    trial artifacts in §4 and record actual sizes in §7.
-4. Start the VRAM poller from a Python cell and keep its handle:
-   `poller = subprocess.Popen(["nvidia-smi", "--query-gpu=timestamp,memory.used", "--format=csv,noheader,nounits", "-lms", "1000"], stdout=open(f"{FEV_RUN_DIR}/vram-{FEV_SESSION}.log", "w"))`;
-   terminate it before ending the session. Its maximum is a 1-second sampled maximum; say so.
+4. Start the VRAM poller from a Python cell and keep its handle. Give it a fresh UTC token
+   `poller_launch = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")`:
+   `poller = subprocess.Popen(["nvidia-smi", "--query-gpu=timestamp,memory.used", "--format=csv,noheader,nounits", "-lms", "1000"], stdout=open(f"/content/vram-{FEV_SESSION}-{poller_launch}.log", "w"), start_new_session=True)`.
+   Use the template's end-of-session cell to stop the poller, wait for it, and copy the local
+   log into `FEV_RUN_DIR`. A VM reset loses the uncopied local tail; direct Drive streaming
+   also risks losing the unflushed tail, so only completed Drive copies are durable evidence.
+   Its maximum is a 1-second sampled maximum; say so.
 
 ## 2. Install, dependency lock, dataset revision
 
@@ -174,7 +187,7 @@ a long task may span sessions, and inference/evaluation stages are not checkpoin
 Order by resolved steps, the two 12,000-step tasks last in the order of their §5 projection
 (shorter first):
 `hierarchical_sales_1W,rossmann_1W,favorita_stores_1W,walmart,rohlik_sales_1W,<hermes|m5_1W>,<m5_1W|hermes>`.
-Launch detached with the template launcher (log `$FEV_RUN_DIR/fev-run-$FEV_SESSION.log`, `.exit`
+Launch detached with the template launcher (log `$FEV_RUN_DIR/fev-run-$FEV_SESSION-<launch>.log`, `.exit`
 status file), with `/usr/bin/time -v` inside the script and the poller running; poll every few
 minutes. After a disconnect: new session, §1–§2 (lock enforced, dataset revision and sha256
 manifest verified), then the same command;

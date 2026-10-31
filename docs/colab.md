@@ -285,7 +285,8 @@ and prevents comparison with published fev tasks. This rule preserves both onlin
 cache regeneration and verification of the bytes actually used.
 
 Launch long commands detached from a Python cell. `%%bash` displays output only after
-the cell finishes. Use a new session log and status path for each launch; keep the
+the cell finishes. Add a fresh UTC launch timestamp to the session log, script and
+status paths so a relaunch in the same runtime retains earlier evidence; keep the
 returned process handle. The script's `EXIT` trap records the **raw command status**
 (0 success, 1 for the deliberate `--stop-after` interruption). `Popen` already sends
 stdout and stderr to the log, so the script body must not use `tee` on that same log.
@@ -294,12 +295,14 @@ stdout and stderr to the log, so the script body must not use `tee` on that same
 import os
 import shlex
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 
 run_dir = Path(os.environ["FEV_RUN_DIR"])
 session = os.environ["FEV_SESSION"]
-log = run_dir / f"fev-run-{session}.log"
-script = Path("/content") / f"fev-run-{session}.sh"
+launch = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+log = run_dir / f"fev-run-{session}-{launch}.log"
+script = Path("/content") / f"fev-run-{session}-{launch}.sh"
 assert not log.exists() and not Path(f"{log}.exit").exists(), "Use a fresh launch log"
 command = shlex.join(
     [
@@ -330,7 +333,12 @@ temporary = script.with_suffix(".tmp")
 temporary.write_text(body)
 temporary.replace(script)
 with log.open("a") as stream:
-    process = subprocess.Popen(["bash", str(script)], stdout=stream, stderr=subprocess.STDOUT)
+    process = subprocess.Popen(
+        ["bash", str(script)],
+        stdout=stream,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
 print({"pid": process.pid, "log": str(log), "status": f"{log}.exit"})
 ```
 
@@ -339,6 +347,16 @@ every few minutes with `tail -n 5 <log>` and read `<log>.exit` when it appears. 
 status after a VM reset means unknown/interrupted, never success. Check the raw status
 against the expected result afterwards; for an interruption trial assert it equals 1.
 Use the task order authorized by the executing prompt instead of `weekly` when specified.
+Both the launcher and poller use `start_new_session=True` to isolate their process
+groups from the kernel's interrupt/restart signals. Poll the printed log and `.exit`
+paths independently of the Python handle, including after a kernel restart. To
+deliberately stop training, signal its process group:
+
+```python
+import signal
+
+os.killpg(process.pid, signal.SIGINT)
+```
 
 For a short, foreground interruption check, preserve the command's exit status through
 the logging pipeline and assert the expected 1 without killing the cell prematurely:
@@ -358,10 +376,14 @@ test "$rc" -eq 1
 
 Start the GPU memory poller in a Python cell before launching training, and keep its
 handle. The maximum in this log is sampled once per second, distinct from the trainer's
-peak allocated tensor memory in `progress.json` and `run.json`.
+peak allocated tensor memory in `progress.json` and `run.json`. Give the poller its own
+UTC launch timestamp and stream to local disk; copy the log to Drive at session end.
 
 ```python
-vram_log = run_dir / f"vram-{session}.log"
+from datetime import datetime, timezone
+
+poller_launch = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+vram_log = Path("/content") / f"vram-{session}-{poller_launch}.log"
 with vram_log.open("w") as stream:
     poller = subprocess.Popen(
         [
@@ -373,11 +395,29 @@ with vram_log.open("w") as stream:
         ],
         stdout=stream,
         stderr=subprocess.STDOUT,
+        start_new_session=True,
     )
 print({"poller_pid": poller.pid, "vram_log": str(vram_log)})
 ```
 
-Before ending the session, call `poller.terminate()` then `poller.wait(timeout=10)`.
+Run this end-of-session cell to stop the poller and publish its completed log on Drive:
+
+```python
+import shutil
+import signal
+
+if poller.poll() is None:
+    os.killpg(poller.pid, signal.SIGINT)
+poller.wait(timeout=10)
+vram_copy = run_dir / vram_log.name
+temporary = vram_copy.with_suffix(".tmp")
+shutil.copy2(vram_log, temporary)
+temporary.replace(vram_copy)
+print({"vram_copy": str(vram_copy), "bytes": vram_copy.stat().st_size})
+```
+
+A VM reset loses the uncopied local tail; direct Drive streaming also risks losing
+the unflushed tail. Only copies already completed on Drive are durable evidence.
 Preserve the sampled maximum, `/usr/bin/time -v` peak RSS, progress files, NPZ diagnostics
 and the report from `scripts/fev_report.py` with the run artifacts.
 
