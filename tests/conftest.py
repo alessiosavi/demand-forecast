@@ -15,11 +15,10 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 torch.set_num_threads(1)
 
 from demand_forecast.config import (  # noqa: E402
-    DataConfig,
+    DatasetConfig,
+    ForecastConfig,
     ModelConfig,
-    OutputConfig,
     Settings,
-    TimeSeriesConfig,
     TrainingConfig,
 )
 
@@ -53,33 +52,24 @@ def sample_sales_data() -> pd.DataFrame:
 def sample_config(tmp_path: Path) -> Settings:
     """Create sample configuration for testing."""
     return Settings(
-        data=DataConfig(
-            input_path=tmp_path / "test_data.csv",
-            resample_period="1W",
-            max_zeros_ratio=0.8,
+        data=DatasetConfig(
+            path=tmp_path / "test_data.csv",
+            id_columns=["id"],
+            target="target",
+            target_support="nonnegative",
+            freq="W-SUN",
         ),
-        timeseries=TimeSeriesConfig(
-            window=10,
-            n_out=4,
-            test_size=0.2,
-        ),
+        forecast=ForecastConfig(horizon=4, max_context=64),
         model=ModelConfig(
-            d_model=64,
-            nhead=4,
+            d_model=16,
+            nhead=2,
             num_encoder_layers=1,
             num_decoder_layers=1,
-            dim_feedforward=128,
-            dropout=0.1,
+            dim_feedforward=32,
+            hidden_continuous_size=16,
+            cat_emb_dim=4,
         ),
-        training=TrainingConfig(
-            num_epochs=2,
-            batch_size=16,
-            learning_rate=1e-4,
-        ),
-        output=OutputConfig(
-            model_dir=tmp_path / "models",
-            cache_dir=tmp_path / "cache",
-        ),
+        training=TrainingConfig(base_steps=10, batch_size=8, amp=False),
         seed=42,
         device="cpu",
     )
