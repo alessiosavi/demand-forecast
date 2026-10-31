@@ -38,6 +38,7 @@ def _empty_timings() -> dict:
         sessions=0,
         peak_cuda_mem_bytes=0,
         nonfinite_losses=0,
+        scaler_skips=0,
     )
 
 
@@ -267,7 +268,14 @@ class Trainer:
                 self.scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip)
                 self.scaler.step(self.optimizer)
+                scale_before = self.scaler.get_scale() if self.scaler.is_enabled() else None
                 self.scaler.update()
+                if (
+                    scale_before is not None
+                    and self.scaler.get_scale() < scale_before
+                    and self.timings["scaler_skips"] is not None
+                ):
+                    self.timings["scaler_skips"] += 1
                 self.scheduler.step()
                 self.step += 1
                 session_steps += 1
@@ -490,6 +498,9 @@ class Trainer:
             "warmup_steps",
         ):
             setattr(self, name, state[name])
+        # Legacy checkpoints cannot establish a cumulative skip total. The
+        # payload may supply it; the measured ZIP footer takes precedence.
+        self.timings["scaler_skips"] = None
         self.timings.update(state.get("timings", {}))
         with ZipFile(path) as archive:
             root = archive.namelist()[0].split("/")[0]

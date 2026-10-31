@@ -241,7 +241,14 @@ def build_report(
                 "task": spec.name,
                 **{
                     key: cumulative.get(key)
-                    for key in ("sessions", "train_s", "eval_s", "checkpoint_s", "nonfinite_losses")
+                    for key in (
+                        "sessions",
+                        "train_s",
+                        "eval_s",
+                        "checkpoint_s",
+                        "nonfinite_losses",
+                        "scaler_skips",
+                    )
                 },
                 "peak_cuda_mem_MiB": cumulative["peak_cuda_mem_bytes"] / 2**20
                 if _finite(cumulative.get("peak_cuda_mem_bytes"))
@@ -361,7 +368,8 @@ def build_report(
         "Trainer elapsed_s is cumulative active train/eval/checkpoint time. checkpoint_s measures "
         "state serialization; its timing footer, atomic rename and progress publication are excluded. "
         "CUDA memory is the maximum allocated tensor memory across sessions; host RAM and sampled "
-        "device-wide VRAM come from the external run logs.\n",
+        "device-wide VRAM come from the external run logs (sampled maxima). Scaler skips count "
+        "attempted fp16 optimizer steps skipped after overflow; legacy totals remain unknown.\n",
     ]
     for title, rows in (
         ("Training", training),

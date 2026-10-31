@@ -354,3 +354,23 @@ def test_report_window_runtime_failure_keeps_later_windows_and_tasks(report_run,
     later = next(row for row in rows if row["task"] == "first" and row["window"] == "1")
     assert float(later["inference_time_s"]) > 0
     assert not any(issue.startswith("second:") for issue in issues)
+
+
+@pytest.mark.parametrize("skips", [0, 3, None, "absent"])
+def test_report_shows_scaler_skips(report_run, skips):
+    specs, out, _, _ = report_run
+    frame = pd.read_csv(out / "summaries.csv", float_precision="round_trip")
+    assert (frame.loc[frame.model_name == "demand-forecast-v2", "scaler_skips"] == 0).all()
+    for spec in specs:
+        path = out / spec.name / "run.json"
+        report = json.loads(path.read_text())
+        cumulative = report["timings"]["cumulative"]
+        cumulative.pop("scaler_skips", None)
+        if skips != "absent":
+            cumulative["scaler_skips"] = skips
+        path.write_text(json.dumps(report))
+    rendered, issues = report_module().build_report(out, specs)
+    assert not issues  # Legacy fallback evidence is valid, with unknown skip totals.
+    assert {row["scaler_skips"] for row in table(rendered, "Timings")} == {
+        "unknown" if skips in (None, "absent") else str(skips)
+    }

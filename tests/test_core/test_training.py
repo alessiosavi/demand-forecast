@@ -136,6 +136,7 @@ def test_reference_checkpoint_resumes_on_optimized_path(
             evaluate_fn=reference_evaluate,
         )
         assert interrupted.stop_reason == "interrupted"
+        rewrite_scaler_timings(reference_dir / "latest.pt")
         copyfile(reference_dir / "latest.pt", optimized_dir / "latest.pt")
         reference_trainer = Trainer(fresh(), cfg, cpu, RUN_ID, SEED)
         reference = reference_trainer.fit(
@@ -177,6 +178,7 @@ def test_reference_checkpoint_resumes_on_optimized_path(
             getattr(reference_trainer, state).state_dict(),
         )
     assert optimized_trainer.sampler.state() == reference_trainer.sampler.state()
+    assert optimized.timings["scaler_skips"] is reference.timings["scaler_skips"] is None
     for field in ("history", "best_state", "best_step", "best_score", "steps", "stop_reason"):
         equal(getattr(optimized, field), getattr(reference, field))
     # The saved model is the live optimizer pair; the returned model is best-state.
@@ -1006,6 +1008,7 @@ def test_timing_categories_sum_with_controlled_clock(
         "sessions": 1,
         "peak_cuda_mem_bytes": 0,
         "nonfinite_losses": 0,
+        "scaler_skips": 0,
     }
     resumed = Trainer(fresh(), cfg, cpu, RUN_ID, SEED).fit(
         panel_long,
@@ -1172,3 +1175,150 @@ def test_cuda_session_reset_and_sampling_points_without_gpu(
         )
     ]
     assert result.timings["peak_cuda_mem_bytes"] == 123
+
+
+class ScriptedScaler:
+    """Exercise overflow skips on CPU without changing AMP/device resolution."""
+
+    scales = (8, 4, 4, 8, 4, 4, 8)
+
+    def __init__(self):
+        self.index = 0
+        self.optimizer_steps = 0
+
+    def is_enabled(self):
+        return True
+
+    def get_scale(self):
+        return self.scales[self.index]
+
+    def scale(self, loss):
+        return loss
+
+    def unscale_(self, optimizer):
+        pass
+
+    def step(self, optimizer):
+        if self.scales[self.index + 1] >= self.get_scale():
+            optimizer.step()
+            self.optimizer_steps += 1
+
+    def update(self):
+        self.index += 1
+
+    def state_dict(self):
+        return {"index": self.index, "optimizer_steps": self.optimizer_steps}
+
+    def load_state_dict(self, state):
+        self.index = state["index"]
+        self.optimizer_steps = state["optimizer_steps"]
+
+
+def rewrite_scaler_timings(path, *, payload="absent", footer="absent"):
+    """Rewrite both timing sources, preserving other fields and serialization."""
+    import json
+    from zipfile import ZipFile
+
+    with ZipFile(path) as archive:
+        member = next(name for name in archive.namelist() if name.endswith("/timings.json"))
+        footer_timings = json.loads(archive.read(member))
+    state = torch.load(path, weights_only=False)
+    for timing, value in ((state["timings"], payload), (footer_timings, footer)):
+        timing.pop("scaler_skips", None)
+        if value != "absent":
+            timing["scaler_skips"] = value
+    torch.save(state, path)
+    with ZipFile(path, "a") as archive:
+        root = archive.namelist()[0].split("/")[0]
+        archive.writestr(f"{root}/timings.json", json.dumps(footer_timings))
+
+
+def test_scaler_skips_counted(fresh, panel_long, plan_long, encoder_long):
+    trainer = Trainer(fresh(), TrainConfig(base_steps=6, amp=False), cpu, RUN_ID, SEED)
+    trainer.scaler = ScriptedScaler()
+    with pytest.warns(UserWarning, match="lr_scheduler.step"):
+        result = trainer.fit(panel_long, plan_long, ForecastConfig(horizon=4), encoder_long)
+    assert type(result.timings["scaler_skips"]) is int
+    assert result.timings["scaler_skips"] == 2
+    assert trainer.scaler.optimizer_steps == 4
+    assert result.steps == trainer.scheduler.last_epoch == 6
+
+
+def test_scaler_skips_cumulative_across_resume(
+    tmp_path, fresh, panel_long, plan_long, encoder_long
+):
+    cfg = TrainConfig(base_steps=6, amp=False)
+    first = Trainer(fresh(), cfg, cpu, RUN_ID, SEED)
+    first.scaler = ScriptedScaler()
+    with pytest.warns(UserWarning, match="lr_scheduler.step"):
+        result = first.fit(
+            panel_long,
+            plan_long,
+            ForecastConfig(horizon=4),
+            encoder_long,
+            checkpoint_dir=tmp_path,
+            stop_after=3,
+        )
+    assert result.timings["scaler_skips"] == 1
+    resumed = Trainer(fresh(), cfg, cpu, RUN_ID, SEED)
+    resumed.scaler = ScriptedScaler()
+    result = resumed.fit(
+        panel_long,
+        plan_long,
+        ForecastConfig(horizon=4),
+        encoder_long,
+        checkpoint_dir=tmp_path,
+        resume=True,
+    )
+    assert result.timings["scaler_skips"] == 2
+    assert resumed.scaler.optimizer_steps == 4
+
+
+def test_scaler_skips_zero_without_scaler(fresh, panel_long, plan_long, encoder_long):
+    trainer = Trainer(fresh(), TrainConfig(base_steps=2, amp=False), cpu, RUN_ID, SEED)
+    assert not trainer.scaler.is_enabled()
+    result = trainer.fit(panel_long, plan_long, ForecastConfig(horizon=4), encoder_long)
+    assert type(result.timings["scaler_skips"]) is int
+    assert result.timings["scaler_skips"] == 0
+
+
+@pytest.mark.parametrize(
+    "payload,footer,expected",
+    [("absent", "absent", None), (7, "absent", 8), ("absent", 9, 10), (7, 9, 10), (7, None, None)],
+)
+def test_scaler_skips_unknown_after_legacy_resume(
+    tmp_path, fresh, panel_long, plan_long, encoder_long, payload, footer, expected
+):
+    cfg = TrainConfig(base_steps=6, amp=False)
+    first = Trainer(fresh(), cfg, cpu, RUN_ID, SEED)
+    first.scaler = ScriptedScaler()
+    with pytest.warns(UserWarning, match="lr_scheduler.step"):
+        first.fit(
+            panel_long,
+            plan_long,
+            ForecastConfig(horizon=4),
+            encoder_long,
+            checkpoint_dir=tmp_path,
+            stop_after=3,
+        )
+    rewrite_scaler_timings(tmp_path / "latest.pt", payload=payload, footer=footer)
+    resumed = Trainer(fresh(), cfg, cpu, RUN_ID, SEED)
+    resumed.scaler = ScriptedScaler()
+    result = resumed.fit(
+        panel_long,
+        plan_long,
+        ForecastConfig(horizon=4),
+        encoder_long,
+        checkpoint_dir=tmp_path,
+        resume=True,
+    )
+    assert result.timings["scaler_skips"] == expected
+    assert resumed.scaler.optimizer_steps == 4
+    import json
+    from zipfile import ZipFile
+
+    saved = torch.load(tmp_path / "latest.pt", weights_only=False)
+    assert saved["timings"]["scaler_skips"] == expected
+    with ZipFile(tmp_path / "latest.pt") as archive:
+        member = next(n for n in archive.namelist() if n.endswith("/timings.json"))
+        assert json.loads(archive.read(member))["scaler_skips"] == expected
