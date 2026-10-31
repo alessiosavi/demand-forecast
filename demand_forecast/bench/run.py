@@ -213,6 +213,7 @@ def run_baseline(specs: Iterable[FevTaskSpec], out_dir: Path) -> pd.DataFrame:
     )
     for spec in specs:
         if spec.name in completed:
+            print(f"Skipping completed task {spec.name}", flush=True)
             continue
         summary = {"task": spec.name, **baseline_summary(spec.to_task())}
         row = pd.DataFrame([summary])

@@ -61,6 +61,27 @@ def resolve_budget(base_steps: int, n_series: int, eval_every: int) -> tuple[int
     return max_steps, min(eval_every, max(max_steps // 5, 1))
 
 
+def amp_dtype_for(device: torch.device) -> torch.dtype | None:
+    """Use native bf16 on compute capability 8.0+ (Ampere and newer), else fp16.
+
+    ``is_bf16_supported()`` counts emulation, so it is not used. Non-CUDA
+    devices return None without querying CUDA.
+    """
+    if device.type != "cuda":
+        return None
+    return torch.bfloat16 if torch.cuda.get_device_capability(device)[0] >= 8 else torch.float16
+
+
+def resolve_amp(amp: bool, device: torch.device) -> tuple[bool, torch.dtype, bool]:
+    """Resolve autocast and scaling without querying CUDA when AMP is disabled."""
+    enabled = amp and device.type == "cuda"
+    if not enabled:
+        return False, torch.float16, False
+    dtype = amp_dtype_for(device)
+    assert dtype is not None  # device is CUDA when AMP is enabled
+    return True, dtype, dtype is torch.float16
+
+
 class Trainer:
     """Train a caller-seeded model; the sampler has its own explicit seed."""
 
@@ -75,12 +96,8 @@ class Trainer:
         self.device = torch.device(device)
         self.model = model.to(self.device)
         self.cfg, self.run_identity, self.seed = cfg, run_identity, seed
-        self.amp = cfg.amp and self.device.type == "cuda"
-        self.amp_dtype = (
-            torch.bfloat16 if self.amp and torch.cuda.is_bf16_supported() else torch.float16
-        )
-        use_scaler = self.amp and self.amp_dtype == torch.float16
-        # The unified scaler API arrived after torch 2.0, our minimum version.
+        self.amp, self.amp_dtype, use_scaler = resolve_amp(cfg.amp, self.device)
+        # Retain compatibility with installations exposing only the CUDA scaler API.
         if hasattr(torch.amp, "GradScaler"):
             self.scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
         else:
