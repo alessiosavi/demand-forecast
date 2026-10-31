@@ -492,3 +492,41 @@ def test_forecast_per_item_origins_preserves_order_and_sums_fallbacks(
     assert totals == {"n_items": 3, "fallback_no_context": 1, "fallback_undefined_scale": 1}
     assert diag["n_origins"] == 2 and diag["device"] == "cpu"
     assert diag["inference_time_s"] > 0
+
+
+def test_predictor_reuses_builder_across_chunks_matches_reference(bundle_and_panel, monkeypatch):
+    from demand_forecast.data.sampler import BatchBuilder
+    from tests.helpers.reference_batch import reference_align_to_origin, reference_make_batch
+
+    predictor, panel, origin = bundle_and_panel
+    # 513 items cross the public default chunk boundary, including unseen ids.
+    panel = replace(
+        panel, series=[replace(panel.series[i % 3], series_id=str(i)) for i in range(513)]
+    )
+    calls = []
+    original = BatchBuilder.__init__
+
+    def capture(self, *args, **kwargs):
+        calls.append(self)
+        original(self, *args, **kwargs)
+
+    monkeypatch.setattr(BatchBuilder, "__init__", capture)
+    ids, actual, diagnostics = predictor.forecast_with_diagnostics(panel, origin)
+    assert len(calls) == 1
+    items = [(i, 29) for i in range(513)]
+    aligned = reference_align_to_origin(panel, items)
+    cfg = predictor.bundle.forecast_cfg
+    expected = []
+    with torch.no_grad():
+        for start in range(0, len(items), 512):
+            batch = reference_make_batch(
+                aligned,
+                items[start : start + 512],
+                cfg.horizon,
+                cfg.max_context,
+                predictor.bundle.encoder,
+            )
+            expected.append(predictor.bundle.model.predict(batch).numpy())
+    assert ids == [str(i) for i in range(513)]
+    assert diagnostics["n_items"] == 513
+    np.testing.assert_array_equal(actual, np.concatenate(expected))
