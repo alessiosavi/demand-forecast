@@ -154,6 +154,20 @@ windows. Context extends with newly available observations, and deterministic co
 statistics update without remapping embedding ids. `refit: none` keeps the selected
 checkpoint and extends its context through inner validation at inference time.
 
+**Item-specific origins.** fev integer cutoffs are positions: every item is split at its own
+position, so items that end on different timestamps have different first future timestamps
+(walmart: 11 origins, 37 of 2,936 items ending early). The window origin `O` for the run
+identity, the inner-validation block and training is the latest item origin: the validation
+block is `[O − H·Δ, O)` and the inclusive training cutoff is `O − (H + 1)·Δ` (except under
+the short-history exception); items ending inside the block contribute a partial validation
+horizon and items ending before it contribute none. Every item is forecast at its own first
+future timestamp with its own past as context. The bundle's earliest permissible origin is the
+earliest item origin, a global floor. Early-ending items are scored on periods that other
+items' available past covers; this equals the information set fev gives every model (each
+item's past is truncated at its own cutoff) and is not an out-of-time test for those items.
+Shared-origin windows are the special case with one origin. Prompt 00's profile reports
+`distinct_origins_first_window` per task.
+
 ## Persistence and execution evidence
 
 The trainer persists model, optimizer, scheduler, scaler, RNG states, sampler
@@ -189,17 +203,24 @@ columns in order. Selectors also accept comma-separated task names or a task YAM
 `--profiles roles.yaml` supplies the required roles for custom tasks. `--resume`
 preserves completed rows and adds missing tasks. Without it, selected tasks replace
 the output as they complete. Loading errors stop the command and preserve completed rows.
+A profile written before `distinct_origins_first_window` exists cannot be resumed; use a
+fresh output path. Older twelve-column CSVs are rejected and left unchanged.
 
 | Column | Definition |
 | --- | --- |
 | task | Task name from `FevTaskSpec`. |
 | n_series | Number of items in fev's full preprocessed dataset, before window filtering. |
-| length_min, length_median, length_max | Full target-history lengths in time steps, including missing targets. |
+| length_min | Minimum full target-history length in time steps, including missing targets. |
+| length_median | Median full target-history length in time steps, including missing targets. |
+| length_max | Maximum full target-history length in time steps, including missing targets. |
 | anchor_weekday | Pandas `weekday()` of the first timestamp of fev's first item (id-sorted): Monday 0 through Sunday 6. This is not an anchor-distribution check. |
-| nan_share, negative_share, zero_share | Counts of missing, negative and zero target values, each divided by **all** target values, including missing values. |
+| nan_share | Count of missing target values divided by **all** target values, including missing values. |
+| negative_share | Count of negative target values divided by **all** target values, including missing values. |
+| zero_share | Count of zero target values divided by **all** target values, including missing values. |
 | zero_scale_items | Items whose full-history `mean(abs(y[t] - y[t-m]))` is zero or undefined/non-finite; m is the task's seasonality. Missing lag pairs are omitted, and no valid pair means undefined. |
 | eligible_items_first_window | Items returned in fev's first window with past length at least `min_context_length` and positive finite scale computed on that window's past alone. This is not the inner-validation eligibility test. An empty first window gives zero. |
 | static_nan_share | Missing cells across all declared static columns and full-dataset items, numeric and categorical; 0.0 when there are no static columns. |
+| distinct_origins_first_window | Number of distinct first future timestamps across the items of fev's first window; 0 for an empty first window. |
 
 The seven tasks are univariate. For custom multivariate tasks, shares cover all target
 columns, and scale pools observed lag differences across target columns within each

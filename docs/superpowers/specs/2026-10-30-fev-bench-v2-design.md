@@ -138,7 +138,10 @@ positional contract. Seasonal period `m` for scaling follows fev's convention pe
 ### 4.3 Future inputs and origins
 `origin` is the first forecast timestamp; the context is strictly before it. Rows at or after the origin supply
 known-future covariates; their target and past-only values are ignored (logged). Missing known-future values are
-NaN + mask. For fev, `origin = cutoff + step` and `future_data` supplies the known covariates.
+NaN + mask. For fev, a timestamp cutoff gives one origin `cutoff + Δ` for all items, where `Δ`
+is the frequency step. An integer cutoff is a per-item position, so origins may differ per item
+(see the [protocol's item-specific origins rule](../../protocol.md#selection-short-histories-and-fallbacks)).
+`future_data` supplies the known covariates.
 
 ### 4.4 Preprocessing (stateless where possible)
 - Target: no fitted scaler. Per sample: location = masked context median; scale = mean absolute `m`-lag difference over
@@ -241,7 +244,8 @@ batches); also MASE, WAPE, WQL, per-knot pinball, 80% interval coverage/width. V
 - Inference bundle (versioned directory): weights (all cluster models when `per_model`), architecture config, family,
   quantile knots, target support, column roles, frequency offset and `m`, vocabularies, fitted static preprocessing,
   cluster centroids/labels, training cutoff, selection vs final-model flag, package version and git SHA. `forecast
-  --origin` loads the bundle, refuses origins earlier than the training cutoff, and reloads in a fresh CPU process with
+  --origin` loads the bundle, refuses origins earlier than the bundle's earliest permissible origin (the earliest
+  item origin of the training window), and reloads in a fresh CPU process with
   bit-identical outputs (test). Unseen ids/categories map to `unknown`; unseen series get the nearest cluster (tests).
 - fev harness (`demand-forecast fev run --tasks weekly|<names> --family v2 --policy first_window|per_window --resume`):
   per task/window, build the Panel from `past_data`/`future_data`, fit (or reuse under `first_window`: same bundle,
