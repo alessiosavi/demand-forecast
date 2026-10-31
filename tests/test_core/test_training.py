@@ -2,17 +2,19 @@
 
 import random
 from copy import deepcopy
-from dataclasses import replace
+from dataclasses import asdict, replace
 
 import numpy as np
 import pytest
 import torch
 
 from demand_forecast.config.settings import ForecastConfig
+from demand_forecast.core.bundle import save_bundle
 from demand_forecast.core.evaluation import evaluate
 from demand_forecast.core.training import InterruptedRun, TrainConfig, Trainer, resolve_budget
 from demand_forecast.data.encoders import StaticEncoder
 from demand_forecast.data.sampler import make_batch
+from demand_forecast.inference.predictor import Predictor
 from demand_forecast.metrics import summarize
 from demand_forecast.models.base import ModelSpec
 from tests.helpers.models import build_v2
@@ -147,7 +149,42 @@ def test_singleton_only_panel_returns_no_training_result_with_observed_median(
     ).all()
 
 
-# Task 23 adds test_all_missing_panel_trains_nothing_and_serves_fallbacks_after_reload.
+@pytest.mark.parametrize("support", ["nonnegative", "real"])
+def test_all_missing_panel_trains_nothing_and_serves_fallbacks_after_reload(
+    tmp_path,
+    support,
+    fresh_for,
+    panel_all_missing,
+    plan_all_missing,
+    encoder_all_missing,
+    cutoff_am,
+    origin_am,
+):
+    p = replace(panel_all_missing, target_support=support)
+    m = fresh_for(p, 4)
+    r = Trainer(m, TrainConfig(base_steps=30, batch_size=4, amp=False), cpu, RUN_ID, SEED).fit(
+        p, plan_all_missing, ForecastConfig(horizon=4), encoder_all_missing
+    )
+    assert r.stop_reason == "no_training_data" and r.steps == 0
+    assert m.fallback_level.item() == 0.0 and plan_all_missing.fit_ids == []
+    save_bundle(
+        tmp_path / "b",
+        model=m,
+        family="v2",
+        backbone_kwargs=asdict(m.backbone.cfg),
+        forecast_cfg=ForecastConfig(horizon=4),
+        dataset_cfg=None,
+        encoder=encoder_all_missing,
+        panel=p,
+        training_cutoff=cutoff_am,
+        earliest_origin=origin_am,
+        manifest={},
+    )
+    df = Predictor.from_bundle(tmp_path / "b").forecast(p, origin_am)
+    assert np.isfinite(df[["q0.1", "q0.5", "q0.9", "point"]].to_numpy()).all()
+    assert (df["q0.5"] == 0).all()
+
+
 @pytest.mark.parametrize("support", ["nonnegative", "real"])
 def test_all_missing_panel_returns_zero_fallback_without_training(
     fresh_for, panel_all_missing, plan_all_missing, encoder_all_missing, support
