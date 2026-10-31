@@ -1,4 +1,17 @@
-# fev batch performance and the EC2 frozen run — Implementation Plan (rev 3)
+# fev batch performance and the EC2 frozen run — Implementation Plan (rev 4)
+
+> **Rev 4 (2026-11-01).** The prompt 02 quick run at `2863356` found non-finite training losses
+> on walmart (150/150 steps) and rohlik_sales_1W (99/150). The fp16 GradScaler skipped every one,
+> so walmart never took an optimizer step. A frozen run at `2863356` would therefore be defective,
+> and so would the old fallback. Changes:
+> - Gate 0 adds the NaN fix (peer session demand-forecast-2d owns it) merged, plus a clean quick run.
+> - The fallback and P3 reference become that fix's merge SHA, written **F** below.
+> - `nonfinite_losses > 0` on any task blocks acceptance in P4 and in the frozen report.
+> - This branch rebases onto F before its PR merges. If the fix touches `data/sampler.py` or
+>   `core/evaluation.py`, the reference oracle and `BatchBuilder` are re-frozen on F.
+>
+> Measured scaler state (quick run, T4): start-of-run skips are 0–2 on the five healthy tasks.
+> That supports D4.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -29,7 +42,7 @@ wording), all accepted into rev 3 as specified.
 
 | # | Decision | Basis |
 | --- | --- | --- |
-| D1 | **Performance first, then the frozen run on the merged SHA.** Order inside the PR: validation caching (Task 1, measured cost: m5 evaluation is 56% of its budget) before the `BatchBuilder` rewrite (Task 2, behind a profiling gate). If any EC2 parity gate fails, the same instance runs the frozen protocol at `2863356` under the fallback procedure (Task 5). Gate 0: the Colab quick run (prompt 02) passes. | User chose this over the cheapest path (today's code, parallel, ≈ 5.6 h wall). Codex notes that path is viable for the earliest frozen result. The speed gains are estimates until P4 measures them. Correctness does not depend on them, because parity is exact. |
+| D1 | **Performance first, then the frozen run on the merged SHA.** Order inside the PR: validation caching (Task 1, measured cost: m5 evaluation is 56% of its budget) before the `BatchBuilder` rewrite (Task 2, behind a profiling gate). If any EC2 parity gate fails, the same instance runs the frozen protocol at F (the NaN-fix merge SHA; rev 4) under the fallback procedure (Task 5). Gate 0: the Colab quick run (prompt 02) passes. | User chose this over the cheapest path (today's code, parallel, ≈ 5.6 h wall). Codex notes that path is viable for the earliest frozen result. The speed gains are estimates until P4 measures them. Correctness does not depend on them, because parity is exact. |
 | D2 | **g4dn.4xlarge on-demand**: 1× T4 16 GB, 16 vCPU, 64 GiB, $1.505/h (eu-central-1, AWS Pricing API, 2026-10-31). | T4 keeps the fp16 + GradScaler path that prerequisites A–D and the quick run exercised. 16 vCPU (8 cores) covers the fallback's CPU-bound processes. g5/g6 (A10G/L4) select bf16 without a scaler: protocol-permitted but no real-data run has used it. The identity hashes the configured `device` (`null` here), not the resolved hardware or AMP dtype, so a cross-hardware resume is not detected. g4dn.12xlarge has four T4s and is not needed. Spot saves ≈ $3–6, but one interruption kills every process. |
 | D3 | **Budget $50 (user).** Expected ≈ $7.5–9 (≈ 5–6 h including the gates and the quick dress rehearsal); fallback ≈ $15 (≈ 10 h). Twelve-hour compute guard: `shutdown -h +720` with `InstanceInitiatedShutdownBehavior=stop` (≈ $18 compute per guarded session). EBS stays billable after a stop until the volume is deleted. Transfer is budgeted from the measured artifact size. | Hourly price × hours. The guard is not a hard ceiling: setup delays, retries and the stop latency fall outside it. The remaining headroom covers one restart. |
 | D4 | **No warm-up amendment before the frozen run.** Keep the frozen semantics: the LR schedule, `eval_every`, `checkpoint_every` and `max_steps` count attempted optimizer steps, including steps the fp16 scaler skips. Count skips (`timings["scaler_skips"]`) and document the semantics (Task 3). | Changing it introduces a second step counter, so cosine would not reach zero at `max_steps`. The step is not harmless to drop either: a zero-LR AdamW step still updates the moments and the step counter. Skip counts are unmeasured; prompt 02 reports start-of-run scales and Task 3 reports totals. A later amendment is phase-4 work with its own dated entry. |
@@ -272,7 +285,10 @@ wording), all accepted into rev 3 as specified.
 
 Every gate's artifacts are kept under `ROOT/../probes-<UTC>` and copied back with the run.
 
-- [ ] **Gate 0:** prompt 02 quick run passes; PR merged with green CI and a reviewed bot report.
+- [ ] **Gate 0:**
+  - The NaN fix is merged at F, and a quick run at F or later shows `nonfinite_losses == 0` on all
+    seven tasks.
+  - This PR is rebased onto F and merged, with green CI and a reviewed bot report.
 - [ ] **Provision:** g4dn.4xlarge on-demand, eu-central-1, 150 GB gp3 (`DeleteOnTermination=true`),
   shutdown behaviour *stop*, `sudo shutdown -h +720` at boot. Record the instance and volume IDs in the ledger.
 - [ ] **Setup:** venv at the merged SHA, lock enforced, pins verified, HF cache warmed one task at a time.
@@ -292,9 +308,9 @@ Every gate's artifacts are kept under `ROOT/../probes-<UTC>` and copied back wit
   - `n_fit_ids` 2936, `n_val_items` 2864, `max_steps` 4404, `eval_every` 200, AMP float16.
   - No run.json, bundle or NPZ.
 - [ ] **P3 repeatability** (same venv lock, threads and shapes): hermes `--stop-after 200` with the PR
-  code once and with `2863356` twice, run sequentially. Compared quantities: the full-precision
+  code once and with **F** twice (F replaces `2863356` throughout P3), run sequentially. Compared quantities: the full-precision
   inner SQL at step 200 from `progress.json`/history, and the `model` tensors in `latest.pt`.
-  - If the two `2863356` runs are bitwise equal, the PR run must be bitwise equal to them.
+  - If the two F runs are bitwise equal, the PR run must be bitwise equal to them.
   - Otherwise the PR run passes iff `|SQL_PR − SQL_ref1| ≤ 3 × |SQL_ref1 − SQL_ref2|`.
   - A failure with a bitwise-repeatable reference is a code difference → **fallback**.
   - If the reference pair disagrees, rerun the reference once more before assigning any cause.
@@ -316,7 +332,10 @@ Every gate's artifacts are kept under `ROOT/../probes-<UTC>` and copied back wit
   - Add a 10% margin. Launch all seven together if the bound is ≤ 14 GB VRAM and ≤ 48 GB RSS.
     Otherwise split into waves whose own bound fits, and keep reducing concurrency. If even one task
     does not fit, block.
-- [ ] **Failure handling — fallback** (second venv at `2863356`, fresh directories):
+- [ ] **Non-finite gate:** any task with `nonfinite_losses > 0` blocks acceptance, in P4 and in the
+  frozen report. `scaler_skips` beyond start-of-run calibration (measured 0–2 per healthy task) is
+  investigated before launch.
+- [ ] **Failure handling — fallback** (second venv at **F**, never `2863356`; fresh directories):
   - Provenance records the executing SHA and interpreter.
   - Prerequisites A, B and D and P4 are repeated with that code; `scaler_skips` is reported unknown.
 - [ ] **Launch:** fresh `ROOT=runs/ec2-frozen-<sha>-<UTC>`; tasks per the P4 decision; Monitor on the exit files; cost guard checked hourly.
