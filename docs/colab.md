@@ -95,9 +95,11 @@ paths unchanged.
 Run this as a shell notebook cell (`%%bash` on its first line). On a new runtime it
 clones the public repository; on reconnect it checks the same commit. Do not reset
 uncommitted changes in an existing clone: report an unexpected dirty checkout first.
+The guard installs GNU time if absent, so later `/usr/bin/time -v` cells can run on a fresh VM.
 
 ```bash
 set -euo pipefail
+if [ ! -x /usr/bin/time ]; then apt-get -qq update && apt-get -qq install -y time; fi
 cd /content
 if [ ! -d demand-forecast ]; then
   git clone https://github.com/alessiosavi/demand-forecast
