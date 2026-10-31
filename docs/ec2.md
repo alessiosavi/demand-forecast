@@ -15,8 +15,29 @@ filled from the operator's evidence, never guessed.
 
 Record the passing prompt-02 Colab quick run, merged SHA, green CI, bot findings and
 critical verification in the ledger. Owner agreement is required before merging.
-Do not provision the experiment until these are recorded. Keep the Colab constraints
-lock, prompt-00 baseline CSV and dataset manifest available for transfer.
+Do not provision the experiment until these are recorded. The Colab session relays
+these three original artifacts to the Mac before provisioning; record their full
+Drive source paths in the ledger. Paths below are relative to
+`/content/drive/MyDrive/demand-forecast/`:
+
+| Input | Colab source | Filename in the Mac input directory |
+| --- | --- | --- |
+| Colab image lock | Prompt 02 at `2863356`: `runs/02-quick-v2-2863356212c68debda92923f7c746d288d20f4df/environment-lock.txt` | `environment-lock.txt` |
+| Original dataset manifest | The same prompt-02 run directory: `dataset-manifest.json` | `colab-dataset-manifest.json` (rename only; preserve bytes) |
+| Baseline CSV | Prompt 00: `runs/00-profile-and-baselines-97f3ec7…/summaries.csv` (resolve the full recorded directory) | `summaries.csv` |
+
+Save/run this on the Mac after receiving the files. Keep the SHA-256 record with the
+inputs; §2 copies them with `scp`, records their hashes again on EC2, and requires
+all three hashes to match before setup.
+
+```bash
+#!/bin/bash
+set -euo pipefail
+: "${MAC_INPUTS:?absolute Mac directory containing the three relayed files}"
+cd "$MAC_INPUTS"
+shasum -a 256 environment-lock.txt colab-dataset-manifest.json summaries.csv > mac-inputs.sha256
+cat mac-inputs.sha256
+```
 
 ## 1. Provision
 
@@ -79,17 +100,44 @@ before resuming. Never mix hardware/dtype or fallback code in an existing run di
 
 ## 2. Setup: code, lock, pins, sequential cache warm-up
 
-Copy the Colab `environment-lock.txt`, original `dataset-manifest.json` and prompt-00
-`summaries.csv` to `/home/ubuntu/fev-inputs/` using `scp -i KEY.pem … ubuntu@IP:…`.
+Copy Gate 0's three Colab inputs and Mac hash record to `/home/ubuntu/fev-inputs/`.
+Save/run this transfer script on the Mac after provisioning:
+
+```bash
+#!/bin/bash
+set -euo pipefail
+: "${MAC_INPUTS:?absolute Mac input directory}" "${KEY:?absolute SSH key path}" "${HOST:?public IP}"
+cd "$MAC_INPUTS"
+shasum -a 256 --check mac-inputs.sha256
+ssh -i "$KEY" "ubuntu@$HOST" 'mkdir -p /home/ubuntu/fev-inputs'
+scp -i "$KEY" environment-lock.txt colab-dataset-manifest.json summaries.csv mac-inputs.sha256 \
+  "ubuntu@$HOST:/home/ubuntu/fev-inputs/"
+ssh -i "$KEY" "ubuntu@$HOST" 'bash -se' <<'BASH'
+set -euo pipefail
+cd /home/ubuntu/fev-inputs
+sha256sum environment-lock.txt colab-dataset-manifest.json summaries.csv > ec2-inputs.sha256
+cat ec2-inputs.sha256
+diff -u mac-inputs.sha256 ec2-inputs.sha256
+BASH
+scp -i "$KEY" "ubuntu@$HOST:/home/ubuntu/fev-inputs/ec2-inputs.sha256" "$MAC_INPUTS/"
+```
+
+The hash diff must be empty; retain both records. A mismatch blocks setup.
 The baseline comparison below requires prompt 00's revision
 `d3e7e720f4158eab03ebcb021f1cce779cd92acc`; a different revision blocks this experiment's
-six-significant-figure gate. Keep the original manifest as `colab-dataset-manifest.json`.
+six-significant-figure gate. Keep the original `colab-dataset-manifest.json` unchanged.
 
 Save the following as `/home/ubuntu/setup-fev.sh` and run it on EC2. Set `FEV_SHA`
-to the full merged SHA. A constraints file limits versions but does not recreate an
-image: install its packages and **require an empty normalised freeze diff**. A lock
-containing unavailable/local Colab packages is a setup failure to resolve, not permission
-to silently discard pins. Only editable paths and comments are excluded from the diff.
+to the full merged SHA. `COLAB_LOCK` is the full Colab image freeze: use it only as
+constraints (`-c`) when installing `.[bench]`. Colab-only packages such as google-colab,
+tensorflow and jax need not be installed on EC2. The numerical-environment gate is
+`closure_parity.py` exit 0 for every installed `demand-forecast[bench]` dependency,
+excluding demand-forecast itself: normalised names and **exact version strings**,
+including local tags. This includes torch `2.11.0+cu128`, its `nvidia-*` CUDA/cuDNN
+wheels, numpy `2.0.2`, pandas `2.2.2`, pyarrow `18.1.0`, datasets `4.0.0`, fev,
+statsforecast and all other packages in that closure. Missing pins, unavailable
+closure wheels or unequal versions block setup; do not drop pins to get past the gate.
+Packages outside the closure are reported for information only.
 
 ```bash
 #!/bin/bash
@@ -105,23 +153,28 @@ cd code
 git checkout --detach "$FEV_SHA"
 test "$(git rev-parse HEAD)" = "$FEV_SHA"
 python3.12 -m venv /home/ubuntu/fev/venv-pr
-export FEV_LOCK_FILE=/home/ubuntu/fev-inputs/environment-lock.txt
+export COLAB_LOCK=/home/ubuntu/fev-inputs/environment-lock.txt
 env -u LD_LIBRARY_PATH /home/ubuntu/fev/venv-pr/bin/python -m pip install \
   --extra-index-url https://download.pytorch.org/whl/cu128 \
-  -r "$FEV_LOCK_FILE" -c "$FEV_LOCK_FILE" -e '.[bench]'
+  -c "$COLAB_LOCK" -e '.[bench]'
 ```
 
 Create `/home/ubuntu/fev/env.sh` with this content, filling the SHA. Every subsequent
 script starts by sourcing it. `TOOLS` stays at the merged code even during fallback;
 `VENV` selects the actual CLI installation. The launcher resolves its provenance using
 that interpreter in isolated mode, and runs from its installed package checkout.
+`COLAB_LOCK` remains the input for closure parity. After that gate passes,
+`verify-env.sh` below creates `FEV_LOCK_FILE` from the PR venv's normalised freeze
+at `/home/ubuntu/fev/ec2-environment-lock.txt`. This EC2 lock governs the launcher's
+existing exact drift check, including packages outside the numerical closure.
 
 ```bash
 #!/bin/bash
 export FEV_SHA='<full merged SHA>'
 export TOOLS=/home/ubuntu/fev/code
 export VENV=/home/ubuntu/fev/venv-pr
-export FEV_LOCK_FILE=/home/ubuntu/fev-inputs/environment-lock.txt
+export COLAB_LOCK=/home/ubuntu/fev-inputs/environment-lock.txt
+export FEV_LOCK_FILE=/home/ubuntu/fev/ec2-environment-lock.txt
 export FEV_DATASET_MANIFEST=/home/ubuntu/fev/dataset-manifest.json
 export PROMPT00=/home/ubuntu/fev-inputs/summaries.csv
 export HF_HOME=/home/ubuntu/fev/hf
@@ -135,7 +188,11 @@ export ALL_TASKS=m5_1W,favorita_stores_1W,rossmann_1W,rohlik_sales_1W,walmart,he
 unset LD_LIBRARY_PATH HF_DATASETS_OFFLINE HF_HUB_OFFLINE FEV_DATASETS_PREFIX PYTHONPATH
 ```
 
-Initialise the evidence directories and verify the environment in `verify-env.sh`:
+Initialise the evidence directories and verify the environment in `verify-env.sh`.
+Run it initially with `VENV=/home/ubuntu/fev/venv-pr`; repeat checks on later sessions.
+An existing EC2 lock is compared, never regenerated to accept drift. Normalisation
+for this lock matches the launcher: remove editable lines, comments and blank lines,
+then sort; all remaining freeze entries must match exactly.
 
 ```bash
 #!/bin/bash
@@ -143,12 +200,19 @@ set -euo pipefail
 source /home/ubuntu/fev/env.sh
 mkdir -p "$OPS" "$PROBES" "$HF_HUB_CACHE" "$HF_DATASETS_CACHE"
 cd "$TOOLS"
-env -u LD_LIBRARY_PATH "$VENV/bin/python" -m pip freeze > "$PROBES/pip-freeze.txt"
-sed '/^#/d; /^-e /d; /^$/d' "$FEV_LOCK_FILE" | sort > "$PROBES/expected-pins.txt"
-sed '/^#/d; /^-e /d; /^$/d' "$PROBES/pip-freeze.txt" | sort > "$PROBES/actual-pins.txt"
-diff -u "$PROBES/expected-pins.txt" "$PROBES/actual-pins.txt" > "$PROBES/lock.diff"
+env -u LD_LIBRARY_PATH "$VENV/bin/python" -I -m pip freeze > "$PROBES/pip-freeze.txt"
+env -u LD_LIBRARY_PATH "$VENV/bin/python" -I "$TOOLS/scripts/ec2/closure_parity.py" \
+  --colab-lock "$COLAB_LOCK" --freeze "$PROBES/pip-freeze.txt" --extras bench \
+  --out "$PROBES/closure-parity.txt"
 env -u LD_LIBRARY_PATH "$VENV/bin/python" scripts/pip_check_closure.py \
   --extras bench --report "$PROBES/pip-check.txt"
+sed '/^#/d; /^-e /d; /^$/d' "$PROBES/pip-freeze.txt" | sort > "$PROBES/actual-pins.txt"
+if [[ ! -e $FEV_LOCK_FILE ]]; then
+    test "$VENV" = /home/ubuntu/fev/venv-pr
+    cp "$PROBES/actual-pins.txt" "$FEV_LOCK_FILE"
+fi
+sed '/^#/d; /^-e /d; /^$/d' "$FEV_LOCK_FILE" | sort > "$PROBES/expected-pins.txt"
+diff -u "$PROBES/expected-pins.txt" "$PROBES/actual-pins.txt" > "$PROBES/lock.diff"
 env -u LD_LIBRARY_PATH "$VENV/bin/python" - <<'PY' > "$PROBES/hardware.txt"
 import sys
 import torch
@@ -446,9 +510,13 @@ are gates, including in fallback. D is startup evidence; P1 also covers ragged i
 ## 7. P3 — repeatability at fixed lock, threads and shapes
 
 Create a **second checkout and venv at `2863356`**, outside the merged checkout. Keep
-`TOOLS` pointing at the merged code. Install using the same lock and freeze-diff check
-from setup. Run every torch command under `env -u LD_LIBRARY_PATH` and the same two
-thread variables. Never reuse a PR trial directory for reference code.
+`TOOLS` pointing at the merged code. Install with `COLAB_LOCK` as constraints, then
+run the merged checkout's parity helper with the **reference interpreter** so it
+traverses the reference installation's closure. Require exit 0 and an empty exact
+freeze diff against `FEV_LOCK_FILE`, the EC2 lock recorded from the PR venv. The
+launcher repeats that EC2 drift check before each launch, ignoring the editable
+checkout line. Run every torch command under `env -u LD_LIBRARY_PATH` and the same
+two thread variables. Never reuse a PR trial directory for reference code.
 
 ```bash
 #!/bin/bash
@@ -461,7 +529,19 @@ git checkout --detach 2863356
 python3.12 -m venv /home/ubuntu/fev/venv-reference
 env -u LD_LIBRARY_PATH /home/ubuntu/fev/venv-reference/bin/python -m pip install \
   --extra-index-url https://download.pytorch.org/whl/cu128 \
-  -r "$FEV_LOCK_FILE" -c "$FEV_LOCK_FILE" -e '.[bench]'
+  -c "$COLAB_LOCK" -e '.[bench]'
+env -u LD_LIBRARY_PATH /home/ubuntu/fev/venv-reference/bin/python -I -m pip freeze \
+  > "$PROBES/reference-pip-freeze.txt"
+env -u LD_LIBRARY_PATH /home/ubuntu/fev/venv-reference/bin/python -I \
+  "$TOOLS/scripts/ec2/closure_parity.py" --colab-lock "$COLAB_LOCK" \
+  --freeze "$PROBES/reference-pip-freeze.txt" --extras bench \
+  --out "$PROBES/reference-closure-parity.txt"
+env -u LD_LIBRARY_PATH /home/ubuntu/fev/venv-reference/bin/python \
+  "$TOOLS/scripts/pip_check_closure.py" --extras bench --report "$PROBES/reference-pip-check.txt"
+sed '/^#/d; /^-e /d; /^$/d' "$FEV_LOCK_FILE" | sort > "$PROBES/reference-expected-pins.txt"
+sed '/^#/d; /^-e /d; /^$/d' "$PROBES/reference-pip-freeze.txt" | sort > "$PROBES/reference-actual-pins.txt"
+diff -u "$PROBES/reference-expected-pins.txt" "$PROBES/reference-actual-pins.txt" \
+  > "$PROBES/reference-lock.diff"
 ```
 
 Save `$OPS/p3-run.sh`; it runs sequentially, PR once and reference twice. The selected
@@ -804,8 +884,9 @@ find "$@" -type l -printf '%p -> %l\n' | sort > copyback.links.txt
 du -sb "$@" > copyback.bytes.txt
 ```
 
-Copy the run/probe roots, manifests, operator scripts, `env.sh`, setup logs, Colab inputs
-and provisioning JSON to the Mac. Example local Bash script (GNU `sha256sum` or the shown
+Copy the run/probe roots, manifests, operator scripts, `env.sh`, `ec2-environment-lock.txt`,
+setup logs, Colab inputs with both transfer hash records and provisioning JSON to the Mac.
+Example local Bash script (GNU `sha256sum` or the shown
 Python verifier works on macOS):
 
 ```bash
@@ -816,6 +897,8 @@ mkdir -p "$DEST"
 rsync -a -e "ssh -i $KEY" "ubuntu@$HOST:/home/ubuntu/fev/runs/" "$DEST/runs/"
 rsync -a -e "ssh -i $KEY" "ubuntu@$HOST:/home/ubuntu/fev/ops/" "$DEST/ops/"
 scp -i "$KEY" "ubuntu@$HOST:/home/ubuntu/fev/env.sh" "$DEST/"
+scp -i "$KEY" "ubuntu@$HOST:/home/ubuntu/fev/ec2-environment-lock.txt" "$DEST/"
+rsync -a -e "ssh -i $KEY" "ubuntu@$HOST:/home/ubuntu/fev-inputs/" "$DEST/fev-inputs/"
 cd "$DEST/runs"
 python3 - <<'PY'
 import hashlib

@@ -27,9 +27,11 @@ done
 [[ -n $venv && -n $root && -n $config && -n $tasks ]] || { usage; exit 2; }
 [[ -z $stop_after || $stop_after =~ ^[1-9][0-9]*$ ]] || fail "invalid --stop-after"
 [[ $(uname -s) == Linux ]] || fail "this launcher requires Linux/EC2"
-: "${FEV_LOCK_FILE:?set FEV_LOCK_FILE to the Colab constraints lock}"
+: "${FEV_LOCK_FILE:?set FEV_LOCK_FILE to the verified EC2 environment lock}"
 : "${FEV_DATASET_MANIFEST:?set FEV_DATASET_MANIFEST to the verified dataset manifest}"
-for command in setsid nohup flock nvidia-smi realpath; do command -v "$command" >/dev/null; done
+for command in setsid nohup flock nvidia-smi realpath; do
+    command -v "$command" >/dev/null || fail "missing command $command"
+done
 [[ -x /usr/bin/time && -x $venv/bin/python && -x $venv/bin/demand-forecast ]] || fail "missing time or venv executables"
 venv=$(realpath "$venv")
 config=$(realpath "$config")
@@ -94,7 +96,7 @@ cp "$tools_dir/frozen_parallel.sh" "$tools_dir/sample_resources.py" "$provenance
 printf '%s\n' "$sha" > "$provenance/commit.txt"
 git -C "$package_root" status --porcelain > "$provenance/git-status.txt"
 env -u LD_LIBRARY_PATH "$venv/bin/python" -I -m pip freeze > "$provenance/pip-freeze.txt"
-# Editable paths/comments differ between the PR and fallback; package pins must not.
+# Compare against the verified EC2 lock; editable PR/fallback paths/comments may differ.
 sed '/^#/d; /^-e /d; /^$/d' "$lock" | sort > "$provenance/expected-pins.txt"
 sed '/^#/d; /^-e /d; /^$/d' "$provenance/pip-freeze.txt" | sort > "$provenance/actual-pins.txt"
 diff -u "$provenance/expected-pins.txt" "$provenance/actual-pins.txt" > "$provenance/lock.diff" || fail "environment drift (see $provenance/lock.diff)"
