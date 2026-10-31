@@ -2,12 +2,17 @@
 
 from collections.abc import Sequence
 from dataclasses import replace
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import numpy as np
 import pandas as pd
 
+from demand_forecast.config.settings import DatasetConfig
 from demand_forecast.data.frequency import seasonal_period, to_offset
+from demand_forecast.data.loader_long import load_long
 from demand_forecast.data.panel import Panel, Roles, Series
+from demand_forecast.synthetic.generator import generate_long_panel
 
 
 def weekly_panel(lengths: Sequence[int]) -> Panel:
@@ -38,8 +43,46 @@ def series_with(panel: Panel, **overrides) -> Series:
     return replace(source, series_id=series_id, statics={**source.statics, **overrides})
 
 
-def synthetic_panel(n_series: int, length: int, freq: str, seed: int) -> Panel:
-    """Build a large deterministic panel directly, without frames or bench extras."""
+def synthetic_panel(
+    n_series: int, length: int, freq: str, seed: int, *, signal: str | None = None
+) -> Panel:
+    """Build uniform targets directly, or load a seasonal/promo panel through CSV.
+
+    With ``seasonal_promo``, the promo effect is made dominant so a linear toy
+    backbone can learn it (``promo_uplift=5.0``).
+    """
+    if signal == "seasonal_promo":
+        long, static = generate_long_panel(
+            n_series,
+            length,
+            freq,
+            start="2023-01-01",
+            known=("promo",),
+            past=("oil",),
+            statics=("cat",),
+            seed=seed,
+            promo_uplift=5.0,
+        )
+        with TemporaryDirectory(prefix="dfc-seasonal-promo-") as directory:
+            path = Path(directory) / "long.csv"
+            static_path = Path(directory) / "static.csv"
+            long.to_csv(path, index=False)
+            static.to_csv(static_path, index=False)
+            return load_long(
+                DatasetConfig(
+                    path=path,
+                    id_columns=["id"],
+                    target="target",
+                    target_support="nonnegative",
+                    known_dynamic=["promo"],
+                    past_dynamic=["oil"],
+                    static_path=static_path,
+                    static_categorical=["cat"],
+                    freq=freq,
+                )
+            )
+    if signal is not None:
+        raise ValueError(f"Unknown synthetic signal: {signal!r}")
     rng = np.random.default_rng(seed)
     start = to_offset(freq).rollforward(pd.Timestamp("2023-01-01"))
     targets = rng.uniform(1, 20, size=(n_series, length)).astype(np.float32)
