@@ -222,3 +222,95 @@ def test_report_detects_incomplete_or_noncomparable_evidence(report_run, corrupt
         assert table(report, "Scores")[0]["v2/baseline SQL ratio"] == "not comparable"
     if corruption == "legacy":
         assert "unknown" in report and "diagnostics" in " ".join(issues)
+
+
+@pytest.mark.parametrize("failure_at", ["task", "dataset", "iteration_start", "iteration_next"])
+def test_report_task_runtime_failure_preserves_other_task_and_writes_report(
+    report_run, monkeypatch, failure_at
+):
+    specs, out, tasks, roles = report_run
+    module = report_module()
+    to_task = type(specs[0]).to_task
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("Failed to load the dataset")
+
+    def faulty_task(spec):
+        if spec.name != "first":
+            return to_task(spec)
+        if failure_at == "task":
+            fail()
+        task = to_task(spec)
+        if failure_at == "dataset":
+            monkeypatch.setattr(task, "load_full_dataset", fail)
+        elif failure_at == "iteration_start":
+            monkeypatch.setattr(task, "iter_windows", fail)
+        else:
+            iter_windows = task.iter_windows
+
+            def interrupted_windows():
+                yield next(iter(iter_windows()))
+                fail()
+
+            monkeypatch.setattr(task, "iter_windows", interrupted_windows)
+        return task
+
+    monkeypatch.setattr(type(specs[0]), "to_task", faulty_task)
+
+    def assert_report(report):
+        completeness = report.split("## Completeness\n", 1)[1]
+        assert "first: task could not be audited: Failed to load the dataset" in completeness
+        assert "Incomplete" in completeness
+        assert "second:" not in completeness
+        for title, column in (
+            ("Training", "steps"),
+            ("Scores", "SQL"),
+            ("Diagnostics", "coverage_80"),
+            ("Doubled, unscaled pinball", "pinball_0.1"),
+        ):
+            row = next(row for row in table(report, title) if row["task"] == "second")
+            assert np.isfinite(float(row[column]))
+
+    report, issues = module.build_report(out, specs)
+    assert issues
+    assert_report(report)
+    output = out / "failed-task-report.md"
+    args = [
+        "--run-dir",
+        str(out),
+        "--tasks",
+        str(tasks),
+        "--profiles",
+        str(roles),
+        "--out",
+        str(output),
+    ]
+    assert module.main(args) == 1
+    assert_report(output.read_text())
+    assert module.main([*args, "--allow-partial"]) == 0
+    assert_report(output.read_text())
+
+
+def test_report_window_runtime_failure_keeps_later_windows_and_tasks(report_run, monkeypatch):
+    specs, out, _, _ = report_run
+    module = report_module()
+    load = np.load
+
+    def fail_first_window(path, **kwargs):
+        if Path(path) == out / "first/window_0.npz":
+            raise RuntimeError("Failed to read window evidence")
+        return load(path, **kwargs)
+
+    monkeypatch.setattr(module.np, "load", fail_first_window)
+    report, issues = module.build_report(out, specs)
+    assert any(
+        "first: window_0.npz" in issue and "Failed to read window evidence" in issue
+        for issue in issues
+    )
+    rows = table(report, "Window diagnostics")
+    assert len(rows) == 4
+    failed = next(row for row in rows if row["task"] == "first" and row["window"] == "0")
+    assert failed["inference_time_s"] == "unknown"
+    later = next(row for row in rows if row["task"] == "first" and row["window"] == "1")
+    assert float(later["inference_time_s"]) > 0
+    assert not any(issue.startswith("second:") for issue in issues)
