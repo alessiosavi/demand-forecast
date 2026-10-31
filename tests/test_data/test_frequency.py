@@ -135,7 +135,10 @@ def test_time_of_day_is_off_grid_for_one_row_and_for_a_whole_series():
     validate_on_grid(pd.date_range("2023-01-01 13:00", periods=4, freq=to_offset("H")), "H", "s3")
 
 
-@pytest.mark.parametrize("freq", ["D", "2D", "W-WED", "MS", "M", "QS", "YS", "24H", "48h"])
+@pytest.mark.parametrize(
+    "freq",
+    ["D", "2D", "W-WED", "MS", "M", "QS", "YS", "24H", "48h", "B", "BMS", "SMS", "WOM-1MON"],
+)
 def test_daily_and_coarser_grids_reject_nonmidnight_singletons(freq):
     timestamp = pd.date_range("2023-01-01", periods=1, freq=to_offset(freq))[0]
     validate_on_grid(pd.DatetimeIndex([timestamp]), freq, "s1")
@@ -143,6 +146,15 @@ def test_daily_and_coarser_grids_reject_nonmidnight_singletons(freq):
     with pytest.raises(GridError) as exc:
         validate_on_grid(pd.DatetimeIndex([bad]), freq, "s1")
     assert exc.value.timestamp == bad
+
+
+@pytest.mark.parametrize("freq", ["bh", pd.offsets.BusinessHour(), pd.offsets.CustomBusinessHour()])
+def test_business_hour_grids_preserve_time_of_day(freq):
+    index = pd.date_range("2023-01-02 09:00", periods=10, freq=freq)
+    expected = index.copy()
+    validate_on_grid(index, freq, "s1")
+    pd.testing.assert_index_equal(index, expected)
+    assert index[0] == pd.Timestamp("2023-01-02 09:00")
 
 
 @pytest.mark.parametrize(
@@ -249,6 +261,19 @@ def test_calendar_feature_names_width_dtype_and_empty_input(freq, fields):
     empty = calendar_features(pd.DatetimeIndex([]), freq)
     assert empty.shape == (0, len(names)) and empty.dtype == np.float32
     np.testing.assert_array_equal(features, calendar_features(idx, to_offset(freq)))
+
+
+@pytest.mark.parametrize(
+    "freq",
+    [
+        "BMS",
+        pd.offsets.BusinessMonthEnd(),
+        pd.offsets.CustomBusinessMonthBegin(),
+        pd.offsets.CustomBusinessMonthEnd(),
+    ],
+)
+def test_business_month_calendar_feature_names_match_monthly(freq):
+    assert calendar_feature_names(freq) == calendar_feature_names("MS")
 
 
 def test_calendar_features_use_iso_week_and_float_sine_cosine_values():
