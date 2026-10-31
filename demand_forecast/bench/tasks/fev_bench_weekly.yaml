@@ -1,0 +1,105 @@
+# Source: https://raw.githubusercontent.com/autogluon/fev/v0.10.0/benchmarks/fev_bench/tasks.yaml
+# Tag: v0.10.0; seven entries copied verbatim, in weekly benchmark order.
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0; see THIRD_PARTY_NOTICES.md.
+tasks:
+- dataset_path: autogluon/fev_datasets
+  horizon: 13
+  num_windows: 1
+  seasonality: 1
+  eval_metric: SQL
+  extra_metrics:
+  - MASE
+  - {name: WAPE, epsilon: 1.0}
+  - {name: WQL, epsilon: 1.0}
+  quantile_levels: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+  known_dynamic_columns: [sell_price, event_National, event_Religious, event_Cultural, snap_CA, event_Sporting, snap_WI, snap_TX]
+  static_columns: [item_id, dept_id, cat_id, store_id, state_id]
+  dataset_config: m5_1W
+- dataset_path: autogluon/fev_datasets
+  horizon: 13
+  num_windows: 10
+  seasonality: 1
+  eval_metric: SQL
+  extra_metrics:
+  - MASE
+  - {name: WAPE, epsilon: 1.0}
+  - {name: WQL, epsilon: 1.0}
+  quantile_levels: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+  target: sales
+  known_dynamic_columns: [onpromotion]
+  past_dynamic_columns: [oil_price]
+  static_columns: [store_nbr, family, city, state, type, cluster]
+  dataset_config: favorita_stores_1W
+- dataset_path: autogluon/fev_datasets
+  horizon: 13
+  num_windows: 8
+  seasonality: 1
+  eval_metric: SQL
+  extra_metrics:
+  - MASE
+  - {name: WAPE, epsilon: 1.0}
+  - {name: WQL, epsilon: 1.0}
+  quantile_levels: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+  target: Sales
+  known_dynamic_columns: [Open, SchoolHoliday, StateHoliday, Promo]
+  past_dynamic_columns: [Customers]
+  static_columns: [Store, StoreType, Assortment, CompetitionDistance, CompetitionOpenSinceMonth, CompetitionOpenSinceYear, Promo2, Promo2SinceWeek, Promo2SinceYear,
+    PromoInterval]
+  dataset_config: rossmann_1W
+- dataset_path: autogluon/fev_datasets
+  horizon: 8
+  num_windows: 1
+  initial_cutoff: '2023-12-15'
+  min_context_length: 8
+  seasonality: 1
+  eval_metric: SQL
+  extra_metrics:
+  - MASE
+  - {name: WAPE, epsilon: 1.0}
+  - {name: WQL, epsilon: 1.0}
+  quantile_levels: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+  target: sales
+  known_dynamic_columns: [total_orders, sell_price_main, type_0_discount, type_1_discount, type_2_discount, type_3_discount, type_4_discount, type_5_discount,
+    type_6_discount, holiday, shops_closed, winter_school_holidays, school_holidays]
+  past_dynamic_columns: [availability]
+  static_columns: [product_unique_id, name, L1_category_name_en, L2_category_name_en, L3_category_name_en, L4_category_name_en, warehouse]
+  dataset_config: rohlik_sales_1W
+- dataset_path: autogluon/fev_datasets
+  horizon: 39
+  num_windows: 1
+  seasonality: 1
+  eval_metric: SQL
+  extra_metrics:
+  - MASE
+  - {name: WAPE, epsilon: 1.0}
+  - {name: WQL, epsilon: 1.0}
+  quantile_levels: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+  known_dynamic_columns: [MarkDown2, Unemployment, MarkDown4, Fuel_Price, MarkDown1, Temperature, MarkDown5, MarkDown3, CPI, IsHoliday]
+  static_columns: [Store, Dept, Type, Size]
+  dataset_config: walmart
+- dataset_path: autogluon/fev_datasets
+  horizon: 52
+  num_windows: 1
+  seasonality: 1
+  eval_metric: SQL
+  extra_metrics:
+  - MASE
+  - {name: WAPE, epsilon: 1.0}
+  - {name: WQL, epsilon: 1.0}
+  quantile_levels: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+  known_dynamic_columns: [external]
+  static_columns: [country, category]
+  dataset_config: hermes
+- dataset_path: autogluon/fev_datasets
+  horizon: 13
+  num_windows: 10
+  seasonality: 1
+  eval_metric: SQL
+  extra_metrics:
+  - MASE
+  - {name: WAPE, epsilon: 1.0}
+  - {name: WQL, epsilon: 1.0}
+  quantile_levels: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+  static_columns: []
+  dataset_config: hierarchical_sales_1W
