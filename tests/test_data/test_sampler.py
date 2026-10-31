@@ -8,10 +8,57 @@ import pandas as pd
 import pytest
 import torch
 
+from demand_forecast.core.validation import plan_inner_validation
 from demand_forecast.data.encoders import StaticEncoder
-from demand_forecast.data.frequency import calendar_features
+from demand_forecast.data.frequency import calendar_features, grid_range
+from demand_forecast.data.panel import Panel, Roles, build_series
 from demand_forecast.data.sampler import Batch, WindowSampler, build_origins, make_batch
 from tests.helpers.panels import synthetic_panel, weekly_panel
+
+
+def test_ragged_histories_never_produce_labels_past_their_own_end():
+    lengths = (40, 38, 40, 28, 38, 40)
+    timestamps = pd.date_range("2023-01-01", periods=41, freq="W-SUN")
+    roles = Roles("target", (), (), (), ())
+    panel = Panel(
+        [
+            build_series(
+                str(i),
+                pd.DataFrame(
+                    {"target": np.arange(length, dtype=float) + 1}, index=timestamps[:length]
+                ),
+                freq="W-SUN",
+                roles=roles,
+                missing_target="nan",
+                statics={},
+            )
+            for i, length in enumerate(lengths)
+        ],
+        roles,
+        "W-SUN",
+        1,
+        "nonnegative",
+    )
+    plan = plan_inner_validation(panel, timestamps[40], 4, min_train_history=12)
+    assert plan.val_items.tolist() == [0, 1, 2, 4, 5]
+    assert plan.train_upto == timestamps[35]
+    encoder = StaticEncoder().fit(panel, plan.fit_ids)
+    origins = build_origins(panel, 4, 1, upto=plan.train_upto)
+    assert set(origins[:, 0]) == set(range(6))
+    for series_index, origin_pos in origins:
+        assert origin_pos <= panel.series[series_index].history_length
+    batch = make_batch(
+        panel, [tuple(x) for x in origins], 4, 32, encoder, label_upto=plan.train_upto
+    )
+    for row, (series_index, origin_pos) in enumerate(origins):
+        series = panel.series[series_index]
+        grid = grid_range(series.start, int(origin_pos) + 4, panel.freq)
+        expected = (np.arange(origin_pos, origin_pos + 4) < series.history_length) & (
+            grid[origin_pos:] <= plan.train_upto
+        )
+        np.testing.assert_array_equal(batch.label_mask[row].numpy(), expected)
+    early_last = np.flatnonzero((origins[:, 0] == 3) & (origins[:, 1] == 27)).item()
+    assert batch.label_mask[early_last].tolist() == [True, False, False, False]
 
 
 @pytest.mark.parametrize("horizon", [8, 13, 39, 52])
