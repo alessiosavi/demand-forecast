@@ -51,11 +51,20 @@ class Panel:
             raise ValueError("target_support must be 'nonnegative' or 'real'")
 
     def index_of(self, series_id: str) -> int:
-        """Return the series' position, raising KeyError for an unknown id."""
-        for i, series in enumerate(self.series):
-            if series.series_id == series_id:
-                return i
-        raise KeyError(series_id)
+        """Look up a unique id in O(1), rebuilding the lazy index when stale.
+
+        Validate the cached hit against the live series rather than scanning all
+        ids on every lookup. A changed length, renamed/moved id or new id rebuilds
+        the map on demand. Cache attributes are not dataclass fields.
+        """
+        index = getattr(self, "_id_index", None)
+        if index is not None and self._indexed_length == len(self.series):
+            position = index.get(series_id)
+            if position is not None and self.series[position].series_id == series_id:
+                return position
+        self._id_index = {series.series_id: i for i, series in enumerate(self.series)}
+        self._indexed_length = len(self.series)
+        return self._id_index[series_id]
 
     def timestamps(self, i: int, length: int | None = None) -> pd.DatetimeIndex:
         """Return the series' historical grid, or a requested number of steps."""

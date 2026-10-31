@@ -1,3 +1,4 @@
+import time
 from dataclasses import FrozenInstanceError, replace
 
 import numpy as np
@@ -6,6 +7,7 @@ import pytest
 
 from demand_forecast.data.frequency import GridError, seasonal_period
 from demand_forecast.data.panel import Panel, Roles, Series, build_series
+from tests.helpers.panels import synthetic_panel
 
 W_SUN = pd.tseries.frequencies.to_offset("W-SUN")
 ROLES = Roles(
@@ -249,3 +251,30 @@ def test_build_series_rejects_empty_duplicate_or_invalid_span():
         build_series("a", frame, history_end=pd.Timestamp("2022-12-25"), **kwargs)
     with pytest.raises(ValueError, match="missing_target"):
         build_series("a", frame, **{**kwargs, "missing_target": "typo"})
+
+
+def test_index_of_rebuilds_after_length_id_order_and_list_changes(panel29):
+    assert panel29.index_of("b") == 1
+    panel29.series.append(replace(panel29.series[0], series_id="d"))
+    assert panel29.index_of("d") == 3
+    panel29.series[1].series_id = "renamed"
+    with pytest.raises(KeyError, match="b"):
+        panel29.index_of("b")
+    assert panel29.index_of("renamed") == 1
+    panel29.series.reverse()
+    assert panel29.index_of("d") == 0
+    assert panel29.index_of("a") == 3
+    panel29.series = [replace(s, series_id=str(i)) for i, s in enumerate(panel29.series)]
+    assert panel29.index_of("2") == 2
+    panel29.series.pop(0)
+    assert panel29.index_of("2") == 1
+
+
+def test_m5_sized_panel_lookup_is_fast(record_property):
+    panel = synthetic_panel(n_series=30_490, length=250, freq="W-SUN", seed=0)
+    started = time.perf_counter()
+    for i in range(30_000):
+        assert panel.index_of(str(i)) == i
+    elapsed = time.perf_counter() - started
+    record_property("lookup_seconds", elapsed)
+    assert elapsed < 1, f"30,000 lookups took {elapsed:.3f}s"
