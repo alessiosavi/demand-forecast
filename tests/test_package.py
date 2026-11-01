@@ -85,3 +85,27 @@ def test_cli_version_is_2_0_0():
     result = CliRunner().invoke(app, ["version"])
     assert result.exit_code == 0
     assert result.output.strip() == "demand-forecast version 2.0.0"
+
+
+def test_pretrain_imports_without_bench(tmp_path):
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            textwrap.dedent("""\
+                import importlib
+                import sys
+
+                for name in ("pyarrow", "datasets", "huggingface_hub", "fev", "statsforecast"):
+                    sys.modules[name] = None
+
+                importlib.import_module("demand_forecast.pretrain")
+                importlib.import_module("demand_forecast.pretrain.corpus")
+            """),
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
