@@ -263,6 +263,7 @@ The reviewed config must freeze seed 0, the protocol's standard v2 architecture 
 resolved budget. Put checkpoints, bundles and completed-window predictions on Drive.
 Split tasks across sessions and use `--resume` after reconnects. Preserve identity
 mismatch errors and investigate; never overwrite mismatched artifacts to force resume.
+After a non-finite-loss failure, retain the checkpoint and `checkpoints/progress.json` with `stop_reason: nonfinite_losses`; the failed task produces no bundle and no summary row.
 
 Training prompts must budget Drive space **per task**: a checkpoint is approximately
 16 bytes/parameter (model, best state and AdamW moments), multiplied by 2 during

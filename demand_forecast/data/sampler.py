@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, fields, replace
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import numpy as np
 import pandas as pd
@@ -78,8 +78,11 @@ class Batch:
         return Batch(**values)
 
 
-def _add_row_diagnostics(batch: Batch, row: int, diag: DynamicDiagnostics) -> None:
-    """Accumulate one sample-column's diagnostics in its batch row."""
+def _add_row_diagnostics(batch: Any, row: int, diag: DynamicDiagnostics) -> None:
+    """Accumulate one sample-column's diagnostics in its batch row.
+
+    Any object exposing per-row-indexable cold_covariates, clipped_covariates, floored_covariates may be passed.
+    """
     batch.cold_covariates[row] += diag.cold
     batch.clipped_covariates[row] += diag.clipped
     batch.floored_covariates[row] += diag.floored
