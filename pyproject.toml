@@ -29,7 +29,7 @@ bench = [
     "fev==0.10.0",
     "datasets<5",
     "statsforecast==2.0.1",
-    "pyarrow<26",             # retained benchmark compatibility boundary until the phase-5 dependency lock
+    "pyarrow<26",             # retained benchmark compatibility boundary until the frozen execution dependency lock
 ]
 dev = [
     "pytest>=7.4",
@@ -76,10 +76,6 @@ target-version = "py310"
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W", "UP"]
 ignore = ["E501"]
-
-[tool.ruff.format]
-# Implementation plans contain illustrative snippets, not executable Python.
-exclude = ["docs/superpowers/plans/*.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
