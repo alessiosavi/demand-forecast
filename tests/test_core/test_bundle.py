@@ -445,7 +445,15 @@ def test_forecast_per_item_origins_matches_single_origin_when_shared(bundle_and_
     ids2, arrays2, diag2 = predictor.forecast_per_item_origins(panel, {key: origin for key in ids})
     assert ids2 == ids
     np.testing.assert_array_equal(arrays2, arrays)
-    for key in ("n_items", "fallback_no_context", "fallback_undefined_scale", "device"):
+    for key in (
+        "n_items",
+        "fallback_no_context",
+        "fallback_undefined_scale",
+        "device",
+        "cold_covariate_columns",
+        "clipped_covariate_values",
+        "floored_covariate_columns",
+    ):
         assert diag2[key] == diag[key]
     assert diag2["n_origins"] == 1 and diag2["inference_time_s"] > 0
 
@@ -465,9 +473,19 @@ def test_forecast_per_item_origins_preserves_order_and_sums_fallbacks(
     panel.series[0].target[:] = np.nan
     panel.series[1].target[:] = 6.0
     origins = {"a": origin + panel.freq, "b": origin, "c": origin + panel.freq}
+    panel.series[0].dynamic["promo"] = np.r_[np.full(30, np.nan), np.full(13, 1e5)]
+    panel.series[1].dynamic["promo"] = np.r_[3.0 + 1e-6, np.full(28, 3.0), np.full(13, 4.0)]
+    panel.series[2].dynamic["promo"] = np.r_[np.zeros(30), np.full(13, 1e5)]
     forecast = predictor.forecast_with_diagnostics
     expected = {}
-    totals = {"n_items": 0, "fallback_no_context": 0, "fallback_undefined_scale": 0}
+    totals = {
+        "n_items": 0,
+        "fallback_no_context": 0,
+        "fallback_undefined_scale": 0,
+        "cold_covariate_columns": 0,
+        "clipped_covariate_values": 0,
+        "floored_covariate_columns": 0,
+    }
     for group_origin in (origin + panel.freq, origin):
         group = replace(
             panel, series=[s for s in panel.series if origins[s.series_id] == group_origin]
@@ -489,6 +507,13 @@ def test_forecast_per_item_origins_preserves_order_and_sums_fallbacks(
     np.testing.assert_array_equal(arrays, np.stack([expected[key] for key in ids]))
     assert seen == [(origin + panel.freq, ["a", "c"], 1), (origin, ["b"], 1)]
     assert {key: diag[key] for key in totals} == totals
-    assert totals == {"n_items": 3, "fallback_no_context": 1, "fallback_undefined_scale": 1}
+    assert totals == {
+        "n_items": 3,
+        "fallback_no_context": 1,
+        "fallback_undefined_scale": 1,
+        "cold_covariate_columns": 1,
+        "clipped_covariate_values": 13,
+        "floored_covariate_columns": 1,
+    }
     assert diag["n_origins"] == 2 and diag["device"] == "cpu"
     assert diag["inference_time_s"] > 0

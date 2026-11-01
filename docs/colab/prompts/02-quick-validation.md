@@ -5,6 +5,8 @@ Paste these instructions into a Claude session that can drive Colab (see
 `configs/fev-v2-quick.yaml` and `scripts/fev_report.py`. This authorizes ONE labelled
 quick-validation run, seed 0, policy `first_window`, on all seven weekly tasks; it
 authorizes no tuning, second seed, configuration change or variant selection.
+For the authorized two-task rerun after the non-finite-input fix, §5 overrides the
+run directory, task selection and corresponding counts; all other rules still apply.
 
 You are the executing agent. Create, run and save a Jupyter notebook on my **hosted
 Colab free-tier kernel**, T4 GPU, Runtime version **2026.07** (Python 3.12), using
@@ -167,6 +169,10 @@ its `run.json`/`checkpoints/progress.json`:
   optimizer steps. For `rossmann_1W` (and any other exception task), expect
   `exception=True`, `val_items=0`, no validation selection, 300 steps and
   `stop_reason=exception_budget`. Do not misclassify that expected stop as a failure.
+- Every task must show `fit_result.nonfinite_losses == 0`. A `nonfinite_losses` stop
+  (also published in `checkpoints/progress.json`) or a positive count is a failed run,
+  never a configuration question. Preserve the checkpoint, logs and failure evidence;
+  do not treat this exit 1 as an expected interruption or change the configuration.
 - Preserve `panel: task=… window=… build_s=…`, `origins:` diagnostics and each
   `eval:` line with `train_s_per_step` and `eval_s`. Record `max_distinct_origins`
   in §4. Unexpected budgets, counts or stop reasons require investigation and a
@@ -209,6 +215,9 @@ complete audit for a complete run; a nonzero exit still leaves diagnostic tables
 Preserve them and report partial/blocked status with the missing evidence; do not
 use `--allow-partial` to claim success. Do not select another variant after reading
 any score, including partial results.
+Every task must show `fit_result.nonfinite_losses == 0`; record this gate per task.
+A `nonfinite_losses` stop or a positive count is a failed run, never a configuration
+question, even if saved predictions and benchmark metrics are finite.
 
 Compose `$FEV_RUN_DIR/report.md` **by hand**, with the following sentence as its
 **first line**, verbatim (no title before it):
@@ -240,6 +249,7 @@ Hardware: GPU, capability, amp dtype, VRAM, MemTotal/MemAvailable, RSS_LIMIT in 
 Dataset manifest: required Hub revision; both online checks per session; seven parquet paths/sizes/sha256 and LFS checks; equal to prompt 00 (yes|no):
 Baseline: seven seasonal_naive rows; per-task SQL/MASE equality to six significant figures:
 Per task: steps, stop_reason, best_step, n_val_items/n_val_items_eligible, val_items_max:
+Per task: fit_result.nonfinite_losses == 0 gate; cold_covariate_columns, floored_covariate_columns, clipped_covariate_values:
 Per task: timestamp-derived wall with interval boundaries, panel: build_s per window, train_s_per_step, eval_s, inference seconds, max_distinct_origins:
 Memory: whole-command peak RSS in kB; per-task RSS unmeasured; sampled VRAM maximum and interval attribution if available; peak_cuda_mem_bytes per task:
 Quick scores: SQL ratio vs seasonal_naive (or not comparable), 80% coverage/width, fallback counts, metrics/per-knot pinball, exclusions and completeness from report-tables.md:
@@ -257,3 +267,120 @@ with diagnostics, all command logs and `.exit` files, completed VRAM-log copies,
 `dataset-manifest.json`, provenance `commit.txt`/protocol/task/profile snapshots and
 `fev-v2-quick.yaml`, plus the exported executed notebook. Include paths to reused
 A–D evidence; preserve its original directory. Missing evidence stays explicit.
+
+## 5. Rerun of walmart and rohlik_sales_1W after the fix
+
+This is the authorized rerun of the two failed tasks at the fix commit `<SHA>`.
+It is also the **T4 fp16 acceptance check for the 1e3 covariate bound**: a hosted
+Colab T4 runtime is required, with capability `(7, 5)` and AMP `torch.float16`.
+A CPU run, fp16 emulation or another GPU does not satisfy this acceptance check;
+record it as blocked if a T4 is unavailable. Do not rerun the five clean tasks.
+The quick configuration, seed 0, `first_window` policy and score-use restrictions
+remain fixed. No tuning or configuration selection is authorized.
+
+Repeat §1–§2 with these overrides applied **before any cell runs**:
+
+- Set `FEV_SHA=<SHA>` and
+  `FEV_RUN_DIR=$FEV_DRIVE_ROOT/runs/02b-quick-v2-<SHA>/` in `os.environ`.
+  Use a new directory; do not resume into the failed seven-task quick run or a
+  prompt 01 directory. Preserve their artifacts and producing SHAs. For a reconnect
+  to this two-task rerun, use this same new directory and the usual `--resume` rules.
+- Keep the install/restart, dependency lock, provenance, online dataset-revision
+  verification, launcher, raw exit status, VRAM poller and memory gates. Check the
+  **Drive free-space gate of 300 MB** as before. All task-specific expectations in
+  §1–§4 now apply to these two tasks: two parquet manifest entries, two baseline rows,
+  two quick-model rows, and two `Skipping completed task <name>` lines on each
+  completed baseline/model rerun, with unchanged evidence hashes. Keep every item,
+  horizon and window of both tasks; do not substitute a smaller dataset.
+- Reuse prompt 00 baseline evidence and prompt 01 prerequisite A–D evidence, with
+  their recorded producing SHAs; do not rerun A–D. These evidence directories may
+  be restored copies on a different Drive: the Colab operator byte-copied `runs/`
+  with a sha256 manifest at
+  `MyDrive/demand-forecast/restore-from-old-account-<UTC>.json`.
+  **Before citing any restored file, the notebook must re-verify its sha256 against
+  that manifest on the fresh VM.** Record the manifest path, each cited file's path,
+  expected/observed sha256 and verification result in this run's `report.md`.
+  A missing manifest entry or hash mismatch blocks use of that evidence; preserve
+  and report it. The `hf/` directory is **not restored**: regenerate it online using
+  the existing §1–§2 steps and re-verify the pinned dataset revision and both parquet
+  hashes against their LFS pointers before continuing. Restored evidence does not
+  replace the fresh runtime, dataset or free-space gates.
+
+Run the two-task baseline through §0's detached launcher and poller:
+
+```bash
+set -euo pipefail
+cd /content/demand-forecast
+/usr/bin/time -v demand-forecast fev baseline --tasks walmart,rohlik_sales_1W \
+  --out-dir "$FEV_RUN_DIR"
+```
+
+Require exit 0 and exactly two `seasonal_naive` rows. Compare SQL/MASE for these two
+tasks with the verified prompt 00 evidence to six significant figures as in §2;
+stop on a mismatch. Baseline resume is automatic: a repeat must produce two skip
+lines and leave `summaries.csv` sha256 unchanged. Display only baseline scores.
+
+Then run the unchanged quick configuration, with a fresh launch token:
+
+```bash
+set -euo pipefail
+cd /content/demand-forecast
+/usr/bin/time -v demand-forecast fev run --tasks walmart,rohlik_sales_1W \
+  --config configs/fev-v2-quick.yaml --policy first_window --out-dir "$FEV_RUN_DIR" \
+  --resume --model-name demand-forecast-v2-quick
+```
+
+Require exit 0 and record the §3 budget/validation checks for both tasks before
+viewing quick-model scores. In addition, record these acceptance checks per task:
+
+- `fit_result.nonfinite_losses == 0` in `run.json`, with the cumulative count also
+  zero. A `nonfinite_losses` stop or any positive count is a failed run, never a
+  configuration question. Preserve terminal checkpoints and `progress.json`;
+  repeatedly resuming a terminal failure does not retrain it.
+- `timings.cumulative.cold_covariate_columns`, `floored_covariate_columns` and
+  `clipped_covariate_values` are present and recorded, including zeros. Legacy
+  `unknown` values are allowed by the general report, but do not satisfy this new
+  run's counter-evidence requirement.
+- `fit_result.stop_reason` and `checkpoints/progress.json["stop_reason"]` must be
+  equal to each other and both be `early_stop` or `max_steps`, with matching final
+  steps. Neither task is expected to take the short-history exception.
+- Load the task's `checkpoints/latest.pt` on CPU. Report its GradScaler
+  `scaler["scale"]` **diagnostically only**, with no exact value or lower-bound
+  gate: two legitimate overflow back-offs can give 16384, and scale growth needs
+  2,000 steps, beyond this quick run. A finite loss can still have overflowing
+  gradients, so the zero-loss-count check alone does not prove optimizer updates.
+- **Observation, not a gate:** expect `timings.cumulative.cold_covariate_columns > 0`
+  for walmart (MarkDown futures inside training windows after about 2011-02) and
+  `timings.cumulative.floored_covariate_columns > 0` for rohlik_sales_1W (tiny-std
+  prices and discounts). A zero means "investigate and report", not a failure.
+  Record both counters' values in `report.md`'s observations line together with
+  the GradScaler `k = log2(65536/scale)`.
+- Require finite model parameters in the checkpoint's `model` and `best_state`
+  and in the saved bundle, and finite prediction `arrays` in every `window_*.npz`.
+  Record checked tensor/array counts and any failures.
+- Show actual optimizer-update evidence from `checkpoint["optimizer"]["state"]`:
+  require nonempty AdamW state with positive finite per-parameter `step` values;
+  record how many parameter states have positive steps and their minimum/maximum,
+  alongside the checkpoint training step. Inspect and report finite `exp_avg` and
+  `exp_avg_sq` tensors. Do not infer updates from the training step, scheduler,
+  finite parameters or loss count alone, and do not require optimizer steps to
+  equal training steps (GradScaler may legitimately skip gradient overflows).
+
+Generate the audit only at §4's score-viewing stage, with the same selected tasks
+and model label:
+
+```bash
+set -euo pipefail
+cd /content/demand-forecast
+python scripts/fev_report.py --run-dir "$FEV_RUN_DIR" --tasks walmart,rohlik_sales_1W \
+  --baseline seasonal_naive --model-name demand-forecast-v2-quick \
+  --out "$FEV_RUN_DIR/report-tables.md"
+```
+
+Require report exit 0 and complete evidence for both tasks; `--allow-partial` cannot
+establish acceptance. Compose `report.md` using §4's exact first-line label and
+evidence format, with two-task counts, the fix `<SHA>`, the restored-evidence
+manifest path and fresh verification results, all gates above, measured timing and
+memory, and the executed notebook path. Report T4 fp16 acceptance as passed only
+when every gate passes; otherwise preserve artifacts and state failed or blocked
+with the missing evidence. Keep the earlier seven-task quick report separate.

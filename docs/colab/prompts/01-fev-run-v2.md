@@ -262,6 +262,12 @@ manifest verified), then the same command;
 completed tasks print `Skipping completed task <name>`, an interrupted task continues from
 `checkpoints/latest.pt`. Never reorder, drop or add tasks between sessions.
 
+For a successful run, every task must show `fit_result.nonfinite_losses == 0` in
+`run.json`. A `nonfinite_losses` stop (also published in `checkpoints/progress.json`)
+or a positive count is a failed run, never a configuration question. Preserve the
+checkpoint, logs and failure evidence; do not treat exit 1 from this failure as an
+expected interruption or change the frozen configuration to continue.
+
 ## 7. Report (first look at any v2 score happens here)
 
 ```bash
@@ -270,6 +276,11 @@ cd /content/demand-forecast
 python scripts/fev_report.py --run-dir "$FEV_RUN_DIR" --tasks weekly --baseline seasonal_naive --out "$FEV_RUN_DIR/report-tables.md"
 demand-forecast fev leaderboard "$FEV_RUN_DIR/summaries.csv" --baseline seasonal_naive | tee "$FEV_RUN_DIR/leaderboard.txt"
 ```
+
+Require report exit 0 and verify that every task shows `fit_result.nonfinite_losses == 0`;
+record the count per task. A `nonfinite_losses` stop or a positive count is a failed
+run, never a configuration question. Preserve diagnostic tables from a nonzero report
+exit and report the failure; `--allow-partial` cannot establish success.
 
 Verify on Drive: `summaries.csv`, `leaderboard.txt`, `report-tables.md`, per-task `run.json`,
 `checkpoints/progress.json`, `bundle/manifest.json`, `window_*.npz` (with diagnostics), all
@@ -295,6 +306,7 @@ Prerequisite B: step 120 interrupt evidence; resumed_from_step; fit_result.steps
 Prerequisite C: per task build_s, train_s_per_step, eval_s, peak RSS/VRAM, projection; summed projection; gate decision:
 Prerequisite D: distinct origins, earliest/latest origin, interrupt evidence; step, max_steps, n_fit_ids; no run.json/bundle/NPZ:
 Per task: producing SHA; max_distinct_origins (n/a for rev-1 tasks):
+Per task: fit_result.nonfinite_losses == 0 gate; stop_reason; any nonfinite_losses failure:
 Frozen run: paste report-tables.md (per-task budgets/timings/memory, metrics incl. per-knot pinball and 80% coverage/width, v2/naive ratio or "not comparable", fallbacks and exclusions, fingerprints, sizes, completeness):
 Information-set caveat: walmart's early-ending items are scored on periods other items' available past covers; this is the information set fev gives every model, not an out-of-time test for those items.
 Leaderboard text:
