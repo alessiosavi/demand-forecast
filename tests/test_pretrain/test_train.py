@@ -1,6 +1,7 @@
 """Training outcomes, terminal failures and exact continuation on tiny shards."""
 
 import json
+import math
 
 import pytest
 import torch
@@ -80,3 +81,91 @@ def test_nonfinite_stops_with_checkpoint(tmp_path, nonfinite_cfg, monkeypatch):
     with pytest.raises(NonFiniteTraining):
         pretrain(nonfinite_cfg, tmp_path / "c", resume=True)
     assert torch.load(tmp_path / "c/checkpoints/latest.pt", weights_only=False)["step"] == 20
+
+
+def test_no_finite_selection_score_keeps_checkpoint_without_publication(
+    tmp_path, tiny_pretrain_cfg
+):
+    from typer.testing import CliRunner
+
+    from demand_forecast.cli import app
+    from demand_forecast.pretrain.corpus import corpus_manifest, write_manifest
+    from demand_forecast.pretrain.train import pretrain
+    from tests.helpers.corpus_fixture import write_corpus_fixture
+
+    cfg = tiny_pretrain_cfg
+    for kind in ("tsmixup", "kernel_synth"):
+        write_corpus_fixture(cfg.corpus.root, kind=kind, index=1, constant=True)
+    write_manifest(corpus_manifest(cfg.corpus.root), cfg.corpus.root / "manifest.json")
+    out = tmp_path / "unselected"
+    checkpoint_path = out / "checkpoints/latest.pt"
+    message = (
+        "pretraining finished without a finite selection score; "
+        f"checkpoint kept at {checkpoint_path}"
+    )
+    with pytest.raises(RuntimeError) as error:
+        pretrain(cfg, out)
+    assert str(error.value) == message
+    checkpoint = torch.load(checkpoint_path, weights_only=False)
+    assert checkpoint["step"] == cfg.training.max_steps
+    assert checkpoint["best_score"] is None and checkpoint["best_step"] == 0
+    assert all(math.isfinite(row["loss"]) for row in checkpoint["history"])
+    assert any(
+        not torch.equal(value, checkpoint["best_state"][key])
+        for key, value in checkpoint["model"].items()
+    )
+    progress = json.loads(checkpoint_path.with_name("progress.json").read_text())
+    assert progress["stop_reason"] == "max_steps"
+    assert progress["step"] == cfg.training.max_steps and progress["best_score"] is None
+    for name in ("bundle", "pretrain.json", "history.csv"):
+        assert not (out / name).exists()
+
+    config_path = tmp_path / "constant-holdouts.yaml"
+    cfg.to_yaml(config_path)
+    result = CliRunner().invoke(
+        app,
+        ["pretrain", "run", "--config", str(config_path), "--out", str(out), "--resume"],
+    )
+    assert result.exit_code == 1, (result.output, result.exception)
+    assert message in result.output
+    for name in ("bundle", "pretrain.json", "history.csv"):
+        assert not (out / name).exists()
+
+
+def test_all_nan_training_shard_continues_to_kernel_updates(
+    tmp_path, tiny_pretrain_cfg, monkeypatch
+):
+    from demand_forecast.pretrain.corpus import corpus_manifest, write_manifest
+    from demand_forecast.pretrain.train import _PretrainLoop, pretrain
+    from tests.helpers.corpus_fixture import write_corpus_fixture
+
+    cfg = tiny_pretrain_cfg
+    write_corpus_fixture(cfg.corpus.root, kind="tsmixup", index=0, all_nan=True)
+    write_manifest(corpus_manifest(cfg.corpus.root), cfg.corpus.root / "manifest.json")
+    train_step = _PretrainLoop.train_step
+    kernel_updates = []
+    ineligible_batches = []
+
+    def observe_step(loop, batch, batch_s):
+        if loop.sampler.last_kind == "kernel_synth":
+            before = [parameter.detach().clone() for parameter in loop.model.parameters()]
+            train_step(loop, batch, batch_s)
+            kernel_updates.append(
+                any(
+                    not torch.equal(previous, current)
+                    for previous, current in zip(before, loop.model.parameters(), strict=True)
+                )
+            )
+        else:
+            ineligible_batches.append(not batch.loss_eligible.any().item())
+            train_step(loop, batch, batch_s)
+
+    monkeypatch.setattr(_PretrainLoop, "train_step", observe_step)
+    result = pretrain(cfg, tmp_path / "ineligible")
+    assert result.steps == cfg.training.max_steps and result.stop_reason == "max_steps"
+    assert len(result.history) == cfg.training.max_steps
+    assert all(math.isfinite(row["loss"]) for row in result.history)
+    assert all(row["loss"] == 0 for row in result.history if row["kind"] == "tsmixup")
+    assert result.timings["nonfinite_losses"] == 0
+    assert kernel_updates == [True]
+    assert ineligible_batches == [True] * (cfg.training.max_steps - 1)

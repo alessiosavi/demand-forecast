@@ -160,7 +160,7 @@ class ValidationSet:
     def build(
         cls, cfg: PretrainConfig, refs: list[ShardRef], encoder: StaticEncoder
     ) -> ValidationSet:
-        """Select local hold-outs by kind/index; an absent external set is optional."""
+        """Select local hold-outs by kind/index and require configured external data."""
         sets = {}
         for kind in ("tsmixup", "kernel_synth"):
             wanted = set(getattr(cfg.corpus, f"holdout_{kind}"))
@@ -187,7 +187,10 @@ class ValidationSet:
             )
         external = None
         config_name = cfg.corpus.external_validation
-        if config_name and (cfg.corpus.root / config_name).is_dir():
+        if config_name is not None:
+            directory = cfg.corpus.root / config_name
+            if not directory.is_dir():
+                raise FileNotFoundError(f"external validation directory not found: {directory}")
             external = external_pairs(config_name, cfg.corpus.root, horizon=cfg.forecast.horizon)
         return cls(
             **sets,
@@ -236,11 +239,8 @@ class ValidationSet:
             else:
                 result[f"val_sql_{kind}"] = scores["SQL"]
         corpus_scores = [
-            result[key]
+            result[key] if result[key] is not None else float("nan")
             for key in ("val_sql_tsmixup", "val_sql_kernel_synth")
-            if result[key] is not None
         ]
-        if corpus_scores:
-            observed = [score for score in corpus_scores if not np.isnan(score)]
-            result["val_sql"] = float(np.mean(observed)) if observed else float("nan")
+        result["val_sql"] = float(np.mean(corpus_scores))
         return result

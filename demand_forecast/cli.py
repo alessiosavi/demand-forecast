@@ -28,7 +28,6 @@ def pretrain_run(
     """Train to the fixed pretraining budget, or resume a matching checkpoint."""
     import yaml
 
-    from demand_forecast.core.training import InterruptedRun, NonFiniteTraining
     from demand_forecast.pretrain.config import PretrainConfig
     from demand_forecast.pretrain.train import pretrain
 
@@ -38,7 +37,7 @@ def pretrain_run(
         pretrain(cfg, out, resume=resume, stop_after=stop_after)
     except (ValueError, OSError, ImportError, yaml.YAMLError) as exc:
         raise typer.BadParameter(str(exc)) from exc
-    except (InterruptedRun, NonFiniteTraining) as exc:
+    except RuntimeError as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=1) from exc
     typer.echo(f"Bundle saved to {out / 'bundle'}")

@@ -396,6 +396,11 @@ def pretrain(
                 f"at step {loop.step}; checkpoint {checkpoint}"
             )
         loop.checkpoint(checkpoint, "max_steps")
+        if loop.best_score is None:
+            raise RuntimeError(
+                "pretraining finished without a finite selection score; "
+                f"checkpoint kept at {checkpoint}"
+            )
         loop.model.load_state_dict(loop.best_state)
         external = None
         if loop.validation.external is not None:

@@ -2,7 +2,9 @@
 
 import json
 import math
+import time
 import weakref
+from contextlib import nullcontext
 
 import pytest
 import torch
@@ -50,6 +52,50 @@ def test_cli_pretrain_run_and_probe(tmp_path, tiny_pretrain_yaml):
     ):
         assert report[key] > 0, key
     assert report["peak_cuda_mem_bytes"] is report["eval_peak_cuda_mem_bytes"] is None
+    assert report["nonfinite_losses"] == 0
+    assert math.isfinite(report["val_sql"])
+
+
+@pytest.mark.parametrize("nan_step", [1, 11], ids=["warmup", "measurement"])
+def test_pretrain_probe_rejects_nonfinite_losses(
+    tmp_path, tiny_pretrain_cfg, monkeypatch, nan_step
+):
+    from demand_forecast.pretrain import train
+    from demand_forecast.pretrain.probe import pretrain_probe
+
+    pinball_loss = train.pinball_loss
+    calls = 0
+
+    def fail_one_loss(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == nan_step:
+            return torch.tensor(float("nan"), requires_grad=True), 1
+        return pinball_loss(*args, **kwargs)
+
+    monkeypatch.setattr(train, "pinball_loss", fail_one_loss)
+    out = tmp_path / "failed-probe.json"
+    warning = (
+        pytest.warns(UserWarning, match="lr_scheduler.step") if nan_step == 1 else nullcontext()
+    )
+    with warning, pytest.raises(RuntimeError, match="nonfinite_losses=1"):
+        pretrain_probe(tiny_pretrain_cfg, steps=3, out=out)
+    assert not out.exists()
+
+
+def test_pretrain_probe_rejects_nonfinite_validation(tmp_path, tiny_pretrain_cfg):
+    from demand_forecast.pretrain.corpus import corpus_manifest, write_manifest
+    from demand_forecast.pretrain.probe import pretrain_probe
+    from tests.helpers.corpus_fixture import write_corpus_fixture
+
+    cfg = tiny_pretrain_cfg
+    for kind in ("tsmixup", "kernel_synth"):
+        write_corpus_fixture(cfg.corpus.root, kind=kind, index=1, constant=True)
+    write_manifest(corpus_manifest(cfg.corpus.root), cfg.corpus.root / "manifest.json")
+    out = tmp_path / "unscored-probe.json"
+    with pytest.raises(RuntimeError, match="val_sql=nan"):
+        pretrain_probe(cfg, steps=3, out=out)
+    assert not out.exists()
 
 
 def test_cli_probe_task_on_fixture_task(
@@ -151,6 +197,35 @@ def test_cli_probe_task_on_fixture_task(
     assert prepared_batches == [512] and training_batches == [128]
     assert events.count("update") == 2
     assert all(events[i + 1] == "sync" for i, event in enumerate(events) if event == "update")
+
+
+def test_task_probe_includes_trainer_setup_in_init(
+    tmp_path, fixture_tasks_yaml, fixture_profiles_yaml, tiny_experiment_yaml, monkeypatch
+):
+    from demand_forecast.bench.specs import load_task_specs
+    from demand_forecast.config import Settings
+    from demand_forecast.core import training
+    from demand_forecast.pretrain.probe import task_probe
+
+    build_origins = training.build_origins
+
+    def delayed_origins(*args, **kwargs):
+        time.sleep(0.2)
+        return build_origins(*args, **kwargs)
+
+    monkeypatch.setattr(training, "build_origins", delayed_origins)
+    out = tmp_path / "setup-probe"
+    reports = task_probe(
+        load_task_specs(str(fixture_tasks_yaml), fixture_profiles_yaml),
+        Settings.from_yaml(tiny_experiment_yaml),
+        steps=2,
+        out=out,
+        max_series=6,
+    )
+    report = reports["fixture"]
+    assert report["fit_setup_s"] >= 0.2
+    assert report["init_s"] >= report["fit_setup_s"]
+    assert json.loads((out / "fixture.json").read_text())["fit_setup_s"] == report["fit_setup_s"]
 
 
 def test_pretrain_duration_counts_overheads(tiny_pretrain_cfg):

@@ -94,6 +94,9 @@ def pretrain_probe(cfg: PretrainConfig, *, steps: int = 50, out: Path) -> dict:
             loop.train_step(batch, batch_s)
             if not load_s:
                 batch_times.append(batch_s)
+        nonfinite_losses = loop.timings["nonfinite_losses"]
+        if nonfinite_losses != 0:
+            raise RuntimeError(f"pretraining probe observed nonfinite_losses={nonfinite_losses}")
         s_per_step = (loop.timings["train_s"] - train_s) / steps
         # A tiny shard can transition on every step. Measure a resident batch
         # explicitly in that case, without adding any optimizer updates.
@@ -123,11 +126,18 @@ def pretrain_probe(cfg: PretrainConfig, *, steps: int = 50, out: Path) -> dict:
             checkpoint_s = time.perf_counter() - started
         _reset_peak(loop.device)
         started = time.perf_counter()
-        loop.validation.evaluate(loop.model, device=loop.device)
+        scores = loop.validation.evaluate(loop.model, device=loop.device)
         _sync(loop.device)
         eval_s = time.perf_counter() - started
+        val_sql = scores["val_sql"]
+        if val_sql is None or not math.isfinite(val_sql):
+            raise RuntimeError(
+                f"pretraining probe requires a finite val_sql; observed val_sql={val_sql}"
+            )
         eval_peak = _cuda_peak(loop.device)
         report = dict(
+            nonfinite_losses=nonfinite_losses,
+            val_sql=val_sql,
             s_per_step=s_per_step,
             batch_build_s_per_step=float(np.mean(batch_times)),
             init_s=init_s,
@@ -225,8 +235,14 @@ def task_probe(
         train_cfg.base_steps = train_cfg.max_steps_cap = steps
         trainer = _ProbeTrainer(model, train_cfg, device, f"probe-{spec.name}", settings.seed)
         _sync(device)
+        started = time.perf_counter()
         result = trainer.fit(panel, replace(plan, exception=True), forecast, encoder)
         _sync(device)
+        fit_wall_s = time.perf_counter() - started
+        # Trainer's train_s excludes origin enumeration, fallback and optimizer
+        # setup, and the initial state copy. Charge that overhead to init once.
+        fit_setup_s = fit_wall_s - result.timings["train_s"]
+        init_s += fit_setup_s
         if result.stop_reason == "nonfinite_losses":
             raise NonFiniteTraining(f"Task probe stopped on non-finite losses: {spec.name}")
         if not result.steps:
@@ -300,6 +316,7 @@ def task_probe(
         infer_s = time.perf_counter() - started
         report = dict(
             init_s=init_s,
+            fit_setup_s=fit_setup_s,  # Included in init_s; not an additional cost.
             prep_s=prep_s,
             eval_s=eval_s,
             ckpt_s=ckpt_s,

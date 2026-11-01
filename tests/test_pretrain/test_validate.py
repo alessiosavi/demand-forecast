@@ -322,14 +322,16 @@ def test_validation_set_selects_holdouts_and_keeps_external_diagnostic_separate(
 @pytest.mark.parametrize("constant", [False, True])
 def test_validation_set_missing_sources_and_nan_selection_score(tmp_path, constant):
     cfg = _config(tmp_path)
+    cfg.corpus.external_validation = None
     model, encoder = _toy_model(_panel())
     missing = ValidationSet.build(cfg, [], encoder)
     assert missing.tsmixup is missing.kernel_synth is missing.external is None
-    assert missing.evaluate(model, device="cpu") == dict.fromkeys(
+    missing_scores = missing.evaluate(model, device="cpu")
+    assert np.isnan(missing_scores.pop("val_sql"))
+    assert missing_scores == dict.fromkeys(
         [
             "val_sql_tsmixup",
             "val_sql_kernel_synth",
-            "val_sql",
             "ext_sql",
             "ext_sql_naive",
             "n_excluded_tsmixup",
@@ -341,10 +343,46 @@ def test_validation_set_missing_sources_and_nan_selection_score(tmp_path, consta
     validation = ValidationSet.build(cfg, corpus_manifest(tmp_path), encoder)
     scores = validation.evaluate(model, device="cpu")
     assert scores["val_sql_kernel_synth"] is scores["n_excluded_kernel_synth"] is None
+    assert np.isnan(scores["val_sql"])
     if constant:
-        assert np.isnan(scores["val_sql"])
         assert np.isnan(scores["val_sql_tsmixup"])
         assert scores["n_excluded_tsmixup"] == 2
     else:
-        assert np.isfinite(scores["val_sql"])
-        assert scores["val_sql"] == scores["val_sql_tsmixup"]
+        assert np.isfinite(scores["val_sql_tsmixup"])
+
+
+@pytest.mark.parametrize("invalid_kind", ["tsmixup", "kernel_synth"])
+@pytest.mark.parametrize("missing", [False, True])
+def test_validation_selection_requires_both_corpus_scores(tmp_path, invalid_kind, missing):
+    cfg = _config(tmp_path)
+    cfg.corpus.external_validation = None
+    for kind, index in [("tsmixup", 199), ("kernel_synth", 19)]:
+        if kind == invalid_kind and missing:
+            continue
+        write_corpus_fixture(
+            tmp_path,
+            kind=kind,
+            index=index,
+            n_series=2,
+            lengths=(14, 14),
+            constant=kind == invalid_kind,
+        )
+    model, encoder = _toy_model(_panel())
+    validation = ValidationSet.build(cfg, corpus_manifest(tmp_path), encoder)
+    scores = validation.evaluate(model, device="cpu")
+    valid_kind = "kernel_synth" if invalid_kind == "tsmixup" else "tsmixup"
+    assert np.isfinite(scores[f"val_sql_{valid_kind}"])
+    if missing:
+        assert scores[f"val_sql_{invalid_kind}"] is None
+    else:
+        assert np.isnan(scores[f"val_sql_{invalid_kind}"])
+    assert np.isnan(scores["val_sql"])
+
+
+def test_validation_set_requires_configured_external_directory(tmp_path):
+    cfg = _config(tmp_path)
+    _, encoder = _toy_model(_panel())
+    directory = cfg.corpus.root / cfg.corpus.external_validation
+    with pytest.raises(FileNotFoundError) as error:
+        ValidationSet.build(cfg, [], encoder)
+    assert str(directory) in str(error.value)
