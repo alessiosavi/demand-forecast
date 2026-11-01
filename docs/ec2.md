@@ -3,7 +3,10 @@
 Run this procedure on EC2 after the prerequisite changes have merged. Local work is limited to
 synthetic fixtures. The binding [protocol](protocol.md)
 and [prompt 01 §§2–7](colab/prompts/01-fev-run-v2.md) supply the gates below, in this order.
-The NaN-fix reference **F** is `4e33a3e7d811b5fa9dcc1101a48f6c1fc454dfc7`.
+The NaN-fix reference **F** is `ba7fc31e569609d25cee013604f6dd299d0baa6e`.
+F's original pre-rewrite SHA was `4e33a3e7d811b5fa9dcc1101a48f6c1fc454dfc7`;
+historical evidence and Drive paths retain their original SHAs and names (see the
+[history-rewrite mapping](protocol.md#history-rewrite-2026-11-01)).
 No tuning, budget change, second seed or variant selection is authorised. Quick scores
 are pipeline checks only. Do not view frozen v2 scores before all gates pass.
 
@@ -543,7 +546,7 @@ Require every check to pass: 200 seed-0 sampler batches per task, prepared valid
 batches, all first-window inference batches, and exact GPU evaluation metrics (NaN equals
 NaN). Walmart must report 11 origins, earliest 2011-10-14, latest 2012-02-03,
 `train_upto=2011-04-29`, `val_origin=2011-05-06`. The probe builds each first-window panel
-once and uses the frozen F (`4e33a3e7d811b5fa9dcc1101a48f6c1fc454dfc7`) reference oracle. Locally only `--self-test` is allowed.
+once and uses the frozen F (`ba7fc31e569609d25cee013604f6dd299d0baa6e`) reference oracle. Locally only `--self-test` is allowed.
 A parity failure invokes the fallback procedure below; do not continue a failing PR path.
 
 ## 5. Prerequisite B — full interruption/resume trial
@@ -648,7 +651,7 @@ are gates, including in fallback. D is startup evidence; P1 also covers ragged i
 
 ## 7. P3 — repeatability at fixed lock, threads and shapes
 
-Create a **second checkout and venv at F (`4e33a3e7d811b5fa9dcc1101a48f6c1fc454dfc7`)**, outside the merged checkout. Keep
+Create a **second checkout and venv at F (`ba7fc31e569609d25cee013604f6dd299d0baa6e`)**, outside the merged checkout. Keep
 `TOOLS` pointing at the merged code. Install with §2's `INSTALL_CONSTRAINTS`, then
 run the merged checkout's parity helper with the **reference interpreter** so it
 traverses the reference installation's closure. Require exit 0 and an empty exact
@@ -664,8 +667,8 @@ source /home/ubuntu/fev/env.sh
 cd /home/ubuntu/fev
 git clone https://github.com/alessiosavi/demand-forecast reference
 cd reference
-git checkout --detach 4e33a3e7d811b5fa9dcc1101a48f6c1fc454dfc7
-test "$(git rev-parse HEAD)" = "4e33a3e7d811b5fa9dcc1101a48f6c1fc454dfc7"
+git checkout --detach ba7fc31e569609d25cee013604f6dd299d0baa6e
+test "$(git rev-parse HEAD)" = "ba7fc31e569609d25cee013604f6dd299d0baa6e"
 python3.12 -m venv /home/ubuntu/fev/venv-reference
 env -u LD_LIBRARY_PATH /home/ubuntu/fev/venv-reference/bin/python -m pip install \
   --extra-index-url https://download.pytorch.org/whl/cu128 \
@@ -906,7 +909,7 @@ for task in tasks:
         assert (
             run["plan"]["exception"]
             or run["n_val_items"] == 0
-            or all(sha == "4e33a3e7d811b5fa9dcc1101a48f6c1fc454dfc7" for sha in executing)
+            or all(sha == "ba7fc31e569609d25cee013604f6dd299d0baa6e" for sha in executing)
         )
         adjusted = rss
     assert np.isfinite(adjusted) and adjusted > 0
@@ -1051,7 +1054,7 @@ printf '%s\n' "$rehearsals" > "$PROBES/accepted-waves-root.txt"
 
 ## 9. Failure handling — fallback
 
-If a PR parity gate fails, use `/home/ubuntu/fev/venv-reference` at F (`4e33a3e7d811b5fa9dcc1101a48f6c1fc454dfc7`) and fresh
+If a PR parity gate fails, use `/home/ubuntu/fev/venv-reference` at F (`ba7fc31e569609d25cee013604f6dd299d0baa6e`) and fresh
 probe/run roots. Preserve the failed artifacts and reason. Change `VENV` and `PROBES`
 in `env.sh` to the reference venv and a new `probes-fallback-<UTC>` sibling; keep `TOOLS`
 at the merged SHA. Repeat **setup verification and pin warm-up, A, B, D and P4**, in

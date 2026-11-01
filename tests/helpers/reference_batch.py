@@ -1,4 +1,4 @@
-# Frozen reference: verbatim functions from commit 4e33a3e7d811b5fa9dcc1101a48f6c1fc454dfc7, renamed reference_*.
+# Frozen reference: verbatim functions from commit 4e33a3e7d811b5fa9dcc1101a48f6c1fc454dfc7 (rewritten history: ba7fc31e569609d25cee013604f6dd299d0baa6e), renamed reference_*.
 # Keep these bodies independent of the live alignment, batching and evaluation paths.
 """Frozen batching/evaluation oracle and exact tensor comparison for parity tests."""
 
