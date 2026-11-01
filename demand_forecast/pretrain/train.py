@@ -113,6 +113,8 @@ class _PretrainLoop:
             holdout.extend(ref for ref in self.refs if ref.kind == kind and ref.index in held_out)
         if not selected["tsmixup"]:
             raise ValueError("pretraining requires a tsmixup shard for the model specification")
+        if cfg.corpus.kernel_synth_every > 0 and not selected["kernel_synth"]:
+            raise ValueError("kernel_synth_every > 0 requires at least one kernel_synth shard")
         self.sampler = CorpusSampler(
             **selected,
             horizon=cfg.forecast.horizon,

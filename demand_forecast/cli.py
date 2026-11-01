@@ -61,6 +61,9 @@ def pretrain_probe_command(
         pretrain_probe(cfg, steps=steps, out=out)
     except (ValueError, OSError, ImportError, yaml.YAMLError) as exc:
         raise typer.BadParameter(str(exc)) from exc
+    except RuntimeError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
     typer.echo(f"Probe saved to {out}")
 
 
@@ -80,7 +83,6 @@ def pretrain_probe_task(
 
     from demand_forecast.bench.specs import load_task_specs
     from demand_forecast.config import Settings
-    from demand_forecast.core.training import NonFiniteTraining
     from demand_forecast.pretrain.probe import task_probe
 
     try:
@@ -91,7 +93,7 @@ def pretrain_probe_task(
         )
     except (ValueError, OSError, ImportError, yaml.YAMLError) as exc:
         raise typer.BadParameter(str(exc)) from exc
-    except NonFiniteTraining as exc:
+    except RuntimeError as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=1) from exc
     typer.echo(f"Task probes saved to {out}")
