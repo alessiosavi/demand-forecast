@@ -1,13 +1,35 @@
 # Demand Forecast
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-[![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.3+-ee4c2c.svg)](https://pytorch.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Version 2.0.0 provides quantile forecasting for long-format panels: explicit data
-roles, frequency-aware sampling, a shared `v2` model and trainer, portable bundles,
-and optional fev evaluation. Predictions include every input series, with finite
-fallbacks for insufficient histories and ordered quantiles in original units.
+Demand Forecast provides quantile forecasting for long-format time-series panels:
+explicit data roles, frequency-aware sampling, a shared `v2` model and trainer,
+portable bundles, and optional fev evaluation. Predictions include every input
+series, with fallbacks for missing context or unusable scale, ordered quantiles
+in original units, and a median point forecast.
+
+The current pipeline supports **v2 only**. Standard, advanced, TCN and mixer
+models remain in a separate legacy registry and are not yet integrated with the
+current trainer, bundle or fev path.
+
+## How it works
+
+Long-format tables or fev windows become a `Panel` with declared target,
+known-future, past-only and static roles. An inner validation split determines
+the permitted training history; fitted static vocabularies and masked sample
+batches feed `ForecastModel` and its `V2Backbone`. Training uses doubled pinball
+loss and selects weights by inner SQL. A saved bundle carries the model and
+preprocessing to `Predictor` for inference.
+
+Categorical statics and series IDs have learned embeddings, including unknown
+and missing slots. Numeric statics and continuous covariates are projected with
+their masks. Full-past target scaling, guarded covariate normalization and a
+bidirectional known-future decoder support heterogeneous inputs. A monotone
+quantile head keeps knots ordered, and nonnegative target support clamps
+forecasts at zero. The [architecture guide](docs/ARCHITECTURE.md) includes the
+data-flow diagram, artifact table, fallback rules and per-item-origin semantics.
 
 ## Quick start
 
@@ -20,8 +42,7 @@ demand-forecast generate-data /tmp/dfc-example --format long \
 ```
 
 Save this as `/tmp/dfc-example/config.yaml`. This is a tiny CPU smoke configuration
-(16-wide model, at most 30 optimizer steps); real training belongs on the GPU host
-or Colab with a separately agreed budget.
+with a 16-wide model and at most 30 optimizer steps.
 
 ```yaml
 data:
@@ -67,7 +88,7 @@ demand-forecast forecast --bundle /tmp/dfc-example/run/bundle \
 demand-forecast version
 ```
 
-Training writes `bundle/`, `checkpoints/`, and `run.json`. Add `--resume` to the
+This training example writes `bundle/`, `checkpoints/`, and `run.json`. Add `--resume` to the
 same training command to reuse a matching run; changed settings or inputs fail
 identity checks. Forecast CSVs contain `series_id`, `origin`, `timestamp`,
 `q0.1` through `q0.9`, and `point` (the median, `q0.5`). Supply known covariates
@@ -85,23 +106,26 @@ pip install -e ".[dev,bench]"
 demand-forecast fev --help
 ```
 
-The seven official weekly tasks run on Colab; see the
-[Colab workflow](docs/colab.md) and [frozen protocol](docs/protocol.md).
-Prepare `fev-config.yaml` using the [Settings schema](demand_forecast/config/settings.py)
-with the agreed model and training budget. The runner derives data roles, horizon
-and quantiles from each task. On that host:
+For the seven bundled weekly tasks, use the [frozen protocol](docs/protocol.md),
+[Colab workflow](docs/colab.md) or [EC2 runbook](docs/ec2.md). The checked-in
+[standard configuration](configs/fev-v2-standard.yaml) defines the model and
+training controls; the runner derives data roles, horizon and quantiles from
+each task. On the benchmark host:
 
 ```bash
 demand-forecast fev baseline --tasks weekly --out-dir fev-results
-demand-forecast fev run --tasks weekly --config fev-config.yaml \
+demand-forecast fev run --tasks weekly --config configs/fev-v2-standard.yaml \
   --policy first_window --out-dir fev-results --resume
 demand-forecast fev leaderboard fev-results/summaries.csv
 ```
 
 `--tasks` also accepts comma-separated task names or a local task YAML. Baselines
 skip completed tasks; model runs with `--resume` reuse matching bundles and saved
-windows. Local end-to-end tests use only fixture data. `training.refit: full`
-and `--policy per_window` are deferred to phase 4 and currently rejected.
+windows. Each task trains on its first window, then forecasts later windows at
+each item's own origin. Identity checks cover configuration, data and the
+resolved training origin. Training progress, checkpoints, window predictions and
+summaries retain timing and diagnostic information. `training.refit: full`
+and `--policy per_window` are currently unimplemented and rejected.
 
 ## Commands
 
@@ -114,9 +138,10 @@ and `--policy per_window` are deferred to phase 4 and currently rejected.
 | `generate-sales` | Generate sales from a product catalogue |
 | `version` | Print the installed package version |
 
-Use `demand-forecast <command> --help` for options. Model selection, tuning,
-clustering, general benchmarking and export integrations beyond the current `v2`
-path are covered by the phase-4 plan.
+Use `demand-forecast --help` or a command's `--help` for options. The
+[complete CLI table](docs/ARCHITECTURE.md#command-line-interface) lists required
+and optional arguments. Tuning, clustering, export and DHF are not integrated
+into the current pipeline.
 
 ## Package modules
 
@@ -139,7 +164,7 @@ The current implementation is organized as follows (paths are under `demand_fore
 
 `models/wrapper.py`, `models/transformer.py`, `models/transformer_v2.py`,
 `models/lightweight.py`, `core/tuning.py`, and `utils/clustering.py` remain on the
-legacy contract until the phase-4 plan. Their imports and tests are retained;
+legacy contract. Their imports and tests are retained;
 `data/feature_engineering.py` and legacy loss classes also remain available.
 The current `v2` CLI uses `models/v2.py`.
 
@@ -164,14 +189,11 @@ Tiny-bundle timings are smoke measurements, not standard-model benchmark results
 
 ## Documentation
 
-- [Design and migration specification](docs/superpowers/specs/2026-10-30-fev-bench-v2-design.md)
-- [Implementation plan for phases 0–3](docs/superpowers/plans/2026-10-31-fev-core-v2.md)
-- [Architecture pointers](docs/ARCHITECTURE.md)
-- [Configuration pointers](docs/CONFIGURATION.md)
+- [Documentation home](docs/index.md)
+- [Architecture and data flow](docs/ARCHITECTURE.md)
+- [Configuration](docs/CONFIGURATION.md)
+- [API reference](docs/API.md)
+- [Frozen evaluation protocol](docs/protocol.md)
 - [Settings schema](demand_forecast/config/settings.py)
-
-A full documentation rewrite is planned for phase 5. Other guides may still
-describe the retired store-specific pipeline; use this quick start and the schema
-for current commands and settings.
 
 MIT License; see [LICENSE](LICENSE) and [third-party notices](THIRD_PARTY_NOTICES.md).
