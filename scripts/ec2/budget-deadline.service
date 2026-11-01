@@ -1,0 +1,17 @@
+[Unit]
+Description=Pretraining twenty-minute boot budget grace
+# Avoid the target's implicit After= ordering opposing our explicit After=.
+DefaultDependencies=no
+After=multi-user.target
+Before=shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/arm-deadline.sh boot
+RemainAfterExit=yes
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target

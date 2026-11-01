@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Pretraining Phase C (2026-11-01)** — opt-in EC2 runbook, self-contained
+  bootstrap user data, setup/parity and dataset warm-up script, fail-closed boot
+  deadline unit, and cost guard with reserved sessions and AWS stop/cleanup schedules.
+
 - **Debug Scripts**
   - `debug_notebook.py` - Comprehensive debug script with cell markers for Jupyter conversion
   - `debug_quick.py` - Minimal quick test script (~1-2 minute runtime)

@@ -35,6 +35,13 @@ https://github.com/autogluon/fev/blob/v0.10.0/benchmarks/fev_bench/tasks.yaml
 The entries are selected and reordered for the weekly benchmark. Their fields
 and formatting are unchanged.
 
+`demand_forecast/bench/tasks/fev_bench_weekly_heldout.yaml` contains five entries
+from fev's `benchmarks/fev_bench/tasks.yaml` at commit
+`193e4fcdbafe37bd5f676a00db65cf02ca1f737e`, with `task_name` dropped:
+https://github.com/autogluon/fev/blob/193e4fcdbafe37bd5f676a00db65cf02ca1f737e/benchmarks/fev_bench/tasks.yaml
+
+These entries define the held-out weekly tasks for the opt-in pretraining experiment.
+
 `demand_forecast/metrics.py` is adapted from fev's `src/fev/metrics.py` at tag
 `v0.10.0`: https://github.com/autogluon/fev/blob/v0.10.0/src/fev/metrics.py
 The port uses a univariate NumPy API, supports ragged histories and quiet empty

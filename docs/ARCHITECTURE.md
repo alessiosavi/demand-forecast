@@ -275,8 +275,11 @@ resamples and a configurable reference model.
 
 `run_identity` is SHA-256 over sorted, compact UTF-8 JSON containing JSON-mode
 settings, seed, dataset fingerprint, package version, resolved origin in ISO
-format and task definition. Only unset `max_steps_cap` and `val_items_max` are
-omitted from settings. Git revision is provenance, not an identity input.
+format and task definition. Unset `training.max_steps_cap`,
+`training.val_items_max` and `training.init_from`, and false `training.zero_shot`
+and `training.eval_at_start`, are omitted from settings. A set `training.init_from`
+is replaced by `{pretrain_identity, model_sha256}` from its bundle manifest. Git
+revision is provenance, not an identity input.
 User-data runs use a null task definition and hash the long/static file bytes
 with length framing; fev runs use the task dataset fingerprint.
 
@@ -345,7 +348,7 @@ optional column have defaults.
 
 Training and forecasting commands require long-panel settings. fev execution
 requires the optional benchmark dependencies. Its task selector accepts
-`weekly`, comma-separated bundled task names, or a task YAML; `--profiles`
+`weekly`, `heldout`, comma-separated weekly names, or a task YAML; `--profiles`
 overrides the target-support/static-role profiles. `--policy` defaults to
 `first_window`; `per_window` is recognized but rejected. `--stop-after` interrupts
 after that many training steps in the current call, saving a checkpoint if

@@ -357,8 +357,9 @@ def test_train_panel_zero_shot_requires_init_from(tmp_path, tiny_panel_and_setti
 
 
 @pytest.mark.bench
+@pytest.mark.parametrize("short_history", [False, True])
 def test_train_panel_zero_shot_writes_bundle_progress_and_no_training(
-    tmp_path, panel29, origin29, tiny_pretrained_bundle_dir, monkeypatch
+    tmp_path, panel29, origin29, tiny_pretrained_bundle_dir, monkeypatch, short_history
 ):
     pytest.importorskip("pyarrow")
     from demand_forecast.core import run
@@ -372,6 +373,11 @@ def test_train_panel_zero_shot_writes_bundle_progress_and_no_training(
     settings.training.init_from = str(tiny_pretrained_bundle_dir)
     settings.training.zero_shot = True
     settings.training.eval_at_start = True
+    if short_history:
+        panel29 = weekly_panel([8, 8])
+        origin29 = panel29.timestamps(0, 9)[8]
+    plan = plan_inner_validation(panel29, origin29, settings.forecast.horizon)
+    assert plan.exception is short_history
     bundle_dir = train_panel(panel29, origin29, settings, tmp_path, dataset_fingerprint="fp")
     bundle = load_bundle(bundle_dir)
     report = json.loads((tmp_path / "run.json").read_text())
@@ -398,7 +404,7 @@ def test_train_panel_zero_shot_writes_bundle_progress_and_no_training(
         "eval_every": 0,
         "n_fit_ids": len(report["plan"]["fit_ids"]),
         "n_val_items": 0,
-        "exception": False,
+        "exception": plan.exception,
         "device": "cpu",
         "amp_dtype": None,
         "timings": cumulative,

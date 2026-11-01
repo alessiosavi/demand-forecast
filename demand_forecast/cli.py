@@ -175,7 +175,7 @@ def forecast(
 @fev_app.command("run")
 def fev_run(
     tasks: str = typer.Option(
-        "weekly", "--tasks", help="weekly, comma-separated names, or task YAML"
+        "weekly", "--tasks", help="weekly, heldout, comma-separated weekly names, or task YAML"
     ),
     config: Path = typer.Option(
         ..., "--config", exists=True, dir_okay=False, help="Model and training settings YAML"
@@ -224,7 +224,7 @@ def fev_run(
 @fev_app.command("baseline")
 def fev_baseline(
     tasks: str = typer.Option(
-        "weekly", "--tasks", help="weekly, comma-separated names, or task YAML"
+        "weekly", "--tasks", help="weekly, heldout, comma-separated weekly names, or task YAML"
     ),
     out_dir: Path = typer.Option(..., "--out-dir", help="Directory for resumable summaries.csv"),
     profiles: Path | None = typer.Option(

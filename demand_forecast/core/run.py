@@ -251,7 +251,7 @@ def train_panel(
                 **resolved_budget,
                 "n_fit_ids": len(plan.fit_ids),
                 "n_val_items": 0,
-                "exception": False,
+                "exception": plan.exception,
                 "device": str(device),
                 "amp_dtype": None,
                 "timings": timings,

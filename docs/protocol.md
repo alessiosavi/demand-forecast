@@ -221,7 +221,7 @@ D4 **"Only if data shows it (Recommended)"**.
    which remains required. The three new covariate counters are optional for legacy
    evidence and display as `unknown` when absent.
 5. `stop_reason` values: `max_steps`, `early_stop`, `exception_budget`, `no_training_data`,
-   `interrupted`, `nonfinite_losses`. The standard configuration is unchanged;
+   `interrupted`, `nonfinite_losses`, `zero_shot`. The standard configuration is unchanged;
    identities are unchanged. Batch tensors are unchanged for every sample without a
    cold column, without a floored or clipped value and without non-finite source values.
 6. Standardization scale for dynamic covariates is `max(std, 1e-3 × max|past|)` when
@@ -382,9 +382,12 @@ labelled interval contributes.
 
 ### Identity, bundles and fev forecasts
 
-For the run identity, settings are serialised in JSON mode, omitting only
-`training.max_steps_cap` and `training.val_items_max` when unset; all other null
-fields remain. The payload contains `settings`, `seed`, `dataset_fingerprint`,
+For the run identity, settings are serialised in JSON mode, omitting
+`training.max_steps_cap`, `training.val_items_max` and `training.init_from` when
+unset, and `training.zero_shot` and `training.eval_at_start` when false. A set
+`training.init_from` is replaced by `{pretrain_identity, model_sha256}` from its
+bundle manifest; all other null fields remain. The payload contains `settings`,
+`seed`, `dataset_fingerprint`,
 `package_version`, the resolved `origin` in ISO format and `task_definition` (the
 fields listed above for fev, or `None` for user data). Serialize with sorted JSON
 keys and compact separators `(',', ':')`, encode as UTF-8 and hash with SHA-256.
@@ -442,3 +445,13 @@ the original SHAs in evidence records.
 | `e2735e23ed7421ca1bb2de615246111015b0937d` | `8a04c7209af863ae342f0b51836efa0464bbddd9` |
 | `5ffce940f0b9212279005588f9f976517362ffa9` | `ad6cb737fc6db5bc48773f55c20efb0a0b3719d5` |
 | `a29fa7af0c9a70e08c51cdb592cfabb90d33ada3` | `abe28158370e78d22ca5109d0e964da5911fa71b` |
+
+## Opt-in pretraining experiment (2026-11-01)
+
+Pretraining is opt-in; the frozen protocol, configurations and identities remain
+unchanged. The experiment labels are `demand-forecast-v2`,
+`demand-forecast-v2-zero-shot`, `demand-forecast-v2-finetuned`,
+`demand-forecast-v2-wide-random` and `demand-forecast-v2-heldout-frozen`. No
+configuration decision follows from this experiment's fev scores. Held-out
+`target_support` is preregistered from semantics, without full-history statistics;
+the [pretraining EC2 runbook](pretrain-ec2.md) specifies the operational gates.
