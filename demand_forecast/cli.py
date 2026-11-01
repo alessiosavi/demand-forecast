@@ -14,6 +14,88 @@ app = typer.Typer(
 )
 fev_app = typer.Typer(help="Run fev benchmarks and compare evaluation summaries.")
 app.add_typer(fev_app, name="fev")
+pretrain_app = typer.Typer(help="Pretrain on local corpus shards and measure run costs.")
+app.add_typer(pretrain_app, name="pretrain")
+
+
+@pretrain_app.command("run")
+def pretrain_run(
+    config: Path = typer.Option(..., "--config", exists=True, dir_okay=False),
+    out: Path = typer.Option(..., "--out", help="Run directory for checkpoints and bundle"),
+    resume: bool = typer.Option(False, "--resume"),
+    stop_after: int | None = typer.Option(None, "--stop-after", min=1),
+):
+    """Train to the fixed pretraining budget, or resume a matching checkpoint."""
+    import yaml
+
+    from demand_forecast.core.training import InterruptedRun, NonFiniteTraining
+    from demand_forecast.pretrain.config import PretrainConfig
+    from demand_forecast.pretrain.train import pretrain
+
+    try:
+        cfg = PretrainConfig.from_yaml(config)
+        configure_logging(cfg.log_level)
+        pretrain(cfg, out, resume=resume, stop_after=stop_after)
+    except (ValueError, OSError, ImportError, yaml.YAMLError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    except (InterruptedRun, NonFiniteTraining) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"Bundle saved to {out / 'bundle'}")
+
+
+@pretrain_app.command("probe")
+def pretrain_probe_command(
+    config: Path = typer.Option(..., "--config", exists=True, dir_okay=False),
+    out: Path = typer.Option(..., "--out", help="Probe JSON path"),
+    steps: int = typer.Option(50, "--steps", min=1),
+):
+    """Measure corpus training, validation, checkpoint and shard overheads."""
+    import yaml
+
+    from demand_forecast.pretrain.config import PretrainConfig
+    from demand_forecast.pretrain.probe import pretrain_probe
+
+    try:
+        cfg = PretrainConfig.from_yaml(config)
+        configure_logging(cfg.log_level)
+        pretrain_probe(cfg, steps=steps, out=out)
+    except (ValueError, OSError, ImportError, yaml.YAMLError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    typer.echo(f"Probe saved to {out}")
+
+
+@pretrain_app.command("probe-task")
+def pretrain_probe_task(
+    tasks: str = typer.Option("weekly", "--tasks", help="weekly, heldout, or task YAML"),
+    config: Path = typer.Option(..., "--config", exists=True, dir_okay=False),
+    out: Path = typer.Option(..., "--out", help="Directory for task probe JSONs"),
+    steps: int = typer.Option(30, "--steps", min=1),
+    profiles: Path | None = typer.Option(None, "--profiles", exists=True, dir_okay=False),
+    max_series: int | None = typer.Option(
+        None, "--max-series", min=1, help="Limit series for testing"
+    ),
+):
+    """Measure training and last-window inference with real task shapes."""
+    import yaml
+
+    from demand_forecast.bench.specs import load_task_specs
+    from demand_forecast.config import Settings
+    from demand_forecast.core.training import NonFiniteTraining
+    from demand_forecast.pretrain.probe import task_probe
+
+    try:
+        settings = Settings.from_yaml(config)
+        configure_logging(settings.log_level)
+        task_probe(
+            load_task_specs(tasks, profiles), settings, steps=steps, out=out, max_series=max_series
+        )
+    except (ValueError, OSError, ImportError, yaml.YAMLError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    except NonFiniteTraining as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"Task probes saved to {out}")
 
 
 @app.command("train")
