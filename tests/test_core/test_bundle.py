@@ -445,7 +445,15 @@ def test_forecast_per_item_origins_matches_single_origin_when_shared(bundle_and_
     ids2, arrays2, diag2 = predictor.forecast_per_item_origins(panel, {key: origin for key in ids})
     assert ids2 == ids
     np.testing.assert_array_equal(arrays2, arrays)
-    for key in ("n_items", "fallback_no_context", "fallback_undefined_scale", "device"):
+    for key in (
+        "n_items",
+        "fallback_no_context",
+        "fallback_undefined_scale",
+        "device",
+        "cold_covariate_columns",
+        "clipped_covariate_values",
+        "floored_covariate_columns",
+    ):
         assert diag2[key] == diag[key]
     assert diag2["n_origins"] == 1 and diag2["inference_time_s"] > 0
 
@@ -465,9 +473,19 @@ def test_forecast_per_item_origins_preserves_order_and_sums_fallbacks(
     panel.series[0].target[:] = np.nan
     panel.series[1].target[:] = 6.0
     origins = {"a": origin + panel.freq, "b": origin, "c": origin + panel.freq}
+    panel.series[0].dynamic["promo"] = np.r_[np.full(30, np.nan), np.full(13, 1e5)]
+    panel.series[1].dynamic["promo"] = np.r_[3.0 + 1e-6, np.full(28, 3.0), np.full(13, 4.0)]
+    panel.series[2].dynamic["promo"] = np.r_[np.zeros(30), np.full(13, 1e5)]
     forecast = predictor.forecast_with_diagnostics
     expected = {}
-    totals = {"n_items": 0, "fallback_no_context": 0, "fallback_undefined_scale": 0}
+    totals = {
+        "n_items": 0,
+        "fallback_no_context": 0,
+        "fallback_undefined_scale": 0,
+        "cold_covariate_columns": 0,
+        "clipped_covariate_values": 0,
+        "floored_covariate_columns": 0,
+    }
     for group_origin in (origin + panel.freq, origin):
         group = replace(
             panel, series=[s for s in panel.series if origins[s.series_id] == group_origin]
@@ -489,16 +507,32 @@ def test_forecast_per_item_origins_preserves_order_and_sums_fallbacks(
     np.testing.assert_array_equal(arrays, np.stack([expected[key] for key in ids]))
     assert seen == [(origin + panel.freq, ["a", "c"], 1), (origin, ["b"], 1)]
     assert {key: diag[key] for key in totals} == totals
-    assert totals == {"n_items": 3, "fallback_no_context": 1, "fallback_undefined_scale": 1}
+    assert totals == {
+        "n_items": 3,
+        "fallback_no_context": 1,
+        "fallback_undefined_scale": 1,
+        "cold_covariate_columns": 1,
+        "clipped_covariate_values": 13,
+        "floored_covariate_columns": 1,
+    }
     assert diag["n_origins"] == 2 and diag["device"] == "cpu"
     assert diag["inference_time_s"] > 0
 
 
-def test_predictor_reuses_builder_across_chunks_matches_reference(bundle_and_panel, monkeypatch):
+@pytest.mark.parametrize("guarded", [False, True])
+def test_predictor_reuses_builder_across_chunks_matches_reference(
+    bundle_and_panel, monkeypatch, guarded
+):
     from demand_forecast.data.sampler import BatchBuilder
     from tests.helpers.reference_batch import reference_align_to_origin, reference_make_batch
 
     predictor, panel, origin = bundle_and_panel
+    if guarded:
+        panel.series[0].dynamic["promo"] = np.r_[np.full(29, np.nan), np.full(13, 1e5)]
+        panel.series[1].dynamic["promo"] = np.r_[
+            100.0 + 1e-6, np.full(28, 100.0), np.full(13, 110.0)
+        ]
+        panel.series[2].dynamic["promo"] = np.r_[1e-9, np.zeros(28), np.full(13, 0.5)]
     # 513 items cross the public default chunk boundary, including unseen ids.
     panel = replace(
         panel, series=[replace(panel.series[i % 3], series_id=str(i)) for i in range(513)]
@@ -517,6 +551,7 @@ def test_predictor_reuses_builder_across_chunks_matches_reference(bundle_and_pan
     aligned = reference_align_to_origin(panel, items)
     cfg = predictor.bundle.forecast_cfg
     expected = []
+    counters = dict.fromkeys(("cold_covariates", "clipped_covariates", "floored_covariates"), 0)
     with torch.no_grad():
         for start in range(0, len(items), 512):
             batch = reference_make_batch(
@@ -527,6 +562,15 @@ def test_predictor_reuses_builder_across_chunks_matches_reference(bundle_and_pan
                 predictor.bundle.encoder,
             )
             expected.append(predictor.bundle.model.predict(batch).numpy())
+            for field in counters:
+                counters[field] += int(getattr(batch, field).sum())
     assert ids == [str(i) for i in range(513)]
     assert diagnostics["n_items"] == 513
+    for field, key in zip(
+        counters,
+        ("cold_covariate_columns", "clipped_covariate_values", "floored_covariate_columns"),
+    ):
+        assert diagnostics[key] == counters[field]
+        if guarded:
+            assert counters[field] > 0
     np.testing.assert_array_equal(actual, np.concatenate(expected))

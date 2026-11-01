@@ -29,7 +29,7 @@ def train(
 
     from demand_forecast.config import Settings
     from demand_forecast.core.run import train_from_settings
-    from demand_forecast.core.training import InterruptedRun
+    from demand_forecast.core.training import InterruptedRun, NonFiniteTraining
 
     try:
         settings = Settings.from_yaml(config)
@@ -37,7 +37,7 @@ def train(
         bundle = train_from_settings(settings, out, resume=resume)
     except (ValueError, OSError, ImportError, NotImplementedError, yaml.YAMLError) as exc:
         raise typer.BadParameter(str(exc)) from exc
-    except InterruptedRun as exc:
+    except (InterruptedRun, NonFiniteTraining) as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=1) from exc
     typer.echo(f"Bundle saved to {bundle}")
@@ -95,7 +95,7 @@ def fev_run(
     from demand_forecast.bench.run import run_fev
     from demand_forecast.bench.specs import load_task_specs
     from demand_forecast.config import Settings
-    from demand_forecast.core.training import InterruptedRun
+    from demand_forecast.core.training import InterruptedRun, NonFiniteTraining
 
     try:
         settings = Settings.from_yaml(config)
@@ -111,7 +111,7 @@ def fev_run(
         )
     except (ValueError, OSError, ImportError, NotImplementedError, yaml.YAMLError) as exc:
         raise typer.BadParameter(str(exc)) from exc
-    except InterruptedRun as exc:
+    except (InterruptedRun, NonFiniteTraining) as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=1) from exc
     typer.echo(f"Summaries saved to {out_dir / 'summaries.csv'}")

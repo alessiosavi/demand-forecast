@@ -6,7 +6,7 @@ import pytest
 
 from demand_forecast.core.bundle import load_bundle
 from demand_forecast.core.run import _identity_settings, run_identity, train_panel
-from demand_forecast.core.training import resolve_budget
+from demand_forecast.core.training import InterruptedRun, resolve_budget
 from demand_forecast.core.validation import plan_inner_validation
 from demand_forecast.data.frequency import to_offset
 from tests.helpers.panels import weekly_panel
@@ -150,3 +150,109 @@ def test_train_panel_rejects_off_grid_earliest_origin(tmp_path, tiny_panel_and_s
             dataset_fingerprint="fp",
             earliest_origin=origin - pd.Timedelta(days=1),
         )
+
+
+def test_covariate_counters_reach_run_json_after_stop_and_resume(tmp_path, tiny_panel_and_settings):
+    panel, origin, settings = tiny_panel_and_settings
+    with pytest.raises(InterruptedRun):
+        train_panel(panel, origin, settings, tmp_path, dataset_fingerprint="fp", stop_after=1)
+    progress = json.loads((tmp_path / "checkpoints/progress.json").read_text())
+    for key in ("cold_covariate_columns", "clipped_covariate_values"):
+        assert progress["timings"][key] == 0
+    # The seeded first epoch includes series b at origin 2: oil's std is ~0.05,
+    # below its relative floor (~0.0511). Later draws need no additional floor.
+    assert progress["timings"]["floored_covariate_columns"] == 1
+    bundle = train_panel(panel, origin, settings, tmp_path, dataset_fingerprint="fp", resume=True)
+    report = json.loads((tmp_path / "run.json").read_text())
+    assert report["resumed_from_step"] == 1
+    assert report["timings"]["cumulative"]["sessions"] == 2
+    for key in ("cold_covariate_columns", "clipped_covariate_values"):
+        assert report["timings"]["cumulative"][key] == 0
+    assert report["timings"]["cumulative"]["floored_covariate_columns"] == 1
+    assert load_bundle(bundle).manifest["run"] == report
+
+
+def test_train_panel_raises_nonfinite_training_without_bundle_or_report(
+    tmp_path, quick_panel_and_settings, monkeypatch
+):
+    import torch
+
+    from demand_forecast.core import run, training
+
+    panel, origin, settings = quick_panel_and_settings
+    settings.training.patience = 100
+    out = tmp_path / "failed"
+    monkeypatch.setattr(training, "pinball_loss", lambda pred, *a: (pred.sum() * float("nan"), 1))
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("failed training must not publish a bundle")
+
+    monkeypatch.setattr(run, "save_bundle", forbidden)
+    with (
+        pytest.warns(UserWarning, match=r"lr_scheduler.step\(\).*before.*optimizer.step"),
+        pytest.raises(training.NonFiniteTraining) as caught,
+    ):
+        train_panel(panel, origin, settings, out, dataset_fingerprint="fp")
+    expected = (
+        "Training stopped after 20 consecutive non-finite losses at step 20; "
+        f"checkpoint {out / 'checkpoints/latest.pt'}"
+    )
+    assert str(caught.value) == expected
+    assert isinstance(caught.value, RuntimeError) and not isinstance(caught.value, InterruptedRun)
+    assert not (out / "bundle").exists() and not (out / "run.json").exists()
+    saved = torch.load(out / "checkpoints/latest.pt", weights_only=False)
+    assert saved["terminal_reason"] == "nonfinite_losses" and saved["step"] == 20
+    monkeypatch.setattr(training, "pinball_loss", forbidden)
+    with pytest.raises(training.NonFiniteTraining) as resumed:
+        train_panel(panel, origin, settings, out, dataset_fingerprint="fp", resume=True)
+    assert str(resumed.value) == expected
+    assert not (out / "bundle").exists() and not (out / "run.json").exists()
+    assert json.loads((out / "checkpoints/progress.json").read_text())["stop_reason"] == (
+        "nonfinite_losses"
+    )
+
+
+@pytest.mark.parametrize("marker", ["both", "reason", "counter"])
+def test_terminal_checkpoint_precedes_reuse_of_an_older_bundle(
+    tmp_path, quick_panel_and_settings, monkeypatch, marker
+):
+    import torch
+
+    from demand_forecast.core import training
+
+    panel, origin, settings = quick_panel_and_settings
+    settings.training.patience = 100
+    args = (panel, origin, settings, tmp_path)
+    train_panel(*args, dataset_fingerprint="fp")
+    artifacts = {
+        path: path.read_bytes()
+        for path in tmp_path.rglob("*")
+        if path.is_file() and "checkpoints" not in path.parts
+    }
+    monkeypatch.setattr(training, "pinball_loss", lambda pred, *a: (pred.sum() * float("nan"), 1))
+    with (
+        pytest.warns(UserWarning, match=r"lr_scheduler.step\(\).*before.*optimizer.step"),
+        pytest.raises(training.NonFiniteTraining),
+    ):
+        train_panel(*args, dataset_fingerprint="fp")
+    path = tmp_path / "checkpoints/latest.pt"
+    state = torch.load(path, weights_only=False)
+    assert state["terminal_reason"] == "nonfinite_losses" and state["consecutive_nonfinite"] == 20
+    if marker == "reason":
+        state["consecutive_nonfinite"] = 0
+    elif marker == "counter":
+        state["terminal_reason"] = None
+    torch.save(state, path)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("terminal checkpoint resumed training")
+
+    monkeypatch.setattr(training, "pinball_loss", forbidden)
+    with pytest.raises(
+        training.NonFiniteTraining, match="20 consecutive non-finite losses at step 20"
+    ):
+        train_panel(*args, dataset_fingerprint="fp", resume=True)
+    assert all(path.read_bytes() == content for path, content in artifacts.items())
+    assert json.loads((tmp_path / "checkpoints/progress.json").read_text())["stop_reason"] == (
+        "nonfinite_losses"
+    )

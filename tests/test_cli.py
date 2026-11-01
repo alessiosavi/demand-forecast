@@ -562,3 +562,29 @@ def test_run_json_serialises_nonfinite_as_null(tmp_path):
         "negative": None,
         "finite": 1.0,
     }
+
+
+def test_train_cli_nonfinite_training_exits_1_with_stderr_and_no_bundle(
+    tmp_path, run_settings, monkeypatch
+):
+    from demand_forecast.core import training
+
+    run_settings.training.base_steps = 20
+    run_settings.training.patience = 100
+    run_settings.to_yaml(tmp_path / "cfg.yaml")
+    monkeypatch.setattr(training, "pinball_loss", lambda pred, *a: (pred.sum() * float("nan"), 1))
+    out = tmp_path / "failed"
+    args = ["train", "--config", str(tmp_path / "cfg.yaml"), "--out", str(out)]
+    with pytest.warns(UserWarning, match=r"lr_scheduler.step\(\).*before.*optimizer.step"):
+        result = runner.invoke(app, args)
+    expected = (
+        "Training stopped after 20 consecutive non-finite losses at step 20; "
+        f"checkpoint {out / 'checkpoints/latest.pt'}"
+    )
+    assert result.exit_code == 1 and expected in result.stderr
+    assert "Bundle saved" not in result.stdout
+    assert not (out / "bundle").exists() and not (out / "run.json").exists()
+    assert (out / "checkpoints/latest.pt").exists()
+    resumed = runner.invoke(app, [*args, "--resume"])
+    assert resumed.exit_code == 1 and expected in resumed.stderr
+    assert not (out / "bundle").exists() and not (out / "run.json").exists()

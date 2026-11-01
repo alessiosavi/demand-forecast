@@ -74,6 +74,9 @@ class Predictor:
         diagnostics = {
             "fallback_no_context": 0,
             "fallback_undefined_scale": 0,
+            "cold_covariate_columns": 0,
+            "clipped_covariate_values": 0,
+            "floored_covariate_columns": 0,
             "n_items": 0,
             "device": str(self.bundle.model.fallback_level.device),
             "n_origins": len(groups),
@@ -88,7 +91,14 @@ class Predictor:
             )
             group_ids, arrays, diag = self.forecast_with_diagnostics(group, origin, batch_size)
             predictions[[positions[key] for key in group_ids]] = arrays
-            for key in ("fallback_no_context", "fallback_undefined_scale", "n_items"):
+            for key in (
+                "fallback_no_context",
+                "fallback_undefined_scale",
+                "cold_covariate_columns",
+                "clipped_covariate_values",
+                "floored_covariate_columns",
+                "n_items",
+            ):
                 diagnostics[key] += diag[key]
             diagnostics["device"] = diag["device"]
         diagnostics["inference_time_s"] = time.perf_counter() - started
@@ -135,6 +145,9 @@ class Predictor:
         diagnostics = {
             "fallback_no_context": 0,
             "fallback_undefined_scale": 0,
+            "cold_covariate_columns": 0,
+            "clipped_covariate_values": 0,
+            "floored_covariate_columns": 0,
             "n_items": len(ids),
             "device": str(model.fallback_level.device),
         }
@@ -142,6 +155,9 @@ class Predictor:
             batch = builder.build(items[start : start + batch_size]).to(model.fallback_level.device)
             for name, flag in model.fallback_flags(batch).items():
                 diagnostics[f"fallback_{name}"] += int(flag.sum().item())
+            diagnostics["cold_covariate_columns"] += int(batch.cold_covariates.sum().item())
+            diagnostics["clipped_covariate_values"] += int(batch.clipped_covariates.sum().item())
+            diagnostics["floored_covariate_columns"] += int(batch.floored_covariates.sum().item())
             # predict performs the single denormalisation and the model's fallbacks.
             predictions[start : start + batch.size] = model.predict(batch).cpu().numpy()
         # Each .cpu().numpy() above waits for its CUDA output, so this includes

@@ -5,9 +5,9 @@
 > so walmart never took an optimizer step. A frozen run at `2863356` would therefore be defective,
 > and so would the old fallback. Changes:
 > - Gate 0 adds the NaN fix (peer session demand-forecast-2d owns it) merged, plus a clean quick run.
-> - The fallback and P3 reference become that fix's merge SHA, written **F** below.
+> - The fallback and P3 reference become that fix's merge SHA, written **F** below: `4e33a3e7d811b5fa9dcc1101a48f6c1fc454dfc7`.
 > - `nonfinite_losses > 0` on any task blocks acceptance in P4 and in the frozen report.
-> - This branch rebases onto F before its PR merges. If the fix touches `data/sampler.py` or
+> - This branch incorporates F before its PR merges. If the fix touches `data/sampler.py` or
 >   `core/evaluation.py`, the reference oracle and `BatchBuilder` are re-frozen on F.
 >
 > Measured scaler state (quick run, T4): start-of-run skips are 0–2 on the five healthy tasks.
@@ -16,7 +16,7 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build inner-validation batches once per fit and training batches without per-row pandas
-work, with tensors bit-identical to `2863356`, then run the frozen seven-task protocol on one EC2
+work, with tensors bit-identical to **F**, then run the frozen seven-task protocol on one EC2
 T4 instance as parallel per-task processes.
 
 **Architecture:** `prepare_validation` builds the validation inputs once per fit session;
@@ -60,12 +60,12 @@ wording), all accepted into rev 3 as specified.
 
 ## Global Constraints
 
-- Every `Batch` field is `torch.equal` to `2863356`'s `make_batch`, with the same dtype, shape and
+- Every `Batch` field is `torch.equal` to **F**'s `make_batch`, with the same dtype, shape and
   `cat` keys, for the same `(series, origin)` list and `label_upto`. Validation metrics equal
-  `2863356`'s `evaluate` for the same model state (NaN equals NaN). Errors raised for the same inputs
+  **F**'s `evaluate` for the same model state (NaN equals NaN). Errors raised for the same inputs
   (types and messages) are unchanged, including float32 overflow on `loc`/`scale`.
 - Do not add a `Settings` field, change the `core/run.py` identity payload or bump `__version__`.
-  The pinned identities in `tests/test_bench/test_fev_run.py` stay unchanged and `2863356`
+  The pinned identities in `tests/test_bench/test_fev_run.py` stay unchanged and **F**
   checkpoints keep resuming.
 - `WindowSampler` draw order, RNG streams and checkpointed state (`epoch`, `position`) unchanged.
 - Model, losses, budget function, validation rule, metrics and fev scoring unchanged. Evaluation keeps
@@ -99,10 +99,12 @@ wording), all accepted into rev 3 as specified.
 ### Task 1: inner validation prepared once per fit session
 
 **Files:**
-- Create: `tests/helpers/reference_batch.py`: verbatim copies of `2863356`'s `align_to_origin`,
-  `_dynamic_values`, `make_batch` and `core/evaluation.evaluate`, renamed `reference_*`, with
+- Create: `tests/helpers/reference_batch.py`: verbatim copies of **F**'s `align_to_origin`,
+  `_dynamic_values`, `_add_row_diagnostics`, `DynamicDiagnostics`, `make_batch` and
+  `core/evaluation.evaluate`, renamed `reference_*`, with
   `reference_evaluate` calling the reference alignment and batching. Header comment names the SHA.
-  Also `assert_batches_equal(a, b)` (field by field, dtype, shape, `cat` keys).
+  Also `assert_batches_equal(a, b)` (field by field, dtype, shape, `cat` keys, including
+  int64 `cold_covariates`, `clipped_covariates` and `floored_covariates`).
 - Modify: `demand_forecast/core/evaluation.py`, `demand_forecast/core/training.py`
 - Test: `tests/test_core/test_evaluation.py` (create), `tests/test_core/test_training.py`
 
@@ -112,7 +114,7 @@ wording), all accepted into rev 3 as specified.
   `evaluate_prepared(model, prepared, quantiles) -> dict[str, float]` (same `model.eval()` / `finally: model.train()`).
   `evaluate(...)` keeps its signature and returns `evaluate_prepared(model, prepare_validation(...), quantiles)`.
 - Produces in `tests/helpers/reference_batch.py`: `reference_make_batch`, `reference_align_to_origin`,
-  `reference_evaluate`, `reference_batches(sampler, batch_size)` (2863356's `WindowSampler.batches` loop over
+  `reference_evaluate`, `reference_batches(sampler, batch_size)` (F's `WindowSampler.batches` loop over
   `reference_make_batch`), `assert_batches_equal`.
 
 - [ ] **Step 1: Write failing tests.**
@@ -160,7 +162,9 @@ wording), all accepted into rev 3 as specified.
   - `test_build_matches_reference[<fixture>]` for `shared_start`, `mixed_starts`, `tz_collision`,
     `cutoff_growth`, `phase_mismatch`,
     `hourly_dst`, `monthly`, `late_start`, `ragged_aligned`, `indicator_column`, `all_nan_past`,
-    `label_cutoff`, `week53`, `daily`, `origin_zero`, `long_context`, `unseen_statics`:
+    `label_cutoff`, `week53`, `daily`, `origin_zero`, `long_context`, `unseen_statics`,
+    `inf_indicator`, `inf_continuous`, `nonfinite_past`, `cold_empty_past`, `tiny_std_floor`,
+    `standardized_clamp`, `combined_diagnostics`, `indicator_clamp`, `origin_zero_diagnostics`:
     `assert_batches_equal(builder.build(items, label_upto), reference_make_batch(...))`.
   - `test_build_errors_match_reference[overflow_scale|empty|bad_items]`: same exception type and message.
   - `test_build_matches_reference_random_origins`: 20 batches of 128 from `build_origins` with
@@ -184,7 +188,9 @@ wording), all accepted into rev 3 as specified.
     cached per `(key, label_upto)`. Keep per-row `sample_frame` and `_dynamic_values` on identical slices (no
   cumulative sums). Keep the per-row scalar tensor assignment for `loc` and `scale`, which preserves
   torch's overflow check. Fill other fields as fresh numpy float32/bool arrays per call, converted
-  once with `torch.from_numpy`.
+  once with `torch.from_numpy`. Allocate the three diagnostic counters as per-row int64
+  arrays; unpack `_dynamic_values`' diagnostics and use F's `_add_row_diagnostics` on a
+  small attribute holder for those arrays, preserving F's counting.
 - [ ] **Step 4: Run** `pytest tests/test_data tests/test_core tests/test_bench/test_fev_run.py -q` → PASS.
 - [ ] **Step 5: Micro-benchmark.** `python scripts/bench_batches.py` prints reference vs builder ms per
   128-row batch over 20 batches. Report the ratio; it is not a pass/fail gate.
@@ -199,7 +205,8 @@ wording), all accepted into rev 3 as specified.
 
 **Interfaces:**
 - Produces: `timings["scaler_skips"]: int | None`: `0` in `_empty_timings()`, +1 when the scaler is
-  enabled and `get_scale()` after `update()` is below the value before it. When neither the checkpoint
+  enabled and `get_scale()` after `update()` is below the value before it. Count immediately
+  after `update()` inside F's finite-loss branch; non-finite losses bypass the scaler entirely. When neither the checkpoint
   timings nor the ZIP-footer `timings.json` has the key, a resume sets it to `None` (unknown, never
   zero) and it stays `None`.
 
@@ -286,9 +293,11 @@ wording), all accepted into rev 3 as specified.
 Every gate's artifacts are kept under `ROOT/../probes-<UTC>` and copied back with the run.
 
 - [ ] **Gate 0:**
-  - The NaN fix is merged at F, and a quick run at F or later shows `nonfinite_losses == 0` on all
-    seven tasks.
-  - This PR is rebased onto F and merged, with green CI and a reviewed bot report.
+  - The NaN fix is merged at F (`4e33a3e7`).
+  - The Colab prompt-02b rerun at F (T4, fp16) shows `nonfinite_losses == 0` on walmart and
+    rohlik_sales_1W.
+  - P4 then requires the same on all seven tasks at the frozen run's exact SHA.
+  - This PR incorporates F and is merged, with green CI and a reviewed bot report.
 - [ ] **Provision:** g4dn.4xlarge on-demand, eu-central-1, 150 GB gp3 (`DeleteOnTermination=true`),
   shutdown behaviour *stop*, `sudo shutdown -h +720` at boot. Record the instance and volume IDs in the ledger.
 - [ ] **Setup:** venv at the merged SHA, lock enforced, pins verified, HF cache warmed one task at a time.
@@ -308,8 +317,9 @@ Every gate's artifacts are kept under `ROOT/../probes-<UTC>` and copied back wit
   - `n_fit_ids` 2936, `n_val_items` 2864, `max_steps` 4404, `eval_every` 200, AMP float16.
   - No run.json, bundle or NPZ.
 - [ ] **P3 repeatability** (same venv lock, threads and shapes): hermes `--stop-after 200` with the PR
-  code once and with **F** twice (F replaces `2863356` throughout P3), run sequentially. Compared quantities: the full-precision
-  inner SQL at step 200 from `progress.json`/history, and the `model` tensors in `latest.pt`.
+  code once and with **F** twice (`4e33a3e7d811b5fa9dcc1101a48f6c1fc454dfc7`), run sequentially. Compared quantities: the full-precision
+  inner SQL at step 200 from checkpoint history in `latest.pt` (progress has no SQL),
+  and the `model` tensors in `latest.pt`.
   - If the two F runs are bitwise equal, the PR run must be bitwise equal to them.
   - Otherwise the PR run passes iff `|SQL_PR − SQL_ref1| ≤ 3 × |SQL_ref1 − SQL_ref2|`.
   - A failure with a bitwise-repeatable reference is a code difference → **fallback**.
@@ -335,7 +345,7 @@ Every gate's artifacts are kept under `ROOT/../probes-<UTC>` and copied back wit
 - [ ] **Non-finite gate:** any task with `nonfinite_losses > 0` blocks acceptance, in P4 and in the
   frozen report. `scaler_skips` beyond start-of-run calibration (measured 0–2 per healthy task) is
   investigated before launch.
-- [ ] **Failure handling — fallback** (second venv at **F**, never `2863356`; fresh directories):
+- [ ] **Failure handling — fallback** (second venv at **F** (`4e33a3e7d811b5fa9dcc1101a48f6c1fc454dfc7`); fresh directories):
   - Provenance records the executing SHA and interpreter.
   - Prerequisites A, B and D and P4 are repeated with that code; `scaler_skips` is reported unknown.
 - [ ] **Launch:** fresh `ROOT=runs/ec2-frozen-<sha>-<UTC>`; tasks per the P4 decision; Monitor on the exit files; cost guard checked hourly.
@@ -344,7 +354,9 @@ Every gate's artifacts are kept under `ROOT/../probes-<UTC>` and copied back wit
   - `python scripts/fev_report.py --run-dir ROOT/merged --tasks weekly --baseline seasonal_naive --out ROOT/merged/report-tables.md`
     exits 0 with no completeness issue.
   - `fev leaderboard ROOT/merged/summaries.csv --baseline seasonal_naive`.
-  - Ledger: hardware/dtype, `scaler_skips`, `steps`/`max_steps`/`best_step`/`stop_reason` per task,
+  - Ledger: hardware/dtype, `nonfinite_losses`, `scaler_skips`,
+    `cold_covariate_columns`, `floored_covariate_columns`, `clipped_covariate_values`
+    for training and inference, `steps`/`max_steps`/`best_step`/`stop_reason` per task,
     timings and peak RSS/VRAM.
 - [ ] **Copy back and tear down:**
   - `rsync -a` ROOT and the probes to the Mac; compare a sha256 manifest on both sides.

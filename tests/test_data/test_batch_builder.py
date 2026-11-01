@@ -1,6 +1,7 @@
-"""Exact 2863356 batch parity across grids, exceptional inputs and cache reuse."""
+"""Exact NaN-fix F batch parity across grids, exceptional inputs and cache reuse."""
 
 from copy import deepcopy
+from dataclasses import replace
 
 import numpy as np
 import pandas as pd
@@ -86,6 +87,52 @@ def batch_case(name):
             series.start = pd.Timestamp("2024-02-25", tz="Europe/Rome")
     elif name == "origin_zero":
         calls = [([(0, 0), (1, 0)], None)]
+    elif name in ("inf_indicator", "inf_continuous"):
+        # F's test_inf_in_a_covariate_is_missing, including both past transforms.
+        past = [0, 1] if name == "inf_indicator" else [2, 4]
+        panel.series[0].dynamic["promo"] = np.array(
+            [*past, np.inf, -np.inf, np.inf, -np.inf, *past]
+        )
+        horizon, context = 4, 4
+        calls = [([(0, 4), (1, 4)], None)]
+    elif name == "nonfinite_past":
+        # F's cold-detection cases: no finite past, with/without a finite future.
+        panel.series[0].dynamic["promo"] = np.array([np.nan, np.inf, -np.inf, np.nan, 1e5])
+        panel.series[1].dynamic["promo"] = np.array([np.nan, np.inf, -np.inf, np.nan])
+        horizon, context = 4, 4
+        calls = [([(0, 4), (1, 4)], None)]
+    elif name in (
+        "cold_empty_past",
+        "tiny_std_floor",
+        "standardized_clamp",
+        "combined_diagnostics",
+    ):
+        # Exact source arrays/origins from F's panel_with_cold_and_tiny_std.
+        panel = weekly_panel([40, 38])
+        columns = {
+            "promo": np.r_[np.full(30, np.nan), np.full(10, 1e5)],
+            "tiny": np.r_[1e-9, np.zeros(27), np.full(12, 0.5)],
+            "price": np.r_[100.0 + 1e-6, np.full(27, 100.0), np.full(12, 110.0)],
+        }
+        selected = {
+            "cold_empty_past": ("promo",),
+            "tiny_std_floor": ("price",),
+            "standardized_clamp": ("tiny",),
+            "combined_diagnostics": tuple(columns),
+        }[name]
+        panel.roles = replace(panel.roles, known_dynamic=selected)
+        for series in panel.series:
+            series.dynamic.update({key: columns[key].copy() for key in selected})
+        horizon, context = 4, 32
+        calls = [([(0, 28), (1, 25)], None), ([(0, 34)], None)]
+    elif name == "indicator_clamp":
+        panel.series[0].dynamic["promo"] = np.array([0.0, 1.0, 1e5, -1e5, 1e3, -1e3])
+        horizon, context = 4, 2
+        calls = [([(0, 2), (1, 2)], None)]
+    elif name == "origin_zero_diagnostics":
+        panel.series[0].dynamic["promo"] = np.array([1e5])
+        panel.series[1].dynamic["promo"] = np.array([np.nan, np.inf, -np.inf])
+        calls = [([(0, 0), (1, 0)], None)]
     elif name == "long_context":
         context = 512
     panel.seasonal_period = seasonal_period(panel.freq)
@@ -115,6 +162,15 @@ def batch_case(name):
         "week53",
         "daily",
         "origin_zero",
+        "inf_indicator",
+        "inf_continuous",
+        "nonfinite_past",
+        "cold_empty_past",
+        "tiny_std_floor",
+        "standardized_clamp",
+        "combined_diagnostics",
+        "indicator_clamp",
+        "origin_zero_diagnostics",
         "long_context",
         "unseen_statics",
     ],
@@ -128,6 +184,16 @@ def test_build_matches_reference(case):
         assert_batches_equal(
             sampler.make_batch(panel, items, horizon, context, encoder, cutoff), expected
         )
+
+
+@pytest.mark.parametrize("field", ["cold_covariates", "clipped_covariates", "floored_covariates"])
+def test_batch_comparison_checks_diagnostics(field):
+    panel, horizon, context, encoder, calls = batch_case("combined_diagnostics")
+    expected = reference_make_batch(panel, calls[0][0], horizon, context, encoder)
+    changed = expected.clone()
+    getattr(changed, field)[0] += 1
+    with pytest.raises(AssertionError, match=field):
+        assert_batches_equal(changed, expected)
 
 
 @pytest.mark.parametrize("case", ["overflow_scale", "empty", "bad_items"])

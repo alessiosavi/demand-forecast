@@ -187,6 +187,87 @@ def test_report_optional_validation_columns_and_legacy_runs(report_run, legacy):
             assert row["val_items_max"] == "2" and row["n_val_items_eligible"] == "6"
 
 
+@pytest.mark.parametrize(
+    "fit_count,cumulative_count,expected_count", [(7, 0, 7), (None, 9, 9), (0, 9, 0)]
+)
+def test_report_nonfinite_losses_gate_and_fit_result_precedence(
+    report_run, fit_count, cumulative_count, expected_count
+):
+    specs, out, _, _ = report_run
+    path = out / "first/run.json"
+    report = json.loads(path.read_text())
+    if fit_count is None:
+        report["fit_result"].pop("nonfinite_losses", None)
+    else:
+        report["fit_result"]["nonfinite_losses"] = fit_count
+    report["timings"]["cumulative"]["nonfinite_losses"] = cumulative_count
+    path.write_text(json.dumps(report))
+
+    rendered, issues = report_module().build_report(out, specs)
+    expected_issues = (
+        [f"first: {expected_count} non-finite training losses"] if expected_count else []
+    )
+    assert issues == expected_issues
+    assert table(rendered, "Training")[0]["nonfinite_losses"] == str(expected_count)
+    process, rendered = invoke_report(report_run)
+    assert process.returncode == int(expected_count > 0), process.stdout + process.stderr
+    if expected_count:
+        assert expected_issues[0] in rendered
+        process, rendered = invoke_report(report_run, "--allow-partial")
+        assert process.returncode == 0, process.stdout + process.stderr
+        assert "Incomplete" in rendered and expected_issues[0] in rendered
+
+
+@pytest.mark.parametrize("fit_count_present", [False, True])
+@pytest.mark.parametrize("legacy", ["none", "first", "all"])
+def test_report_optional_covariate_counters_and_legacy_shapes(
+    report_run, fit_count_present, legacy
+):
+    specs, out, _, _ = report_run
+    counters = {
+        "cold_covariate_columns": 3,
+        "floored_covariate_columns": 5,
+        "clipped_covariate_values": 11,
+    }
+    for spec in specs:
+        path = out / spec.name / "run.json"
+        report = json.loads(path.read_text())
+        if fit_count_present:
+            report["fit_result"]["nonfinite_losses"] = 0
+        else:
+            report["fit_result"].pop("nonfinite_losses", None)
+        cumulative = report["timings"]["cumulative"]
+        for key, value in counters.items():
+            if legacy in ("all", spec.name):
+                cumulative.pop(key, None)
+            else:
+                cumulative[key] = value
+        path.write_text(json.dumps(report))
+
+    rendered, issues = report_module().build_report(out, specs)
+    assert not issues
+    for row in table(rendered, "Training"):
+        assert row["nonfinite_losses"] == "0"
+        for key, value in counters.items():
+            assert row[key] == ("unknown" if legacy in ("all", row["task"]) else str(value))
+
+
+@pytest.mark.parametrize("fit_count_present", [False, True])
+def test_report_cumulative_nonfinite_count_remains_required(report_run, fit_count_present):
+    specs, out, _, _ = report_run
+    path = out / "first/run.json"
+    report = json.loads(path.read_text())
+    if fit_count_present:
+        report["fit_result"]["nonfinite_losses"] = 0
+    else:
+        report["fit_result"].pop("nonfinite_losses", None)
+    report["timings"]["cumulative"].pop("nonfinite_losses")
+    path.write_text(json.dumps(report))
+
+    _, issues = report_module().build_report(out, specs)
+    assert issues == ["first: missing/non-finite timings.cumulative.nonfinite_losses"]
+
+
 def test_report_quick_model_name_and_validation_counts(report_run):
     specs, out, _, _ = report_run
     settings = tiny_settings(base_steps=10, d_model=8)

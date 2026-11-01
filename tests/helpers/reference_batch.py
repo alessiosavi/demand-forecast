@@ -1,4 +1,4 @@
-# Frozen reference: verbatim functions from commit 2863356, renamed reference_*.
+# Frozen reference: verbatim functions from commit 4e33a3e7d811b5fa9dcc1101a48f6c1fc454dfc7, renamed reference_*.
 # Keep these bodies independent of the live alignment, batching and evaluation paths.
 """Frozen batching/evaluation oracle and exact tensor comparison for parity tests."""
 
@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import fields, replace
+from typing import Any, NamedTuple
 
 import numpy as np
 import pandas as pd
@@ -24,8 +25,19 @@ from demand_forecast.data.scaling import sample_frame
 from demand_forecast.metrics import summarize
 from demand_forecast.models.base import ForecastModel
 
+COVARIATE_BOUND: float = 1e3
+REL_STD_FLOOR: float = 1e-3
+
 
 # fmt: off
+class DynamicDiagnostics(NamedTuple):
+    """Cold/floored sample-column flags and the number of clipped valid values."""
+
+    cold: bool
+    clipped: int
+    floored: bool
+
+
 def reference_positive(value: int, name: str) -> None:
     if not isinstance(value, (int, np.integer)) or value < 1:
         raise ValueError(f"{name} must be a positive integer")
@@ -40,6 +52,16 @@ def reference_items_array(panel: Panel, items: Iterable[tuple[int, int]]) -> np.
     if np.any(items < 0) or np.any(items[:, 0] >= len(panel)):
         raise ValueError("items contain an invalid series index or origin position")
     return items
+
+
+def reference_add_row_diagnostics(batch: Any, row: int, diag: DynamicDiagnostics) -> None:
+    """Accumulate one sample-column's diagnostics in its batch row.
+
+    Any object exposing per-row-indexable cold_covariates, clipped_covariates, floored_covariates may be passed.
+    """
+    batch.cold_covariates[row] += diag.cold
+    batch.clipped_covariates[row] += diag.clipped
+    batch.floored_covariates[row] += diag.floored
 
 
 def reference_align_to_origin(panel: Panel, items: Iterable[tuple[int, int]]) -> Panel:
@@ -75,22 +97,51 @@ def reference_align_to_origin(panel: Panel, items: Iterable[tuple[int, int]]) ->
 
 def reference_dynamic_values(
     source: np.ndarray | None, start: int, origin: int, stop: int
-) -> tuple[np.ndarray, np.ndarray]:
-    """Slice one dynamic column and standardise using only its observed past."""
+) -> tuple[np.ndarray, np.ndarray, DynamicDiagnostics]:
+    """Standardise a dynamic column using only its finite, whole past.
+
+    Classify indicators from the past so future values cannot change the context
+    transform. A column with no observed past but finite values in this slice is
+    cold: mask off the entire slice. Floor positive standard deviations relative
+    to the largest absolute past value; a zero std still uses scale 1. Bound valid
+    values before conversion to float32; non-finite source values are missing
+    throughout.
+    """
     values = np.full(stop - start, np.nan, dtype=np.float64)
     if source is None:
-        return np.zeros(stop - start, dtype=np.float32), np.zeros(stop - start, dtype=bool)
+        return (
+            np.zeros(stop - start, dtype=np.float32),
+            np.zeros(stop - start, dtype=bool),
+            DynamicDiagnostics(cold=False, clipped=0, floored=False),
+        )
     end = min(stop, len(source))
     if end > start:
         values[: end - start] = source[start:end]
     past = np.asarray(source[:origin], dtype=np.float64)
-    past = past[~np.isnan(past)]
-    # An unobserved past uses the identity transform. Classify indicators from
-    # the past as well, so future values cannot change the context transform.
+    past = past[np.isfinite(past)]
+    mask = np.isfinite(values)
+    if not past.size and mask.any():
+        return (
+            np.zeros(stop - start, dtype=np.float32),
+            np.zeros(stop - start, dtype=bool),
+            DynamicDiagnostics(cold=True, clipped=0, floored=False),
+        )
+    values[~mask] = np.nan
+    floored = False
     if past.size and not np.all((past == 0) | (past == 1)):
-        values = (values - past.mean()) / (past.std() or 1.0)
-    mask = ~np.isnan(values)
-    return np.where(mask, values, 0).astype(np.float32), mask
+        std = past.std()
+        scale = std or 1.0
+        if std > 0:
+            scale = max(std, REL_STD_FLOOR * np.max(np.abs(past)))
+            floored = bool(scale > std)
+        values = (values - past.mean()) / scale
+    clipped = int(np.count_nonzero(mask & (np.abs(values) > COVARIATE_BOUND)))
+    values = np.clip(values, -COVARIATE_BOUND, COVARIATE_BOUND)
+    return (
+        np.where(mask, values, 0).astype(np.float32),
+        mask,
+        DynamicDiagnostics(cold=False, clipped=clipped, floored=floored),
+    )
 
 
 def reference_make_batch(
@@ -139,6 +190,9 @@ def reference_make_batch(
         loss_eligible=torch.zeros(size, dtype=torch.bool),
         series_index=torch.tensor(items[:, 0], dtype=torch.long),
         origin_pos=torch.tensor(items[:, 1], dtype=torch.long),
+        cold_covariates=torch.zeros(size, dtype=torch.int64),
+        clipped_covariates=torch.zeros(size, dtype=torch.int64),
+        floored_covariates=torch.zeros(size, dtype=torch.int64),
     )
     for row, (i, origin) in enumerate(items):
         i, origin = int(i), int(origin)
@@ -166,7 +220,10 @@ def reference_make_batch(
         for column, name in enumerate(dynamic, start=n_calendar):
             is_known = column < n_dec
             stop = origin + horizon if is_known else origin
-            values, mask = reference_dynamic_values(series.dynamic.get(name), start, origin, stop)
+            values, mask, diagnostics = reference_dynamic_values(
+                series.dynamic.get(name), start, origin, stop
+            )
+            reference_add_row_diagnostics(batch, row, diagnostics)
             batch.enc_cov[row, dest, column] = torch.from_numpy(values[:context_length])
             batch.enc_cov_mask[row, dest, column] = torch.from_numpy(mask[:context_length])
             if is_known:
@@ -191,20 +248,20 @@ def reference_make_batch(
     return batch
 
 
-def reference_batches(sampler, batch_size: int) -> Iterator[Batch]:
+def reference_batches(self, batch_size: int) -> Iterator[Batch]:
     """Batch consecutive remaining draws, retaining a final partial batch."""
     reference_positive(batch_size, "batch_size")
     items = []
-    for item in sampler:
+    for item in self:
         items.append(item)
         if len(items) == batch_size:
             yield reference_make_batch(
-                sampler.panel, items, sampler.horizon, sampler.max_context, sampler.encoder, sampler.label_upto
+                self.panel, items, self.horizon, self.max_context, self.encoder, self.label_upto
             )
             items = []
     if items:
         yield reference_make_batch(
-            sampler.panel, items, sampler.horizon, sampler.max_context, sampler.encoder, sampler.label_upto
+            self.panel, items, self.horizon, self.max_context, self.encoder, self.label_upto
         )
 
 

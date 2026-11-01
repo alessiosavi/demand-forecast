@@ -113,6 +113,10 @@ for task in "${task_names[@]}"; do
     flock -n "$task_lock" || fail "$task already has an active process"
     task_locks+=("$task_lock")
     session_dir="$task_dir/launches/$launch"
+    # Refuse unsafe aliases for every task before dispatching any worker.
+    for name in run.log exit; do
+        [[ ! -e $task_dir/$name || -L $task_dir/$name ]] || fail "refusing to replace regular $task_dir/$name"
+    done
     baseline=("$venv/bin/demand-forecast" fev baseline --tasks "$task" --out-dir "$task_dir")
     run=("$venv/bin/demand-forecast" fev run --tasks "$task" --config "$provenance/config.yaml"
          --policy first_window --out-dir "$task_dir" --resume)
@@ -142,7 +146,6 @@ for index in "${!task_names[@]}"; do
     session_dir="$task_dir/launches/$launch"
     # Retain old logs/exits and publish aliases for the most recent session.
     for name in run.log exit; do
-        [[ ! -e $task_dir/$name || -L $task_dir/$name ]] || fail "refusing to replace regular $task_dir/$name"
         ln -sfn "launches/$launch/$name" "$task_dir/$name"
     done
     (
