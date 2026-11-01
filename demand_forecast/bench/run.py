@@ -152,6 +152,8 @@ def run_fev(
     Resume validates saved identities and computes only missing artifacts.
     Timings come from persisted trainer and prediction measurements, including
     earlier sessions. Fully verified completed tasks retain their summary row.
+    ``NonFiniteTraining`` propagates before a failed task can write a summary
+    row; its terminal checkpoint remains the marker for subsequent resumes.
 
     Early-ending items are forecast for calendar periods that other items'
     available past (and selection labels) already cover. No item's own future
