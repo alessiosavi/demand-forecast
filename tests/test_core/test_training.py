@@ -815,6 +815,9 @@ def test_timing_categories_sum_with_controlled_clock(
         "sessions": 1,
         "peak_cuda_mem_bytes": 0,
         "nonfinite_losses": 0,
+        "cold_covariate_columns": 0,
+        "clipped_covariate_values": 0,
+        "floored_covariate_columns": 0,
     }
     resumed = Trainer(fresh(), cfg, cpu, RUN_ID, SEED).fit(
         panel_long,
@@ -981,3 +984,55 @@ def test_cuda_session_reset_and_sampling_points_without_gpu(
         )
     ]
     assert result.timings["peak_cuda_mem_bytes"] == 123
+
+
+def test_covariate_counters_accumulate_and_resume(tmp_path, monkeypatch, fresh_for):
+    import json
+
+    from demand_forecast.core import training
+    from demand_forecast.core.validation import plan_inner_validation
+
+    panel = weekly_panel([40] * 3)
+    panel.roles = replace(panel.roles, known_dynamic=("promo", "tiny", "price"))
+    for series in panel.series:
+        series.dynamic["promo"] = np.r_[np.full(30, np.nan), np.full(10, 1e5)]
+        series.dynamic["tiny"] = np.r_[1e-9, np.zeros(27), np.full(12, 0.5)]
+        series.dynamic["price"] = np.r_[100.0 + 1e-6, np.full(27, 100.0), np.full(12, 110.0)]
+    plan = plan_inner_validation(panel, panel.timestamps(0, 41)[40], 4)
+    encoder = StaticEncoder().fit(panel, plan.fit_ids)
+    # Keep sampling real batches at the pathological origin on both sides of resume.
+    monkeypatch.setattr(
+        training, "build_origins", lambda *a, **k: np.array([(i, 28) for i in range(3)])
+    )
+    cfg = TrainConfig(base_steps=4, batch_size=8, amp=False)
+    forecast = ForecastConfig(horizon=4, max_context=32)
+    first = Trainer(fresh_for(panel, 4), cfg, cpu, RUN_ID, SEED).fit(
+        panel,
+        plan,
+        forecast,
+        encoder,
+        checkpoint_dir=tmp_path,
+        stop_after=2,
+    )
+    assert first.stop_reason == "interrupted"
+    expected = {
+        "cold_covariate_columns": 6,
+        "clipped_covariate_values": 24,
+        "floored_covariate_columns": 6,
+    }
+    progress = json.loads((tmp_path / "progress.json").read_text())
+    state = torch.load(tmp_path / "latest.pt", weights_only=False)
+    for key, value in expected.items():
+        assert first.timings[key] == progress["timings"][key] == state["timings"][key] == value
+    resumed = Trainer(fresh_for(panel, 4), cfg, cpu, RUN_ID, SEED).fit(
+        panel,
+        plan,
+        forecast,
+        encoder,
+        checkpoint_dir=tmp_path,
+        resume=True,
+    )
+    assert resumed.steps == 4 and resumed.timings["nonfinite_losses"] == 0
+    progress = json.loads((tmp_path / "progress.json").read_text())
+    for key, value in expected.items():
+        assert resumed.timings[key] == progress["timings"][key] == value * 2

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, fields, replace
+from typing import NamedTuple
 
 import numpy as np
 import pandas as pd
@@ -13,6 +14,17 @@ from demand_forecast.data.encoders import StaticEncoder
 from demand_forecast.data.frequency import calendar_feature_names, calendar_features, grid_range
 from demand_forecast.data.panel import Panel
 from demand_forecast.data.scaling import sample_frame
+
+COVARIATE_BOUND: float = 1e3
+REL_STD_FLOOR: float = 1e-3
+
+
+class DynamicDiagnostics(NamedTuple):
+    """Cold/floored sample-column flags and the number of clipped valid values."""
+
+    cold: bool
+    clipped: int
+    floored: bool
 
 
 @dataclass
@@ -38,6 +50,9 @@ class Batch:
     loss_eligible: torch.Tensor
     series_index: torch.Tensor
     origin_pos: torch.Tensor
+    cold_covariates: torch.Tensor
+    clipped_covariates: torch.Tensor
+    floored_covariates: torch.Tensor
 
     @property
     def size(self) -> int:
@@ -61,6 +76,13 @@ class Batch:
                 else function(value)
             )
         return Batch(**values)
+
+
+def _add_row_diagnostics(batch: Batch, row: int, diag: DynamicDiagnostics) -> None:
+    """Accumulate one sample-column's diagnostics in its batch row."""
+    batch.cold_covariates[row] += diag.cold
+    batch.clipped_covariates[row] += diag.clipped
+    batch.floored_covariates[row] += diag.floored
 
 
 def _positive(value: int, name: str) -> None:
@@ -161,22 +183,51 @@ def align_to_origin(panel: Panel, items: Iterable[tuple[int, int]]) -> Panel:
 
 def _dynamic_values(
     source: np.ndarray | None, start: int, origin: int, stop: int
-) -> tuple[np.ndarray, np.ndarray]:
-    """Slice one dynamic column and standardise using only its observed past."""
+) -> tuple[np.ndarray, np.ndarray, DynamicDiagnostics]:
+    """Standardise a dynamic column using only its finite, whole past.
+
+    Classify indicators from the past so future values cannot change the context
+    transform. A column with no observed past but finite values in this slice is
+    cold: mask off the entire slice. Floor positive standard deviations relative
+    to the largest absolute past value; a zero std still uses scale 1. Bound valid
+    values before conversion to float32; non-finite source values are missing
+    throughout.
+    """
     values = np.full(stop - start, np.nan, dtype=np.float64)
     if source is None:
-        return np.zeros(stop - start, dtype=np.float32), np.zeros(stop - start, dtype=bool)
+        return (
+            np.zeros(stop - start, dtype=np.float32),
+            np.zeros(stop - start, dtype=bool),
+            DynamicDiagnostics(cold=False, clipped=0, floored=False),
+        )
     end = min(stop, len(source))
     if end > start:
         values[: end - start] = source[start:end]
     past = np.asarray(source[:origin], dtype=np.float64)
-    past = past[~np.isnan(past)]
-    # An unobserved past uses the identity transform. Classify indicators from
-    # the past as well, so future values cannot change the context transform.
+    past = past[np.isfinite(past)]
+    mask = np.isfinite(values)
+    if not past.size and mask.any():
+        return (
+            np.zeros(stop - start, dtype=np.float32),
+            np.zeros(stop - start, dtype=bool),
+            DynamicDiagnostics(cold=True, clipped=0, floored=False),
+        )
+    values[~mask] = np.nan
+    floored = False
     if past.size and not np.all((past == 0) | (past == 1)):
-        values = (values - past.mean()) / (past.std() or 1.0)
-    mask = ~np.isnan(values)
-    return np.where(mask, values, 0).astype(np.float32), mask
+        std = past.std()
+        scale = std or 1.0
+        if std > 0:
+            scale = max(std, REL_STD_FLOOR * np.max(np.abs(past)))
+            floored = bool(scale > std)
+        values = (values - past.mean()) / scale
+    clipped = int(np.count_nonzero(mask & (np.abs(values) > COVARIATE_BOUND)))
+    values = np.clip(values, -COVARIATE_BOUND, COVARIATE_BOUND)
+    return (
+        np.where(mask, values, 0).astype(np.float32),
+        mask,
+        DynamicDiagnostics(cold=False, clipped=clipped, floored=floored),
+    )
 
 
 def make_batch(
@@ -225,6 +276,9 @@ def make_batch(
         loss_eligible=torch.zeros(size, dtype=torch.bool),
         series_index=torch.tensor(items[:, 0], dtype=torch.long),
         origin_pos=torch.tensor(items[:, 1], dtype=torch.long),
+        cold_covariates=torch.zeros(size, dtype=torch.int64),
+        clipped_covariates=torch.zeros(size, dtype=torch.int64),
+        floored_covariates=torch.zeros(size, dtype=torch.int64),
     )
     for row, (i, origin) in enumerate(items):
         i, origin = int(i), int(origin)
@@ -252,7 +306,10 @@ def make_batch(
         for column, name in enumerate(dynamic, start=n_calendar):
             is_known = column < n_dec
             stop = origin + horizon if is_known else origin
-            values, mask = _dynamic_values(series.dynamic.get(name), start, origin, stop)
+            values, mask, diagnostics = _dynamic_values(
+                series.dynamic.get(name), start, origin, stop
+            )
+            _add_row_diagnostics(batch, row, diagnostics)
             batch.enc_cov[row, dest, column] = torch.from_numpy(values[:context_length])
             batch.enc_cov_mask[row, dest, column] = torch.from_numpy(mask[:context_length])
             if is_known:
