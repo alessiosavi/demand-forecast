@@ -61,7 +61,7 @@ Save and run this locally as `provision-ec2.sh` (AWS CLI and jq required):
 ```bash
 #!/bin/bash
 set -euo pipefail
-export AWS_PROFILE=veliu-staging AWS_REGION=eu-central-1
+export AWS_PROFILE=veliu-staging AWS_REGION=eu-central-1 AWS_DEFAULT_OUTPUT=json
 : "${OPERATOR_IP:?your current public IPv4 address}"
 : "${VPC_ID:?selected VPC}" "${SUBNET_ID:?public subnet in that VPC}"
 TOKEN=$(date -u +%Y%m%dT%H%M%SZ)
@@ -135,9 +135,14 @@ The baseline comparison below requires prompt 00's revision
 `d3e7e720f4158eab03ebcb021f1cce779cd92acc`; a different revision blocks this experiment's
 six-significant-figure gate. Keep the original `colab-dataset-manifest.json` unchanged.
 
-Save the following as `/home/ubuntu/setup-fev.sh` and run it on EC2. Set `FEV_SHA`
-to the full merged SHA. `COLAB_LOCK` is the full Colab image freeze: use it only as
-constraints (`-c`) when installing `.[bench]`. Colab-only packages such as google-colab,
+Save the following as `/home/ubuntu/setup-fev.sh` and run it on EC2 using the detached
+outer-job recipe below. Set `FEV_SHA` to the full merged SHA. Generate
+`INSTALL_CONSTRAINTS` once from the full Colab image freeze (`COLAB_LOCK`), removing
+only lines containing ` @ ` and preserving the original. This filtered file is the
+**verified install input of 2026-11-01**, reused in §7. Its six excluded packages are
+`cucim-cu12`, `cuvs-cu12`, `en-core-web-sm`, `google-colab`, `jupyter-kernel-gateway`
+and `nx-cugraph-cu12`; all were outside the recorded required closure. This is not a
+claim that pip universally rejects direct references. Colab-only packages such as
 tensorflow and jax need not be installed on EC2. The numerical-environment gate is
 `closure_parity.py` exit 0 for every installed `demand-forecast[bench]` dependency,
 excluding demand-forecast itself: normalised names and **exact version strings**,
@@ -162,13 +167,106 @@ git checkout --detach "$FEV_SHA"
 test "$(git rev-parse HEAD)" = "$FEV_SHA"
 python3.12 -m venv /home/ubuntu/fev/venv-pr
 export COLAB_LOCK=/home/ubuntu/fev-inputs/environment-lock.txt
+export INSTALL_CONSTRAINTS=/home/ubuntu/fev-inputs/install-constraints.txt
+python3.12 - <<'PY'
+import os
+from pathlib import Path
+source = Path(os.environ["COLAB_LOCK"])
+target = Path(os.environ["INSTALL_CONSTRAINTS"])
+with target.open("xb") as stream:
+    stream.writelines(line for line in source.read_bytes().splitlines(keepends=True) if b" @ " not in line)
+PY
 env -u LD_LIBRARY_PATH /home/ubuntu/fev/venv-pr/bin/python -m pip install \
   --extra-index-url https://download.pytorch.org/whl/cu128 \
-  -c "$COLAB_LOCK" -e '.[bench]'
+  -c "$INSTALL_CONSTRAINTS" -e '.[bench]'
+```
+
+For long remote jobs (setup, gates, rehearsals, frozen launch and report), save
+`/home/ubuntu/dispatch-job.sh` on EC2 **before setup**. It creates a unique directory
+under `host-logs/`, saves the exact command, and uses `setsid -f` with stdin, stdout
+and stderr redirected. The saved job's EXIT trap atomically publishes its exit code,
+including when `set -e` stops on failure. Keep the inner
+`scripts/ec2/frozen_parallel.sh` unchanged: its `$!` session ID feeds the resource sampler.
+
+```bash
+#!/bin/bash
+set -euo pipefail
+label=$1
+shift
+[[ $label =~ ^[a-zA-Z0-9_-]+$ && $# -gt 0 ]]
+mkdir -p /home/ubuntu/fev/host-logs
+job=$(mktemp -d "/home/ubuntu/fev/host-logs/$label.XXXXXXXX")
+{
+    printf '#!/bin/bash\nset -euo pipefail\n'
+    printf 'status_file=%q\n' "$job/exit"
+    cat <<'BASH'
+: "${status_file:?absolute status path set by dispatcher}"
+publish_exit() {
+    local rc=$?
+    printf '%s\n' "$rc" > "$status_file.tmp"
+    mv "$status_file.tmp" "$status_file"
+    exit "$rc"
+}
+trap publish_exit EXIT
+BASH
+    printf '%q ' "$@"
+    printf '\n'
+} > "$job/command.sh"
+setsid -f bash "$job/command.sh" < /dev/null > "$job/run.log" 2>&1
+printf '%s\n' "$job"
+```
+
+Save `/home/ubuntu/wait-job.sh` on EC2. A successful dispatch is **not completion**.
+Poll the exact returned directory; only the expected status permits the next gate.
+The optional timeout is seconds (default twelve hours; shorten to the remaining guard).
+After interruption, absent status means **unknown**, including if the SSH dispatch
+connection failed before returning a directory. Inspect retained `host-logs/` before
+retrying; never infer success or automatically dispatch a duplicate job.
+
+```bash
+#!/bin/bash
+set -euo pipefail
+job=$1 expected=${2:-0} timeout=${3:-43200}
+[[ $expected =~ ^[0-9]+$ && $timeout =~ ^[1-9][0-9]*$ ]]
+deadline=$((SECONDS + timeout))
+while (( SECONDS < deadline )); do
+    if [[ -s $job/exit ]]; then
+        actual=$(cat "$job/exit")
+        [[ $actual == "$expected" ]] || { echo "FAILED: $job exit=$actual expected=$expected" >&2; exit 1; }
+        exit 0
+    fi
+    sleep 1
+done
+echo "UNKNOWN: $job has no exit status before timeout; next gate blocked" >&2
+exit 124
+```
+
+Save this local helper as `dispatch-and-wait.sh`. `PROVISIONING` is the absolute local
+`ec2-<TOKEN>` directory from §1; keep each job-path record there. Save/copy the remote
+scripts before calling it. For setup, invoke
+`bash dispatch-and-wait.sh setup-fev env FEV_SHA="$FEV_SHA" bash /home/ubuntu/setup-fev.sh`.
+Use the same pattern for the subsequent saved scripts; do not dispatch the next gate
+until this helper returns zero. After a lost connection, use the saved job path with
+`wait-job.sh` to poll again, without redispatching.
+
+```bash
+#!/bin/bash
+set -euo pipefail
+: "${KEY:?absolute SSH key path}" "${HOST:?public IP}" "${PROVISIONING:?local provisioning directory}"
+record=$(mktemp "$PROVISIONING/outer-job.XXXXXXXX")
+mv "$record" "$record.txt"
+record="$record.txt"
+printf -v remote '%q ' bash /home/ubuntu/dispatch-job.sh "$@"
+ssh -n -i "$KEY" "ubuntu@$HOST" "$remote" > "$record"
+job=$(cat "$record")
+test -n "$job"
+printf 'Dispatched %s; retained path: %s\n' "$job" "$record"
+printf -v remote '%q ' bash /home/ubuntu/wait-job.sh "$job" 0 "${JOB_TIMEOUT_SECONDS:-43200}"
+ssh -n -i "$KEY" "ubuntu@$HOST" "$remote"
 ```
 
 Create `/home/ubuntu/fev/env.sh` with this content, filling the SHA. Every subsequent
-script starts by sourcing it. `TOOLS` stays at the merged code even during fallback;
+gate script starts by sourcing it. `TOOLS` stays at the merged code even during fallback;
 `VENV` selects the actual CLI installation. The launcher resolves its provenance using
 that interpreter in isolated mode, and runs from its installed package checkout.
 `COLAB_LOCK` remains the input for closure parity. After that gate passes,
@@ -182,6 +280,8 @@ export FEV_SHA='<full merged SHA>'
 export TOOLS=/home/ubuntu/fev/code
 export VENV=/home/ubuntu/fev/venv-pr
 export COLAB_LOCK=/home/ubuntu/fev-inputs/environment-lock.txt
+export INSTALL_CONSTRAINTS=/home/ubuntu/fev-inputs/install-constraints.txt
+export COLAB_MANIFEST=/home/ubuntu/fev-inputs/colab-dataset-manifest.json
 export FEV_LOCK_FILE=/home/ubuntu/fev/ec2-environment-lock.txt
 export FEV_DATASET_MANIFEST=/home/ubuntu/fev/dataset-manifest.json
 export PROMPT00=/home/ubuntu/fev-inputs/summaries.csv
@@ -234,6 +334,8 @@ PY
 nvidia-smi -q > "$PROBES/nvidia-smi.txt"
 free -b > "$PROBES/ram.txt"
 df -B1 > "$PROBES/disk.txt"
+# The redirect is intentionally unprivileged: PROBES belongs to ubuntu.
+# shellcheck disable=SC2024
 sudo shutdown --show > "$PROBES/shutdown.txt"
 ```
 
@@ -243,7 +345,10 @@ parquet bytes against the pinned LFS pointers. Keep both caches writable: datase
 file locks. Do not set offline mode or override the task dataset paths. Save the following
 as `$OPS/pin-and-warm.py`; it warms only the seven selected tasks, sequentially, and
 requires one identifiable parquet per task. An unexpected repository layout fails closed
-for inspection; it does not download unrelated datasets.
+for inspection; it does not download unrelated datasets. The original Colab schema is
+`tasks[task].files[filename]` with `bytes`; the generated EC2 schema is a `files` list
+with `size`. Map the exact Colab filename to the Hub sibling, including nested paths
+such as `m5/1W/train-00000-of-00001.parquet`.
 
 ```python
 import hashlib
@@ -257,6 +362,8 @@ repo = "autogluon/fev_datasets"
 revision = "d3e7e720f4158eab03ebcb021f1cce779cd92acc"
 manifest_path = Path(os.environ["FEV_DATASET_MANIFEST"])
 previous = json.loads(manifest_path.read_text()) if manifest_path.exists() else None
+colab = json.loads(Path(os.environ["COLAB_MANIFEST"]).read_text())
+assert colab["repo"] == repo and colab["revision"] == revision
 api = HfApi()
 
 
@@ -272,22 +379,20 @@ def verify_head():
 
 
 info = verify_head()
-if previous:
-    assert previous["revision"] == revision
+if previous is not None:
+    assert previous["repo"] == repo and previous["revision"] == revision
 entries = []
 for spec in load_task_specs("weekly"):
-    candidates = [
-        s
-        for s in info.siblings
-        if s.rfilename.endswith(".parquet")
-        and (
-            Path(s.rfilename).stem == spec.dataset_config
-            or spec.dataset_config in Path(s.rfilename).parts
-        )
-    ]
+    colab_files = colab["tasks"][spec.name]["files"]
+    assert len(colab_files) == 1, (spec.name, list(colab_files))
+    ((rfilename, colab_file),) = colab_files.items()
+    assert rfilename.endswith(".parquet"), rfilename
+    candidates = [s for s in info.siblings if s.rfilename == rfilename]
     assert len(candidates) == 1, (spec.name, [s.rfilename for s in candidates])
     sibling = candidates[0]
     assert sibling.lfs is not None
+    assert sibling.lfs.sha256 == colab_file["sha256"], (spec.name, "Colab sha256 differs")
+    assert sibling.lfs.size == colab_file["bytes"], (spec.name, "Colab size differs")
     task = spec.to_task()
     fingerprint = dataset_fingerprint(task)  # sequential warm-up, never training
     path = Path(hf_hub_download(repo, sibling.rfilename, repo_type="dataset", revision=revision))
@@ -302,7 +407,7 @@ for spec in load_task_specs("weekly"):
         size=path.stat().st_size,
         fingerprint=fingerprint,
     )
-    if previous:
+    if previous is not None:
         old = next(x for x in previous["files"] if x["task"] == spec.name)
         assert all(entry[k] == old[k] for k in ("filename", "sha256", "size", "fingerprint"))
     entries.append(entry)
@@ -322,16 +427,37 @@ Two reusable operator scripts keep launch/status handling consistent. Save `$OPS
 ```bash
 #!/bin/bash
 set -euo pipefail
-root=$1 task=$2 expected=$3
-while [[ ! -f $root/$task/exit ]]; do sleep 5; done
+root=$1 task=$2 expected=$3 timeout=${4:-43200}
+[[ $expected =~ ^[0-9]+$ && $timeout =~ ^[1-9][0-9]*$ ]]
+# Resolve the launch alias before the task exit exists; retain this session identity.
+test -L "$root/$task/exit"
 session=$(dirname "$(readlink -f "$root/$task/exit")")
-while [[ ! -f $session/sampler.exit ]]; do sleep 1; done
-test "$(cat "$root/$task/exit")" -eq "$expected"
-test "$(cat "$session/sampler.exit")" -eq 0
+deadline=$((SECONDS + timeout))
+while (( SECONDS < deadline )); do
+    sampler=
+    if [[ -s $session/sampler.exit ]]; then
+        sampler=$(cat "$session/sampler.exit")
+        [[ $sampler == 0 ]] || { echo "FAILED: $session sampler=$sampler" >&2; exit 1; }
+    fi
+    if [[ -s $session/exit ]]; then
+        actual=$(cat "$session/exit")
+        [[ $actual == "$expected" ]] || { echo "FAILED: $session exit=$actual expected=$expected" >&2; exit 1; }
+        [[ $sampler != 0 ]] || exit 0
+    elif [[ $sampler == 0 ]]; then
+        echo "UNKNOWN: sampler finished without task exit: $session" >&2
+        exit 1
+    fi
+    sleep 1
+done
+echo "UNKNOWN: task/sampler completion timed out: $session; next step blocked" >&2
+exit 124
 ```
 
-Missing exits after a reset or killed process require investigation, not indefinite
-waiting and never an assumed success. For deliberate interruption use `--stop-after`;
+The optional fourth argument bounds the wait in seconds (default twelve hours).
+The sampler's own failure blocks immediately, even when the task session disappeared
+without writing an exit. Timeout returns 124 and blocks the next step; missing exits
+after a reset or killed process require investigation, never an assumed success.
+For deliberate interruption use `--stop-after`;
 for an emergency use `kill -INT -- -PID` on the recorded session PID and retain the logs.
 Save `$OPS/one-task.sh` (arguments: root, task, expected exit, optional stop-after):
 
@@ -404,9 +530,14 @@ EC2 only, no training. Save/run `gate-p1.sh`:
 set -euo pipefail
 source /home/ubuntu/fev/env.sh
 cd "$TOOLS"
+env -u LD_LIBRARY_PATH "$VENV/bin/python" "$OPS/pin-and-warm.py" > "$PROBES/p1-pins.log" 2>&1
 env -u LD_LIBRARY_PATH /usr/bin/time -v "$VENV/bin/python" scripts/ec2/check_real_parity.py \
-  --tasks m5_1W,hermes,walmart --batches 200 --out "$PROBES/p1.json" > "$PROBES/p1.log" 2>&1
+  --tasks m5_1W,hermes,walmart,rohlik_sales_1W --batches 200 --out "$PROBES/p1.json" > "$PROBES/p1.log" 2>&1
 ```
+
+Rohlik covers the floor/clamp guard; walmart covers the cold mask.
+Historical 2026-11-01 measurement: four tasks sequentially, 36:10 elapsed, reported 3.39 GB
+maximum RSS (retained `/usr/bin/time -v`: 3,390,296 KiB); this is not a future guarantee.
 
 Require every check to pass: 200 seed-0 sampler batches per task, prepared validation
 batches, all first-window inference batches, and exact GPU evaluation metrics (NaN equals
@@ -518,7 +649,7 @@ are gates, including in fallback. D is startup evidence; P1 also covers ragged i
 ## 7. P3 — repeatability at fixed lock, threads and shapes
 
 Create a **second checkout and venv at F (`4e33a3e7d811b5fa9dcc1101a48f6c1fc454dfc7`)**, outside the merged checkout. Keep
-`TOOLS` pointing at the merged code. Install with `COLAB_LOCK` as constraints, then
+`TOOLS` pointing at the merged code. Install with §2's `INSTALL_CONSTRAINTS`, then
 run the merged checkout's parity helper with the **reference interpreter** so it
 traverses the reference installation's closure. Require exit 0 and an empty exact
 freeze diff against `FEV_LOCK_FILE`, the EC2 lock recorded from the PR venv. The
@@ -538,7 +669,7 @@ test "$(git rev-parse HEAD)" = "4e33a3e7d811b5fa9dcc1101a48f6c1fc454dfc7"
 python3.12 -m venv /home/ubuntu/fev/venv-reference
 env -u LD_LIBRARY_PATH /home/ubuntu/fev/venv-reference/bin/python -m pip install \
   --extra-index-url https://download.pytorch.org/whl/cu128 \
-  -c "$COLAB_LOCK" -e '.[bench]'
+  -c "$INSTALL_CONSTRAINTS" -e '.[bench]'
 env -u LD_LIBRARY_PATH /home/ubuntu/fev/venv-reference/bin/python -I -m pip freeze \
   > "$PROBES/reference-pip-freeze.txt"
 env -u LD_LIBRARY_PATH /home/ubuntu/fev/venv-reference/bin/python -I \
@@ -564,6 +695,7 @@ source /home/ubuntu/fev/env.sh
 for leg in pr ref1 ref2; do
     selected="$VENV"
     [[ $leg == pr ]] || selected=/home/ubuntu/fev/venv-reference
+    env -u LD_LIBRARY_PATH "$selected/bin/python" "$OPS/pin-and-warm.py" > "$PROBES/p3-$leg-pins.log" 2>&1
     bash "$TOOLS/scripts/ec2/frozen_parallel.sh" --venv "$selected" --run-root "$PROBES/P3-$leg" \
       --config "$TOOLS/configs/fev-v2-standard.yaml" --tasks hermes --stop-after 200
     bash "$OPS/wait.sh" "$PROBES/P3-$leg" hermes 1
@@ -623,6 +755,8 @@ If references disagree, run a third reference before assigning a cause:
 #!/bin/bash
 set -euo pipefail
 source /home/ubuntu/fev/env.sh
+env -u LD_LIBRARY_PATH /home/ubuntu/fev/venv-reference/bin/python "$OPS/pin-and-warm.py" \
+  > "$PROBES/p3-ref3-pins.log" 2>&1
 bash "$TOOLS/scripts/ec2/frozen_parallel.sh" --venv /home/ubuntu/fev/venv-reference \
   --run-root "$PROBES/P3-ref3" --config "$TOOLS/configs/fev-v2-standard.yaml" \
   --tasks hermes --stop-after 200
@@ -653,12 +787,15 @@ count (`fit_result.nonfinite_losses`, or the cumulative count for older reports)
 set -euo pipefail
 source /home/ubuntu/fev/env.sh
 QUICK="$PROBES/P4"
+test ! -e "$QUICK"
+env -u LD_LIBRARY_PATH "$VENV/bin/python" "$OPS/pin-and-warm.py" > "$PROBES/p4-pins.log" 2>&1
 bash "$TOOLS/scripts/ec2/frozen_parallel.sh" --venv "$VENV" --run-root "$QUICK" \
   --config "$TOOLS/configs/fev-v2-quick.yaml" --tasks "$ALL_TASKS"
 IFS=, read -r -a task_names <<< "$ALL_TASKS"
 for task in "${task_names[@]}"; do bash "$OPS/wait.sh" "$QUICK" "$task" 0; done
-env -u LD_LIBRARY_PATH "$VENV/bin/python" "$TOOLS/scripts/fev_merge_runs.py" --run-root "$QUICK" --tasks weekly
-env -u LD_LIBRARY_PATH "$VENV/bin/python" "$TOOLS/scripts/fev_report.py" --run-dir "$QUICK/merged" \
+REPORT_PY=/home/ubuntu/fev/venv-pr/bin/python
+env -u LD_LIBRARY_PATH "$REPORT_PY" "$TOOLS/scripts/fev_merge_runs.py" --run-root "$QUICK" --tasks weekly
+env -u LD_LIBRARY_PATH "$REPORT_PY" "$TOOLS/scripts/fev_report.py" --run-dir "$QUICK/merged" \
   --tasks weekly --baseline seasonal_naive --model-name demand-forecast-v2-quick \
   --out "$QUICK/merged/report-tables.md"
 ```
@@ -680,41 +817,65 @@ cache count and the substituted count in the ledger. Batch shapes and history si
 vary: if average quick bytes/item does not bound the full set, use the conservative bound
 below, or measure the full cache on EC2. Never pass on an unverified optimistic estimate.
 
-Save `$OPS/capacity.py` and run under the PR tools venv; it reports a conservative host
+Save `$OPS/capacity.py` and run under the PR tools venv with a rehearsal root and task
+subset; reuse this exact check for each wave. It reports a conservative host
 bound using a full context and maximum past length for every validation item. The bound
 includes all Batch fields, float64 truth/past, and the quick payload replacement. This is
 more conservative than scaling a random subsample's mean bytes/item on ragged histories.
 
 ```python
-import json, os, re
+import argparse, json, os, re
 from pathlib import Path
 import numpy as np
 import pandas as pd
 
-root = Path(os.environ["PROBES"]) / "P4"
+parser = argparse.ArgumentParser()
+parser.add_argument("--root", type=Path, required=True)
+parser.add_argument("--tasks", required=True)
+parser.add_argument("--validation-bounds", type=Path, required=True)
+args = parser.parse_args()
+root = args.root
+tasks = args.tasks.split(",")
+assert (
+    tasks
+    and len(tasks) == len(set(tasks))
+    and set(tasks) <= set(os.environ["ALL_TASKS"].split(","))
+)
 tot_gpu = tot_rss = 0
-for task in os.environ["ALL_TASKS"].split(","):
+for task in tasks:
     base = root / task
-    reports = list((base / "launches").glob("*/resources.csv"))
-    assert reports
-    samples = pd.concat([pd.read_csv(p) for p in reports])
-    assert len(samples) and np.isfinite(samples[["rss_KiB", "gpu_MiB"]]).all().all()
-    assert all((p.parent / "sampler.exit").read_text().strip() == "0" for p in reports)
-    gpu = samples.groupby("pid").gpu_MiB.max().sum() * 2**20
-    rss = samples.groupby("timestamp").rss_KiB.sum().max() * 2**10
+    sessions = sorted(p for p in (base / "launches").iterdir() if p.is_dir())
+    assert sessions, f"{task}: no sampler sessions"
+    frames = []
+    for session in sessions:
+        assert (session / "sampler.exit").read_text().strip() == "0", f"{session}: sampler failed"
+        frame = pd.read_csv(session / "resources.csv")
+        values = frame[["timestamp", "pid", "rss_KiB", "gpu_MiB"]]
+        assert len(frame) and np.isfinite(values).all().all(), f"{session}: empty/nonfinite sample"
+        assert (values >= 0).all().all() and (frame.pid > 0).all()
+        frame["session"] = session.name
+        frames.append(frame)
+    samples = pd.concat(frames)
+    gpu = samples.groupby(["session", "pid"]).gpu_MiB.max().sum() * 2**20
+    rss = samples.groupby(["session", "timestamp"]).rss_KiB.sum().max() * 2**10
     assert gpu > 0 and rss > 0, f"{task}: no observed GPU/RSS footprint"
     run = json.loads((base / task / "run.json").read_text())
-    logs = "\n".join(p.read_text() for p in (base / "launches").glob("*/run.log"))
+    logs = "\n".join((p / "run.log").read_text() for p in sessions)
     matches = re.findall(r"validation prepared: items=(\d+) batches=\d+ bytes=(\d+)", logs)
     if matches:
         items, payload = map(int, matches[-1])
         eligible = run["n_val_items_eligible"]
+        assert isinstance(eligible, int) and eligible >= items > 0 and payload > 0
         # Supply a verified upper bound per task, measured from the first-window
         # panel metadata. It must be >= every retained full-past history length.
-        bounds = json.loads((Path(os.environ["PROBES"]) / "validation-bounds.json").read_text())
+        bounds = json.loads(args.validation_bounds.read_text())
         b = bounds[task]
         h, c = run["settings"]["forecast"]["horizon"], run["settings"]["forecast"]["max_context"]
         enc, dec, num, cats = (b[k] for k in ("n_enc", "n_dec", "n_numeric", "n_categorical"))
+        assert all(
+            isinstance(v, int) and v >= 0 for v in (h, c, enc, dec, num, cats, b["max_history"])
+        )
+        assert h > 0 and c > 0
         per_item = (
             6 * c
             + 5 * c * enc
@@ -729,6 +890,8 @@ for task in os.environ["ALL_TASKS"].split(","):
         adjusted = rss - payload + frozen_payload
         print(
             task,
+            "quick items",
+            items,
             "quick bytes/item",
             payload / items,
             "frozen items",
@@ -746,11 +909,13 @@ for task in os.environ["ALL_TASKS"].split(","):
             or all(sha == "4e33a3e7d811b5fa9dcc1101a48f6c1fc454dfc7" for sha in executing)
         )
         adjusted = rss
+    assert np.isfinite(adjusted) and adjusted > 0
     print(task, "sampled maxima GPU bytes", gpu, "RSS bytes", rss, "adjusted RSS", adjusted)
     tot_gpu += gpu
     tot_rss += adjusted
-print("with 10% margin", tot_gpu * 1.1, tot_rss * 1.1)
-assert tot_gpu * 1.1 <= 14 * 2**30 and tot_rss * 1.1 <= 48 * 2**30, "split into smaller waves"
+print("with 10% margin: GPU GiB / adjusted RAM GiB", tot_gpu * 1.1 / 2**30, tot_rss * 1.1 / 2**30)
+assert tot_gpu * 1.1 <= 14 * 2**30, "GPU bound exceeded: split into smaller waves"
+assert tot_rss * 1.1 <= 48 * 2**30, "adjusted RAM bound exceeded: split into smaller waves"
 ```
 
 Populate `validation-bounds.json` on EC2 without training: for each first-window panel,
@@ -795,13 +960,94 @@ for spec in load_task_specs("weekly"):
 (Path(os.environ["PROBES"]) / "validation-bounds.json").write_text(json.dumps(bounds, indent=2))
 ```
 
-Run `env -u LD_LIBRARY_PATH "$VENV/bin/python" "$OPS/validation-bounds.py"` and then
-`env -u LD_LIBRARY_PATH "$VENV/bin/python" "$OPS/capacity.py" > "$PROBES/capacity.txt"`.
+Before the panel loads, rerun §2's pin verifier with a retained
+`$PROBES/validation-bounds-pins.log`, then run
+`env -u LD_LIBRARY_PATH "$VENV/bin/python" "$OPS/validation-bounds.py"` (skip this
+helper for fallback's missing cache). Then run the capacity check:
+
+```bash
+#!/bin/bash
+set -euo pipefail
+source /home/ubuntu/fev/env.sh
+env -u LD_LIBRARY_PATH /home/ubuntu/fev/venv-pr/bin/python "$OPS/capacity.py" \
+  --root "$PROBES/P4" --tasks "$ALL_TASKS" --validation-bounds "$PROBES/validation-bounds.json" \
+  > "$PROBES/capacity.txt" 2>&1
+```
+
 Verify the byte formula against one observed prepared cache before accepting the bound.
 Inference already exercises the one-512-item-batch GPU validation footprint. If the bound
 exceeds **14 GiB VRAM or 48 GiB RSS**, split into waves whose own margin-adjusted sums fit;
 record task membership and rerun the rehearsal for those waves. Keep reducing concurrency.
 If even one task does not fit, block. No measured speedup is assumed before this rehearsal.
+
+Historical 2026-11-01 results (including the 10% margin): P4's seven concurrent tasks
+required **23.87 GiB sampled process GPU memory**, exceeding the 14 GiB limit. The
+rehearsed W1 below required **12.86 GiB GPU / 34.17 GiB adjusted RAM**; W2 required
+**11.01 / 4.35 GiB**. These are past measurements, not guarantees for another run.
+Sampled process GPU memory includes context/allocator overhead; allocated tensor
+memory (`peak_cuda_mem_bytes`) is a separate quantity and cannot replace that bound.
+
+Define the waves **once** in `$OPS/waves.sh`, shared by rehearsal and frozen launch.
+This starts with the two measured waves. If the all-seven bound passes, a single
+`WAVE_TASKS=("$ALL_TASKS")` is also allowed; run the same acceptance loop. Any changed
+membership requires a new rehearsal. The check rejects empty, duplicate, missing or
+foreign members and requires all seven tasks exactly once.
+
+```bash
+#!/bin/bash
+# Source after env.sh, from scripts with set -euo pipefail.
+WAVE_TASKS=(
+    'm5_1W,hermes,rohlik_sales_1W,walmart,rossmann_1W'
+    'favorita_stores_1W,hierarchical_sales_1W'
+)
+env -u LD_LIBRARY_PATH "$VENV/bin/python" - "$ALL_TASKS" "${WAVE_TASKS[@]}" <<'PY'
+import sys
+all_tasks = sys.argv[1].split(",")
+waves = [wave.split(",") for wave in sys.argv[2:]]
+members = [task for wave in waves for task in wave]
+assert len(all_tasks) == len(set(all_tasks)) == 7 and all(all_tasks)
+assert waves and all(all(wave) for wave in waves), "empty wave"
+assert len(members) == len(set(members)), "duplicate wave membership"
+assert set(members) == set(all_tasks), "incomplete or foreign wave membership"
+print("Wave membership verified:", waves)
+PY
+```
+
+Save `$OPS/rehearse-waves.sh` and run via §2's outer wrapper. Every wave gets a fresh
+root, online pin log, task/sampler waits, both capacity bounds and a strict subset
+merge/report (including the nonfinite-loss gate). A failure stops the loop; no later
+wave is dispatched. Review scaler skips as above. The acceptance record is published
+only after **all** waves pass. Keep it and the copied definition with the ledger.
+
+```bash
+#!/bin/bash
+set -euo pipefail
+source /home/ubuntu/fev/env.sh
+source "$OPS/waves.sh"
+test ! -e "$PROBES/accepted-waves-root.txt"
+rehearsals=$(mktemp -d "$PROBES/P4-waves.XXXXXXXX")
+cp "$OPS/waves.sh" "$rehearsals/waves.sh"
+REPORT_PY=/home/ubuntu/fev/venv-pr/bin/python
+for index in "${!WAVE_TASKS[@]}"; do
+    wave=${WAVE_TASKS[index]}
+    name="W$((index + 1))"
+    quick="$rehearsals/$name"
+    test ! -e "$quick"
+    env -u LD_LIBRARY_PATH "$VENV/bin/python" "$OPS/pin-and-warm.py" > "$rehearsals/$name-pins.log" 2>&1
+    bash "$TOOLS/scripts/ec2/frozen_parallel.sh" --venv "$VENV" --run-root "$quick" \
+      --config "$TOOLS/configs/fev-v2-quick.yaml" --tasks "$wave"
+    IFS=, read -r -a names <<< "$wave"
+    for task in "${names[@]}"; do bash "$OPS/wait.sh" "$quick" "$task" 0; done
+    env -u LD_LIBRARY_PATH "$REPORT_PY" "$OPS/capacity.py" --root "$quick" --tasks "$wave" \
+      --validation-bounds "$PROBES/validation-bounds.json" > "$rehearsals/$name-capacity.txt" 2>&1
+    env -u LD_LIBRARY_PATH "$REPORT_PY" "$TOOLS/scripts/fev_merge_runs.py" --run-root "$quick" --tasks "$wave"
+    env -u LD_LIBRARY_PATH "$REPORT_PY" "$TOOLS/scripts/fev_report.py" --run-dir "$quick/merged" \
+      --tasks "$wave" --baseline seasonal_naive --model-name demand-forecast-v2-quick \
+      --out "$quick/merged/report-tables.md"
+done
+cmp "$OPS/waves.sh" "$rehearsals/waves.sh"
+printf '%s\n' "$rehearsals" > "$PROBES/accepted-waves-root.txt"
+```
 
 ## 9. Failure handling — fallback
 
@@ -824,24 +1070,43 @@ An unexplained reference variability or a failed reference prerequisite still bl
 Only after the gate ledger records acceptance, select a fresh root
 `/home/ubuntu/fev/runs/ec2-frozen-<executing-sha>-<UTC>`, a sibling of the probes.
 Check the twelve-hour guard and budget. Run the same online pin verification again.
-Save the launch script with the accepted all-seven selection, or the recorded waves:
+Save `$OPS/frozen-launch.sh`; it uses the accepted definition from §8, verifies pins
+before **each** wave with a distinct retained log, and waits for every task and sampler
+before the next wave. Any failure blocks later waves and §11.
 
 ```bash
 #!/bin/bash
 set -euo pipefail
 source /home/ubuntu/fev/env.sh
 : "${ROOT:?fresh frozen root containing executing SHA and UTC}"
-env -u LD_LIBRARY_PATH "$VENV/bin/python" "$OPS/pin-and-warm.py" > "$PROBES/launch-pins.log" 2>&1
-sudo shutdown --show
-bash "$TOOLS/scripts/ec2/frozen_parallel.sh" --venv "$VENV" --run-root "$ROOT" \
-  --config "$TOOLS/configs/fev-v2-standard.yaml" --tasks "$ALL_TASKS"
+source "$OPS/waves.sh"
+accepted=$(cat "$PROBES/accepted-waves-root.txt")
+cmp "$OPS/waves.sh" "$accepted/waves.sh"
+mkdir "$ROOT"
+cp "$OPS/waves.sh" "$ROOT/waves.sh"
+for index in "${!WAVE_TASKS[@]}"; do
+    wave=${WAVE_TASKS[index]}
+    env -u LD_LIBRARY_PATH "$VENV/bin/python" "$OPS/pin-and-warm.py" > "$ROOT/W$((index + 1))-pins.log" 2>&1
+    sudo shutdown --show
+    bash "$TOOLS/scripts/ec2/frozen_parallel.sh" --venv "$VENV" --run-root "$ROOT" \
+      --config "$TOOLS/configs/fev-v2-standard.yaml" --tasks "$wave"
+    IFS=, read -r -a names <<< "$wave"
+    for task in "${names[@]}"; do bash "$OPS/wait.sh" "$ROOT" "$task" 0; done
+    printf 'WAVE_DONE %s\n' "$wave"
+done
 ```
 
-For waves replace `--tasks "$ALL_TASKS"` with the approved comma-separated subset,
-wait for every task in that wave, then launch the next subset into the **same root**.
+From the Mac, use §2's helper:
+`bash dispatch-and-wait.sh frozen-launch env ROOT="$ROOT" bash /home/ubuntu/fev/ops/frozen-launch.sh`.
+Retain that job's path: its `run.log` and `exit` are the outer frozen-job evidence.
+All waves write into the **same root**. This loop does not merge/report; run §11 once,
+after its outer status is zero and the ledger accepts all waves.
 No `--stop-after`, config change or model-name override in the frozen run. Poll task exits
 and logs; check cost/guard hourly. A disconnect does not stop the detached tasks. After a
 VM reset, recheck environment/pins/hardware and resume with the same root and config;
+the fresh-root script above intentionally refuses an existing root. Save a separate
+resume script retaining the wave checks/waits, replacing `mkdir`/the definition copy
+with `cmp "$OPS/waves.sh" "$ROOT/waves.sh"`, and using a new log path for each pin check;
 the launcher retains earlier sessions. It checks every requested task's `run.log`/`exit`
 aliases in the prepare loop, before starting any task: a regular file at either path
 refuses the entire launch, so this validation cannot abort a partly dispatched wave.
@@ -849,8 +1114,11 @@ Preserve such files before retrying. Never delete artifacts to force identity ac
 
 ## 11. Report
 
-Every selected task exit must be zero, and all pollers must have valid evidence. Then
-run the strict merge (no `--allow-partial`) and report using the merged tools venv:
+Every selected task exit and the outer frozen-job exit must be zero, and all pollers
+must have valid evidence. Save the following as `$OPS/report.sh` and run it once via
+§2's wrapper, passing `env ROOT="$ROOT" bash /home/ubuntu/fev/ops/report.sh` after the
+job label. Wait for its outer status zero before §12. It runs the strict merge
+(no `--allow-partial`) and report using the merged tools venv:
 
 ```bash
 #!/bin/bash
@@ -901,37 +1169,77 @@ cd /home/ubuntu/fev/runs
 find "$@" -type f -print0 | sort -z | xargs -0 sha256sum > copyback.sha256
 find "$@" -type l -printf '%p -> %l\n' | sort > copyback.links.txt
 du -sb "$@" > copyback.bytes.txt
+# Include setup scripts/logs, outer job commands/logs/exits and the current manifest.
+cd /home/ubuntu/fev
+cp /home/ubuntu/setup-fev.sh /home/ubuntu/dispatch-job.sh /home/ubuntu/wait-job.sh host-logs/
+cp dataset-manifest.json host-logs/
+find ops host-logs env.sh ec2-environment-lock.txt -type f -print0 \
+  | sort -z | xargs -0 sha256sum > host-evidence.sha256
+cd /home/ubuntu
+find fev-inputs -type f -print0 | sort -z | xargs -0 sha256sum >> /home/ubuntu/fev/host-evidence.sha256
 ```
 
 Copy the run/probe roots, manifests, operator scripts, `env.sh`, `ec2-environment-lock.txt`,
-setup logs, Colab inputs with both transfer hash records and provisioning JSON to the Mac.
+`host-logs/` (including setup logs and the outer frozen-job `run.log` and `exit`),
+Colab inputs with both transfer hash records, and local provisioning evidence to the Mac.
+The archive layout is `runs/`, `ops/`, `host-logs/`, `fev-inputs/`, `provisioning/`,
+plus the environment files and checksum record. Keep the frozen job-path record in
+`provisioning/` to identify its unique directory under `host-logs/`.
+Save `verify-env.sh` under `ops/`; if any setup command was run outside the wrapper,
+first place its saved script and log in `host-logs/` before hashing. Run this manifest
+script only after jobs complete, in the foreground: its own output must not change a
+file being hashed. **No private key in evidence**; keep the SSH key outside the archive.
 Example local Bash script (GNU `sha256sum` or the shown
-Python verifier works on macOS):
+Python 3.11+ verifier works on macOS):
 
 ```bash
 #!/bin/bash
 set -euo pipefail
 : "${KEY:?SSH key}" "${HOST:?public IP}" "${DEST:?local evidence directory}"
+: "${PROVISIONING:?absolute local ec2-TOKEN provisioning directory}"
 mkdir -p "$DEST"
 rsync -a -e "ssh -i $KEY" "ubuntu@$HOST:/home/ubuntu/fev/runs/" "$DEST/runs/"
 rsync -a -e "ssh -i $KEY" "ubuntu@$HOST:/home/ubuntu/fev/ops/" "$DEST/ops/"
+rsync -a -e "ssh -i $KEY" "ubuntu@$HOST:/home/ubuntu/fev/host-logs/" "$DEST/host-logs/"
 scp -i "$KEY" "ubuntu@$HOST:/home/ubuntu/fev/env.sh" "$DEST/"
 scp -i "$KEY" "ubuntu@$HOST:/home/ubuntu/fev/ec2-environment-lock.txt" "$DEST/"
+scp -i "$KEY" "ubuntu@$HOST:/home/ubuntu/fev/host-evidence.sha256" "$DEST/"
 rsync -a -e "ssh -i $KEY" "ubuntu@$HOST:/home/ubuntu/fev-inputs/" "$DEST/fev-inputs/"
-cd "$DEST/runs"
-python3 - <<'PY'
+mkdir -p "$DEST/provisioning"
+# Only the provisioning JSON, ID/job-path records and saved scripts; never the PEM.
+rsync -a --exclude="$(basename "$KEY")" --include='*.json' --include='*.txt' \
+  --include='*.sh' --exclude='*' "$PROVISIONING/" "$DEST/provisioning/"
+cd "$DEST"
+python3 - "$PROVISIONING" "$KEY" <<'PY'
 import hashlib
+import sys
 from pathlib import Path
-for line in Path('copyback.sha256').read_text().splitlines():
-    digest, name = line.split('  ', 1)
-    with Path(name).open('rb') as stream:
-        actual = hashlib.file_digest(stream, 'sha256').hexdigest()
-    assert actual == digest, name
-for line in Path('copyback.links.txt').read_text().splitlines():
+
+def digest(path):
+    with path.open('rb') as stream:
+        return hashlib.file_digest(stream, 'sha256').hexdigest()
+
+for base, manifest in ((Path('runs'), 'copyback.sha256'), (Path('.'), 'host-evidence.sha256')):
+    lines = (base / manifest).read_text().splitlines()
+    assert lines, manifest
+    for line in lines:
+        expected, name = line.split('  ', 1)
+        assert digest(base / name) == expected, name
+for line in Path('runs/copyback.links.txt').read_text().splitlines():
     name, target = line.split(' -> ', 1)
-    p = Path(name)
+    p = Path('runs') / name
     assert p.is_symlink() and str(p.readlink()) == target and p.exists(), name
-print('All copied bytes and relative symlinks verified')
+source, key = Path(sys.argv[1]), Path(sys.argv[2])
+records = []
+for p in sorted(source.iterdir()):
+    if p.is_file() and p.suffix in ('.json', '.txt', '.sh') and p.name != key.name:
+        copied = Path('provisioning') / p.name
+        assert digest(p) == digest(copied), str(p)
+        assert b'PRIVATE KEY-----' not in copied.read_bytes(), str(copied)
+        records.append(f'{digest(copied)}  {copied}\n')
+assert records, 'no provisioning evidence'
+Path('provisioning.sha256').write_text(''.join(records))
+print('Run bytes, symlinks, host/setup evidence, inputs and provisioning verified')
 PY
 ```
 
@@ -942,8 +1250,10 @@ Delete only this experiment's resources, never unrelated instances/volumes/group
 ```bash
 #!/bin/bash
 set -euo pipefail
-export AWS_PROFILE=veliu-staging AWS_REGION=eu-central-1
+export AWS_PROFILE=veliu-staging AWS_REGION=eu-central-1 AWS_DEFAULT_OUTPUT=json
 : "${INSTANCE:?recorded instance ID}" "${SG:?recorded security group}" "${KEY_NAME:?recorded key name}"
+: "${DEST:?verified local evidence directory}"
+cd "$DEST/provisioning"
 aws ec2 describe-instances --instance-ids "$INSTANCE" > before-termination.json
 aws ec2 terminate-instances --instance-ids "$INSTANCE" > termination.json
 aws ec2 wait instance-terminated --instance-ids "$INSTANCE"
