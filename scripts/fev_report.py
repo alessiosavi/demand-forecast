@@ -218,6 +218,9 @@ def build_report(
             )
         fit, budget = report.get("fit_result", {}), report.get("resolved_budget", {})
         cumulative = report.get("timings", {}).get("cumulative", {})
+        nonfinite_losses = fit.get("nonfinite_losses", cumulative.get("nonfinite_losses"))
+        if _finite(nonfinite_losses) and nonfinite_losses > 0:
+            issues.append(f"{spec.name}: {nonfinite_losses} non-finite training losses")
         training.append(
             {
                 "task": spec.name,
@@ -232,6 +235,15 @@ def build_report(
                 "exception": report.get("plan", {}).get("exception"),
                 **{
                     key: fit.get(key) for key in ("steps", "best_step", "best_score", "stop_reason")
+                },
+                "nonfinite_losses": nonfinite_losses,
+                **{
+                    key: cumulative.get(key)
+                    for key in (
+                        "cold_covariate_columns",
+                        "floored_covariate_columns",
+                        "clipped_covariate_values",
+                    )
                 },
                 "resumed_from_step": report.get("resumed_from_step"),
             }

@@ -1,5 +1,6 @@
 """Tiny CPU training, validation and exact continuation of interrupted runs."""
 
+import json
 import random
 from copy import deepcopy
 from dataclasses import asdict, replace
@@ -815,6 +816,9 @@ def test_timing_categories_sum_with_controlled_clock(
         "sessions": 1,
         "peak_cuda_mem_bytes": 0,
         "nonfinite_losses": 0,
+        "cold_covariate_columns": 0,
+        "clipped_covariate_values": 0,
+        "floored_covariate_columns": 0,
     }
     resumed = Trainer(fresh(), cfg, cpu, RUN_ID, SEED).fit(
         panel_long,
@@ -868,6 +872,256 @@ def test_nonfinite_losses_counter_is_cumulative(
         resume=True,
     )
     assert second.timings["nonfinite_losses"] == 4
+
+
+@pytest.mark.parametrize("invalid", [float("nan"), float("inf"), -float("inf")])
+def test_fit_stops_after_consecutive_nonfinite_losses_with_checkpoint_and_progress(
+    tmp_path, monkeypatch, fresh29, panel29, plan29, encoder29, invalid
+):
+    from demand_forecast.core import training
+
+    trainer = Trainer(
+        fresh29(), TrainConfig(base_steps=60, batch_size=8, amp=False), cpu, RUN_ID, SEED
+    )
+    initial = {name: p.detach().clone() for name, p in trainer.model.named_parameters()}
+    diagnostics = dict.fromkeys(
+        ("cold_covariate_columns", "clipped_covariate_values", "floored_covariate_columns"), 0
+    )
+    batches = training.WindowSampler.batches
+
+    def counted_batches(sampler, size):
+        for batch in batches(sampler, size):
+            for field, key in zip(
+                ("cold_covariates", "clipped_covariates", "floored_covariates"), diagnostics
+            ):
+                # Nonzero diagnostics must survive even when the step is skipped.
+                getattr(batch, field).fill_(1)
+                diagnostics[key] += int(getattr(batch, field).sum())
+            yield batch
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("invalid loss reached backward, gradient clipping, optimizer or scaler")
+
+    def invalid_loss(pred, *args):
+        loss = pred.sum() * pred.new_tensor(invalid)
+        loss.register_hook(forbidden)
+        return loss, 1
+
+    monkeypatch.setattr(training, "pinball_loss", invalid_loss)
+    monkeypatch.setattr(training.WindowSampler, "batches", counted_batches)
+    for name in ("scale", "unscale_", "step", "update"):
+        monkeypatch.setattr(trainer.scaler, name, forbidden)
+    monkeypatch.setattr(torch.optim.AdamW, "step", forbidden)
+    monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", forbidden)
+    scaler_state = deepcopy(trainer.scaler.state_dict())
+    with pytest.warns(UserWarning, match=r"lr_scheduler.step\(\).*before.*optimizer.step"):
+        result = trainer.fit(
+            panel29, plan29, ForecastConfig(horizon=13), encoder29, checkpoint_dir=tmp_path
+        )
+    assert training.NONFINITE_STOP_AFTER == 20
+    assert result.stop_reason == trainer.terminal_reason == "nonfinite_losses"
+    assert result.steps == result.timings["nonfinite_losses"] == trainer.consecutive_nonfinite == 20
+    assert len(result.history) == 20 and all(not np.isfinite(r["loss"]) for r in result.history)
+    assert result.timings["train_s"] > 0 and result.timings["checkpoint_s"] > 0
+    for key, count in diagnostics.items():
+        assert count > 0 and result.timings[key] == count
+    saved = torch.load(tmp_path / "latest.pt", weights_only=False)
+    assert saved["step"] == saved["consecutive_nonfinite"] == 20
+    assert saved["terminal_reason"] == "nonfinite_losses" and len(saved["history"]) == 20
+    assert saved["scheduler"]["last_epoch"] == 20
+    assert saved["optimizer"]["state"] == {}
+    assert saved["scaler"] == scaler_state
+    for name, parameter in trainer.model.named_parameters():
+        assert torch.isfinite(parameter).all() and parameter.grad is None
+        assert torch.equal(parameter, initial[name])
+        assert torch.equal(saved["model"][name], initial[name])
+    progress = json.loads((tmp_path / "progress.json").read_text())
+    assert progress["stop_reason"] == "nonfinite_losses" and progress["step"] == 20
+    assert progress["timings"] == result.timings
+
+
+def test_finite_loss_resets_the_consecutive_counter_and_parameters_are_not_poisoned(
+    tmp_path, monkeypatch, fresh29, panel29, plan29, encoder29
+):
+    from demand_forecast.core import training
+
+    trainer = Trainer(
+        fresh29(),
+        TrainConfig(base_steps=39, batch_size=8, warmup_steps=2, amp=False),
+        cpu,
+        RUN_ID,
+        SEED,
+    )
+    snapshots, optimizer_steps = [], []
+    step = torch.optim.AdamW.step
+
+    def counted_step(optimizer, *args, **kwargs):
+        optimizer_steps.append(trainer.step + 1)
+        return step(optimizer, *args, **kwargs)
+
+    def intermittent_loss(pred, *args):
+        snapshots.append({name: p.detach().clone() for name, p in trainer.model.named_parameters()})
+        loss = pred.square().mean()
+        if len(snapshots) != 20:
+            loss = loss * loss.new_tensor(float("nan"))
+        return loss, 1
+
+    monkeypatch.setattr(training, "pinball_loss", intermittent_loss)
+    monkeypatch.setattr(torch.optim.AdamW, "step", counted_step)
+    with pytest.warns(UserWarning, match=r"lr_scheduler.step\(\).*before.*optimizer.step"):
+        result = trainer.fit(
+            panel29, plan29, ForecastConfig(horizon=13), encoder29, checkpoint_dir=tmp_path
+        )
+    assert result.stop_reason == "exception_budget" and result.steps == 39
+    assert result.timings["nonfinite_losses"] == 38 and trainer.consecutive_nonfinite == 19
+    assert trainer.terminal_reason is None and optimizer_steps == [20]
+    assert trainer.scheduler.last_epoch == 39
+    assert any(not torch.equal(snapshots[0][k], snapshots[20][k]) for k in snapshots[0])
+    for state in snapshots[:20]:
+        assert_state_equal(state, snapshots[0])
+    for state in snapshots[20:]:
+        assert_state_equal(state, snapshots[20])
+    for name, p in trainer.model.named_parameters():
+        assert torch.isfinite(p).all() and p.grad is None
+        assert torch.equal(p, snapshots[20][name])
+    assert json.loads((tmp_path / "progress.json").read_text())["stop_reason"] == "exception_budget"
+
+
+@pytest.mark.parametrize("marker", ["both", "reason", "counter", "no_origins"])
+def test_resume_after_nonfinite_stop_returns_the_terminal_result_without_training(
+    tmp_path, monkeypatch, fresh29, panel29, plan29, encoder29, marker
+):
+    from demand_forecast.core import training
+
+    monkeypatch.setattr(training, "pinball_loss", lambda pred, *a: (pred.sum() * float("nan"), 1))
+    cfg = TrainConfig(base_steps=60, batch_size=8, amp=False)
+    args = (panel29, plan29, ForecastConfig(horizon=13), encoder29)
+    with pytest.warns(UserWarning, match=r"lr_scheduler.step\(\).*before.*optimizer.step"):
+        Trainer(fresh29(), cfg, cpu, RUN_ID, SEED).fit(*args, checkpoint_dir=tmp_path)
+    path = tmp_path / "latest.pt"
+    saved = torch.load(path, weights_only=False)
+    if marker == "reason":
+        saved["consecutive_nonfinite"] = 0
+    elif marker == "counter":
+        saved["terminal_reason"] = None
+    elif marker == "no_origins":
+        # Keep the synthetic empty sampler valid so this exercises the entry
+        # guard's priority over no_training_data, not position validation.
+        saved["sampler"]["position"] = 0
+    torch.save(saved, path)
+    before = path.read_bytes()
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("terminal checkpoint resumed training or evaluation")
+
+    monkeypatch.setattr(training, "pinball_loss", forbidden)
+    monkeypatch.setattr(training.WindowSampler, "batches", forbidden)
+    if marker == "no_origins":
+        monkeypatch.setattr(training, "build_origins", lambda *a, **k: np.empty((0, 2), dtype=int))
+    trainer = Trainer(fresh29(), cfg, cpu, RUN_ID, SEED)
+    result = trainer.fit(*args, checkpoint_dir=tmp_path, resume=True, evaluate_fn=forbidden)
+    assert result.stop_reason == "nonfinite_losses" and result.steps == 20
+    assert len(result.history) == 20 and result.timings["nonfinite_losses"] == 20
+    assert result.timings["sessions"] == 2
+    assert trainer.consecutive_nonfinite == saved["consecutive_nonfinite"]
+    assert trainer.scheduler.state_dict() == saved["scheduler"]
+    assert_state_equal(trainer.model.state_dict(), saved["model"])
+    assert path.read_bytes() == before
+    progress = json.loads((tmp_path / "progress.json").read_text())
+    assert progress["stop_reason"] == "nonfinite_losses" and progress["step"] == 20
+
+
+@pytest.mark.parametrize("boundary", ["max_steps", "cap", "stop_after", "both"])
+@pytest.mark.parametrize("exception", [False, True])
+def test_failure_wins_over_stop_after_and_completion_boundaries(
+    tmp_path, monkeypatch, fresh, panel_long, plan_long, encoder_long, boundary, exception
+):
+    from demand_forecast.core import training
+
+    monkeypatch.setattr(training, "pinball_loss", lambda pred, *a: (pred.sum() * float("nan"), 1))
+    cfg = TrainConfig(
+        base_steps=20 if boundary in ("max_steps", "both") else 60,
+        max_steps_cap=20 if boundary == "cap" else None,
+        batch_size=8,
+        patience=100,
+        amp=False,
+    )
+    trainer = Trainer(fresh(), cfg, cpu, RUN_ID, SEED)
+    evaluations = []
+
+    def evaluate(*args):
+        evaluations.append(trainer.step)
+        return {"SQL": 1.0}
+
+    with pytest.warns(UserWarning, match=r"lr_scheduler.step\(\).*before.*optimizer.step"):
+        result = trainer.fit(
+            panel_long,
+            replace(plan_long, exception=exception),
+            ForecastConfig(horizon=4),
+            encoder_long,
+            checkpoint_dir=tmp_path,
+            stop_after=20 if boundary in ("stop_after", "both") else None,
+            evaluate_fn=evaluate,
+        )
+    assert result.steps == 20 and result.stop_reason == "nonfinite_losses"
+    assert 20 not in evaluations and "SQL" not in result.history[-1]
+    assert json.loads((tmp_path / "progress.json").read_text())["stop_reason"] == "nonfinite_losses"
+
+
+def test_nonfinite_stop_without_checkpoint_dir_creates_fallback_and_progress(
+    tmp_path, monkeypatch, caplog, fresh29, panel29, plan29, encoder29
+):
+    from demand_forecast.core import training
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(training, "pinball_loss", lambda pred, *a: (pred.sum() * float("nan"), 1))
+    trainer = Trainer(fresh29(), TrainConfig(base_steps=60, amp=False), cpu, RUN_ID, SEED)
+    with (
+        caplog.at_level("INFO", logger="demand_forecast.core.training"),
+        pytest.warns(UserWarning, match=r"lr_scheduler.step\(\).*before.*optimizer.step"),
+    ):
+        result = trainer.fit(panel29, plan29, ForecastConfig(horizon=13), encoder29)
+    assert result.steps == 20 and result.stop_reason == "nonfinite_losses"
+    assert (tmp_path / "checkpoints/latest.pt").exists()
+    progress = json.loads((tmp_path / "checkpoints/progress.json").read_text())
+    assert progress["stop_reason"] == "nonfinite_losses" and progress["step"] == 20
+    assert "checkpoint_dir" in caplog.text and "checkpoints" in caplog.text
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_nonfinite_counter_resumes_and_legacy_checkpoint_defaults(
+    tmp_path, monkeypatch, fresh29, panel29, plan29, encoder29, legacy
+):
+    from demand_forecast.core import training
+
+    monkeypatch.setattr(training, "pinball_loss", lambda pred, *a: (pred.sum() * float("nan"), 1))
+    cfg = TrainConfig(base_steps=60, batch_size=8, amp=False)
+    args = (panel29, plan29, ForecastConfig(horizon=13), encoder29)
+    with pytest.warns(UserWarning, match=r"lr_scheduler.step\(\).*before.*optimizer.step"):
+        first = Trainer(fresh29(), cfg, cpu, RUN_ID, SEED).fit(
+            *args, checkpoint_dir=tmp_path, stop_after=19
+        )
+    assert first.stop_reason == "interrupted"
+    assert json.loads((tmp_path / "progress.json").read_text())["stop_reason"] == "interrupted"
+    path = tmp_path / "latest.pt"
+    saved = torch.load(path, weights_only=False)
+    assert saved["consecutive_nonfinite"] == 19 and saved["terminal_reason"] is None
+    if legacy:
+        del saved["consecutive_nonfinite"], saved["terminal_reason"]
+        torch.save(saved, path)
+    trainer = Trainer(fresh29(), cfg, cpu, RUN_ID, SEED)
+    resume = trainer.resume
+
+    def checked_resume(path):
+        resume(path)
+        assert trainer.consecutive_nonfinite == (0 if legacy else 19)
+        assert trainer.terminal_reason is None
+
+    monkeypatch.setattr(trainer, "resume", checked_resume)
+    result = trainer.fit(*args, checkpoint_dir=tmp_path, resume=True)
+    assert result.steps == (39 if legacy else 20)
+    assert result.stop_reason == "nonfinite_losses" and trainer.consecutive_nonfinite == 20
+    assert len(result.history) == result.timings["nonfinite_losses"] == result.steps
 
 
 def test_telemetry_without_validation(tmp_path, fresh29, panel29, plan29, encoder29):
@@ -981,3 +1235,55 @@ def test_cuda_session_reset_and_sampling_points_without_gpu(
         )
     ]
     assert result.timings["peak_cuda_mem_bytes"] == 123
+
+
+def test_covariate_counters_accumulate_and_resume(tmp_path, monkeypatch, fresh_for):
+    import json
+
+    from demand_forecast.core import training
+    from demand_forecast.core.validation import plan_inner_validation
+
+    panel = weekly_panel([40] * 3)
+    panel.roles = replace(panel.roles, known_dynamic=("promo", "tiny", "price"))
+    for series in panel.series:
+        series.dynamic["promo"] = np.r_[np.full(30, np.nan), np.full(10, 1e5)]
+        series.dynamic["tiny"] = np.r_[1e-9, np.zeros(27), np.full(12, 0.5)]
+        series.dynamic["price"] = np.r_[100.0 + 1e-6, np.full(27, 100.0), np.full(12, 110.0)]
+    plan = plan_inner_validation(panel, panel.timestamps(0, 41)[40], 4)
+    encoder = StaticEncoder().fit(panel, plan.fit_ids)
+    # Keep sampling real batches at the pathological origin on both sides of resume.
+    monkeypatch.setattr(
+        training, "build_origins", lambda *a, **k: np.array([(i, 28) for i in range(3)])
+    )
+    cfg = TrainConfig(base_steps=4, batch_size=8, amp=False)
+    forecast = ForecastConfig(horizon=4, max_context=32)
+    first = Trainer(fresh_for(panel, 4), cfg, cpu, RUN_ID, SEED).fit(
+        panel,
+        plan,
+        forecast,
+        encoder,
+        checkpoint_dir=tmp_path,
+        stop_after=2,
+    )
+    assert first.stop_reason == "interrupted"
+    expected = {
+        "cold_covariate_columns": 6,
+        "clipped_covariate_values": 24,
+        "floored_covariate_columns": 6,
+    }
+    progress = json.loads((tmp_path / "progress.json").read_text())
+    state = torch.load(tmp_path / "latest.pt", weights_only=False)
+    for key, value in expected.items():
+        assert first.timings[key] == progress["timings"][key] == state["timings"][key] == value
+    resumed = Trainer(fresh_for(panel, 4), cfg, cpu, RUN_ID, SEED).fit(
+        panel,
+        plan,
+        forecast,
+        encoder,
+        checkpoint_dir=tmp_path,
+        resume=True,
+    )
+    assert resumed.steps == 4 and resumed.timings["nonfinite_losses"] == 0
+    progress = json.loads((tmp_path / "progress.json").read_text())
+    for key, value in expected.items():
+        assert resumed.timings[key] == progress["timings"][key] == value * 2
