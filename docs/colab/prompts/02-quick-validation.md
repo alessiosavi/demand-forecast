@@ -79,6 +79,9 @@ from `docs/colab.md` §1–§2. Apply these overrides before executing any cell:
    seed remains 0 and policy remains `first_window`.
 2. Reuse and cite the recorded A–D prerequisite evidence at
    `$FEV_DRIVE_ROOT/runs/01-fev-run-v2-67d4bd7877e707215ef31fd7123454f5dc017b56/`.
+   This historical Drive path keeps its original name; the equivalent code in the
+   rewritten history is `bdb8c119f87750066026ddce48121d61aa0fdb8c` (see the
+   [history-rewrite mapping](../../protocol.md#history-rewrite-2026-11-01)).
    Record each prerequisite's status and artifact paths in the notebook; missing or
    failed evidence blocks the run. Do not rerun A–D. The seasonal-naive rows in §2
    below populate this quick run directory. **Prompt 01 §6's rerun policy does not

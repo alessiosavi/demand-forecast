@@ -5,6 +5,11 @@
 rossmann_1W and favorita_stores_1W completed. Rev 2 runs at the fix SHA `<SHA>`, adds
 prerequisite D and the rerun policy below.
 
+**History rewrite (2026-11-01):** Historical revision labels and Drive paths below
+retain their original SHAs and names; use the
+[history-rewrite mapping](../../protocol.md#history-rewrite-2026-11-01) to find the
+equivalent code to check out in the rewritten history.
+
 Paste the following instructions into a Claude session that can drive Colab (see
 `docs/colab.md`). Fill `<SHA>` with the full public commit SHA that contains this prompt,
 `configs/fev-v2-standard.yaml` and `scripts/fev_report.py`. This prompt authorizes the phase-5

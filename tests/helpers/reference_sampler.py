@@ -1,4 +1,7 @@
-"""Frozen dynamic helper from 2863356, used only as a batch byte-identity oracle."""
+"""Frozen dynamic helper from 2863356 (rewritten history: 93edad09a4334245e11013949a77165830dda58a).
+
+Used only as a batch byte-identity oracle.
+"""
 
 import numpy as np
 

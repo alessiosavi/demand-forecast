@@ -120,6 +120,7 @@ def test_offline_fev_task_end_to_end_with_resume_and_replacement(tmp_path, monke
     assert seen == []
 
 
+# Historical 67d4bd7 maps to bdb8c119f87750066026ddce48121d61aa0fdb8c in rewritten history.
 @pytest.mark.parametrize(
     "config,expected",
     [
@@ -978,6 +979,7 @@ def test_npz_publication_failure_leaves_no_partial_file(tmp_path, monkeypatch):
     assert list(tmp_path.iterdir()) == []
 
 
+# Historical 2863356 maps to 93edad09a4334245e11013949a77165830dda58a in rewritten history.
 def test_aligned_fixture_batch_is_byte_identical_to_2863356(tmp_path, monkeypatch):
     spec = fixture_spec(write_fev_fixture(tmp_path))
     task = spec.to_task()

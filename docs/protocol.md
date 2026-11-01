@@ -80,6 +80,11 @@ training:
   batch_size: 128
 ```
 
+`configs/fev-v2-standard.yaml` is the frozen file and also pins `model.use_rope: true`,
+`model.hidden_continuous_size: 64` and `model.stochastic_depth_rate: 0.0`, with
+`training.amp: true` (enabled on CUDA, disabled on CPU as described below) and
+`training.checkpoint_every: 200`.
+
 Horizon comes from the task. `use_patch_embedding=True` and `use_decomposition=True`
 are rejected for `v2`. The monotone head uses `width_factor=2.0`; arithmetic uses
 `min_scale=1e-6` only after eligibility is established. Defaults are
@@ -417,3 +422,23 @@ storage rules. Declare task/session partitioning and steps/time budgets before
 execution, preserving the venue split above.
 
 **Editorial amendment (2026-11-01).** Consolidated the protocol definitions and contracts in this document. The frozen experiment’s configuration, evaluation semantics and execution requirements are unchanged.
+
+## History rewrite (2026-11-01)
+
+Repository history was rewritten to remove unpublished planning documents; file
+contents are otherwise identical. Historical evidence, including run-folder names
+and evidence paths, keeps the original SHAs. Run identities contain no Git SHA and
+are unchanged. Use the new SHAs for code checkouts and Git comparisons; preserve
+the original SHAs in evidence records.
+
+| Old SHA | New SHA |
+| --- | --- |
+| `97f3ec7ff4a996e3e81ebf005460ada01c80beed` | `7823d5b01eaf1d6539374919d600830b527b11ea` |
+| `d683bf7f9cf0186e640e38e55f08dcfdffdd694c` | `14df4a2abce2c00163687d07104444eb360c055a` |
+| `67d4bd7877e707215ef31fd7123454f5dc017b56` | `bdb8c119f87750066026ddce48121d61aa0fdb8c` |
+| `2863356212c68debda92923f7c746d288d20f4df` | `93edad09a4334245e11013949a77165830dda58a` |
+| `4e33a3e7d811b5fa9dcc1101a48f6c1fc454dfc7` | `ba7fc31e569609d25cee013604f6dd299d0baa6e` |
+| `432468c784fed4a9fc4f637e43a5d1dc4ae61845` | `7048caf0bcfee46a9846708669e4ff06a5f7f823` |
+| `e2735e23ed7421ca1bb2de615246111015b0937d` | `8a04c7209af863ae342f0b51836efa0464bbddd9` |
+| `5ffce940f0b9212279005588f9f976517362ffa9` | `ad6cb737fc6db5bc48773f55c20efb0a0b3719d5` |
+| `a29fa7af0c9a70e08c51cdb592cfabb90d33ada3` | `abe28158370e78d22ca5109d0e964da5911fa71b` |
