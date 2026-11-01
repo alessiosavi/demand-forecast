@@ -22,7 +22,7 @@ scheduled_usec() {
             fi
         fi
     fi
-    shown=$(shutdown --show) || return 1
+    shown=$(shutdown --show 2>&1) || return 1
     # systemd's --show includes a weekday, timestamp and timezone before the comma.
     timestamp=$(printf '%s\n' "$shown" | sed -n 's/^Shutdown scheduled for \([^,]*\),.*$/\1/p')
     [[ -n $timestamp ]] || return 1

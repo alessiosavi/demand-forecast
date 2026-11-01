@@ -76,7 +76,13 @@ def guest(tmp_path):
         pytest.skip("GNU date required for Ubuntu deadline semantics")
     scripts = {
         "date": f'#!/bin/bash\nif [[ $# == 1 && $1 == +%s ]]; then echo 1793620800; else exec "{date}" "$@"; fi\n',
-        "shutdown": '#!/bin/bash\nprintf "%s\\n" "$*" >> "$CALLS"\nif [[ $1 == --show ]]; then echo "$SHOW"; else echo noisy-shutdown; fi\n',
+        "shutdown": (
+            '#!/bin/bash\nprintf "%s\\n" "$*" >> "$CALLS"\n'
+            "if [[ $1 == --show ]]; then\n"
+            '    printf "%s\\n" "$SHOW" >&2\n'
+            '    exit "$SHOW_EXIT"\n'
+            "fi\necho noisy-shutdown\n"
+        ),
         "busctl": '#!/bin/bash\n[[ ${BUS_FAIL:-0} == 0 ]] || exit 1\nprintf \'(st) "poweroff" %s\\n\' "$SCHEDULED_US"\n',
         "flock": '#!/bin/bash\n[[ $1 == 9 && -e /dev/fd/9 ]] || exit 1\nprintf "%s\\n" "$1" >> "$LOCK_CALLS"\n',
     }
@@ -97,7 +103,9 @@ def guest(tmp_path):
         .replace("/run/budget-deadline.booted", str(marker))
     )
 
-    def invoke(*args, scheduled="1793622600000000", bus_fail="0", show="", fresh_boot=False):
+    def invoke(
+        *args, scheduled="1793622600000000", bus_fail="0", show="", show_exit="0", fresh_boot=False
+    ):
         if fresh_boot:
             marker.unlink(missing_ok=True)
         env = dict(
@@ -108,6 +116,7 @@ def guest(tmp_path):
             SCHEDULED_US=scheduled,
             BUS_FAIL=bus_fail,
             SHOW=show,
+            SHOW_EXIT=show_exit,
             TZ="Pacific/Honolulu",
         )
         result = subprocess.run([bash, str(helper), *args], env=env, capture_output=True, text=True)
@@ -172,6 +181,26 @@ def test_shutdown_show_fallback(guest):
     assert result.returncode == 0, result.stderr
     assert result.stdout == "DEADLINE_SET 2026-11-02T12:30:00Z\n"
     assert calls == ["-c", "-h 12:30", "--show"]
+
+
+@pytest.mark.parametrize("mode", ["boot", "set"])
+def test_shutdown_show_unsupported_fails_closed(guest, mode):
+    args = (mode, "2026-11-02T12:30:45Z") if mode == "set" else (mode,)
+    result, calls = guest(
+        *args,
+        bus_fail="1",
+        show="shutdown: unrecognized option '--show'",
+        show_exit="1",
+        fresh_boot=mode == "boot",
+    )
+    assert result.returncode == 1
+    assert calls[-1] == "--show"
+    if mode == "boot":
+        assert result.stdout == ""
+        assert "cannot read back grace deadline" in result.stderr
+        assert not guest.marker.exists()
+    else:
+        assert result.stdout == "DEADLINE_MISMATCH unknown 2026-11-02T12:30:45Z\n"
 
 
 @pytest.mark.parametrize("mode", ["boot", "grace"])
