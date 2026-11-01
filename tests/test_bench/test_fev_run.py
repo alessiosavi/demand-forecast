@@ -17,6 +17,7 @@ pytestmark = pytest.mark.bench
 
 from demand_forecast import __version__  # noqa: E402
 from demand_forecast.bench.run import (  # noqa: E402
+    prediction_diagnostics,
     predictions_for_fev,
     resolved_origin,
     run_baseline,
@@ -30,11 +31,13 @@ from demand_forecast.config import Settings  # noqa: E402
 from demand_forecast.core.run import run_identity  # noqa: E402
 from demand_forecast.core.training import InterruptedRun, Trainer  # noqa: E402
 from demand_forecast.core.validation import plan_inner_validation  # noqa: E402
+from demand_forecast.data.encoders import StaticEncoder  # noqa: E402
 from demand_forecast.data.loader_fev import item_ids, panel_from_window  # noqa: E402
 from demand_forecast.data.panel import Panel  # noqa: E402
 from demand_forecast.inference.predictor import Predictor  # noqa: E402
 from tests.helpers.fev_fixture import write_fev_fixture  # noqa: E402
 from tests.helpers.fev_spec import fixture_spec  # noqa: E402
+from tests.helpers.reference_sampler import assert_batch_matches_reference  # noqa: E402
 from tests.helpers.settings import tiny_settings  # noqa: E402
 
 Q9 = [i / 10 for i in range(1, 10)]
@@ -803,6 +806,9 @@ def test_extra_info_columns_present_and_baseline_rows_nan(completed_task):
         "n_val_items",
         "nonfinite_losses",
         "sessions",
+        "cold_covariate_columns",
+        "clipped_covariate_values",
+        "floored_covariate_columns",
     ]
     model = result.loc[result.model_name == "demand-forecast-v2"].iloc[0]
     baseline = result.loc[result.model_name == "seasonal_naive"].iloc[0]
@@ -866,6 +872,119 @@ def test_npz_publication_failure_leaves_no_partial_file(tmp_path, monkeypatch):
                 "fallback_undefined_scale": 0,
                 "device": "cpu",
                 "n_items": 1,
+                "cold_covariate_columns": 0,
+                "clipped_covariate_values": 0,
+                "floored_covariate_columns": 0,
             },
         )
     assert list(tmp_path.iterdir()) == []
+
+
+def test_aligned_fixture_batch_is_byte_identical_to_2863356(tmp_path, monkeypatch):
+    spec = fixture_spec(write_fev_fixture(tmp_path))
+    task = spec.to_task()
+    past, future = task.get_window(0).get_input_data()
+    panel = panel_from_window(past, future, spec, task.freq)
+    panel.roles = replace(panel.roles, known_dynamic=(*panel.roles.known_dynamic, "constant"))
+    for series in panel.series:
+        series.dynamic["constant"] = np.r_[np.full(32, 100.0), np.full(4, 110.0)]
+    encoder = StaticEncoder().fit(panel, item_ids(panel))
+    assert_batch_matches_reference(monkeypatch, panel, [(0, 28), (1, 32)], 4, 16, encoder)
+
+
+def test_item_with_cold_known_covariate_at_its_origin_gets_finite_forecasts(tmp_path):
+    from datasets import Dataset, Sequence, Value
+
+    parquet = write_fev_fixture(
+        tmp_path, lengths=(44, 42, 44, 40, 42, 44), length=44, known=("promo", "price")
+    )
+    data = Dataset.from_parquet(str(parquet))
+    features = data.features.copy()
+    features["promo"] = Sequence(Value("float64"))
+    features["price"] = Sequence(Value("float64"))
+
+    def late_column(row):
+        row["promo"] = [np.nan] * 36 + [1e5] * (len(row["promo"]) - 36)
+        # fev casts dynamics to float32; keep the tiny variation representable.
+        row["price"] = [100.0 + 1e-4] + [100.0] * 35 + [110.0] * (len(row["promo"]) - 36)
+        return row
+
+    data.map(late_column, features=features).to_parquet(parquet)
+    spec = fixture_spec(parquet, known_dynamic=["promo", "price"])
+    out = tmp_path / "out"
+    result = run_fev([spec], tiny_settings(base_steps=2, d_model=8), out)
+    counts = []
+    floored_counts = []
+    for i in range(spec.num_windows):
+        with np.load(out / spec.name / f"window_{i}.npz", allow_pickle=False) as saved:
+            assert saved["ids"].tolist() == [str(i) for i in range(6)]
+            assert saved["arrays"].shape == (6, 4, 9)
+            assert np.isfinite(saved["arrays"]).all()
+            assert saved["cold_covariate_columns"].dtype == np.int64
+            assert saved["clipped_covariate_values"].dtype == np.int64
+            counts.append(saved["cold_covariate_columns"].item())
+            assert saved["floored_covariate_columns"].dtype == np.int64
+            floored_counts.append(saved["floored_covariate_columns"].item())
+    # Origins [36,34,36,32,34,36], then [40,38,40,36,38,40].
+    assert counts == [5, 1]
+    assert floored_counts == [6, 1]
+    assert result.floored_covariate_columns.iloc[0] == 7
+    assert result.cold_covariate_columns.iloc[0] == 6
+    assert result.clipped_covariate_values.iloc[0] == 0
+    assert result.num_forecasts.iloc[0] == 12 and np.isfinite(result.SQL.iloc[0])
+
+
+@pytest.mark.parametrize(
+    "kept_counter", [None, "cold_covariate_columns", "floored_covariate_columns"]
+)
+def test_legacy_npz_keeps_original_diagnostics_and_sums_present_counters(
+    completed_task, kept_counter, monkeypatch
+):
+    spec, settings, out = completed_task
+    original = pd.read_csv(out / "summaries.csv")
+    for index in range(spec.num_windows):
+        path = out / spec.name / f"window_{index}.npz"
+        with np.load(path, allow_pickle=False) as saved:
+            legacy = {
+                key: saved[key]
+                for key in saved.files
+                if key
+                not in (
+                    "cold_covariate_columns",
+                    "clipped_covariate_values",
+                    "floored_covariate_columns",
+                )
+            }
+        if kept_counter is not None and index == 1:
+            legacy[kept_counter] = np.asarray(7, dtype=np.int64)
+        np.savez(path, **legacy)
+        with np.load(path, allow_pickle=False) as saved:
+            diagnostics = prediction_diagnostics(saved)
+            assert diagnostics is not None
+            for key in (
+                "inference_time_s",
+                "fallback_no_context",
+                "fallback_undefined_scale",
+                "device",
+            ):
+                assert diagnostics[key] == saved[key].item()
+            assert diagnostics["clipped_covariate_values"] is None
+            for key in ("cold_covariate_columns", "floored_covariate_columns"):
+                assert diagnostics[key] == (7 if kept_counter == key and index == 1 else None)
+    # Rebuild a missing summary using saved windows, with no inference rerun.
+    original.iloc[:0].to_csv(out / "summaries.csv", index=False)
+    monkeypatch.setattr(
+        Predictor, "forecast_with_diagnostics", lambda *a, **k: pytest.fail("unexpected inference")
+    )
+    before = file_states(out / spec.name)
+    rebuilt = run_fev([spec], settings, out, resume=True)
+    for key in ("inference_time_s", "fallback_no_context", "fallback_undefined_scale"):
+        assert rebuilt[key].iloc[0] == pytest.approx(original[key].iloc[0])
+    assert rebuilt.inference_device.iloc[0] == original.inference_device.iloc[0] == "cpu"
+    assert pd.isna(rebuilt.clipped_covariate_values.iloc[0])
+    for key in ("cold_covariate_columns", "floored_covariate_columns"):
+        if kept_counter == key:
+            assert rebuilt[key].iloc[0] == 7
+        else:
+            assert pd.isna(rebuilt[key].iloc[0])
+    assert file_states(out / spec.name) == before

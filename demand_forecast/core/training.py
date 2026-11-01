@@ -38,6 +38,9 @@ def _empty_timings() -> dict:
         sessions=0,
         peak_cuda_mem_bytes=0,
         nonfinite_losses=0,
+        cold_covariate_columns=0,
+        clipped_covariate_values=0,
+        floored_covariate_columns=0,
     )
 
 
@@ -258,6 +261,13 @@ class Trainer:
                 record = {"step": self.step, "loss": float(loss.detach().item())}
                 self.timings["train_s"] += time.perf_counter() - train_started
                 self.timings["nonfinite_losses"] += int(not math.isfinite(record["loss"]))
+                self.timings["cold_covariate_columns"] += int(batch.cold_covariates.sum().item())
+                self.timings["clipped_covariate_values"] += int(
+                    batch.clipped_covariates.sum().item()
+                )
+                self.timings["floored_covariate_columns"] += int(
+                    batch.floored_covariates.sum().item()
+                )
                 self.history.append(record)
                 if not plan.exception and (
                     self.step % self.eval_every == 0 or self.step == self.max_steps

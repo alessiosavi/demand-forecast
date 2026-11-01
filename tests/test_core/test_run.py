@@ -6,7 +6,7 @@ import pytest
 
 from demand_forecast.core.bundle import load_bundle
 from demand_forecast.core.run import _identity_settings, run_identity, train_panel
-from demand_forecast.core.training import resolve_budget
+from demand_forecast.core.training import InterruptedRun, resolve_budget
 from demand_forecast.core.validation import plan_inner_validation
 from demand_forecast.data.frequency import to_offset
 from tests.helpers.panels import weekly_panel
@@ -150,3 +150,23 @@ def test_train_panel_rejects_off_grid_earliest_origin(tmp_path, tiny_panel_and_s
             dataset_fingerprint="fp",
             earliest_origin=origin - pd.Timedelta(days=1),
         )
+
+
+def test_covariate_counters_reach_run_json_after_stop_and_resume(tmp_path, tiny_panel_and_settings):
+    panel, origin, settings = tiny_panel_and_settings
+    with pytest.raises(InterruptedRun):
+        train_panel(panel, origin, settings, tmp_path, dataset_fingerprint="fp", stop_after=1)
+    progress = json.loads((tmp_path / "checkpoints/progress.json").read_text())
+    for key in ("cold_covariate_columns", "clipped_covariate_values"):
+        assert progress["timings"][key] == 0
+    # The seeded first epoch includes series b at origin 2: oil's std is ~0.05,
+    # below its relative floor (~0.0511). Later draws need no additional floor.
+    assert progress["timings"]["floored_covariate_columns"] == 1
+    bundle = train_panel(panel, origin, settings, tmp_path, dataset_fingerprint="fp", resume=True)
+    report = json.loads((tmp_path / "run.json").read_text())
+    assert report["resumed_from_step"] == 1
+    assert report["timings"]["cumulative"]["sessions"] == 2
+    for key in ("cold_covariate_columns", "clipped_covariate_values"):
+        assert report["timings"]["cumulative"][key] == 0
+    assert report["timings"]["cumulative"]["floored_covariate_columns"] == 1
+    assert load_bundle(bundle).manifest["run"] == report

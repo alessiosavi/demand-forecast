@@ -1,19 +1,24 @@
 import copy
 import json
 import time
-from dataclasses import fields
+from dataclasses import fields, replace
 
 import numpy as np
 import pandas as pd
 import pytest
 import torch
 
+from demand_forecast.config.settings import ForecastConfig
 from demand_forecast.core.validation import plan_inner_validation
 from demand_forecast.data.encoders import StaticEncoder
-from demand_forecast.data.frequency import calendar_features, grid_range
+from demand_forecast.data.frequency import calendar_feature_names, calendar_features, grid_range
 from demand_forecast.data.panel import Panel, Roles, build_series
 from demand_forecast.data.sampler import Batch, WindowSampler, build_origins, make_batch
+from demand_forecast.models.base import ModelSpec
+from demand_forecast.models.losses import pinball_loss
+from tests.helpers.models import build_v2
 from tests.helpers.panels import synthetic_panel, weekly_panel
+from tests.helpers.reference_sampler import assert_batch_matches_reference
 
 
 def test_ragged_histories_never_produce_labels_past_their_own_end():
@@ -183,12 +188,13 @@ def test_dynamic_statistics_ignore_future_and_missing_values_and_use_whole_past(
 
 
 @pytest.mark.parametrize(
-    "past,expected", [([0, 1, np.nan, 0], 2), ([7, 7, np.nan, 7], -5), ([np.nan] * 4, 2)]
+    "past,expected", [([0, 1, np.nan, 0], 2), ([7, 7, np.nan, 7], -5), ([np.nan] * 4, 0)]
 )
 def test_binary_constant_and_unobserved_dynamic_history(panel8, encoder8, past, expected):
     panel8.series[0].dynamic["promo"] = np.array([*past, 2, np.nan, 0, 0])
     batch = make_batch(panel8, [(0, 4)], 2, 4, encoder8)
     assert batch.dec_cov[0, 0, 4].item() == expected
+    assert batch.dec_cov_mask[0, 0, 4].item() == bool(np.isfinite(past).any())
     assert not batch.enc_cov_mask[0, 2, 4] and batch.enc_cov[0, 2, 4] == 0
 
 
@@ -385,3 +391,173 @@ def test_m5_sized_origin_index_is_small_and_fast(record_property):
     assert origins.shape == (30_490 * 249, 2) and origins.dtype == np.int32
     assert origins.nbytes < 120_000_000
     assert elapsed < 20, f"origin index took {elapsed:.3f}s"
+
+
+@pytest.fixture
+def panel_with_cold_and_tiny_std():
+    panel = weekly_panel([40, 38])
+    panel.roles = replace(panel.roles, known_dynamic=("promo", "tiny", "price"))
+    for series in panel.series:
+        series.dynamic["promo"] = np.r_[np.full(30, np.nan), np.full(10, 1e5)]
+        series.dynamic["tiny"] = np.r_[1e-9, np.zeros(27), np.full(12, 0.5)]
+        series.dynamic["price"] = np.r_[100.0 + 1e-6, np.full(27, 100.0), np.full(12, 110.0)]
+    return panel
+
+
+def test_cold_known_covariate_is_masked_off_in_context_and_future(panel_with_cold_and_tiny_std):
+    panel = panel_with_cold_and_tiny_std
+    encoder = StaticEncoder().fit(panel, ["a", "b"])
+    col = len(calendar_feature_names(panel.freq))
+    batch = make_batch(panel, [(0, 28), (1, 25)], 4, 32, encoder)
+    assert not batch.enc_cov_mask[0, :, col].any()
+    assert not batch.dec_cov_mask[0, :, col].any()
+    assert not batch.enc_cov[0, :, col].any() and not batch.dec_cov[0, :, col].any()
+    assert batch.cold_covariates.tolist() == [1, 0]
+    assert (
+        batch.cold_covariates.dtype
+        == batch.clipped_covariates.dtype
+        == batch.floored_covariates.dtype
+        == torch.int64
+    )
+    observed = make_batch(panel, [(0, 34)], 4, 32, encoder)
+    assert observed.cold_covariates.tolist() == [0]
+    assert observed.dec_cov_mask[0, :, col].all()
+    # Observations outside the cropped context still prevent the cold rule.
+    panel.series[0].dynamic["promo"][0] = 2.0
+    cropped = make_batch(panel, [(0, 28)], 4, 2, encoder)
+    assert cropped.cold_covariates.tolist() == [0]
+    assert cropped.dec_cov_mask[0, :, col].tolist() == [False, False, True, True]
+
+
+def test_standardized_covariate_is_bounded_and_counted(panel_with_cold_and_tiny_std):
+    from demand_forecast.data.sampler import COVARIATE_BOUND
+
+    panel = panel_with_cold_and_tiny_std
+    encoder = StaticEncoder().fit(panel, ["a", "b"])
+    col = len(calendar_feature_names(panel.freq)) + 1
+    batch = make_batch(panel, [(0, 28)], 4, 32, encoder)
+    assert batch.dec_cov[0, :, col].tolist() == [COVARIATE_BOUND] * 4
+    assert batch.clipped_covariates.tolist() == [4]
+    assert batch.enc_cov.abs().max() <= COVARIATE_BOUND
+    assert batch.dec_cov_mask[0, :, col].all()
+
+
+@pytest.mark.parametrize(
+    "source,origin,stop,cold",
+    [
+        (None, 4, 8, False),
+        ([np.nan, np.inf, -np.inf, np.nan], 4, 8, False),
+        ([np.nan, np.inf, -np.inf, np.nan, 1e5], 4, 8, True),
+        ([np.nan, np.inf, -np.inf, np.nan, 1e5], 4, 4, False),
+        ([1e5], 0, 1, True),
+    ],
+)
+def test_cold_detection_uses_finite_past_and_only_the_requested_slice(source, origin, stop, cold):
+    from demand_forecast.data.sampler import _dynamic_values
+
+    values, mask, diagnostics = _dynamic_values(
+        None if source is None else np.array(source), 0, origin, stop
+    )
+    assert not values.any() and not mask.any()
+    assert diagnostics.cold is cold and diagnostics.clipped == 0 and not diagnostics.floored
+
+
+@pytest.mark.parametrize("past,expected", [([0, 1], [0, 1]), ([2, 4], [-1, 1])])
+def test_inf_in_a_covariate_is_missing(panel8, encoder8, past, expected):
+    panel8.series[0].dynamic["promo"] = np.array([*past, np.inf, -np.inf, np.inf, -np.inf, *past])
+    batch = make_batch(panel8, [(0, 4)], 4, 4, encoder8)
+    assert batch.enc_cov[0, :, 4].tolist() == [*expected, 0, 0]
+    assert batch.enc_cov_mask[0, :, 4].tolist() == [True, True, False, False]
+    assert batch.dec_cov[0, :, 4].tolist() == [0, 0, *expected]
+    assert batch.dec_cov_mask[0, :, 4].tolist() == [False, False, True, True]
+    assert batch.cold_covariates.tolist() == batch.clipped_covariates.tolist() == [0]
+
+
+def test_indicator_future_is_bounded_and_ordinary_zscore_is_untouched(panel8, encoder8):
+    from demand_forecast.data.sampler import COVARIATE_BOUND
+
+    panel8.series[0].dynamic["promo"] = np.array([0.0, 1.0, 1e5, -1e5, 1e3, -1e3])
+    batch = make_batch(panel8, [(0, 2)], 4, 2, encoder8)
+    assert batch.enc_cov[0, :, 4].tolist() == [0, 1]
+    assert batch.dec_cov[0, :, 4].tolist() == [COVARIATE_BOUND, -COVARIATE_BOUND] * 2
+    assert batch.clipped_covariates.tolist() == [2]
+    panel8.series[0].dynamic["promo"] = np.array([2.0, 4.0, 53.0, -47.0])
+    batch = make_batch(panel8, [(0, 2)], 2, 2, encoder8)
+    assert batch.dec_cov[0, :, 4].tolist() == [50, -50]
+    assert batch.clipped_covariates.tolist() == [0]
+
+
+def test_ordinary_covariates_are_byte_identical_to_the_previous_helper(monkeypatch):
+    panel = weekly_panel([40, 40])
+    panel.roles = replace(panel.roles, known_dynamic=("promo", "constant"))
+    for series in panel.series:
+        # Oil has an ordinary std; this new column has std == 0 before both origins.
+        series.dynamic["constant"] = np.r_[np.full(32, 100.0), np.full(8, 110.0)]
+    encoder = StaticEncoder().fit(panel, ["a", "b"])
+    assert_batch_matches_reference(monkeypatch, panel, [(0, 28), (1, 32)], 4, 16, encoder)
+
+
+def test_fp16_cast_inputs_and_model_pass_stay_finite_after_the_guards(
+    panel_with_cold_and_tiny_std, record_property
+):
+    panel = panel_with_cold_and_tiny_std
+    encoder = StaticEncoder().fit(panel, ["a", "b"])
+    cfg = ForecastConfig(horizon=4, max_context=32)
+    batch = make_batch(panel, [(0, 28), (1, 28)], cfg.horizon, cfg.max_context, encoder)
+    for name in ("target", "enc_cov", "dec_cov", "labels"):
+        assert torch.isfinite(getattr(batch, name).half()).all(), name
+    model = build_v2(ModelSpec.from_panel(panel, encoder, cfg, 16, 4))
+    outputs = model(batch)
+    assert torch.isfinite(outputs).all()
+    loss, count = pinball_loss(
+        outputs, batch.labels, batch.label_mask, batch.loss_eligible, torch.tensor(cfg.quantiles)
+    )
+    assert count == 8 and torch.isfinite(loss)
+    loss.backward()
+    gradients = [p.grad for p in model.parameters() if p.grad is not None]
+    assert gradients and all(torch.isfinite(grad).all() for grad in gradients)
+    if torch.amp.autocast_mode.is_autocast_available("cpu"):
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            outputs = model(batch)
+        assert torch.isfinite(outputs).all()
+        record_property("cpu_bfloat16_forward", "finite")
+    else:
+        record_property("cpu_bfloat16_forward", "unsupported")
+
+
+def test_tiny_std_past_is_floored_and_counted():
+    panel = weekly_panel([40])
+    panel.series[0].dynamic["promo"] = np.r_[100.0 + 1e-6, np.full(27, 100.0), np.full(12, 110.0)]
+    encoder = StaticEncoder().fit(panel, ["a"])
+    col = len(calendar_feature_names(panel.freq))
+    batch = make_batch(panel, [(0, 28)], 4, 32, encoder)
+    torch.testing.assert_close(batch.dec_cov[0, :, col], torch.full((4,), 100.0), rtol=0, atol=1e-3)
+    assert batch.floored_covariates.tolist() == [1]
+    assert batch.clipped_covariates.tolist() == batch.cold_covariates.tolist() == [0]
+
+
+def test_std_floor_uses_only_finite_whole_past_and_cannot_change_with_future():
+    from demand_forecast.data.sampler import _dynamic_values
+
+    source = np.array([-100.0 - 1e-6, -100.0, np.inf, -np.inf, np.nan, -110.0])
+    values, mask, diagnostics = _dynamic_values(source, 1, 5, 6)
+    assert values[-1] == pytest.approx(-100.0, abs=1e-3)
+    assert mask.tolist() == [True, False, False, False, True]
+    assert values[1:4].tolist() == [0.0] * 3
+    assert diagnostics.floored and diagnostics.clipped == 0 and not diagnostics.cold
+    source[-1] = 1e10
+    changed, changed_mask, diagnostics = _dynamic_values(source, 1, 5, 6)
+    assert changed[:-1].tobytes() == values[:-1].tobytes()
+    np.testing.assert_array_equal(changed_mask, mask)
+    assert diagnostics.floored and diagnostics.clipped == 1
+
+
+def test_add_row_diagnostics_accumulates_each_column_in_only_its_row(panel8, encoder8):
+    from demand_forecast.data.sampler import DynamicDiagnostics, _add_row_diagnostics
+
+    batch = make_batch(panel8, [(0, 4), (1, 4)], 4, 4, encoder8)
+    _add_row_diagnostics(batch, 1, DynamicDiagnostics(cold=True, clipped=3, floored=True))
+    _add_row_diagnostics(batch, 1, DynamicDiagnostics(cold=False, clipped=4, floored=True))
+    assert batch.cold_covariates.tolist() == [0, 1]
+    assert batch.clipped_covariates.tolist() == [0, 7]
+    assert batch.floored_covariates.tolist() == [0, 2]
