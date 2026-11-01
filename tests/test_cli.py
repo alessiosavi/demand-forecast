@@ -12,6 +12,24 @@ from demand_forecast.cli import app
 runner = CliRunner()
 
 
+def test_pretrain_command_set_and_help():
+    from typer.main import get_command
+
+    assert set(get_command(app).commands) == {
+        "train",
+        "forecast",
+        "fev",
+        "pretrain",
+        "generate-data",
+        "generate-sales",
+        "version",
+    }
+    assert set(get_command(app).commands["pretrain"].commands) == {"run", "probe", "probe-task"}
+    for command in ("run", "probe", "probe-task"):
+        result = runner.invoke(app, ["pretrain", command, "--help"])
+        assert result.exit_code == 0, result.output
+
+
 class TestVersionCommand:
     """Tests for version command."""
 

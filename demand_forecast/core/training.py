@@ -99,6 +99,16 @@ def resolve_budget(
     return max_steps, min(eval_every, max(max_steps // 5, 1))
 
 
+def lr_factor(step: int, *, max_steps: int, warmup_steps: int) -> float:
+    """Linear warm-up followed by cosine decay, zero at and beyond the budget."""
+    if step >= max_steps:
+        return 0.0
+    if step < warmup_steps:
+        return step / warmup_steps
+    progress = (step - warmup_steps) / max(max_steps - warmup_steps, 1)
+    return 0.5 * (1 + math.cos(math.pi * progress))
+
+
 def amp_dtype_for(device: torch.device) -> torch.dtype | None:
     """Use native bf16 on compute capability 8.0+ (Ampere and newer), else fp16.
 
@@ -144,12 +154,7 @@ class Trainer:
             self.scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
 
     def _lr_factor(self, step: int) -> float:
-        if step >= self.max_steps:
-            return 0.0
-        if step < self.warmup_steps:
-            return step / self.warmup_steps
-        progress = (step - self.warmup_steps) / max(self.max_steps - self.warmup_steps, 1)
-        return 0.5 * (1 + math.cos(math.pi * progress))
+        return lr_factor(step, max_steps=self.max_steps, warmup_steps=self.warmup_steps)
 
     def fit(
         self,

@@ -42,7 +42,7 @@ def test_cli_help_lists_only_live_commands_without_bench(tmp_path):
             textwrap.dedent("""\
                 import sys
 
-                for name in ("fev", "datasets", "statsforecast"):
+                for name in ("fev", "datasets", "statsforecast", "pyarrow"):
                     sys.modules[name] = None
 
                 from typer.testing import CliRunner
@@ -57,10 +57,10 @@ def test_cli_help_lists_only_live_commands_without_bench(tmp_path):
                 result = runner.invoke(app, ["--help"])
                 assert result.exit_code == 0, (result.output, result.exception)
                 assert all(command in result.output for command in (
-                    "train", "forecast", "fev", "generate-data", "generate-sales", "version"
+                    "train", "forecast", "fev", "pretrain", "generate-data", "generate-sales", "version"
                 )), result.output
                 assert set(get_command(app).commands) == {
-                    "train", "forecast", "fev", "generate-data", "generate-sales", "version"
+                    "train", "forecast", "fev", "pretrain", "generate-data", "generate-sales", "version"
                 }
                 result = runner.invoke(app, [
                     "fev", "baseline", "--tasks", "weekly", "--out-dir", "baseline"
@@ -85,3 +85,29 @@ def test_cli_version_is_2_0_0():
     result = CliRunner().invoke(app, ["version"])
     assert result.exit_code == 0
     assert result.output.strip() == "demand-forecast version 2.0.0"
+
+
+def test_pretrain_imports_without_bench(tmp_path):
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            textwrap.dedent("""\
+                import importlib
+                import sys
+
+                for name in ("pyarrow", "datasets", "huggingface_hub", "fev", "statsforecast"):
+                    sys.modules[name] = None
+
+                importlib.import_module("demand_forecast.pretrain")
+                importlib.import_module("demand_forecast.pretrain.corpus")
+                importlib.import_module("demand_forecast.pretrain.train")
+                importlib.import_module("demand_forecast.pretrain.probe")
+            """),
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

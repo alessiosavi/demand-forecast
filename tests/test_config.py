@@ -128,6 +128,16 @@ def test_example_configs(path):
     assert settings.training == TrainingConfig()
 
 
+def test_pretrain_config_loads_shipped_yaml():
+    from demand_forecast.pretrain.config import PretrainConfig
+
+    path = Path(__file__).resolve().parents[1] / "configs/pretrain-v2-first-try.yaml"
+    config = PretrainConfig.from_yaml(path)
+    assert config.training.max_steps == 150000
+    assert config.forecast.horizon == 52
+    assert config.corpus.external_validation == "monash_nn5_weekly"
+
+
 def test_legacy_tuning_settings_preserved():
     # The Pydantic schema and the live legacy tuner have separate configs.
     from demand_forecast.core.tuning import HyperparameterTuner

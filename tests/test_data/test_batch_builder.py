@@ -6,10 +6,12 @@ from dataclasses import replace
 import numpy as np
 import pandas as pd
 import pytest
+import torch
 
 from demand_forecast.data import sampler
 from demand_forecast.data.encoders import StaticEncoder
-from demand_forecast.data.frequency import seasonal_period
+from demand_forecast.data.frequency import calendar_feature_names, seasonal_period
+from demand_forecast.data.sampler import make_batch
 from tests.helpers.panels import weekly_panel
 from tests.helpers.reference_batch import (
     assert_batches_equal,
@@ -17,6 +19,27 @@ from tests.helpers.reference_batch import (
     reference_batches,
     reference_make_batch,
 )
+from tests.helpers.reference_sampler import assert_batch_matches_reference
+
+
+def test_calendar_off_zeroes_values_and_masks(panel29, encoder29):
+    on = make_batch(panel29, [(0, 29)], 13, 64, encoder29)
+    off = make_batch(panel29, [(0, 29)], 13, 64, encoder29, calendar=False)
+    n_cal = len(calendar_feature_names(panel29.freq))
+    assert n_cal == 4
+    assert torch.equal(off.enc_cov[..., :n_cal], torch.zeros_like(off.enc_cov[..., :n_cal]))
+    assert torch.equal(off.dec_cov[..., :n_cal], torch.zeros_like(off.dec_cov[..., :n_cal]))
+    assert not off.enc_cov_mask[..., :n_cal].any() and not off.dec_cov_mask[..., :n_cal].any()
+    assert torch.equal(off.enc_cov[..., n_cal:], on.enc_cov[..., n_cal:])
+    assert torch.equal(off.target, on.target) and torch.equal(off.labels, on.labels)
+
+
+def test_calendar_default_is_byte_identical_to_reference(monkeypatch, panel29, encoder29):
+    assert_batch_matches_reference(monkeypatch, panel29, [(0, 29), (1, 29)], 13, 64, encoder29)
+    assert_batches_equal(
+        make_batch(panel29, [(0, 29), (1, 29)], 13, 64, encoder29),
+        reference_make_batch(panel29, [(0, 29), (1, 29)], 13, 64, encoder29),
+    )
 
 
 def batch_case(name):

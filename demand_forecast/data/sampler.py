@@ -241,15 +241,23 @@ class BatchBuilder:
     lengths, statics and encoder must stay fixed during that session. Target and
     dynamic reductions retain the reference's per-row slices and operation order.
     Each build owns fresh buffers, so later batches cannot overwrite earlier ones.
+    With calendar=False, calendar channels stay zero with their masks False.
     """
 
     def __init__(
-        self, panel: Panel, horizon: int, max_context: int, encoder: StaticEncoder
+        self,
+        panel: Panel,
+        horizon: int,
+        max_context: int,
+        encoder: StaticEncoder,
+        *,
+        calendar: bool = True,
     ) -> None:
         _positive(horizon, "horizon")
         _positive(max_context, "max_context")
         self.panel, self.encoder = panel, encoder
         self.horizon, self.max_context = horizon, max_context
+        self.calendar = calendar
         self._lengths = {}
         for series in panel.series:
             # Timestamp equality compares instants, while calendar features use
@@ -344,11 +352,12 @@ class BatchBuilder:
 
             key = (series.start, str(series.start.tz))
             grid, full_calendar = self._grid(key)
-            calendar = full_calendar[start : origin + horizon]
-            arrays["enc_cov"][row, dest, :n_calendar] = calendar[:context_length]
-            arrays["dec_cov"][row, :, :n_calendar] = calendar[context_length:]
-            arrays["enc_cov_mask"][row, dest, :n_calendar] = True
-            arrays["dec_cov_mask"][row, :, :n_calendar] = True
+            if self.calendar:
+                calendar = full_calendar[start : origin + horizon]
+                arrays["enc_cov"][row, dest, :n_calendar] = calendar[:context_length]
+                arrays["dec_cov"][row, :, :n_calendar] = calendar[context_length:]
+                arrays["enc_cov_mask"][row, dest, :n_calendar] = True
+                arrays["dec_cov_mask"][row, :, :n_calendar] = True
             for column, name in enumerate(dynamic, start=n_calendar):
                 is_known = column < n_dec
                 stop = origin + horizon if is_known else origin
@@ -395,9 +404,13 @@ def make_batch(
     max_context: int,
     encoder: StaticEncoder,
     label_upto: pd.Timestamp | None = None,
+    *,
+    calendar: bool = True,
 ) -> Batch:
     """Build one batch; retain a BatchBuilder to reuse features across calls."""
-    return BatchBuilder(panel, horizon, max_context, encoder).build(items, label_upto)
+    return BatchBuilder(panel, horizon, max_context, encoder, calendar=calendar).build(
+        items, label_upto
+    )
 
 
 class WindowSampler:
