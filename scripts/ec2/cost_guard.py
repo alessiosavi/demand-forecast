@@ -108,11 +108,54 @@ def missing(exc):
     )
 
 
+def ssh_failure(exc):
+    """Return failure kind, detail and retryability without hiding guest replies."""
+    output = (exc.stdout or "").strip()
+    error = (exc.stderr or "").strip()
+    detail = "\n".join(part for part in (output, error) if part) or f"SSH exit {exc.returncode}"
+    lowered = error.lower()
+    # arm-deadline.sh prints its mismatch to stdout and then exits nonzero.
+    if "DEADLINE_MISMATCH" in detail:
+        return "DEADLINE_MISMATCH", detail, False
+    if output:
+        return "BAD_OUTPUT", detail, False
+    if exc.returncode == 127 or (
+        "arm-deadline.sh" in lowered
+        and ("no such file" in lowered or "command not found" in lowered)
+    ):
+        return "BOOTSTRAP_NOT_FINISHED", detail, True
+    if "host key verification failed" in lowered or "host identification has changed" in lowered:
+        return "HOST_KEY_REFUSED", detail, True
+    if "timed out" in lowered or "timeout" in lowered:
+        return "CONNECTION_TIMEOUT", detail, True
+    if "connection refused" in lowered:
+        return "CONNECTION_REFUSED", detail, True
+    if exc.returncode == 255:
+        return "CONNECTION_ERROR", detail, True
+    return "BAD_OUTPUT", detail, False
+
+
+def deadline_reply_error(output, requested):
+    if output.startswith("DEADLINE_MISMATCH"):
+        return "DEADLINE_MISMATCH", output.strip()
+    match = re.fullmatch(r"DEADLINE_SET ([^\r\n]+)\n?", output)
+    if not match:
+        return "BAD_OUTPUT", "expected exactly one DEADLINE_SET line"
+    try:
+        delta = (instant(match[1]) - requested).total_seconds()
+    except (ValueError, GuardError) as exc:
+        return "BAD_OUTPUT", str(exc)
+    if not -60 <= delta <= 0:
+        return "DEADLINE_MISMATCH", "armed deadline outside [-60, 0] seconds"
+    return None
+
+
 class Guard:
-    def __init__(self, ledger_path, run=run_command, now=utc_now):
+    def __init__(self, ledger_path, run=run_command, now=utc_now, sleep=time.sleep):
         self.ledger_path = Path(ledger_path)
         self.run = run
         self.now = now
+        self.sleep = sleep
         self.ledger = None
         self.txn = None
         self.command = None
@@ -251,6 +294,7 @@ class Guard:
                     "cleanup_by": stamp(cleanup),
                     "created": stamp(self.now()),
                     "cleanup_schedule_name": f"pretrain-{token}-cleanup",
+                    "known_hosts_path": str(self.ledger_path.parent.resolve() / "known_hosts"),
                     "ready": False,
                 },
                 "sessions": [],
@@ -457,37 +501,74 @@ class Guard:
         return [v for v in response["Volumes"] if v["State"] != "deleted"]
 
     def arm(self, session):
-        requested = instant(session["deadline"])
-        if self.now() >= requested:
-            raise GuardError("session deadline elapsed before arming", 4)
         try:
-            self.stage("deadline_armed")  # persist intent before SSH
-            cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20"]
-            if self.config.get("key_path"):
-                cmd += ["-i", self.config["key_path"]]
+            requested = instant(session["deadline"])
+            txn = self.session_txn(session)
+            called = instant(txn["aws_called"])
             address = str(ipaddress.IPv4Address(session["public_ip"]))
-            output = self.run(
-                cmd
-                + [
-                    "ubuntu@" + address,
-                    "sudo",
-                    "/usr/local/sbin/arm-deadline.sh",
-                    "set",
-                    session["deadline"],
-                ]
-            )
-            match = re.fullmatch(r"DEADLINE_SET ([^\r\n]+)\n?", output)
-            if not match:
-                raise ValueError("expected exactly one DEADLINE_SET line")
-            delta = (instant(match[1]) - requested).total_seconds()
-            if not -60 <= delta <= 0:
-                raise ValueError("armed deadline outside [-60, 0] seconds")
-        except (OSError, ValueError, subprocess.CalledProcessError, GuardError) as exc:
+        except (KeyError, TypeError, ValueError, GuardError) as exc:
             raise GuardError(f"deadline arming failed: {exc}", 4) from exc
-        session["armed_at"] = stamp(self.now())
-        session["status"] = "open"
-        self.session_txn(session)["status"] = "open"
-        self.stage("open", self.session_txn(session))
+        cutoff = min(requested, called + timedelta(minutes=15))
+        known_hosts = self.config.setdefault(
+            "known_hosts_path", str(self.ledger_path.parent.resolve() / "known_hosts")
+        )
+        cmd = [
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=20",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            "-o",
+            "UserKnownHostsFile=" + known_hosts,
+        ]
+        if self.config.get("key_path"):
+            cmd += ["-i", self.config["key_path"]]
+        cmd += [
+            "ubuntu@" + address,
+            "sudo",
+            "/usr/local/sbin/arm-deadline.sh",
+            "set",
+            session["deadline"],
+        ]
+        attempts = session.setdefault("arm_attempts", {"count": 0, "last_error": None, "utc": None})
+        while self.now() < cutoff:
+            attempts["count"] += 1
+            attempts["utc"] = stamp(self.now())
+            # One transaction stage; every attempt durably updates its counter
+            # and timestamp before SSH, including after crash recovery.
+            if not any(s["stage"] == "deadline_armed" for s in txn["stages"]):
+                self.stage("deadline_armed", txn)
+            else:
+                self.save()
+            try:
+                output = self.run(cmd)
+            except subprocess.CalledProcessError as exc:
+                kind, detail, retry = ssh_failure(exc)
+            except OSError as exc:
+                kind, detail, retry = "SSH_ERROR", str(exc), False
+            else:
+                failure = deadline_reply_error(output, requested)
+                if failure is None and self.now() >= cutoff:
+                    failure = "READINESS_EXPIRED", "SSH reply arrived after the arming cutoff"
+                if failure is None:
+                    session["armed_at"] = stamp(self.now())
+                    session["status"] = "open"
+                    txn["status"] = "open"
+                    self.stage("open", txn)
+                    return
+                kind, detail = failure
+                retry = False
+            attempts["last_error"] = {"kind": kind, "detail": detail}
+            self.save()
+            print(f"arming attempt {attempts['count']}: {kind}: {detail}")
+            if not retry:
+                raise GuardError(f"deadline arming failed: {kind}", 4)
+            remaining = (cutoff - self.now()).total_seconds()
+            if remaining > 0:
+                self.sleep(min(20, remaining))
+        raise GuardError(f"deadline arming exhausted at {stamp(cutoff)}", 4)
 
     def prepare_launch(self, args):
         required = ("OPERATOR_IP", "VPC_ID", "SUBNET_ID", "AMI_ID")
@@ -1186,7 +1267,7 @@ def parser():
     return result
 
 
-def main(argv=None, *, run=run_command, now=utc_now):
+def main(argv=None, *, run=run_command, now=utc_now, sleep=time.sleep):
     args = parser().parse_args(argv)
     if args.command == "watch":
         if args.interval <= 0:
@@ -1194,13 +1275,13 @@ def main(argv=None, *, run=run_command, now=utc_now):
             return 2
         try:
             while True:
-                code = main(["--ledger", args.ledger, "reconcile"], run=run, now=now)
+                code = main(["--ledger", args.ledger, "reconcile"], run=run, now=now, sleep=sleep)
                 if code:
                     print(f"reconcile failed ({code}); reservation retained; retrying")
-                time.sleep(args.interval)
+                sleep(args.interval)
         except KeyboardInterrupt:
             return 0
-    guard = Guard(args.ledger, run=run, now=now)
+    guard = Guard(args.ledger, run=run, now=now, sleep=sleep)
     try:
         guard.ledger_path.parent.mkdir(parents=True, exist_ok=True)
         with guard.ledger_path.with_name(guard.ledger_path.name + ".lock").open("a") as lock:

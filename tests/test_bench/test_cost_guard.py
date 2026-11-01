@@ -32,12 +32,17 @@ class Crash(BaseException):
 class Clock:
     def __init__(self):
         self.value = datetime(2026, 11, 2, 12, tzinfo=timezone.utc)
+        self.sleeps = []
 
     def __call__(self):
         return self.value
 
     def advance(self, seconds):
         self.value += timedelta(seconds=seconds)
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.advance(seconds)
 
 
 def option(cmd, name):
@@ -55,6 +60,7 @@ class Cloud:
         self.crash = None
         self.armed_delta = 0
         self.armed_output = None
+        self.ssh_errors = []
         self.corrupt = None
         self.role_exists = True
         self.key = False
@@ -68,6 +74,9 @@ class Cloud:
         if self.fail and self.fail(cmd):
             raise subprocess.CalledProcessError(1, cmd, stderr="simulated failure")
         if cmd[0] == "ssh":
+            if self.ssh_errors:
+                code, output, error = self.ssh_errors.pop(0)
+                raise subprocess.CalledProcessError(code, cmd, output=output, stderr=error)
             if self.armed_output is not None:
                 return self.armed_output
             requested = datetime.fromisoformat(cmd[-1].replace("Z", "+00:00"))
@@ -199,7 +208,9 @@ def env(cg, tmp_path, monkeypatch):
     user_data.write_text("#!/bin/bash\n")
 
     def run(*args):
-        return cg.main(["--ledger", str(path), *map(str, args)], run=cloud, now=clock)
+        return cg.main(
+            ["--ledger", str(path), *map(str, args)], run=cloud, now=clock, sleep=clock.sleep
+        )
 
     def ledger():
         return json.loads(path.read_text())
@@ -641,7 +652,7 @@ def test_wrapper_crash_trap_runs_real_guard_stop_and_cancel(env):
         "    result = cloud(cmd)\n"
         "    state.write_text(json.dumps({k: getattr(cloud, k) for k in ('instance', 'volumes', 'schedules', 'key', 'sg')}))\n"
         "    return result\n"
-        "raise SystemExit(guard.main(sys.argv[2:], run=run, now=clock))\n"
+        "raise SystemExit(guard.main(sys.argv[2:], run=run, now=clock, sleep=clock.sleep))\n"
     )
     shim.chmod(0o700)
     result = subprocess.run(
@@ -884,3 +895,162 @@ def test_cli_runner_forces_json_and_inherits_profile(cg, monkeypatch):
     assert captured["env"]["AWS_DEFAULT_OUTPUT"] == "json"
     assert captured["env"]["AWS_PROFILE"] == "operator-supplied"
     assert captured["check"] and captured["capture_output"]
+
+
+@pytest.mark.parametrize(
+    "failure,kind",
+    [
+        (
+            (255, "", "ssh: connect to host 203.0.113.10 port 22: Connection refused"),
+            "CONNECTION_REFUSED",
+        ),
+        (
+            (255, "", "ssh: connect to host 203.0.113.10 port 22: Connection timed out"),
+            "CONNECTION_TIMEOUT",
+        ),
+        (
+            (127, "", "/usr/local/sbin/arm-deadline.sh: No such file or directory"),
+            "BOOTSTRAP_NOT_FINISHED",
+        ),
+        (
+            (1, "", "sudo: /usr/local/sbin/arm-deadline.sh: command not found"),
+            "BOOTSTRAP_NOT_FINISHED",
+        ),
+    ],
+)
+def test_arming_retries_readiness_and_persists_each_attempt(env, capsys, failure, kind):
+    env.cloud.ssh_errors = [failure, failure]
+    assert env.provision() == 0
+    assert env.clock.sleeps == [20, 20]
+    data = env.ledger()
+    session = data["sessions"][0]
+    assert session["status"] == "open"
+    assert session["arm_attempts"]["count"] == 3
+    assert session["arm_attempts"]["last_error"]["kind"] == kind
+    assert session["arm_attempts"]["utc"] == "2026-11-02T12:00:45Z"
+    snapshots = [
+        s for c, s in zip(env.cloud.calls, env.cloud.snapshots, strict=True) if c[0] == "ssh"
+    ]
+    assert [s["sessions"][0]["arm_attempts"]["count"] for s in snapshots] == [1, 2, 3]
+    assert snapshots[0]["sessions"][0]["arm_attempts"]["last_error"] is None
+    assert snapshots[1]["sessions"][0]["arm_attempts"]["last_error"]["kind"] == kind
+    assert [s["sessions"][0]["arm_attempts"]["utc"] for s in snapshots] == [
+        "2026-11-02T12:00:05Z",
+        "2026-11-02T12:00:25Z",
+        "2026-11-02T12:00:45Z",
+    ]
+    txn = next(t for t in data["transactions"] if t["id"] == session["txn_id"])
+    assert sum(s["stage"] == "deadline_armed" for s in txn["stages"]) == 1
+    assert sum(e["stage"] == "deadline_armed" for e in data["events"]) == 1
+    assert capsys.readouterr().out.count(kind) == 2
+
+
+def test_arming_pins_first_host_key_next_to_ledger(env):
+    expected = str(env.path.parent / "known_hosts")
+    assert env.ledger()["config"]["known_hosts_path"] == expected
+    assert env.provision() == 0
+    cmd, snapshot = next(
+        (c, s) for c, s in zip(env.cloud.calls, env.cloud.snapshots, strict=True) if c[0] == "ssh"
+    )
+    assert "StrictHostKeyChecking=accept-new" in cmd
+    assert "UserKnownHostsFile=" + expected in cmd
+    assert "BatchMode=yes" in cmd and "ConnectTimeout=20" in cmd
+    assert snapshot["config"]["known_hosts_path"] == expected
+    assert not any("StrictHostKeyChecking=no" in arg for arg in cmd)
+    assert cmd[-4:] == ["sudo", "/usr/local/sbin/arm-deadline.sh", "set", "2026-11-02T15:00:00Z"]
+
+
+@pytest.mark.parametrize(
+    "message,kind",
+    [
+        ("Host key verification failed.", "HOST_KEY_REFUSED"),
+        ("ssh: connect to host 203.0.113.10 port 22: Connection timed out", "CONNECTION_TIMEOUT"),
+    ],
+)
+def test_arming_stops_at_fifteen_minutes_from_aws_call(env, capsys, message, kind):
+    env.cloud.ssh_errors = [(255, "", message)] * 50
+    assert env.provision() == 4
+    data = env.ledger()
+    session = data["sessions"][0]
+    assert session["status"] == "cancelled"
+    assert session["settled_cost_usd"] == pytest.approx(905 / 3600 * 1.0114)
+    assert session["arm_attempts"]["count"] == 45
+    assert session["arm_attempts"]["last_error"]["kind"] == kind
+    assert env.clock.sleeps == [20] * 44 + [15]
+    assert env.cloud.instance["State"]["Name"] == "stopped"
+    stop_snapshot = next(
+        s
+        for c, s in zip(env.cloud.calls, env.cloud.snapshots, strict=True)
+        if c[2] == "stop-instances"
+    )
+    assert stop_snapshot["events"][-1]["utc"] == "2026-11-02T12:15:00Z"
+    assert kind in capsys.readouterr().out
+
+
+def test_arming_short_deadline_takes_precedence_over_readiness_window(env):
+    env.cloud.ssh_errors = [(255, "", "Connection refused")] * 10
+    assert env.provision(minutes=1) == 4
+    session = env.ledger()["sessions"][0]
+    assert session["arm_attempts"]["count"] == 3
+    assert env.clock.sleeps == [20, 20, 15]
+    assert session["status"] == "cancelled"
+    assert session["settled_cost_usd"] == pytest.approx(65 / 3600 * 1.0114)
+
+
+@pytest.mark.parametrize(
+    "output,code,kind",
+    [
+        ("DEADLINE_MISMATCH unknown 2026-11-02T15:00:00Z\n", 1, "DEADLINE_MISMATCH"),
+        ("DEADLINE_MISMATCH unknown 2026-11-02T15:00:00Z\n", 0, "DEADLINE_MISMATCH"),
+        ("DEADLINE_SET 2026-11-02T15:00:01Z\n", 0, "DEADLINE_MISMATCH"),
+        ("DEADLINE_SET invalid-time\n", 0, "BAD_OUTPUT"),
+        ("unexpected guest output\n", 0, "BAD_OUTPUT"),
+    ],
+)
+def test_arming_reachable_guest_bad_reply_is_final(env, capsys, output, code, kind):
+    if code:
+        env.cloud.ssh_errors = [(code, output, "")]
+    else:
+        env.cloud.armed_output = output
+    assert env.provision() == 4
+    session = env.ledger()["sessions"][0]
+    assert session["arm_attempts"]["count"] == 1
+    assert session["arm_attempts"]["last_error"]["kind"] == kind
+    assert env.clock.sleeps == []
+    assert env.cloud.instance["State"]["Name"] == "stopped"
+    assert kind in capsys.readouterr().out
+
+
+def test_arming_restart_uses_new_aws_call_for_readiness_bound(env):
+    assert env.provision() == 0
+    assert env.run("stop") == 0
+    env.clock.advance(24 * 3600)
+    env.cloud.ssh_errors = [(255, "", "Connection refused")]
+    assert env.run("start", "--label", "next", "--minutes", 60) == 0
+    assert env.ledger()["sessions"][-1]["arm_attempts"]["count"] == 2
+    assert env.ledger()["sessions"][-1]["status"] == "open"
+
+
+def test_arming_crash_keeps_pre_call_attempt_record(env):
+    env.cloud.crash = lambda c: c[0] == "ssh"
+    with pytest.raises(Crash):
+        env.provision()
+    session = env.ledger()["sessions"][0]
+    assert session["status"] == "pending"
+    assert session["arm_attempts"] == {
+        "count": 1,
+        "last_error": None,
+        "utc": "2026-11-02T12:00:05Z",
+    }
+
+
+def test_arming_recovery_does_not_reset_fifteen_minute_window(env):
+    env.cloud.crash = lambda c: c[0] == "ssh"
+    with pytest.raises(Crash):
+        env.provision()
+    env.cloud.crash = None
+    env.clock.advance(15 * 60)
+    previous_calls = len(env.cloud.calls)
+    assert env.run("reconcile") == 0
+    assert not any(c[0] == "ssh" for c in env.cloud.calls[previous_calls:])
+    assert env.cloud.instance["State"]["Name"] == "stopped"

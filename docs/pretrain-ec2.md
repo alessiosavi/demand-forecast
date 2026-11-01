@@ -96,12 +96,19 @@ Only `arm-deadline.sh` calls shutdown. Its `set` reply is exactly
 `DEADLINE_MISMATCH`. The AWS stop schedule is the hard runtime backstop once verified.
 
 Extract `KEY` from `config.key_path`, `HOST` from the current session's `public_ip`,
-and `INSTANCE` from `instance_id` in the ledger. Verify the SSH host fingerprint
-against the instance console and establish the operator's known-hosts entry. Task 14
-uses batch SSH with a single arming attempt: SSH/cloud-init not ready or an unknown
-host key can produce exit 4 and a safe stop. Inspect the console and ledger; after
-fixing readiness/trust, `reconcile` then `start` with a **new** label. Do not disable
-host-key verification. Refresh `HOST` after every restart.
+and `INSTANCE` from `instance_id` in the ledger. The guard arms the deadline over batch
+SSH with `StrictHostKeyChecking=accept-new` and a ledger-local known-hosts file
+(`config.known_hosts_path`): the first host key is pinned, a changed key is refused.
+It retries every 20 seconds while sshd or cloud-init is not ready (connection refused
+or timed out, helper not installed yet) until the earlier of the transaction's
+`aws_called + 15 min` and the session deadline, so arming always ends before the guest's
+own boot grace (boot + 20 min) can fire; a `DEADLINE_MISMATCH` or malformed reply fails
+immediately. Exhaustion or a final reply means exit 4 after a safe stop; the attempts
+are recorded in the session's `arm_attempts`. After the first successful arming, compare
+the pinned key in `known_hosts` with the instance console's host-key fingerprint and
+record the comparison. If arming failed: inspect the console and ledger, `reconcile`,
+then `start` with a **new** label. Do not disable host-key verification. Refresh `HOST`
+after every restart.
 
 | Guard exit | Meaning/action |
 | --- | --- |
