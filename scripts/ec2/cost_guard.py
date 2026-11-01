@@ -23,6 +23,9 @@ from datetime import datetime, timedelta, timezone
 from decimal import ROUND_CEILING, Decimal
 from pathlib import Path
 
+AWS_TIMEOUT_S = 300
+AWS_WAIT_TIMEOUT_S = 600
+
 
 # Accounting. A pending transfer has a hold and zero settled cost, never two
 # reservations. Historical settled sessions and manual adjustments remain here.
@@ -258,7 +261,10 @@ class Guard:
 
     def aws(self, service, operation, *args, stage=None):
         self.stage(stage or f"aws:{service}:{operation}")
-        result = self.run(["aws", service, operation, *args, "--region", self.config["region"]])
+        timeout = AWS_WAIT_TIMEOUT_S if (service, operation) == ("ec2", "wait") else AWS_TIMEOUT_S
+        result = self.run(
+            ["aws", service, operation, *args, "--region", self.config["region"]], timeout=timeout
+        )
         return json.loads(result) if result.strip() else {}
 
     def admit(self):
@@ -804,7 +810,14 @@ class Guard:
             else:
                 raise GuardError("public IP did not become available", 4)
             self.arm(session)
-        except (GuardError, OSError, ValueError, KeyError, subprocess.CalledProcessError) as exc:
+        except (
+            GuardError,
+            OSError,
+            ValueError,
+            KeyError,
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+        ) as exc:
             # BaseException intentionally escapes: a dead process cannot promise a
             # stop. The durable reservation then belongs to reconcile / shell trap.
             if session.get("instance_id"):
@@ -823,24 +836,33 @@ class Guard:
                     ValueError,
                     KeyError,
                     subprocess.CalledProcessError,
+                    subprocess.TimeoutExpired,
                 ) as stop_error:
                     print(f"stop unconfirmed; reservation retained: {stop_error}")
             raise exc
 
     def stop_time(self, session, instance):
-        """Use the observed transition, or flag the capped asynchronous-stop estimate."""
-        reason = instance.get("StateTransitionReason", "")
+        """Only a stopped-state transition dates a stop; termination is not evidence."""
+        state = instance["State"]["Name"]
+        reason = (instance.get("StateTransitionReason") or "") if state == "stopped" else ""
         match = re.search(r"\((\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) GMT\)", reason)
         called = self.session_txn(session).get("aws_called", session.get("aws_called"))
-        if match:
+        evidenced = None
+        if state == "stopped" and match:
+            evidenced = match[1].replace(" ", "T") + "Z"
+        elif state == "terminated" and session.get("stop_time_estimated") is False:
+            evidenced = session.get("stopped_at")
+        if evidenced:
             try:
-                stopped = instant(match[1].replace(" ", "T") + "Z")
+                stopped = instant(evidenced)
                 if stopped <= self.now() and (not called or stopped >= instant(called)):
-                    session["stop_time_evidence"] = reason
+                    if state == "stopped":
+                        session["stop_time_evidence"] = reason
                     return stopped, False
             except ValueError:
                 pass
-        return min(self.now(), instant(session["deadline"]) + timedelta(minutes=25)), True
+        # Stop at deadline+20, up to 60 minutes of delivery retries, then 5 minutes to stop.
+        return min(self.now(), instant(session["deadline"]) + timedelta(minutes=85)), True
 
     def update_stop_time_flag(self):
         self.ledger["flags"]["STOP_TIME_ESTIMATED"] = any(
@@ -860,6 +882,8 @@ class Guard:
             )
             session["stopped_at"] = stamp(stopped)
             session["stop_time_estimated"] = estimated and bool(called)
+            if session["stop_time_estimated"]:
+                session["observed_at"] = stamp(self.now())
             self.update_stop_time_flag()
             session["status"] = "cancelled" if cancelled else "closed"
             session["schedule_deleted"] = False
@@ -871,7 +895,13 @@ class Guard:
         if instance is None:
             try:
                 instances = self.discover(session)
-            except (OSError, ValueError, KeyError, subprocess.CalledProcessError):
+            except (
+                OSError,
+                ValueError,
+                KeyError,
+                subprocess.CalledProcessError,
+                subprocess.TimeoutExpired,
+            ):
                 # Failed accounting discovery must not prevent stopping a known
                 # instance. Keep its reservation until stop-time evidence can
                 # be recovered; the waiter alone cannot date an earlier stop.
@@ -893,6 +923,14 @@ class Guard:
                 self.aws(
                     "ec2", "wait", "instance-stopped", "--instance-ids", session["instance_id"]
                 )
+                instances = self.discover(session)
+                if len(instances) != 1 or instances[0]["State"]["Name"] not in (
+                    "stopped",
+                    "terminated",
+                ):
+                    raise GuardError("post-wait stop state unconfirmed; reservation retained")
+                instance = instances[0]
+                self.remember_instance(session, instance)
             self.settle_session(session, cancelled=cancelled, instance=instance)
         else:
             self.aws("ec2", "stop-instances", "--instance-ids", session["instance_id"], "--force")
@@ -913,8 +951,9 @@ class Guard:
         txn = self.session_txn(session)
         called = instant(txn.get("aws_called", session["aws_called"]))
         stopped = instant(args.stopped_at)
-        if not called <= stopped <= instant(session["stopped_at"]):
-            raise GuardError("stopped-at must be between aws_called and the recorded estimate")
+        observed = instant(session.get("observed_at", session["stopped_at"]))
+        if not called <= stopped <= observed:
+            raise GuardError("stopped-at must be between aws_called and observed_at")
         txn["stop_time_correction"] = {
             "estimated_stopped_at": session["stopped_at"],
             "stopped_at": stamp(stopped),
@@ -964,7 +1003,18 @@ class Guard:
                 continue
             # Rediscovery covers the interval after AWS replied but before the id
             # reached the ledger. Absence leaves the reservation pending.
-            self.stop_session(session, cancelled=True)
+            try:
+                self.stop_session(session, cancelled=True)
+            except (
+                GuardError,
+                OSError,
+                ValueError,
+                KeyError,
+                subprocess.CalledProcessError,
+                subprocess.TimeoutExpired,
+            ) as exc:
+                print(f"stop unconfirmed; reservation retained: {exc}")
+                raise
             if session["status"] == "cancelled":
                 self.session_txn(session)["evidence"] = "trap"
                 self.stage("cancelled", self.session_txn(session))
@@ -1119,6 +1169,9 @@ class Guard:
                         session["stop_schedule_verified"] = True
                         if session["status"] == "pending":
                             self.arm(session)
+                    except subprocess.TimeoutExpired:
+                        self.stop_session(session)
+                        raise
                     except (
                         GuardError,
                         OSError,
@@ -1424,7 +1477,14 @@ def main(argv=None, *, run=run_command, now=utc_now, sleep=time.sleep):
     except GuardError as exc:
         print(str(exc))
         return exc.code
-    except (OSError, ValueError, KeyError, TypeError, subprocess.CalledProcessError) as exc:
+    except (
+        OSError,
+        ValueError,
+        KeyError,
+        TypeError,
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+    ) as exc:
         print(f"operation failed; inspect ledger and reconcile: {exc}")
         return 2
     finally:

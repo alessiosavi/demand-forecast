@@ -53,6 +53,7 @@ class Cloud:
     def __init__(self, path, clock):
         self.path, self.clock = path, clock
         self.calls, self.snapshots = [], []
+        self.call_options = []
         self.schedules = {}
         self.instance = None
         self.volumes = []
@@ -64,6 +65,8 @@ class Cloud:
         self.ssh_errors = []
         self.ssh_timeouts = 0
         self.ssh_windows = []
+        self.post_stop_reason = None
+        self.timeout_on = None
         self.corrupt = None
         self.role_exists = True
         self.key = False
@@ -71,11 +74,16 @@ class Cloud:
 
     def __call__(self, cmd, **kwargs):
         self.calls.append(cmd)
+        self.call_options.append(kwargs)
         self.snapshots.append(json.loads(self.path.read_text()))
         if self.crash and self.crash(cmd):
             raise Crash()
         if self.fail and self.fail(cmd):
             raise subprocess.CalledProcessError(1, cmd, stderr="simulated failure")
+        if self.timeout_on and self.timeout_on(cmd):
+            timeout = kwargs.get("timeout", 3600)
+            self.clock.advance(timeout)
+            raise subprocess.TimeoutExpired(cmd, timeout)
         if cmd[0] == "ssh":
             self.ssh_windows.append((self.clock(), kwargs.get("timeout")))
             if self.ssh_timeouts:
@@ -208,6 +216,8 @@ class Cloud:
                 self.clock.advance(5)
                 if cmd[3] == "instance-stopped" and self.instance:
                     self.instance["State"]["Name"] = "stopped"
+                    if self.post_stop_reason is not None:
+                        self.instance["StateTransitionReason"] = self.post_stop_reason
                 return ""
         raise AssertionError(f"unexpected external operation: {cmd}")
 
@@ -666,10 +676,10 @@ def test_wrapper_crash_trap_runs_real_guard_stop_and_cancel(env):
         "cloud = Cloud(path, clock)\n"
         "if state.exists():\n"
         "    for key, value in json.loads(state.read_text()).items(): setattr(cloud, key, value)\n"
-        "def run(cmd):\n"
+        "def run(cmd, **kwargs):\n"
         "    with calls.open('a') as stream: stream.write(json.dumps(cmd) + '\\n')\n"
         "    if cmd[2] == 'create-schedule': os._exit(9)\n"
-        "    result = cloud(cmd)\n"
+        "    result = cloud(cmd, **kwargs)\n"
         "    state.write_text(json.dumps({k: getattr(cloud, k) for k in ('instance', 'volumes', 'schedules', 'key', 'sg')}))\n"
         "    return result\n"
         "raise SystemExit(guard.main(sys.argv[2:], run=run, now=clock, sleep=clock.sleep))\n"
@@ -1133,7 +1143,9 @@ def test_obsolete_stop_schedule_blocks_start_until_crash_reconciled(
 @pytest.mark.parametrize("command", ["reconcile", "stop"])
 @pytest.mark.parametrize("state", ["stopped", "stopping", "terminated"])
 @pytest.mark.parametrize("pending", [False, True])
-def test_late_settlement_uses_transition_reason_without_expired_flag(env, command, state, pending):
+def test_late_settlement_uses_state_appropriate_evidence_without_expired_flag(
+    env, command, state, pending
+):
     assert env.provision() == 0
     if pending:
         env.edit(lambda d: d["sessions"][0].update(status="pending"))
@@ -1144,16 +1156,21 @@ def test_late_settlement_uses_transition_reason_without_expired_flag(env, comman
     assert env.run(command) == 0
     session = env.ledger()["sessions"][0]
     assert session["status"] == "closed"
-    assert session["stopped_at"] == "2026-11-02T15:00:00Z"
-    assert session["settled_cost_usd"] == pytest.approx(3.0342)
-    assert not session.get("stop_time_estimated")
+    if state == "terminated":
+        assert session["stopped_at"] == "2026-11-02T16:25:00Z"
+        assert session["settled_cost_usd"] == pytest.approx(265 / 60 * 1.0114)
+        assert session["stop_time_estimated"]
+    else:
+        assert session["stopped_at"] == "2026-11-02T15:00:00Z"
+        assert session["settled_cost_usd"] == pytest.approx(3.0342)
+        assert not session.get("stop_time_estimated")
     assert not env.ledger()["flags"]["EXPIRED_SESSION"]
     assert not any(c[2] == "stop-instances" for c in env.cloud.calls[before:])
 
 
 @pytest.mark.parametrize("command", ["reconcile", "stop"])
 @pytest.mark.parametrize(
-    "delay,expected,hours", [(86400, "15:25:00", 205 / 60), (600, "12:10:05", 605 / 3600)]
+    "delay,expected,hours", [(86400, "16:25:00", 265 / 60), (600, "12:10:05", 605 / 3600)]
 )
 def test_missing_stop_time_is_estimated_and_visible_in_status(
     env, capsys, command, delay, expected, hours
@@ -1165,6 +1182,9 @@ def test_missing_stop_time_is_estimated_and_visible_in_status(
     session = env.ledger()["sessions"][0]
     assert session["stopped_at"] == "2026-11-02T" + expected + "Z"
     assert session["stop_time_estimated"] is True
+    assert session["observed_at"] == (
+        "2026-11-03T12:00:05Z" if delay == 86400 else "2026-11-02T12:10:05Z"
+    )
     assert session["settled_cost_usd"] == pytest.approx(hours * 1.0114)
     assert not env.ledger()["flags"]["EXPIRED_SESSION"]
     capsys.readouterr()
@@ -1223,15 +1243,16 @@ def test_console_stop_time_corrects_estimate_and_records_evidence(env, capsys):
     "stopped,evidence",
     [
         ("2026-11-02T11:59:59Z", "console"),
-        ("2026-11-02T15:25:01Z", "console"),
+        ("2026-11-03T12:00:06Z", "console"),
         ("2026-11-02T15:00:00Z", " "),
     ],
 )
-def test_console_settle_rejects_outside_estimate_or_missing_evidence(env, stopped, evidence):
+def test_console_settle_rejects_outside_observation_or_missing_evidence(env, stopped, evidence):
     assert env.provision() == 0
     env.cloud.instance["State"]["Name"] = "stopped"
     env.clock.advance(24 * 3600)
     assert env.run("reconcile") == 0
+    env.clock.advance(24 * 3600)  # A later correction cannot move the observation bound.
     before = env.path.read_bytes()
     txn = env.ledger()["sessions"][0]["txn_id"]
     assert env.run("settle", "--txn", txn, "--stopped-at", stopped, "--evidence", evidence) == 2
@@ -1330,7 +1351,7 @@ def test_stopping_instance_wait_failure_retains_unsettled_session(env):
 
 @pytest.mark.parametrize(
     "stopped,cost",
-    [("2026-11-02T12:00:00Z", 1.0114 / 60), ("2026-11-02T15:25:00Z", 205 / 60 * 1.0114)],
+    [("2026-11-02T12:00:00Z", 1.0114 / 60), ("2026-11-03T12:00:05Z", (24 + 5 / 3600) * 1.0114)],
 )
 def test_console_settle_accepts_inclusive_interval_endpoints(env, stopped, cost):
     assert env.provision() == 0
@@ -1352,3 +1373,176 @@ def test_stop_still_stops_known_instance_when_state_discovery_fails(env):
     env.cloud.fail = None
     assert env.run("reconcile") == 0
     assert env.ledger()["sessions"][0]["status"] == "closed"
+
+
+@pytest.mark.parametrize(
+    "stopped,expected_cost",
+    [("2026-11-02T16:20:00Z", 4.382733333333333), ("2026-11-02T17:00:00Z", 5.057)],
+)
+def test_stop_estimate_covers_delivery_window_and_accepts_evidence_both_ways(
+    env, stopped, expected_cost
+):
+    assert env.provision() == 0
+    env.cloud.instance["State"]["Name"] = "stopped"
+    env.clock.advance(24 * 3600)
+    assert env.run("reconcile") == 0
+    session = env.ledger()["sessions"][0]
+    assert session["stopped_at"] == "2026-11-02T16:25:00Z"
+    assert session["observed_at"] == "2026-11-03T12:00:05Z"
+    txn = session["txn_id"]
+    assert (
+        env.run("settle", "--txn", txn, "--stopped-at", stopped, "--evidence", "console stop time")
+        == 0
+    )
+    data = env.ledger()
+    assert data["sessions"][0]["settled_cost_usd"] == pytest.approx(expected_cost)
+    assert not data["flags"]["STOP_TIME_ESTIMATED"]
+    transaction = next(t for t in data["transactions"] if t["id"] == txn)
+    assert transaction["stop_time_correction"]["estimated_stopped_at"] == "2026-11-02T16:25:00Z"
+
+
+@pytest.mark.parametrize("reason", ["User initiated (2026-11-03 12:00:00 GMT)", None])
+def test_termination_next_day_is_not_stop_time_and_can_be_corrected(env, reason):
+    assert env.provision() == 0
+    env.cloud.instance["State"]["Name"] = "terminated"
+    env.cloud.instance["StateTransitionReason"] = reason
+    env.clock.advance(24 * 3600)
+    assert env.run("reconcile") == 0
+    session = env.ledger()["sessions"][0]
+    assert session["stopped_at"] == "2026-11-02T16:25:00Z"
+    assert session["stop_time_estimated"] is True
+    assert session["settled_cost_usd"] == pytest.approx(265 / 60 * 1.0114)
+    assert (
+        env.run(
+            "settle",
+            "--txn",
+            session["txn_id"],
+            "--stopped-at",
+            "2026-11-02T15:00:00Z",
+            "--evidence",
+            "console: stopped before cleanup",
+        )
+        == 0
+    )
+    assert env.ledger()["sessions"][0]["settled_cost_usd"] == pytest.approx(3.0342)
+    assert not env.ledger()["flags"]["STOP_TIME_ESTIMATED"]
+
+
+def test_terminated_instance_preserves_previously_evidenced_stop(env):
+    assert env.provision() == 0
+    env.edit(
+        lambda d: d["sessions"][0].update(
+            stopped_at="2026-11-02T15:00:00Z",
+            stop_time_estimated=False,
+            stop_time_evidence="console: stopped",
+        )
+    )
+    env.cloud.instance["State"]["Name"] = "terminated"
+    env.cloud.instance["StateTransitionReason"] = "User initiated (2026-11-03 12:00:00 GMT)"
+    env.clock.advance(24 * 3600)
+    assert env.run("reconcile") == 0
+    session = env.ledger()["sessions"][0]
+    assert session["stopped_at"] == "2026-11-02T15:00:00Z"
+    assert session["settled_cost_usd"] == pytest.approx(3.0342)
+    assert not session["stop_time_estimated"]
+
+
+def test_stopping_wait_uses_redescribed_stop_reason(env):
+    assert env.provision() == 0
+    env.cloud.instance["State"]["Name"] = "stopping"
+    env.cloud.instance["StateTransitionReason"] = "User initiated (2026-11-02 12:01:00 GMT)"
+    env.cloud.post_stop_reason = "User initiated (2026-11-02 15:00:00 GMT)"
+    env.clock.advance(3 * 3600)
+    first = len(env.cloud.calls)
+    assert env.run("stop") == 0
+    session = env.ledger()["sessions"][0]
+    assert session["stopped_at"] == "2026-11-02T15:00:00Z"
+    assert session["settled_cost_usd"] == pytest.approx(3.0342)
+    calls = env.cloud.calls[first:]
+    waiter = next(i for i, c in enumerate(calls) if c[2] == "wait")
+    assert any(c[2] == "describe-instances" for c in calls[waiter + 1 :])
+
+
+def test_every_aws_call_has_a_ledger_independent_process_timeout(env):
+    env.edit(lambda d: d["config"].update(AWS_TIMEOUT_S=1, AWS_WAIT_TIMEOUT_S=1))
+    assert env.provision() == 0
+    assert env.run("stop") == 0
+    assert env.run("terminate", "--abandon") == 0
+    for cmd, options in zip(env.cloud.calls, env.cloud.call_options, strict=True):
+        if cmd[0] == "aws":
+            assert options["timeout"] == (600 if cmd[1:3] == ["ec2", "wait"] else 300)
+
+
+@pytest.mark.parametrize("operation,seconds", [("stop-instances", 300), ("instance-stopped", 600)])
+def test_arming_failure_recovery_timeout_keeps_pending_and_releases_lock(
+    env, capsys, operation, seconds
+):
+    import fcntl
+
+    env.cloud.ssh_timeouts = 50
+    env.cloud.timeout_on = lambda c: operation in c
+    assert env.provision() == 4
+    assert env.clock() == datetime(2026, 11, 2, 12, 15, tzinfo=timezone.utc) + timedelta(
+        seconds=seconds
+    )
+    session = env.ledger()["sessions"][0]
+    assert session["status"] == "pending"
+    assert session["settled_cost_usd"] is None
+    assert session["reservation_usd"] == pytest.approx(3.3713333333333333)
+    assert "stop unconfirmed; reservation retained" in capsys.readouterr().out
+    with env.path.with_name(env.path.name + ".lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+@pytest.mark.parametrize("operation", ["stop-instances", "instance-stopped"])
+def test_launch_trap_timeout_retains_pending_reservation(env, capsys, operation):
+    env.cloud.crash = lambda c: c[2] == "create-schedule"
+    with pytest.raises(Crash):
+        env.provision()
+    env.cloud.crash = None
+    env.cloud.timeout_on = lambda c: operation in c
+    assert env.run("launch-trap") == 2
+    session = env.ledger()["sessions"][0]
+    assert session["status"] == "pending"
+    assert session["settled_cost_usd"] is None
+    assert "stop unconfirmed; reservation retained" in capsys.readouterr().out
+
+
+def test_aws_timeout_elsewhere_is_generic_operational_failure(env, capsys):
+    env.cloud.timeout_on = lambda c: c[2] == "describe-volumes"
+    assert env.run("status") == 2
+    assert "operation failed; inspect ledger and reconcile" in capsys.readouterr().out
+    assert env.clock() == datetime(2026, 11, 2, 12, 5, tzinfo=timezone.utc)
+
+
+def test_discovery_timeout_still_attempts_stop_and_wait_before_returning(env, capsys):
+    env.cloud.ssh_timeouts = 50
+    env.cloud.timeout_on = lambda c: (
+        c[2] == "describe-instances"
+        and env.clock() >= datetime(2026, 11, 2, 12, 15, tzinfo=timezone.utc)
+    )
+    assert env.provision() == 4
+    assert env.cloud.instance["State"]["Name"] == "stopped"
+    assert env.ledger()["sessions"][0]["status"] == "pending"
+    assert "stop unconfirmed; reservation retained" in capsys.readouterr().out
+
+
+def test_recovery_bound_includes_discovery_and_schedule_deletion(env, monkeypatch):
+    cutoff = datetime(2026, 11, 2, 12, 15, tzinfo=timezone.utc)
+    original = Cloud.__call__
+
+    def delayed(cloud, cmd, **kwargs):
+        if cloud.clock() >= cutoff and cmd[0] == "aws":
+            delay = 594 if cmd[2] == "wait" else 299
+            assert delay < kwargs["timeout"]
+            cloud.clock.advance(delay)
+        return original(cloud, cmd, **kwargs)
+
+    monkeypatch.setattr(Cloud, "__call__", delayed)
+    env.cloud.ssh_timeouts = 50
+    assert env.provision() == 4
+    # Discovery + stop + waiter (including its normal 5s) + schedule deletion.
+    assert env.clock() == cutoff + timedelta(seconds=299 + 299 + 599 + 299)
+    assert env.clock() > cutoff + timedelta(seconds=120 + 300 + 600)
+    assert env.clock() < cutoff + timedelta(seconds=300 + 300 + 600 + 300)
+    assert env.ledger()["sessions"][0]["status"] == "cancelled"

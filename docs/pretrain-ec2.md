@@ -112,12 +112,32 @@ transaction's `aws_called + 15 min` and the session deadline. Every complete SSH
 has a timeout of at most 120 seconds and at most the remaining window;
 `COMMAND_TIMEOUT` retries within that same cutoff. Arming therefore ends before the
 guest's own boot grace (boot + 20 min) can fire; a `DEADLINE_MISMATCH` or malformed reply fails
-immediately. Exhaustion or a final reply means exit 4 after a safe stop; the attempts
+immediately. Exhaustion or a final reply means exit 4 after attempting a safe stop; the attempts
 are recorded in the session's `arm_attempts`. After the first successful arming, compare
 the pinned key in `known_hosts` with the instance console's host-key fingerprint and
 record the comparison. If arming failed: inspect the console and ledger, `reconcile`,
 then `start` with a **new** label. Do not disable host-key verification. Refresh `HOST`
 after every restart.
+
+Every AWS subprocess has a ledger-independent timeout: `AWS_TIMEOUT_S = 300` for
+ordinary calls and `AWS_WAIT_TIMEOUT_S = 600` for `aws ec2 wait`. If stop confirmation
+times out after an arming failure, the guard prints `stop unconfirmed; reservation retained`,
+keeps the session pending and returns 4. A launch-trap timeout returns 2 with the
+same retained reservation; other AWS timeouts return the generic operational failure
+(exit 2). Reconcile before retrying a pending session.
+
+For a provision/start that enters arming, the cutoff is
+`min(session deadline, aws_called + 15 min)`. The conservative SSH + stop + waiter
+subtotal is `cutoff + 120 s SSH + 300 s stop + 600 s wait`. The complete recovery
+call chain also budgets discovery and schedule deletion: up to
+`300 s discovery + 300 s stop + 600 s wait + 300 s deletion = 25 min`
+after arming fails. For an already-stopping instance, post-wait discovery replaces
+the stop call in that sum. SSH itself is capped by the remaining cutoff window,
+so that recovery phase ends by `cutoff + 25 min` when arming began before cutoff
+(or `cutoff + 27 min` with the conservative 120-second SSH allowance).
+Provision/start setup also holds the ledger lock and has its own bounded AWS calls;
+setup can finish after the arming cutoff. The complete command has no shared aggregate
+deadline. These are subprocess budgets; process creation and local ledger I/O add overhead.
 
 | Guard exit | Meaning/action |
 | --- | --- |
@@ -627,14 +647,20 @@ While **any experiment resource exists**, the operator must run `guard reconcile
 `OVERDUE_STORAGE` means storage exists after `cleanup_by`: reconcile/stop any session,
 then **`guard terminate --abandon`**, accepting loss of uncopied data to end exposure.
 `EXPIRED_SESSION` means reconciliation found a running instance past `deadline + 20 min`;
-never clear the JSON flag by hand. An already stopped/stopping/terminated instance
-settles at its UTC `StateTransitionReason` time. Without a usable timestamp, settlement
-uses `min(now, deadline + 25 min)` and `status` flags `STOP_TIME_ESTIMATED`.
+never clear the JSON flag by hand. An already stopped instance settles at its UTC
+`StateTransitionReason` time. For `stopping`, the guard waits and re-describes the
+instance before using the post-wait stop reason. A terminated instance's transition
+time dates termination, so it cannot prove when compute stopped; an earlier evidenced
+stop is preserved if already recorded. Without usable stop evidence, settlement uses
+`min(now, deadline + 20 min + 60 min + 5 min)` (stop-schedule delay, delivery retry window,
+then asynchronous-stop slack), records `observed_at = now`, and `status` flags
+`STOP_TIME_ESTIMATED`.
 Replace an estimate with console evidence using
 `guard settle --txn "$TXN" --stopped-at "$STOPPED_UTC" --evidence "$EVIDENCE_TEXT"`.
-The evidenced time must be between that session's `aws_called` and recorded estimate,
-inclusive; the command recomputes cost, records the evidence and clears that session's
-estimate flag. It remains available over the enforcement limit.
+The evidenced time must be between that session's `aws_called` and `observed_at`,
+inclusive. Evidence can move the stop time earlier or later than the estimate;
+the command recomputes cost in either direction, records the evidence and clears
+that session's estimate flag. It remains available over the enforcement limit.
 `OVER CAP` requires recording/reporting the $47 enforcement breach separately from
 the binding $50 cap. Recovery/recording commands are allowed even over the limit.
 
@@ -657,7 +683,7 @@ under the 24-hour operator recovery assumption, rate $1.0114/h and EBS ≈ $0.63
 | Failure | Incremental exposure | Bound | ≈ USD |
 |---|---|---|---|
 | A. Guest bootstrap stalls/fails and operator lost, **while the stop schedule delivers within its retry window** | compute from `deadline + 20` (already funded) until the stop schedule succeeds: 60 s precision + up to 10 retries within 60 min | session stop schedule, conditional on delivery | ≤ 61 min → **$1.03**; typical < $0.05 |
-| A′. Stop schedule delivery fails after its 10 retries / 60 min **AND** the guest grace/deadline failed | compute from the funded reservation end until the next `reconcile` (≤ 24 h): for a 180-min session ≤ **$20.90** plus one EBS day | two independent failures; same class as B′ | **disclosed, not bounded** |
+| A′. Stop schedule delivery fails after its 10 retries / 60 min **AND** the guest grace/deadline failed | up to 24 h of compute after `deadline + 20` until the next `reconcile`: `24 h × $1.0114/h` ≈ **$24.28** plus one EBS day; the previous successful reconcile can be just before the stop schedule is due | two independent failures; same class as B′ | **disclosed, not bounded** |
 | B. Operator process dies in the seconds between `run-instances` and schedule creation | the launch trap stops the instance; EBS until the operator's next `reconcile` (≤ 24 h) → `terminate --abandon` | launch trap; recovery assumption | **$0.64** (EBS one day); if the guest grace also fails but the trap ran: still $0.64 |
 | B′. Operator **host** lost in that window (no trap runs) **and** the guest grace fails | compute from the funded reservation end until the next `reconcile` (≤ 24 h): `(24 − (M + 20)/60) h × rate`, for the 180-min provisioning session ≤ **$20.90**, plus one EBS day | none inside the margin: two independent failures inside a window of seconds | **disclosed, not bounded** |
 | C. Termination at `cleanup_by` fails after retries | EBS from `cleanup_by + 24 h` (funded) until the operator's next `reconcile` (≤ 24 h) | `OVERDUE_STORAGE` flag; recovery assumption | **$0.64** |
@@ -665,7 +691,7 @@ under the 24-hour operator recovery assumption, rate $1.0114/h and EBS ≈ $0.63
 | E. Short sessions | none (60-s minimum is inside `session_cost_usd`) | I3 | **0** |
 | F. Transfer retries | none (each attempt reserved first) | I7 | **0** |
 
-Worst single failure **$1.03** (A, while the stop schedule delivers within its retry window); worst plausible pair inside the margin **$1.67** (A+B under that condition); margin $3 (`cap − enforce`). A′ and B′ are the disclosed double failures outside the margin, not guaranteed bounds. A pre-launch AWS-side guard would address B′'s launch window; independent stop-delivery protection would be needed for A′. This attempt builds neither. Outside the recovery assumption EBS grows at ≈ $0.64/day, and compute continues if both guest shutdown and AWS stop delivery failed, which is why the runbook makes the 24-hour check an operator obligation.
+Worst single failure **$1.03** (A, while the stop schedule delivers within its retry window); worst plausible pair inside the margin **$1.67** (A+B under that condition); margin $3 (`cap − enforce`). A′ and B′ are the disclosed double failures outside the margin, not guaranteed bounds: A′ is approximately **$24.28 plus one EBS day** under the 24-hour recovery cadence, while B′ keeps its launch-anchored formula. Reconciliation is due within 24 hours of the previous reconcile, not necessarily within 24 hours of launch. A pre-launch AWS-side guard would address B′'s launch window; independent stop-delivery protection would be needed for A′. This attempt builds neither. Outside the recovery assumption, compute as well as EBS continues to accrue in A′/B′ until reconciliation stops the instance; EBS grows at ≈ $0.64/day until storage deletion. This is why the runbook makes the 24-hour check an operator obligation.
 
 ## 13. Teardown and final evidence
 
