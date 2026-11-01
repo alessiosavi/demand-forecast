@@ -20,3 +20,22 @@ hermes:
 hierarchical_sales_1W:
   target_support: nonnegative
   categorical_statics: []
+
+# Held-out profiles are preregistered from target semantics, never data statistics:
+# transaction, order, admission and cumulative case counts, and electricity load (MW).
+# negative_share diagnostics report data discrepancies; they do not revise profiles.
+favorita_transactions_1W:
+  target_support: nonnegative
+  categorical_statics: [store_nbr, city, state, type, cluster]
+rohlik_orders_1W:
+  target_support: nonnegative
+  categorical_statics: []
+hospital_admissions_1W:
+  target_support: nonnegative
+  categorical_statics: []
+ercot_1W:
+  target_support: nonnegative
+  categorical_statics: []
+uk_covid_utla_1W:
+  target_support: nonnegative
+  categorical_statics: []

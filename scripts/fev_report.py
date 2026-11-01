@@ -421,7 +421,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument(
-        "--tasks", default="weekly", help="weekly, comma-separated names, or task YAML"
+        "--tasks",
+        default="weekly",
+        help="weekly, heldout, comma-separated weekly names, or task YAML",
     )
     parser.add_argument("--profiles", type=Path)
     parser.add_argument("--baseline", default="seasonal_naive")

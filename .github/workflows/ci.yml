@@ -130,7 +130,7 @@ jobs:
           /tmp/wheelenv/bin/pip install dist/*.whl
           cd /tmp
           /tmp/wheelenv/bin/demand-forecast --help
-          /tmp/wheelenv/bin/python -c "from demand_forecast.bench.specs import load_task_specs; assert len(load_task_specs('weekly')) == 7"
+          /tmp/wheelenv/bin/python -c "from demand_forecast.bench.specs import load_task_specs; assert len(load_task_specs('weekly')) == 7; assert len(load_task_specs('heldout')) == 5"
 
       - name: Check package
         run: twine check dist/*

@@ -124,7 +124,9 @@ def _save_profiles(frame: pd.DataFrame, path: Path) -> None:
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--tasks", default="weekly", help="weekly, comma-separated names, or task YAML"
+        "--tasks",
+        default="weekly",
+        help="weekly, heldout, comma-separated weekly names, or task YAML",
     )
     parser.add_argument("--out", type=Path, required=True, help="Output profile CSV")
     parser.add_argument("--profiles", type=Path, help="Override task role profiles YAML")

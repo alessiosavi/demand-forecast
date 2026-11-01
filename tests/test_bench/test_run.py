@@ -134,12 +134,19 @@ from demand_forecast.bench.specs import load_task_specs
 from demand_forecast.bench.run import run_baseline, leaderboard
 specs = load_task_specs('weekly')
 assert len(specs) == 7
+heldout = load_task_specs('heldout')
+assert len(heldout) == 5
 for args in (['--help'], ['fev', '--help']):
     result = CliRunner().invoke(app, args)
     assert result.exit_code == 0, result.output
     if args[0] == 'fev':
         assert 'baseline' in result.output and 'leaderboard' in result.output
-for operation in (specs[0].to_task, lambda: run_baseline(specs, None), lambda: leaderboard(None)):
+for operation in (
+    specs[0].to_task,
+    heldout[0].to_task,
+    lambda: run_baseline(specs, None),
+    lambda: leaderboard(None),
+):
     try:
         operation()
     except ImportError as exc:
