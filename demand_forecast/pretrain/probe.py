@@ -229,7 +229,16 @@ def task_probe(
         # Keep Trainer's actual split and sampler, but suppress model selection
         # during the bounded timing run. Validation is measured exactly once below.
         train_cfg = TrainConfig(
-            **settings.training.model_dump(exclude={"refit", "min_train_history", "val_items_max"})
+            **settings.training.model_dump(
+                exclude={
+                    "refit",
+                    "min_train_history",
+                    "val_items_max",
+                    "init_from",
+                    "zero_shot",
+                    "eval_at_start",
+                }
+            )
         )
         train_cfg.batch_size = 128
         train_cfg.base_steps = train_cfg.max_steps_cap = steps

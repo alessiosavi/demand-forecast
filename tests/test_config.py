@@ -79,10 +79,19 @@ def test_training_defaults_match_trainer():
     from demand_forecast.core.training import TrainConfig
 
     config = TrainingConfig()
-    assert config.model_dump(exclude={"refit", "min_train_history", "val_items_max"}) == asdict(
-        TrainConfig()
-    )
+    assert config.model_dump(
+        exclude={
+            "refit",
+            "min_train_history",
+            "val_items_max",
+            "init_from",
+            "zero_shot",
+            "eval_at_start",
+        }
+    ) == asdict(TrainConfig())
     assert config.min_train_history is None and config.refit == "none"
+    assert config.init_from is None
+    assert config.zero_shot is False and config.eval_at_start is False
     assert "seed" not in TrainingConfig.model_fields
 
 

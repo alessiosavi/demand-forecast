@@ -1,4 +1,5 @@
 import json
+import shutil
 
 import numpy as np
 import pandas as pd
@@ -63,12 +64,101 @@ def test_identity_ignores_unset_quick_fields_and_changes_when_set(field):
     assert dumped["training"]["val_items_max"] is None
     expected = settings.model_dump(mode="json")
     del expected["training"]["max_steps_cap"], expected["training"]["val_items_max"]
+    for key in ("init_from", "zero_shot", "eval_at_start"):
+        del expected["training"][key]
     assert _identity_settings(settings) == expected
     assert settings.model_dump(mode="json") == dumped
     quick = settings.model_copy(deep=True)
     setattr(quick.training, field, 300)
     assert _identity_settings(quick)["training"][field] == 300
     assert run_identity(quick, 0, "fp", "2.0.0", "2023-01-01", None) != base
+
+
+@pytest.fixture
+def pretrained_bundle_manifest(tmp_path):
+    directory = tmp_path / "pretrained"
+    directory.mkdir()
+    (directory / "manifest.json").write_text(
+        json.dumps({"pretrain_identity": "a" * 64, "sha256": {"model.pt": "b" * 64}}),
+        encoding="utf-8",
+    )
+    return directory
+
+
+def test_identity_uses_bundle_ids_not_path(tmp_path, pretrained_bundle_manifest):
+    settings = tiny_settings()
+    base = run_identity(settings, 0, "fp", "2.0.0", "2023-01-01", None)
+    copied = shutil.copytree(pretrained_bundle_manifest, tmp_path / "copied")
+    identities = []
+    for directory in (pretrained_bundle_manifest, copied):
+        settings.training.init_from = str(directory)
+        dumped = settings.model_dump(mode="json")
+        assert _identity_settings(settings)["training"]["init_from"] == {
+            "pretrain_identity": "a" * 64,
+            "model_sha256": "b" * 64,
+        }
+        identities.append(run_identity(settings, 0, "fp", "2.0.0", "2023-01-01", None))
+        assert settings.model_dump(mode="json") == dumped
+    assert identities[0] == identities[1] != base
+
+
+@pytest.mark.parametrize("field", ["pretrain_identity", "model.pt"])
+def test_identity_changes_with_bundle_provenance(pretrained_bundle_manifest, field):
+    settings = tiny_settings()
+    settings.training.init_from = str(pretrained_bundle_manifest)
+    base = run_identity(settings, 0, "fp", "2.0.0", "2023-01-01", None)
+    path = pretrained_bundle_manifest / "manifest.json"
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    if field == "pretrain_identity":
+        manifest[field] = "c" * 64
+    else:
+        manifest["sha256"][field] = "c" * 64
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    assert run_identity(settings, 0, "fp", "2.0.0", "2023-01-01", None) != base
+
+
+def test_identity_rejects_bundle_without_pretrain_identity(pretrained_bundle_manifest):
+    path = pretrained_bundle_manifest / "manifest.json"
+    path.write_text(json.dumps({"sha256": {"model.pt": "b" * 64}}), encoding="utf-8")
+    settings = tiny_settings()
+    settings.training.init_from = str(pretrained_bundle_manifest)
+    with pytest.raises(ValueError, match="pretrain_identity") as caught:
+        run_identity(settings, 0, "fp", "2.0.0", "2023-01-01", None)
+    assert str(pretrained_bundle_manifest) in str(caught.value)
+
+
+def test_identity_changes_with_zero_shot_and_eval_at_start():
+    settings = tiny_settings()
+    identities = set()
+    for zero_shot, eval_at_start in ((False, False), (True, False), (False, True), (True, True)):
+        # CLI overrides supply init_from later; config validation must accept null.
+        settings.training = type(settings.training).model_validate(
+            {
+                **settings.training.model_dump(),
+                "init_from": None,
+                "zero_shot": zero_shot,
+                "eval_at_start": eval_at_start,
+            }
+        )
+        payload = _identity_settings(settings)["training"]
+        for field, enabled in (("zero_shot", zero_shot), ("eval_at_start", eval_at_start)):
+            if enabled:
+                assert payload[field] is True
+            else:
+                assert field not in payload
+        identities.add(run_identity(settings, 0, "fp", "2.0.0", "2023-01-01", None))
+    assert len(identities) == 4
+
+
+def test_canonical_identity_payload_omits_unset_new_fields():
+    settings = tiny_settings()
+    dumped = settings.model_dump(mode="json")
+    assert dumped["training"]["init_from"] is None
+    assert dumped["training"]["zero_shot"] is False
+    assert dumped["training"]["eval_at_start"] is False
+    payload = _identity_settings(settings)
+    assert {"init_from", "zero_shot", "eval_at_start"}.isdisjoint(payload["training"])
+    assert settings.model_dump(mode="json") == dumped
 
 
 def test_train_panel_records_earliest_origin_and_checks_it_on_reuse(

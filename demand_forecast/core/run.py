@@ -18,7 +18,7 @@ import torch
 
 from demand_forecast import __version__
 from demand_forecast.config import Settings
-from demand_forecast.core.bundle import load_bundle, save_bundle
+from demand_forecast.core.bundle import load_bundle, load_bundle_manifest, save_bundle
 from demand_forecast.core.training import (
     NONFINITE_STOP_AFTER,
     InterruptedRun,
@@ -39,11 +39,24 @@ logger = logging.getLogger(__name__)
 
 
 def _identity_settings(settings: Settings) -> dict:
-    """Preserve legacy identities by omitting only unset quick-validation controls."""
+    """Preserve legacy defaults and identify initialization by bundle provenance."""
     payload = settings.model_dump(mode="json")
-    for key in ("max_steps_cap", "val_items_max"):
-        if payload["training"][key] is None:
-            payload["training"].pop(key)
+    training = payload["training"]
+    for key in ("max_steps_cap", "val_items_max", "init_from"):
+        if training[key] is None:
+            training.pop(key)
+    for key in ("zero_shot", "eval_at_start"):
+        if training[key] is False:
+            training.pop(key)
+    if settings.training.init_from is not None:
+        path = Path(settings.training.init_from)
+        manifest = load_bundle_manifest(path)
+        if "pretrain_identity" not in manifest:
+            raise ValueError(f"Bundle {path} is missing pretrain_identity")
+        training["init_from"] = {
+            "pretrain_identity": manifest["pretrain_identity"],
+            "model_sha256": manifest["sha256"]["model.pt"],
+        }
     return payload
 
 
@@ -195,7 +208,16 @@ def train_panel(
     backbone_kwargs = settings.model.backbone_kwargs()
     model = build_model(settings.model.family, spec, backbone_kwargs)
     cfg = TrainConfig(
-        **settings.training.model_dump(exclude={"refit", "min_train_history", "val_items_max"})
+        **settings.training.model_dump(
+            exclude={
+                "refit",
+                "min_train_history",
+                "val_items_max",
+                "init_from",
+                "zero_shot",
+                "eval_at_start",
+            }
+        )
     )
     device = resolve_device(settings)
     trainer = Trainer(model, cfg, device, identity, settings.seed)

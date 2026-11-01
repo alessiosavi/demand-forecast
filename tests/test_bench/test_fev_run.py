@@ -154,6 +154,46 @@ def test_aligned_fixture_identity_pinned_at_67d4bd7(tmp_path, config, expected):
     )
 
 
+@pytest.mark.parametrize(
+    "config,expected",
+    [
+        ("tiny", "0109546d94a7e19ca25a3d8e427e46af981b5f04ee5a5ca772cc610d0397e03a"),
+        ("frozen", "576741a436a27e53d0643128fc79169f9ccf0a1906c5141eed60c71f7c0a0250"),
+    ],
+)
+def test_identity_unchanged_with_new_fields_unset(tmp_path, config, expected):
+    spec = fixture_spec(write_fev_fixture(tmp_path))
+    settings = (
+        tiny_settings(base_steps=20, d_model=16)
+        if config == "tiny"
+        else Settings.from_yaml(
+            Path(__file__).resolve().parents[2] / "configs/fev-v2-standard.yaml"
+        )
+    )
+    settings.training = type(settings.training).model_validate(
+        {
+            **settings.training.model_dump(),
+            "init_from": None,
+            "zero_shot": False,
+            "eval_at_start": False,
+        }
+    )
+    task = spec.to_task()
+    _, future = task.get_window(0).get_input_data()
+    origin = resolved_origin(window_origins(future, spec.id_column, spec.timestamp_column))
+    assert (
+        run_identity(
+            settings_for_task(spec, settings, task.freq),
+            settings.seed,
+            dataset_fingerprint(task),
+            __version__,
+            origin,
+            spec.task_definition(),
+        )
+        == expected
+    )
+
+
 @pytest.mark.parametrize("quick", [False, True])
 def test_interrupted_training_before_first_bundle_resumes_and_changed_config_is_rejected(
     tmp_path,

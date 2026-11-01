@@ -272,6 +272,8 @@ def test_run_identity_canonical_json(run_settings):
     for key in ("max_steps_cap", "val_items_max"):
         if settings["training"][key] is None:
             del settings["training"][key]
+    for key in ("init_from", "zero_shot", "eval_at_start"):
+        del settings["training"][key]
     payload = {
         "settings": settings,
         "seed": 3,
