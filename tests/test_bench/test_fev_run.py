@@ -687,6 +687,104 @@ def test_cli_run_interrupt_resume_policy_and_missing_bench(tmp_path, monkeypatch
     assert unavailable.exit_code == 2 and "install demand-forecast[bench]" in unavailable.output
 
 
+@pytest.mark.parametrize("entrypoint", ["api", "cli"])
+def test_cli_fev_run_exits_1_on_nonfinite_training_and_writes_no_summary_row(
+    tmp_path, monkeypatch, entrypoint
+):
+    from demand_forecast.core import training
+
+    spec = fixture_spec(
+        write_fev_fixture(tmp_path, statics=()),
+        name="hierarchical_sales_1W",
+        static_columns=[],
+        categorical_statics=[],
+    )
+    settings = tiny_settings(base_steps=20, d_model=8)
+    settings.training.patience = 100
+    out = tmp_path / "out"
+    task_dir = out / spec.name
+    monkeypatch.setattr(training, "pinball_loss", lambda pred, *a: (pred.sum() * float("nan"), 1))
+    definition = asdict(spec)
+    del definition["target_support"], definition["categorical_statics"]
+    tasks = tmp_path / "tasks.yaml"
+    tasks.write_text(yaml.safe_dump({"tasks": [definition]}))
+    config = tmp_path / "cfg.yaml"
+    settings.to_yaml(config)
+    args = [
+        "fev",
+        "run",
+        "--tasks",
+        str(tasks),
+        "--config",
+        str(config),
+        "--out-dir",
+        str(out),
+        "--stop-after",
+        "20",
+    ]
+    expected = (
+        "Training stopped after 20 consecutive non-finite losses at step 20; "
+        f"checkpoint {task_dir / 'checkpoints/latest.pt'}"
+    )
+
+    def invoke(resume):
+        if entrypoint == "api":
+            with pytest.raises(training.NonFiniteTraining) as caught:
+                run_fev([spec], settings, out, resume=resume, stop_after=20)
+            assert str(caught.value) == expected
+        else:
+            result = CliRunner().invoke(app, [*args, *(["--resume"] if resume else [])])
+            assert result.exit_code == 1 and expected in result.stderr
+            assert (
+                "Summaries saved" not in result.stdout and "Skipping completed" not in result.stdout
+            )
+
+    with pytest.warns(UserWarning, match=r"lr_scheduler.step\(\).*before.*optimizer.step"):
+        invoke(resume=False)
+    assert (task_dir / "checkpoints/latest.pt").exists()
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("resume must preserve the failed task without retraining")
+
+    monkeypatch.setattr(training, "pinball_loss", forbidden)
+    invoke(resume=True)
+    assert not (out / "summaries.csv").exists()
+    assert not (task_dir / "bundle").exists() and not (task_dir / "run.json").exists()
+    assert not list(task_dir.glob("window_*.npz"))
+    progress = json.loads((task_dir / "checkpoints/progress.json").read_text())
+    assert progress["step"] == 20 and progress["stop_reason"] == "nonfinite_losses"
+
+
+def test_fev_resume_rejects_nonfinite_checkpoint_even_with_completed_artifacts(
+    tmp_path, monkeypatch, capsys
+):
+    from demand_forecast.core import training
+
+    spec = fixture_spec(write_fev_fixture(tmp_path))
+    settings = tiny_settings(base_steps=20, d_model=8)
+    settings.training.patience = 100
+    out = tmp_path / "out"
+    run_fev([spec], settings, out)
+    summary = (out / "summaries.csv").read_bytes()
+    monkeypatch.setattr(training, "pinball_loss", lambda pred, *a: (pred.sum() * float("nan"), 1))
+    with (
+        pytest.warns(UserWarning, match=r"lr_scheduler.step\(\).*before.*optimizer.step"),
+        pytest.raises(training.NonFiniteTraining),
+    ):
+        run_fev([spec], settings, out)
+    capsys.readouterr()
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("terminal checkpoint resumed training or inference")
+
+    monkeypatch.setattr(training, "pinball_loss", forbidden)
+    monkeypatch.setattr(Predictor, "forecast_with_diagnostics", forbidden)
+    with pytest.raises(training.NonFiniteTraining, match="20 consecutive non-finite losses"):
+        run_fev([spec], settings, out, resume=True)
+    assert "Skipping completed" not in capsys.readouterr().out
+    assert (out / "summaries.csv").read_bytes() == summary
+
+
 @pytest.fixture
 def completed_task(tmp_path):
     spec = fixture_spec(write_fev_fixture(tmp_path))

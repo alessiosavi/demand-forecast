@@ -29,6 +29,8 @@ from demand_forecast.models.losses import pinball_loss
 
 logger = logging.getLogger(__name__)
 
+NONFINITE_STOP_AFTER = 20
+
 
 def _empty_timings() -> dict:
     return dict(
@@ -46,6 +48,10 @@ def _empty_timings() -> dict:
 
 class InterruptedRun(RuntimeError):  # noqa: N818 - public interruption signal from the run protocol
     """A checkpointed training session ended before a bundle could be written."""
+
+
+class NonFiniteTraining(RuntimeError):  # noqa: N818 - public training failure signal
+    """Consecutive non-finite losses stopped training with a terminal checkpoint."""
 
 
 @dataclass
@@ -66,6 +72,8 @@ class TrainConfig:
 
 @dataclass
 class FitResult:
+    """Training outcome; ``nonfinite_losses`` marks a checkpointed terminal failure."""
+
     best_state: dict
     best_score: float | None
     best_step: int
@@ -159,6 +167,12 @@ class Trainer:
         supplied without a directory, checkpoints default to ``checkpoints/``.
         Checkpoints retain the live optimizer/model pair; best weights are
         restored only when training completes, never on interruption.
+        Non-finite losses skip backward, optimizer and all scaler operations,
+        but advance the scheduler and step count. Skipping the first optimizer
+        update therefore produces PyTorch's expected scheduler-order warning.
+        After 20 consecutive non-finite losses, checkpoint (defaulting to
+        ``checkpoints/``) and return ``nonfinite_losses``; resume preserves
+        that terminal result without further training.
         """
         if stop_after is not None and stop_after < 1:
             raise ValueError("stop_after must be positive")
@@ -168,6 +182,7 @@ class Trainer:
             raise ValueError("warmup_steps must be nonnegative")
         if checkpoint_dir is None and (stop_after is not None or resume):
             checkpoint_dir = Path("checkpoints")
+            logger.info("checkpoint_dir not supplied; using %s", checkpoint_dir)
         checkpoint_path = Path(checkpoint_dir) / "latest.pt" if checkpoint_dir is not None else None
         self.progress_path = checkpoint_path.with_name("progress.json") if checkpoint_path else None
         self.plan = plan
@@ -207,6 +222,8 @@ class Trainer:
         )
         self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, self._lr_factor)
         self.step, self.best_step, self.patience_counter = 0, 0, 0
+        self.consecutive_nonfinite = 0
+        self.terminal_reason: str | None = None
         self.history: list[dict] = []
         self.best_score: float | None = None
         self.best_state = deepcopy(self.model.state_dict())
@@ -227,6 +244,11 @@ class Trainer:
             self.device,
             self.amp_dtype if self.amp else None,
         )
+        if (
+            self.terminal_reason == "nonfinite_losses"
+            or self.consecutive_nonfinite >= NONFINITE_STOP_AFTER
+        ):
+            return self._result("nonfinite_losses")
         if not len(origins):
             return self._result("no_training_data")
 
@@ -250,17 +272,21 @@ class Trainer:
                         batch.loss_eligible,
                         quantiles,
                     )
-                self.scaler.scale(loss).backward()
-                self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
+                loss_value = float(loss.detach().item())
+                finite_loss = math.isfinite(loss_value)
+                if finite_loss:
+                    self.scaler.scale(loss).backward()
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip)
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
                 self.scheduler.step()
                 self.step += 1
                 session_steps += 1
-                record = {"step": self.step, "loss": float(loss.detach().item())}
+                record = {"step": self.step, "loss": loss_value}
                 self.timings["train_s"] += time.perf_counter() - train_started
-                self.timings["nonfinite_losses"] += int(not math.isfinite(record["loss"]))
+                self.timings["nonfinite_losses"] += int(not finite_loss)
+                self.consecutive_nonfinite = 0 if finite_loss else self.consecutive_nonfinite + 1
                 self.timings["cold_covariate_columns"] += int(batch.cold_covariates.sum().item())
                 self.timings["clipped_covariate_values"] += int(
                     batch.clipped_covariates.sum().item()
@@ -269,6 +295,15 @@ class Trainer:
                     batch.floored_covariates.sum().item()
                 )
                 self.history.append(record)
+                if self.consecutive_nonfinite >= NONFINITE_STOP_AFTER:
+                    self.terminal_reason = "nonfinite_losses"
+                    if checkpoint_path is None:
+                        checkpoint_dir = Path("checkpoints")
+                        checkpoint_path = checkpoint_dir / "latest.pt"
+                        self.progress_path = checkpoint_dir / "progress.json"
+                        logger.info("checkpoint_dir not supplied; using %s", checkpoint_dir)
+                    self.checkpoint(checkpoint_path)
+                    return self._result("nonfinite_losses")
                 if not plan.exception and (
                     self.step % self.eval_every == 0 or self.step == self.max_steps
                 ):
@@ -366,7 +401,7 @@ class Trainer:
     def _result(self, reason: str) -> FitResult:
         best_state = deepcopy(self.best_state)
         self._sample_peak()
-        self._write_progress()
+        self._write_progress(reason)
         logger.info("fit done: stop_reason=%s steps=%d", reason, self.step)
         return FitResult(
             best_state=best_state,
@@ -385,7 +420,7 @@ class Trainer:
                 self.timings["peak_cuda_mem_bytes"], torch.cuda.max_memory_allocated(self.device)
             )
 
-    def _write_progress(self) -> None:
+    def _write_progress(self, stop_reason: str | None = None) -> None:
         from demand_forecast.core.run import _write_run
 
         if self.progress_path is not None:
@@ -394,6 +429,7 @@ class Trainer:
                 {
                     "run_identity": self.run_identity,
                     "step": self.step,
+                    "stop_reason": stop_reason,
                     "max_steps": self.max_steps,
                     "eval_every": self.eval_every,
                     "n_fit_ids": len(self.plan.fit_ids),
@@ -430,6 +466,8 @@ class Trainer:
             "best_score": self.best_score,
             "best_step": self.best_step,
             "patience_counter": self.patience_counter,
+            "consecutive_nonfinite": self.consecutive_nonfinite,
+            "terminal_reason": self.terminal_reason,
             "max_steps": self.max_steps,
             "eval_every": self.eval_every,
             "warmup_steps": self.warmup_steps,
@@ -455,7 +493,7 @@ class Trainer:
             os.replace(temporary, path)
         finally:
             temporary.unlink(missing_ok=True)
-        self._write_progress()
+        self._write_progress(self.terminal_reason)
         logger.info("checkpoint: step=%d path=%s", self.step, path)
 
     def resume(self, path: Path) -> None:
@@ -481,6 +519,8 @@ class Trainer:
             "warmup_steps",
         ):
             setattr(self, name, state[name])
+        self.consecutive_nonfinite = state.get("consecutive_nonfinite", 0)
+        self.terminal_reason = state.get("terminal_reason")
         self.timings.update(state.get("timings", {}))
         with ZipFile(path) as archive:
             root = archive.namelist()[0].split("/")[0]

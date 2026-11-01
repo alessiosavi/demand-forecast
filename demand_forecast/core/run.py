@@ -19,7 +19,13 @@ import torch
 from demand_forecast import __version__
 from demand_forecast.config import Settings
 from demand_forecast.core.bundle import load_bundle, save_bundle
-from demand_forecast.core.training import InterruptedRun, TrainConfig, Trainer
+from demand_forecast.core.training import (
+    NONFINITE_STOP_AFTER,
+    InterruptedRun,
+    NonFiniteTraining,
+    TrainConfig,
+    Trainer,
+)
 from demand_forecast.core.validation import plan_inner_validation, subsample_validation
 from demand_forecast.data.encoders import StaticEncoder
 from demand_forecast.data.frequency import grid_range, validate_on_grid
@@ -139,17 +145,24 @@ def train_panel(
     resumed_from_step = 0
     if resume:
         # A completed bundle must not hide a mismatched checkpoint or report.
+        failed_checkpoint = False
         if checkpoint.exists():
             state = torch.load(checkpoint, map_location="cpu", weights_only=False)
             if state.get("run_identity") != identity:
                 raise ValueError("run identity mismatch")
             resumed_from_step = state["step"]
+            failed_checkpoint = (
+                state.get("terminal_reason") == "nonfinite_losses"
+                or state.get("consecutive_nonfinite", 0) >= NONFINITE_STOP_AFTER
+            )
             del state
         for path in (report_path, bundle_dir / "manifest.json"):
             if path.exists():
                 if json.loads(path.read_text(encoding="utf-8")).get("run_identity") != identity:
                     raise ValueError("run identity mismatch")
-        if (bundle_dir / "manifest.json").exists():
+        # A failed rerun's checkpoint takes precedence over an older bundle;
+        # let the trainer restore and publish its terminal result below.
+        if not failed_checkpoint and (bundle_dir / "manifest.json").exists():
             bundle = load_bundle(bundle_dir)
             if explicit_earliest_origin and earliest_origin != pd.Timestamp(
                 bundle.panel_metadata["earliest_origin"]
@@ -197,6 +210,11 @@ def train_panel(
         stop_after=stop_after,
     )
     training_time_s = time.perf_counter() - fit_started
+    if result.stop_reason == "nonfinite_losses":
+        raise NonFiniteTraining(
+            f"Training stopped after {NONFINITE_STOP_AFTER} consecutive non-finite losses "
+            f"at step {result.steps}; checkpoint {checkpoint}"
+        )
     if result.stop_reason == "interrupted":
         raise InterruptedRun(
             f"Training interrupted at step {result.steps}; resume from {checkpoint}"
