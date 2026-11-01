@@ -164,8 +164,6 @@ Tiny-bundle timings are smoke measurements, not standard-model benchmark results
 
 ## Documentation
 
-- [Design and migration specification](docs/superpowers/specs/2026-10-30-fev-bench-v2-design.md)
-- [Implementation plan for phases 0–3](docs/superpowers/plans/2026-10-31-fev-core-v2.md)
 - [Architecture pointers](docs/ARCHITECTURE.md)
 - [Configuration pointers](docs/CONFIGURATION.md)
 - [Settings schema](demand_forecast/config/settings.py)

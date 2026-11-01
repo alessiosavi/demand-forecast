@@ -1,7 +1,7 @@
 # EC2 frozen fev run — operator runbook (2026-10-31)
 
-Claude executes this runbook **on EC2 after the PR merges**. Local work is limited to
-synthetic fixtures. The binding [protocol](protocol.md), [performance plan, Task 5](superpowers/plans/2026-10-31-fev-performance-ec2.md)
+Run this procedure on EC2 after the prerequisite changes have merged. Local work is limited to
+synthetic fixtures. The binding [protocol](protocol.md)
 and [prompt 01 §§2–7](colab/prompts/01-fev-run-v2.md) supply the gates below, in this order.
 The NaN-fix reference **F** is `4e33a3e7d811b5fa9dcc1101a48f6c1fc454dfc7`.
 No tuning, budget change, second seed or variant selection is authorised. Quick scores
