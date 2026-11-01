@@ -1546,3 +1546,275 @@ def test_recovery_bound_includes_discovery_and_schedule_deletion(env, monkeypatc
     assert env.clock() > cutoff + timedelta(seconds=120 + 300 + 600)
     assert env.clock() < cutoff + timedelta(seconds=300 + 300 + 600 + 300)
     assert env.ledger()["sessions"][0]["status"] == "cancelled"
+
+
+@pytest.mark.parametrize(
+    "command,args",
+    [
+        ("provision", ["--label", "next", "--minutes", "60"]),
+        ("start", ["--label", "next", "--minutes", "60"]),
+        ("hold", ["--label", "next", "--usd", "35"]),
+        ("transfer-begin", ["--manifest", "/unused", "--attempt", "1"]),
+        ("extend-cleanup", ["--to", "2026-11-09T12:00:00Z"]),
+    ],
+)
+def test_unresolved_estimate_refuses_every_commitment_without_side_effects(
+    env, capsys, command, args
+):
+    assert env.provision() == 0
+    env.cloud.instance["State"]["Name"] = "stopped"
+    env.clock.advance(24 * 3600)
+    assert env.run("reconcile") == 0
+    # Admission must inspect sessions even if the cached flag has not been refreshed.
+    env.edit(lambda d: d["flags"].update(STOP_TIME_ESTIMATED=False, EXPIRED_SESSION=True))
+    txn = env.ledger()["sessions"][0]["txn_id"]
+    before = env.path.read_bytes(), len(env.cloud.calls)
+    capsys.readouterr()
+    assert env.run(command, *args) == 2
+    assert (
+        f"STOP_TIME_ESTIMATED unresolved: settle --txn {txn} --stopped-at <UTC> --evidence <text> first"
+        in capsys.readouterr().out
+    )
+    assert (env.path.read_bytes(), len(env.cloud.calls)) == before
+
+
+@pytest.mark.parametrize("stopped,code", [("2026-11-02T16:20:00Z", 0), ("2026-11-03T12:00:00Z", 2)])
+def test_estimated_stop_blocks_35_dollar_hold_until_evidence_then_i1_applies(
+    env, capsys, stopped, code
+):
+    assert env.provision() == 0
+    env.cloud.instance["State"]["Name"] = "terminated"
+    env.clock.advance(24 * 3600)
+    assert env.run("reconcile") == 0
+    txn = env.ledger()["sessions"][0]["txn_id"]
+    assert env.run("hold", "--label", "next", "--usd", 35) == 2
+    assert txn in capsys.readouterr().out
+    assert "next" not in env.ledger()["holds"]
+    assert (
+        env.run(
+            "settle", "--txn", txn, "--stopped-at", stopped, "--evidence", "CloudTrail stop event"
+        )
+        == 0
+    )
+    capsys.readouterr()
+    assert env.run("hold", "--label", "next", "--usd", 35) == code
+    output = capsys.readouterr().out
+    assert "STOP_TIME_ESTIMATED unresolved" not in output
+    if code:
+        assert "commitment would exceed enforcement limit" in output
+        assert "next" not in env.ledger()["holds"]
+    else:
+        assert env.ledger()["holds"]["next"]["usd"] == 35
+
+
+def test_unresolved_estimate_error_lists_every_transaction(env, capsys):
+    assert env.provision() == 0
+    env.cloud.instance["State"]["Name"] = "stopped"
+    env.clock.advance(24 * 3600)
+    assert env.run("reconcile") == 0
+
+    def legacy_second_estimate(data):
+        session = dict(data["sessions"][0], label="older", txn_id="older-estimate")
+        owner = next(t for t in data["transactions"] if t["id"] == data["sessions"][0]["txn_id"])
+        data["sessions"].append(session)
+        data["transactions"].append(dict(owner, id="older-estimate"))
+
+    env.edit(legacy_second_estimate)
+    capsys.readouterr()
+    assert env.run("hold", "--label", "next", "--usd", 1) == 2
+    output = capsys.readouterr().out
+    for session in env.ledger()["sessions"]:
+        assert f"settle --txn {session['txn_id']} --stopped-at <UTC> --evidence <text>" in output
+    first_txn = env.ledger()["sessions"][0]["txn_id"]
+    assert (
+        env.run(
+            "settle",
+            "--txn",
+            first_txn,
+            "--stopped-at",
+            "2026-11-02T15:00:00Z",
+            "--evidence",
+            "console",
+        )
+        == 0
+    )
+    capsys.readouterr()
+    assert env.run("hold", "--label", "next", "--usd", 1) == 2
+    output = capsys.readouterr().out
+    assert "settle --txn older-estimate" in output
+    assert first_txn not in output
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "stop",
+        "reconcile",
+        "transfer-end",
+        "cancel",
+        "record",
+        "terminate",
+        "settle",
+        "status",
+        "release",
+    ],
+)
+def test_recording_commands_remain_available_with_unresolved_estimate(env, capsys, command):
+    assert env.provision() == 0
+    manifest = env.tmp / "transfer.json"
+    manifest.write_text('{"bytes":1000}')
+    assert env.run("transfer-begin", "--manifest", manifest, "--attempt", 1) == 0
+    assert env.run("hold", "--label", "spare", "--usd", 1) == 0
+    env.cloud.instance["State"]["Name"] = "stopped"
+    env.clock.advance(24 * 3600)
+    assert env.run("reconcile") == 0
+    txn = env.ledger()["sessions"][0]["txn_id"]
+    args = {
+        "stop": [],
+        "reconcile": [],
+        "status": [],
+        "transfer-end": ["--manifest", manifest, "--attempt", 1, "--bytes", 100],
+        "cancel": ["--txn", txn, "--evidence", "console confirms stopped"],
+        "record": ["--kind", "other", "--usd", 1, "--note", "invoice"],
+        "terminate": ["--abandon"],
+        "settle": [
+            "--txn",
+            txn,
+            "--stopped-at",
+            "2026-11-02T15:00:00Z",
+            "--evidence",
+            "console stop",
+        ],
+        "release": ["--label", "spare"],
+    }[command]
+    capsys.readouterr()
+    assert env.run(command, *args) == 0
+    assert "STOP_TIME_ESTIMATED unresolved" not in capsys.readouterr().out
+    assert env.ledger()["sessions"][0]["stop_time_estimated"] is (command != "settle")
+
+
+def legacy_estimated_session(env, settlement_stage):
+    """An e977978-style record, with optional original settlement history."""
+    assert env.provision() == 0
+    env.cloud.instance["State"]["Name"] = "stopped"
+    env.clock.advance(24 * 3600)
+    assert env.run("reconcile") == 0
+
+    def make_legacy(data):
+        session = data["sessions"][0]
+        session.pop("observed_at")
+        session.update(stopped_at="2026-11-02T15:25:00Z", settled_cost_usd=3.455616666666667)
+        owner = next(t for t in data["transactions"] if t["id"] == session["txn_id"])
+        owner["stages"] = [s for s in owner["stages"] if s["stage"] not in ("closed", "cancelled")]
+        if settlement_stage:
+            session["status"] = owner["status"] = settlement_stage
+            owner["stages"].append({"stage": settlement_stage, "utc": "2026-11-03T12:00:05Z"})
+
+    env.edit(make_legacy)
+    return env.ledger()["sessions"][0]["txn_id"]
+
+
+@pytest.mark.parametrize("stage", ["closed", "cancelled"])
+def test_legacy_settle_recovers_observation_from_settlement_stage(env, stage):
+    txn = legacy_estimated_session(env, stage)
+    before_calls = len(env.cloud.calls)
+    assert (
+        env.run(
+            "settle",
+            "--txn",
+            txn,
+            "--stopped-at",
+            "2026-11-02T16:20:00Z",
+            "--evidence",
+            "console stop",
+        )
+        == 0
+    )
+    session = env.ledger()["sessions"][0]
+    assert session["observed_at"] == "2026-11-03T12:00:05Z"
+    assert session["settled_cost_usd"] == pytest.approx(4.382733333333333)
+    assert not session["stop_time_estimated"]
+    assert len(env.cloud.calls) == before_calls
+
+
+def test_legacy_settle_without_observation_requires_explicit_evidence(env, capsys):
+    txn = legacy_estimated_session(env, None)
+    before = env.path.read_bytes()
+    assert (
+        env.run(
+            "settle",
+            "--txn",
+            txn,
+            "--stopped-at",
+            "2026-11-02T15:00:00Z",
+            "--evidence",
+            "console stop",
+        )
+        == 2
+    )
+    assert "--observed-at" in capsys.readouterr().out
+    assert env.path.read_bytes() == before
+    evidence = "CloudTrail stop 16:20; console observed stopped next day at noon"
+    assert (
+        env.run(
+            "settle",
+            "--txn",
+            txn,
+            "--stopped-at",
+            "2026-11-02T16:20:00Z",
+            "--observed-at",
+            "2026-11-03T12:00:00Z",
+            "--evidence",
+            evidence,
+        )
+        == 0
+    )
+    data = env.ledger()
+    assert data["sessions"][0]["observed_at"] == "2026-11-03T12:00:00Z"
+    assert data["sessions"][0]["settled_cost_usd"] == pytest.approx(4.382733333333333)
+    owner = next(t for t in data["transactions"] if t["id"] == txn)
+    assert owner["stop_time_correction"]["observed_at"] == "2026-11-03T12:00:00Z"
+    assert owner["evidence"] == evidence
+
+
+@pytest.mark.parametrize("observed", ["2026-11-02T16:19:59Z", "2026-11-04T12:00:00Z"])
+def test_legacy_settle_refuses_invalid_observation_evidence(env, observed):
+    txn = legacy_estimated_session(env, None)
+    before = env.path.read_bytes()
+    assert (
+        env.run(
+            "settle",
+            "--txn",
+            txn,
+            "--stopped-at",
+            "2026-11-02T16:20:00Z",
+            "--observed-at",
+            observed,
+            "--evidence",
+            "console",
+        )
+        == 2
+    )
+    assert env.path.read_bytes() == before
+
+
+def test_legacy_original_settlement_bound_cannot_be_widened_by_later_cancel_or_override(env):
+    txn = legacy_estimated_session(env, "closed")
+    env.clock.advance(24 * 3600)
+    assert env.run("cancel", "--txn", txn, "--evidence", "later console observation") == 0
+    before = env.path.read_bytes()
+    assert (
+        env.run(
+            "settle",
+            "--txn",
+            txn,
+            "--stopped-at",
+            "2026-11-03T13:00:00Z",
+            "--observed-at",
+            "2026-11-04T12:00:00Z",
+            "--evidence",
+            "console",
+        )
+        == 2
+    )
+    assert env.path.read_bytes() == before

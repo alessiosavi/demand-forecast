@@ -654,13 +654,36 @@ time dates termination, so it cannot prove when compute stopped; an earlier evid
 stop is preserved if already recorded. Without usable stop evidence, settlement uses
 `min(now, deadline + 20 min + 60 min + 5 min)` (stop-schedule delay, delivery retry window,
 then asynchronous-stop slack), records `observed_at = now`, and `status` flags
-`STOP_TIME_ESTIMATED`.
+`STOP_TIME_ESTIMATED`. This provisional estimate covers the delivery retry window;
+failed delivery in case A′ can incur more compute. While **any** session's estimate
+is unresolved, `provision`, `start`, `hold`, `transfer-begin`, and `extend-cleanup`
+are refused with exit 2 and `STOP_TIME_ESTIMATED unresolved`, listing every transaction
+that needs settlement. New commitments remain blocked until `settle` resolves all
+such sessions; the normal $47 admission check still applies afterward.
+`stop`, `reconcile`, `transfer-end`, `cancel`, `record`, `terminate`, `settle`,
+`status`, and `release` remain available under their existing validation rules.
+
+For a stopped instance, obtain the UTC stop time from the EC2 console's state-transition
+details. Otherwise inspect CloudTrail `StopInstances` / `TerminateInstances` events for
+the same instance and session, preserving event times and identifiers as evidence.
+Distinguish a later cleanup termination from an earlier stop; the termination event
+alone does not establish that compute ran continuously until termination.
 Replace an estimate with console evidence using
 `guard settle --txn "$TXN" --stopped-at "$STOPPED_UTC" --evidence "$EVIDENCE_TEXT"`.
 The evidenced time must be between that session's `aws_called` and `observed_at`,
 inclusive. Evidence can move the stop time earlier or later than the estimate;
 the command recomputes cost in either direction, records the evidence and clears
 that session's estimate flag. It remains available over the enforcement limit.
+
+For old records without `observed_at`, `settle` recovers the bound from the owning
+transaction's original `closed` or `cancelled` stage timestamp. If neither is present,
+include `--observed-at "$OBSERVED_UTC"` with the settlement command and describe the
+console evidence of **when the stopped state was observed** in `--evidence`.
+This observation must be at or after `--stopped-at`, specify UTC, and not be in the
+future. The guard records the recovered or supplied observation in the session and
+correction transaction. `--observed-at` cannot override an existing or recovered bound;
+a later cancellation does not extend it, and the estimate is never used as the bound.
+
 `OVER CAP` requires recording/reporting the $47 enforcement breach separately from
 the binding $50 cap. Recovery/recording commands are allowed even over the limit.
 

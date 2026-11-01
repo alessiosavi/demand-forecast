@@ -268,11 +268,21 @@ class Guard:
         return json.loads(result) if result.strip() else {}
 
     def admit(self):
+        self.require_resolved_stop_times()
         if self.ledger["flags"].get("EXPIRED_SESSION"):
             raise GuardError("EXPIRED_SESSION: reconcile before new commitments", 7)
         self.validate()
         if committed(self.ledger) > self.config["enforce_usd"]:
             raise GuardError("commitment would exceed enforcement limit")
+
+    def require_resolved_stop_times(self):
+        corrections = [
+            f"settle --txn {s['txn_id']} --stopped-at <UTC> --evidence <text>"
+            for s in self.ledger["sessions"]
+            if s.get("stop_time_estimated")
+        ]
+        if corrections:
+            raise GuardError("STOP_TIME_ESTIMATED unresolved: " + "; ".join(corrections) + " first")
 
     def active(self):
         return [s for s in self.ledger["sessions"] if s["status"] in ("open", "pending")]
@@ -951,21 +961,44 @@ class Guard:
         txn = self.session_txn(session)
         called = instant(txn.get("aws_called", session["aws_called"]))
         stopped = instant(args.stopped_at)
-        observed = instant(session.get("observed_at", session["stopped_at"]))
+        observed_at = session.get("observed_at")
+        if not observed_at:
+            # Stages are append-only: a later cancellation must not widen the
+            # original settlement's observation bound.
+            observed_at = next(
+                (
+                    s["utc"]
+                    for s in txn.get("stages", [])
+                    if s["stage"] in ("closed", "cancelled") and s.get("utc")
+                ),
+                None,
+            )
+        if not observed_at:
+            observed_at = args.observed_at
+        if not observed_at:
+            raise GuardError(
+                "settle requires --observed-at <UTC> with console observation evidence"
+            )
+        observed = instant(observed_at)
+        if observed > self.now():
+            raise GuardError("observed-at cannot be in the future")
         if not called <= stopped <= observed:
             raise GuardError("stopped-at must be between aws_called and observed_at")
         txn["stop_time_correction"] = {
             "estimated_stopped_at": session["stopped_at"],
             "stopped_at": stamp(stopped),
+            "observed_at": stamp(observed),
             "evidence": args.evidence,
         }
         txn["evidence"] = args.evidence
         session["stopped_at"] = stamp(stopped)
+        session["observed_at"] = stamp(observed)
         session["settled_cost_usd"] = session_cost_usd(
             (stopped - called).total_seconds(), self.rate
         )
         session["stop_time_estimated"] = False
         self.update_stop_time_flag()
+        txn.setdefault("stages", [])
         self.stage("stop_time_corrected", txn)
 
     def stop(self, _args):
@@ -1377,8 +1410,10 @@ class Guard:
         elif args.command != "init":
             raise GuardError("ledger does not exist; init first")
         commitments = {"provision", "start", "hold", "transfer-begin", "extend-cleanup"}
-        if self.command in commitments and self.ledger["flags"].get("EXPIRED_SESSION"):
-            raise GuardError("EXPIRED_SESSION: reconcile before new commitments", 7)
+        if self.command in commitments:
+            self.require_resolved_stop_times()
+            if self.ledger["flags"].get("EXPIRED_SESSION"):
+                raise GuardError("EXPIRED_SESSION: reconcile before new commitments", 7)
         method = (
             "begin_session"
             if self.command in ("start", "provision")
@@ -1422,6 +1457,7 @@ def parser():
     settle = commands.add_parser("settle")
     settle.add_argument("--txn", required=True)
     settle.add_argument("--stopped-at", required=True)
+    settle.add_argument("--observed-at")
     settle.add_argument("--evidence", required=True)
     hold = commands.add_parser("hold")
     hold.add_argument("--label", type=label, required=True)
