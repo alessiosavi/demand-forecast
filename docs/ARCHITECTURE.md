@@ -6,8 +6,8 @@ batches → shared `ForecastModel` with a `V2Backbone` → trainer → inference
 
 Use these sources for the current contract:
 
-- [Settings schema](../demand_forecast/config/settings.py) for the implemented
-  configuration, and the [README module inventory](../README.md#package-modules)
+- [Settings schema](https://github.com/alessiosavi/demand-forecast/blob/main/demand_forecast/config/settings.py) for the implemented
+  configuration, and the [README module inventory](https://github.com/alessiosavi/demand-forecast/blob/main/README.md#package-modules)
   for current package paths.
 - [Frozen evaluation protocol](protocol.md) and [Colab workflow](colab.md).
 
