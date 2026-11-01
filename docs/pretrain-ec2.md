@@ -485,8 +485,14 @@ It is **not** a renamed cost ledger. Keep a separate raw ledger snapshot in `ops
   --finetune "$RUNS/finetune" --wide-random "$RUNS/wide-random" \
   --heldout-frozen "$RUNS/heldout-frozen" --baseline "$RUNS/baseline" \
   --published "$PUBLISHED" --fev-commit 193e4fc --spend /home/ubuntu/fev/spend.json \
+  --leaked solar_1W solar_1D \
   --out "$RUNS/REPORT.md"
 ```
+
+`--leaked` is the leakage audit's declaration (§1): the report's Leakage section renders
+exactly this list, and without it the artifact would state "None declared." although the
+audit excluded `solar_1W`/`solar_1D` as a known corpus overlap. Change the list only if the
+audit's verdict table changes.
 
 Quiesce all workload writers before hashing. The copy-back set is `runs/**` except
 `checkpoints/*.pt`, plus `ops/`, `host-logs/`, probe JSONs (under `runs/probes-*`),
