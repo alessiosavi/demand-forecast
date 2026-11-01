@@ -112,6 +112,8 @@ by the fp16 GradScaler still advances the schedule, including warm-up; torch may
 warn `lr_scheduler.step() before optimizer.step()`. Cumulative `scaler_skips`
 reports these skips; legacy checkpoints without that telemetry remain unknown,
 never zero. bf16 and CPU runs do not use the scaler and never skip for this reason.
+Under the 2026-11-01 amendment, non-finite losses bypass backward, optimizer and
+scaler calls entirely; those attempts count in `nonfinite_losses`, not `scaler_skips`.
 No warm-up or schedule amendment is introduced.
 
 **Stop rule reaffirmed (2026-10-31, unchanged).** Early stopping (patience 5,
@@ -193,6 +195,47 @@ one free Colab session. Its summaries carry `model_name demand-forecast-v2-quick
 a different run identity; its benchmark scores are reported only as a pipeline check
 and must never inform a configuration, early-stopping, tuning or ablation decision.
 The frozen configuration above is unchanged by these fields (both `null`).
+
+### Amendment 2026-11-01 (non-finite training inputs)
+
+The user's approved decisions, quoted verbatim: D1 **"D1a: mask it off (Recommended)"**;
+D2 **"Yes (Recommended)"**; D3 **"Yes (Recommended)"**;
+D4 **"Only if data shows it (Recommended)"**.
+
+1. A dynamic covariate with no finite value before a sample's origin but at least one
+   finite value in the sample's slice is unobserved for that sample in both context and
+   future (mask off, value 0); an entirely missing slice counts zero; the count of such
+   sample-columns is recorded (`cold_covariate_columns`). Future values never shape a
+   sample's context transform, as before.
+2. Dynamic covariate values are bounded to ±1e3 after either the indicator pass-through
+   or the standardization; clipped entries are counted (`clipped_covariate_values`);
+   non-finite source values (NaN, ±inf) are missing.
+3. Training stops after 20 consecutive non-finite losses with `stop_reason` set to
+   `nonfinite_losses`, after checkpointing; such a task has no bundle and no summary
+   row and the run is failed.
+4. A task with `fit_result.nonfinite_losses > 0` fails the report's completeness check.
+   When that field is absent, the gate uses `timings.cumulative.nonfinite_losses`,
+   which remains required. The three new covariate counters are optional for legacy
+   evidence and display as `unknown` when absent.
+5. `stop_reason` values: `max_steps`, `early_stop`, `exception_budget`, `no_training_data`,
+   `interrupted`, `nonfinite_losses`. The standard configuration is unchanged;
+   identities are unchanged. Batch tensors are unchanged for every sample without a
+   cold column, without a floored or clipped value and without non-finite source values.
+6. Standardization scale for dynamic covariates is `max(std, 1e-3 × max|past|)` when
+   std > 0; floored sample-columns are counted (`floored_covariate_columns`). An exactly
+   constant past retains the existing `std or 1.0` rule.
+
+**D4 (target-frame floor): not triggered.** The 2026-11-01 diagnostic found rohlik
+target scale minima 0.50–1.0 and maxima 983–1407; walmart's target scale was not small,
+and no target-frame overflow was found. The failed quick run had 150/150 non-finite
+losses on walmart and 99/150 on rohlik_sales_1W. The CPU diagnostic with fp16 emulation
+found walmart's cold MarkDown columns in 128/128 rows, with raw maxima
+97,741 / 20,834 / 34,348, and rohlik decoder covariates of
+4.95e6 / 8.28e6 / 2.03e7 from tiny nonzero past standard deviations (sell_price_main
+std < 1e-6 in 54 series, smallest 1.71e-8; type_4_discount smallest 1.63e-9).
+Both tasks were fp32-finite and fp16-NaN. The two-task rerun in prompt 02 §5 is the
+required T4 fp16 acceptance check for the 1e3 covariate bound; these diagnostic
+observations do not claim that acceptance has passed.
 
 ## Persistence and execution evidence
 

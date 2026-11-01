@@ -20,6 +20,14 @@ DIAGNOSTIC_DTYPES = {
     "fallback_no_context": np.int64,
     "fallback_undefined_scale": np.int64,
     "device": str,
+    "cold_covariate_columns": np.int64,
+    "clipped_covariate_values": np.int64,
+    "floored_covariate_columns": np.int64,
+}
+OPTIONAL_DIAGNOSTICS = {
+    "cold_covariate_columns",
+    "clipped_covariate_values",
+    "floored_covariate_columns",
 }
 
 
@@ -102,9 +110,9 @@ def _check_prediction_identity(saved, identity: str) -> None:
 
 def prediction_diagnostics(saved) -> dict | None:
     """Read scalar diagnostics; legacy windows remain unknown, never zero."""
-    if not all(key in saved for key in DIAGNOSTIC_DTYPES):
+    if not all(key in saved for key in DIAGNOSTIC_DTYPES.keys() - OPTIONAL_DIAGNOSTICS):
         return None
-    return {key: saved[key].item() for key in DIAGNOSTIC_DTYPES}
+    return {key: saved[key].item() if key in saved else None for key in DIAGNOSTIC_DTYPES}
 
 
 def _save_predictions(
@@ -144,6 +152,8 @@ def run_fev(
     Resume validates saved identities and computes only missing artifacts.
     Timings come from persisted trainer and prediction measurements, including
     earlier sessions. Fully verified completed tasks retain their summary row.
+    ``NonFiniteTraining`` propagates before a failed task can write a summary
+    row; its terminal checkpoint remains the marker for subsequent resumes.
 
     Early-ending items are forecast for calendar periods that other items'
     available past (and selection labels) already cover. No item's own future
@@ -273,6 +283,11 @@ def run_fev(
             continue
 
         def diagnostic_sum(key):
+            if key in OPTIONAL_DIAGNOSTICS:
+                values = [
+                    d[key] for d in diagnostics_per_window if d is not None and d[key] is not None
+                ]
+                return sum(values) if values else None
             return (
                 sum(d[key] for d in diagnostics_per_window)
                 if all(d is not None for d in diagnostics_per_window)
@@ -293,6 +308,9 @@ def run_fev(
                     "max_distinct_origins": max_distinct_origins,
                     "fallback_no_context": diagnostic_sum("fallback_no_context"),
                     "fallback_undefined_scale": diagnostic_sum("fallback_undefined_scale"),
+                    "cold_covariate_columns": diagnostic_sum("cold_covariate_columns"),
+                    "clipped_covariate_values": diagnostic_sum("clipped_covariate_values"),
+                    "floored_covariate_columns": diagnostic_sum("floored_covariate_columns"),
                     "inference_device": ",".join(sorted(devices))
                     if all(d is not None for d in diagnostics_per_window)
                     else "unknown",
