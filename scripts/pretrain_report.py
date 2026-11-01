@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import ast
 import json
+from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
@@ -27,6 +28,14 @@ BASELINE = "seasonal_naive"
 PUBLISHED_MODELS = 43
 FEV_COMMIT = "193e4fc"
 RUN_NAMES = ("frozen", "zero-shot", "finetune", "wide-random", "heldout-frozen")
+DEFAULT_CONFIGS_DIR = Path(__file__).resolve().parents[1] / "configs"
+RUN_CONFIGS = {
+    "frozen": "fev-v2-standard.yaml",
+    "heldout-frozen": "fev-v2-standard.yaml",
+    "zero-shot": "fev-v2-pretrained-zero-shot.yaml",
+    "finetune": "fev-v2-pretrained-finetune.yaml",
+    "wide-random": "fev-v2-wide-random.yaml",
+}
 
 
 def _normalize(frame: pd.DataFrame, *, published: bool = False) -> pd.DataFrame:
@@ -60,6 +69,94 @@ def _one_model(frame: pd.DataFrame) -> str:
     if _keys(frame).duplicated().any():
         raise ValueError("duplicate candidate pivot definitions")
     return str(frame.model_name.iloc[0])
+
+
+def _validate_task_set(frame: pd.DataFrame, selector: str, block: str) -> None:
+    from fev.analysis import RESULTS_DTYPES, _load_summaries
+
+    from demand_forecast.bench.specs import load_task_specs
+
+    definitions = pd.DataFrame([asdict(spec.to_task()) for spec in load_task_specs(selector)])
+    # Normalize Python lists and None exactly as fev normalizes CSV summaries;
+    # empty result fields are placeholders, not evaluation evidence.
+    for column in RESULTS_DTYPES:
+        if column not in definitions:
+            definitions[column] = None
+    expected = _keys(_load_summaries(definitions))
+    difference = expected.merge(
+        _keys(frame), how="outer", on=list(expected.columns), indicator=True, validate="one_to_one"
+    )
+    missing = difference.loc[difference._merge == "left_only", expected.columns]
+    extra = difference.loc[difference._merge == "right_only", expected.columns]
+    if not missing.empty or not extra.empty:
+        raise ValueError(
+            f"{block}: preregistered pivot definitions differ; "
+            f"missing={missing.to_dict('records')}; unexpected={extra.to_dict('records')}"
+        )
+
+
+def _recipe(settings) -> dict:
+    values = settings.model_dump(mode="json")
+    del values["data"]
+    del values["forecast"]["horizon"], values["forecast"]["quantiles"]
+    del values["training"]["init_from"]
+    return values
+
+
+def _changed_keys(actual: dict, expected: dict, prefix: str = "") -> list[str]:
+    changes = []
+    for key in sorted(actual.keys() | expected.keys()):
+        path = f"{prefix}{key}"
+        if key not in actual or key not in expected:
+            changes.append(path)
+        elif isinstance(actual[key], dict) and isinstance(expected[key], dict):
+            changes.extend(_changed_keys(actual[key], expected[key], f"{path}."))
+        elif actual[key] != expected[key]:
+            changes.append(path)
+    return changes
+
+
+def _validate_recipes(
+    runs: dict[str, Path], frames: dict[str, pd.DataFrame], configs_dir: Path
+) -> None:
+    from demand_forecast.config import Settings
+
+    expected = {
+        name: _recipe(Settings.from_yaml(configs_dir / filename))
+        for name, filename in RUN_CONFIGS.items()
+    }
+    source = None
+    for name, frame in frames.items():
+        for task in frame.task:
+            label = f"{name}/{task}"
+            report = _json(runs[name] / task / "run.json")
+            try:
+                settings = Settings.model_validate(report.get("settings"))
+            except ValueError as exc:
+                raise ValueError(f"{label}: invalid settings: {exc}") from exc
+            transferred = name in ("zero-shot", "finetune")
+            init_from = settings.training.init_from
+            if transferred and (init_from is None or not init_from.strip()):
+                raise ValueError(f"{label}: training.init_from must be set")
+            if not transferred and init_from is not None:
+                raise ValueError(f"{label}: training.init_from must be unset")
+            if changes := _changed_keys(_recipe(settings), expected[name]):
+                raise ValueError(
+                    f"{label}: settings differ from {RUN_CONFIGS[name]}: {', '.join(changes)}"
+                )
+            if transferred:
+                transfer = report.get("transfer") or {}
+                identity = {}
+                for key in ("pretrain_identity", "model_sha256"):
+                    value = transfer.get(key)
+                    if not isinstance(value, str) or not value.strip():
+                        raise ValueError(f"{label}: transfer.{key} must be set")
+                    if source is not None and value != source[key]:
+                        raise ValueError(
+                            f"{label}: transfer.{key} differs from the experiment source bundle"
+                        )
+                    identity[key] = value
+                source = identity
 
 
 def load_published(directory: Path) -> pd.DataFrame:
@@ -233,6 +330,10 @@ def _provenance(run_dir: Path, row: pd.Series) -> dict:
     source = _json(Path(source_path) / "manifest.json") if source_path else {}
     if source and source.get("pretrain_identity") != transfer.get("pretrain_identity"):
         raise ValueError(f"{task_dir}: pretrain_identity mismatch")
+    if source:
+        source_hash = source.get("sha256", {}).get("model.pt")
+        if not source_hash or source_hash != transfer.get("model_sha256"):
+            raise ValueError(f"{task_dir}: model_sha256 mismatch in source manifest")
     params = None
     if (bundle_dir / "model.pt").exists():
         bundle = load_bundle(bundle_dir, device="cpu")
@@ -261,6 +362,7 @@ def build_report(
     fev_commit: str,
     spend: dict,
     leaked: list[str],
+    configs_dir: Path = DEFAULT_CONFIGS_DIR,
 ) -> str:
     """Build the two comparison blocks; no network or benchmark selection."""
     import fev
@@ -276,6 +378,8 @@ def build_report(
             raise ValueError(f"{name}: expected unique local task names for saved evidence")
         frames[name] = frame
     retail, heldout = frames["frozen"], frames["heldout-frozen"]
+    _validate_task_set(retail, "weekly", "frozen tasks")
+    _validate_task_set(heldout, "heldout", "held-out tasks")
     union = pd.concat([retail, heldout], ignore_index=True)
     if _keys(union).duplicated().any():
         raise ValueError("Frozen and held-out task sets overlap")
@@ -283,6 +387,7 @@ def build_report(
         if len(frames[name]) != len(expected):
             raise ValueError(f"{name}: full task coverage mismatch")
         _align(frames[name], expected, name)
+    _validate_recipes(runs, frames, Path(configs_dir))
     reference = pd.read_csv(baseline / "summaries.csv", float_precision="round_trip")
     reference = reference.loc[reference.model_name == BASELINE]
     published_frame = load_published(published)
@@ -336,6 +441,9 @@ def build_report(
         [
             "# Pretraining comparison\n",
             f"post_hoc: no\n\nfev version: {fev.__version__}; published fev commit: {fev_commit}.\n",
+            "Verified preregistered 7/5 task sets, run recipes equal to the declared configs "
+            "minus per-task data/horizon/quantiles and training.init_from, and one source bundle "
+            "(pretrain_identity and model_sha256) across zero-shot and fine-tuned runs.\n",
             "Each row compares one candidate with 43 published models and our canonical seasonal_naive "
             "baseline (45 models, full coverage). The published Seasonal Naive is excluded. "
             "fev rank follows the returned leaderboard order (win rate); skill rank sorts skill_score "
@@ -382,6 +490,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.add_argument(f"--{name}", type=Path, required=True)
     parser.add_argument("--fev-commit", required=True, choices=[FEV_COMMIT])
     parser.add_argument("--leaked", nargs="*", default=[])
+    parser.add_argument("--configs-dir", type=Path, default=DEFAULT_CONFIGS_DIR)
     args = parser.parse_args(argv)
     try:
         report = build_report(
@@ -391,6 +500,7 @@ def main(argv: list[str] | None = None) -> int:
             args.fev_commit,
             json.loads(args.spend.read_text(encoding="utf-8")),
             args.leaked,
+            configs_dir=args.configs_dir,
         )
     except (OSError, ValueError, KeyError) as exc:
         parser.error(str(exc))

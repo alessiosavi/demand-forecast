@@ -3,8 +3,7 @@
 import importlib
 import json
 import shutil
-import subprocess
-import sys
+from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
@@ -14,6 +13,9 @@ import pytest
 pytest.importorskip("fev")
 pytestmark = pytest.mark.bench
 
+from demand_forecast.bench.run import settings_for_task  # noqa: E402
+from demand_forecast.bench.specs import load_task_specs  # noqa: E402
+from demand_forecast.config import Settings  # noqa: E402
 from scripts import fev_report  # noqa: E402
 from tests.test_bench.test_fev_report import report_template, table  # noqa: E402, F401
 
@@ -191,28 +193,51 @@ def test_covid_task_filtered_by_definition_not_name(comparisons):
     assert board.loc["candidate", "skill_score"] == pytest.approx(0.5)
 
 
-def test_coverage_from_window_metrics(tmp_path, report_template):  # noqa: F811 -- pytest fixture
-    report_module()
-    specs, source, _, _ = report_template
-    summary = pd.read_csv(source / "summaries.csv")
-    baseline = tmp_path / "baseline"
+CONFIGS = SCRIPT.parents[1] / "configs"
+RECIPE_FILES = {
+    "frozen": "fev-v2-standard.yaml",
+    "zero-shot": "fev-v2-pretrained-zero-shot.yaml",
+    "finetune": "fev-v2-pretrained-finetune.yaml",
+    "wide-random": "fev-v2-wide-random.yaml",
+    "heldout-frozen": "fev-v2-standard.yaml",
+}
+
+
+@pytest.fixture
+def experiment(tmp_path, monkeypatch):
+    """Real task/recipe definitions with synthetic summaries and no large models."""
+    module = report_module()
+    weekly, heldout = load_task_specs("weekly"), load_task_specs("heldout")
+    records = []
+    for spec in [*weekly, *heldout]:
+        records.append(
+            {
+                **asdict(spec.to_task()),
+                "task": spec.name,
+                "model_name": "seasonal_naive",
+                "test_error": 1.0,
+                "SQL": 1.0,
+                "training_time_s": 0.0,
+                "inference_time_s": 1.0,
+                "trained_on_this_dataset": False,
+                "fev_version": "0.10.0",
+                "dataset_fingerprint": f"synthetic-{spec.name}",
+                "num_forecasts": 3 * spec.num_windows,
+            }
+        )
+    reference = pd.DataFrame(records)
+    baseline, published = tmp_path / "baseline", tmp_path / "published"
     baseline.mkdir()
-    summary.loc[summary.model_name == "seasonal_naive"].to_csv(
-        baseline / "summaries.csv", index=False
-    )
-    candidates = summary.loc[summary.model_name != "seasonal_naive"].copy()
-    candidates["coverage_80"] = 999  # Neither metric may be read from this column.
-    candidates["MASE"] = 999
-    published = tmp_path / "published"
     published.mkdir()
+    reference.to_csv(baseline / "summaries.csv", index=False)
     for i in range(43):
-        frame = candidates.assign(model_name=f"synthetic-{i:02d}")
+        frame = reference.assign(model_name=f"synthetic-{i:02d}")
         if i in (0, 2):
-            frame.loc[frame.index[0], "dataset_fingerprint"] = "different" if i == 0 else None
+            frame.loc[0, "dataset_fingerprint"] = "different" if i == 0 else None
         elif i == 1:
             frame = frame.drop(columns="num_forecasts").assign(fev_version="0.6.1")
         frame.to_csv(published / f"synthetic-{i:02d}.csv", index=False)
-    candidates.assign(model_name="Seasonal Naive").to_csv(
+    reference.assign(model_name="Seasonal Naive").to_csv(
         published / "seasonal_naive.csv", index=False
     )
     pretrain = tmp_path / "pretrain-bundle"
@@ -221,76 +246,82 @@ def test_coverage_from_window_metrics(tmp_path, report_template):  # noqa: F811 
         json.dumps(
             {
                 "pretrain_identity": "pretraining-identity",
+                "sha256": {"model.pt": "a" * 64},
                 "best_step": 17,
                 "git_sha": "pretrain-sha",
                 "external_diagnostic": {"name": "nn5", "ext_sql": 0.7, "ext_sql_naive": 1.2},
             }
         )
     )
-    args = []
-    for name in ("frozen", "zero-shot", "finetune", "wide-random", "heldout-frozen"):
-        run_dir = tmp_path / name
-        shutil.copytree(source, run_dir)
-        selected = (
-            candidates
+    runs = {}
+    for name, filename in RECIPE_FILES.items():
+        specs = (
+            [*weekly, *heldout]
             if name == "zero-shot"
-            else candidates.loc[
-                candidates.task == ("second" if name == "heldout-frozen" else "first")
-            ]
+            else (heldout if name == "heldout-frozen" else weekly)
         )
-        selected.assign(model_name=name).to_csv(run_dir / "summaries.csv", index=False)
-        if name in ("zero-shot", "finetune"):
-            for spec in specs:
-                path = run_dir / spec.name / "run.json"
-                record = json.loads(path.read_text())
-                record["settings"]["training"]["init_from"] = str(pretrain)
-                record["transfer"] = {"pretrain_identity": "pretraining-identity"}
-                path.write_text(json.dumps(record))
-        args.extend([f"--{name}", str(run_dir)])
-    spend = tmp_path / "spend.json"
-    spend.write_text(
-        json.dumps(
-            {
-                "runs": {
-                    name: {"spend_usd": 1.25, "wall_time_s": 73}
-                    for name in ("frozen", "zero-shot", "finetune", "wide-random", "heldout-frozen")
+        run_dir = runs[name] = tmp_path / name
+        run_dir.mkdir()
+        selected = reference.loc[reference.task.isin([spec.name for spec in specs])].copy()
+        selected["model_name"] = name
+        selected["test_error"] = selected["SQL"] = 0.5
+        selected["run_identity"] = [f"{name}:{task}" for task in selected.task]
+        selected.to_csv(run_dir / "summaries.csv", index=False)
+        for spec in specs:
+            settings = settings_for_task(spec, Settings.from_yaml(CONFIGS / filename), "W-SUN")
+            record = {"run_identity": f"{name}:{spec.name}", "fit_result": {"best_step": 2}}
+            if name in ("zero-shot", "finetune"):
+                settings.training.init_from = str(pretrain)
+                record["transfer"] = {
+                    "pretrain_identity": "pretraining-identity",
+                    "model_sha256": "a" * 64,
                 }
-            }
-        )
-    )
-    output = tmp_path / "REPORT.md"
-    process = subprocess.run(
-        [
-            sys.executable,
-            str(SCRIPT),
-            *args,
-            "--baseline",
-            str(baseline),
-            "--published",
-            str(published),
-            "--fev-commit",
-            "193e4fc",
-            "--spend",
-            str(spend),
-            "--out",
-            str(output),
-            "--leaked",
-            "solar_1W",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-    assert process.returncode == 0, process.stdout + process.stderr
-    report = output.read_text()
+            record["settings"] = settings.model_dump(mode="json")
+            task_dir = run_dir / spec.name
+            task_dir.mkdir()
+            (task_dir / "run.json").write_text(json.dumps(record))
+
+    # Only the dataset-reading boundary is replaced. Task/recipe checks, source
+    # manifests, report rendering, and fev's actual ranking all run normally.
+    def metrics(run_dir, task):
+        return {
+            "coverage_80": [0.75] * task.num_windows,
+            "MASE": [2.0] * task.num_windows,
+            "dataset_fingerprint": f"synthetic-{task.task_name}",
+            "num_forecasts": 3 * task.num_windows,
+            "run_identity": f"{Path(run_dir).name}:{task.task_name}",
+        }
+
+    monkeypatch.setattr(module.fev_report, "window_metrics", metrics)
+    return {
+        "runs": runs,
+        "baseline": baseline,
+        "published": published,
+        "fev_commit": "193e4fc",
+        "spend": {"runs": {name: {"spend_usd": 1.25, "wall_time_s": 73} for name in runs}},
+        "leaked": ["solar_1W"],
+    }
+
+
+def test_preregistered_report(experiment):
+    # Display names are not part of the preregistered pivot definition.
+    for directory in experiment["runs"].values():
+        path = directory / "summaries.csv"
+        pd.read_csv(path).assign(task_name="display alias").to_csv(path, index=False)
+    report = report_module().build_report(**experiment)
+    assert "post_hoc: no" in report and "preregistered 7/5 task sets" in report
+    assert "one source bundle" in report
     rows = table(report, "Comparison")
     assert len(rows) == 6
-    assert {row["block"] for row in rows} == {"frozen tasks", "held-out tasks"}
+    for row in rows:
+        assert len(row["per-task SQL"].split(";")) == (7 if row["block"] == "frozen tasks" else 5)
+        assert row["mean MASE"] == "2" and row["mean coverage_80"] == "0.75"
+        assert row["spend USD"] == "1.25" and row["wall time s"] == "73"
     comparability = table(report, "Comparability")
     assert len(comparability) == 43
     assert [row["model_name"] for row in comparability] == [f"synthetic-{i:02d}" for i in range(43)]
     for i, row in enumerate(comparability):
-        assert row["fingerprint matches"] == ("1/2" if i in (0, 2) else "2/2")
+        assert row["fingerprint matches"] == ("11/12" if i in (0, 2) else "12/12")
         assert row["num_forecasts"] == ("unreported" if i == 1 else "equal")
         assert row["fev_version"] == ("0.6.1" if i == 1 else "0.10.0")
     assert (
@@ -298,7 +329,143 @@ def test_coverage_from_window_metrics(tmp_path, report_template):  # noqa: F811 
         < report.index("## Comparability")
         < report.index("## Leakage")
     )
-    assert "different revision" in report and "where reported" in report
+    assert "different revision" in report and "where reported" in report and "solar_1W" in report
+    transferred = [
+        row for row in table(report, "Provenance") if row["run"] in ("zero-shot", "finetune")
+    ]
+    assert len(transferred) == 19
+    assert all(row["pretrain best step"] == "17" for row in transferred)
+    assert all(
+        row["external SQL"] == "0.7" and row["external naive SQL"] == "1.2" for row in transferred
+    )
+
+
+@pytest.mark.parametrize(
+    "change,match",
+    [
+        ("missing", "frozen tasks.*m5_1W"),
+        ("extra", "frozen tasks.*unexpected-task"),
+        ("swapped", "frozen tasks.*horizon"),
+        ("heldout_frozen", "held-out tasks.*m5_1W"),
+    ],
+)
+def test_preregistered_task_sets_required(experiment, change, match):
+    label = "heldout-frozen" if change == "heldout_frozen" else "frozen"
+    path = experiment["runs"][label] / "summaries.csv"
+    frame = pd.read_csv(path)
+    if change == "missing":
+        frame = frame.iloc[1:]
+        # Maintain internal agreement to demonstrate that a curated six-task
+        # experiment is rejected even when every other run covers those six.
+        for name in ("zero-shot", "finetune", "wide-random"):
+            other_path = experiment["runs"][name] / "summaries.csv"
+            other = pd.read_csv(other_path)
+            other.loc[other.task != "m5_1W"].to_csv(other_path, index=False)
+    elif change == "extra":
+        extra = frame.iloc[:1].assign(task="unexpected-task", dataset_config="unexpected-task")
+        frame = pd.concat([frame, extra], ignore_index=True)
+    elif change == "swapped":
+        frame.loc[0, "horizon"] += 1
+    else:
+        frozen = pd.read_csv(experiment["runs"]["frozen"] / "summaries.csv")
+        frame.iloc[0] = frozen.iloc[0]
+        frame["model_name"] = label
+    frame.to_csv(path, index=False)
+    with pytest.raises(ValueError, match=match):
+        report_module().build_report(**experiment)
+
+
+@pytest.mark.parametrize(
+    "label,section,key,value",
+    [
+        ("frozen", "model", "d_model", 256),
+        ("frozen", "training", "max_steps_cap", 10),
+        ("zero-shot", "training", "init_from", None),
+        ("zero-shot", "training", "zero_shot", False),
+        ("wide-random", "training", "init_from", "unexpected-bundle"),
+        ("zero-shot", "transfer", "model_sha256", "b" * 64),
+        ("finetune", "transfer", "pretrain_identity", "another-source"),
+    ],
+)
+def test_declared_recipes_and_one_source_required(experiment, label, section, key, value):
+    frame = pd.read_csv(experiment["runs"][label] / "summaries.csv")
+    # Last zero-shot task is held out: the source must agree across both blocks.
+    task = frame.task.iloc[-1 if label == "zero-shot" else 0]
+    path = experiment["runs"][label] / task / "run.json"
+    record = json.loads(path.read_text())
+    destination = record["transfer"] if section == "transfer" else record["settings"][section]
+    destination[key] = value
+    if label == "frozen" and section == "model":
+        destination.update(
+            Settings.from_yaml(CONFIGS / RECIPE_FILES["zero-shot"]).model.model_dump()
+        )
+    path.write_text(json.dumps(record))
+    with pytest.raises(ValueError) as error:
+        report_module().build_report(**experiment)
+    assert label in str(error.value) and task in str(error.value) and key in str(error.value)
+
+
+def test_configs_dir_and_normalized_defaults(experiment, tmp_path):
+    configs = tmp_path / "declared-configs"
+    configs.mkdir()
+    for filename in set(RECIPE_FILES.values()):
+        settings = Settings.from_yaml(CONFIGS / filename)
+        settings.log_level = "DEBUG"
+        settings.to_yaml(configs / filename)
+    for directory in experiment["runs"].values():
+        for path in directory.glob("*/run.json"):
+            record = json.loads(path.read_text())
+            record["settings"]["log_level"] = "DEBUG"
+            # Omitted defaults must compare equal to explicit YAML defaults.
+            record["settings"]["training"].pop("val_items_max")
+            path.write_text(json.dumps(record))
+    spend = tmp_path / "spend.json"
+    spend.write_text(json.dumps(experiment["spend"]))
+    out = tmp_path / "report.md"
+    args = [
+        part
+        for name, directory in experiment["runs"].items()
+        for part in (f"--{name}", str(directory))
+    ]
+    args += [
+        "--baseline",
+        str(experiment["baseline"]),
+        "--published",
+        str(experiment["published"]),
+        "--fev-commit",
+        "193e4fc",
+        "--spend",
+        str(spend),
+        "--out",
+        str(out),
+        "--configs-dir",
+        str(configs),
+    ]
+    assert report_module().main(args) == 0
+    assert "post_hoc: no" in out.read_text()
+
+
+@pytest.mark.parametrize("source_hash", ["a" * 64, "b" * 64, None])
+def test_provenance_binds_source_checkpoint(experiment, source_hash):
+    directory = experiment["runs"]["zero-shot"]
+    row = pd.read_csv(directory / "summaries.csv").iloc[0]
+    record = json.loads((directory / row.task / "run.json").read_text())
+    path = Path(record["settings"]["training"]["init_from"]) / "manifest.json"
+    source = json.loads(path.read_text())
+    source["sha256"]["model.pt"] = source_hash
+    path.write_text(json.dumps(source))
+    if source_hash == "a" * 64:
+        result = report_module()._provenance(directory, row)
+        assert result["pretrain identity"] == "pretraining-identity"
+        assert result["pretrain best step"] == 17
+        assert result["external SQL"] == 0.7
+    else:
+        with pytest.raises(ValueError, match="model_sha256"):
+            report_module()._provenance(directory, row)
+
+
+def test_coverage_from_window_metrics(tmp_path, report_template):  # noqa: F811 -- pytest fixture
+    specs, source, _, _ = report_template
     for spec in specs:
         expected_coverage, expected_mase = [], []
         for index, window in enumerate(spec.to_task().iter_windows()):
@@ -322,31 +489,6 @@ def test_coverage_from_window_metrics(tmp_path, report_template):  # noqa: F811 
         metrics = fev_report.window_metrics(source, spec.to_task())
         assert metrics["coverage_80"] == pytest.approx(expected_coverage)
         assert metrics["MASE"] == pytest.approx(expected_mase)
-        for row in rows:
-            if spec.name in row["per-task SQL"]:
-                assert float(row["mean coverage_80"]) == pytest.approx(np.mean(expected_coverage))
-                assert float(row["mean MASE"]) == pytest.approx(np.mean(expected_mase))
-                assert row["spend USD"] == "1.25" and row["wall time s"] == "73"
-    for term in (
-        "post_hoc: no",
-        "solar_1W",
-        "193e4fc",
-        "pretraining-identity",
-        "17",
-        "params",
-        "0.7",
-        "1.2",
-        "training time s",
-        "inference time s",
-        "pretrain-sha",
-    ):
-        assert term in report
-    provenance = table(report, "Provenance")
-    assert all(int(row["params"]) > 0 for row in provenance)
-    transferred = [row for row in provenance if row["run"] in ("zero-shot", "finetune")]
-    assert all(row["pretrain best step"] == "17" for row in transferred)
-    assert all(row["external SQL"] == "0.7" for row in transferred)
-    assert all(row["external naive SQL"] == "1.2" for row in transferred)
 
     # A finite average must not conceal a corrupted prediction cell.
     damaged = tmp_path / "damaged"
