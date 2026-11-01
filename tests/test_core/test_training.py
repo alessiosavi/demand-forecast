@@ -55,6 +55,227 @@ def assert_state_equal(actual, expected):
     assert all(torch.equal(actual[k], v) for k, v in expected.items())
 
 
+def test_fit_prepares_validation_once(
+    tmp_path, monkeypatch, fresh, panel_long, plan_long, encoder_long, caplog
+):
+    from demand_forecast.core import training
+
+    prepare = training.prepare_validation
+    calls = []
+
+    def capture(panel, items, *args, **kwargs):
+        calls.append(items.copy())
+        return prepare(panel, items, *args, **kwargs)
+
+    monkeypatch.setattr(training, "prepare_validation", capture)
+    plan = replace(plan_long, val_items=plan_long.val_items[[1, 5, 7]])
+    cfg = TrainConfig(base_steps=4, batch_size=8, amp=False)
+    forecast = ForecastConfig(horizon=4)
+    with caplog.at_level("INFO"):
+        Trainer(fresh(), cfg, cpu, RUN_ID, SEED).fit(
+            panel_long, plan, forecast, encoder_long, checkpoint_dir=tmp_path, stop_after=2
+        )
+    assert len(calls) == 1
+    assert "validation prepared: items=3 batches=1 bytes=" in caplog.text
+    Trainer(fresh(), cfg, cpu, RUN_ID, SEED).fit(
+        panel_long, plan, forecast, encoder_long, checkpoint_dir=tmp_path, resume=True
+    )
+    assert len(calls) == 2
+    for items in calls:
+        np.testing.assert_array_equal(items, plan.val_items)
+    for skipped in (
+        replace(plan, exception=True),
+        replace(plan, val_items=np.array([], dtype=int)),
+    ):
+        Trainer(fresh(), cfg, cpu, RUN_ID, SEED).fit(panel_long, skipped, forecast, encoder_long)
+    assert len(calls) == 2
+
+
+@pytest.fixture(params=["ordinary", "guarded"])
+def reference_path_case(request, monkeypatch, panel_long):
+    if request.param == "guarded":
+        from demand_forecast.core import training
+
+        for i, series in enumerate(panel_long.series):
+            series.dynamic["promo"] = (
+                np.r_[np.full(30, np.nan), np.full(50, 1e5)],
+                np.r_[1e-9, np.zeros(27), np.full(52, 0.5)],
+                np.r_[100.0 + 1e-6, np.full(27, 100.0), np.full(52, 110.0)],
+            )[i % 3]
+            series.dynamic["oil"][1:3] = [np.inf, -np.inf]
+        monkeypatch.setattr(
+            training, "build_origins", lambda *a, **k: np.array([(i, 28) for i in range(20)])
+        )
+    return request.param
+
+
+def test_fit_matches_reference_path(
+    monkeypatch, fresh, panel_long, plan_long, encoder_long, reference_path_case
+):
+    from demand_forecast.data.sampler import WindowSampler
+    from tests.helpers.reference_batch import reference_batches, reference_evaluate
+
+    cfg = TrainConfig(base_steps=6, batch_size=8, warmup_steps=2, patience=10, amp=False)
+    forecast = ForecastConfig(horizon=4)
+    optimized = Trainer(fresh(), cfg, cpu, RUN_ID, SEED).fit(
+        panel_long, plan_long, forecast, encoder_long
+    )
+    with monkeypatch.context() as patch:
+        patch.setattr(WindowSampler, "batches", reference_batches)
+        reference = Trainer(fresh(), cfg, cpu, RUN_ID, SEED).fit(
+            panel_long, plan_long, forecast, encoder_long, evaluate_fn=reference_evaluate
+        )
+    np.testing.assert_equal(optimized.history, reference.history)
+    assert_state_equal(optimized.best_state, reference.best_state)
+    assert (optimized.best_step, optimized.stop_reason) == (
+        reference.best_step,
+        reference.stop_reason,
+    )
+    for key in ("cold_covariate_columns", "clipped_covariate_values", "floored_covariate_columns"):
+        assert optimized.timings[key] == reference.timings[key]
+        if reference_path_case == "guarded":
+            assert optimized.timings[key] > 0
+
+
+def test_reference_checkpoint_resumes_on_optimized_path(
+    tmp_path, monkeypatch, fresh, panel_long, plan_long, encoder_long, reference_path_case
+):
+    from shutil import copyfile
+
+    from demand_forecast.data.sampler import WindowSampler
+    from tests.helpers.reference_batch import reference_batches, reference_evaluate
+
+    cfg = TrainConfig(base_steps=6, batch_size=8, warmup_steps=2, patience=10, amp=False)
+    forecast = ForecastConfig(horizon=4)
+    reference_dir, optimized_dir = tmp_path / "reference", tmp_path / "optimized"
+    optimized_dir.mkdir()
+    with monkeypatch.context() as patch:
+        patch.setattr(WindowSampler, "batches", reference_batches)
+        interrupted = Trainer(fresh(), cfg, cpu, RUN_ID, SEED).fit(
+            panel_long,
+            plan_long,
+            forecast,
+            encoder_long,
+            checkpoint_dir=reference_dir,
+            stop_after=2,
+            evaluate_fn=reference_evaluate,
+        )
+        assert interrupted.stop_reason == "interrupted"
+        rewrite_scaler_timings(reference_dir / "latest.pt")
+        copyfile(reference_dir / "latest.pt", optimized_dir / "latest.pt")
+        reference_trainer = Trainer(fresh(), cfg, cpu, RUN_ID, SEED)
+        reference = reference_trainer.fit(
+            panel_long,
+            plan_long,
+            forecast,
+            encoder_long,
+            checkpoint_dir=reference_dir,
+            resume=True,
+            evaluate_fn=reference_evaluate,
+        )
+    optimized_trainer = Trainer(fresh(), cfg, cpu, RUN_ID, SEED)
+    optimized = optimized_trainer.fit(
+        panel_long,
+        plan_long,
+        forecast,
+        encoder_long,
+        checkpoint_dir=optimized_dir,
+        resume=True,
+    )
+
+    def equal(actual, expected):
+        if isinstance(expected, torch.Tensor):
+            assert torch.equal(actual, expected)
+        elif isinstance(expected, dict):
+            assert actual.keys() == expected.keys()
+            for key in expected:
+                equal(actual[key], expected[key])
+        elif isinstance(expected, (list, tuple)):
+            assert len(actual) == len(expected)
+            for a, b in zip(actual, expected):
+                equal(a, b)
+        else:
+            np.testing.assert_equal(actual, expected)
+
+    for state in ("model", "optimizer", "scheduler", "scaler"):
+        equal(
+            getattr(optimized_trainer, state).state_dict(),
+            getattr(reference_trainer, state).state_dict(),
+        )
+    assert optimized_trainer.sampler.state() == reference_trainer.sampler.state()
+    assert optimized.timings["scaler_skips"] is reference.timings["scaler_skips"] is None
+    for key in ("cold_covariate_columns", "clipped_covariate_values", "floored_covariate_columns"):
+        assert optimized.timings[key] == reference.timings[key]
+        if reference_path_case == "guarded":
+            assert optimized.timings[key] > 0
+    for field in ("history", "best_state", "best_step", "best_score", "steps", "stop_reason"):
+        equal(getattr(optimized, field), getattr(reference, field))
+    # The saved model is the live optimizer pair; the returned model is best-state.
+    actual = torch.load(optimized_dir / "latest.pt", weights_only=False)
+    expected = torch.load(reference_dir / "latest.pt", weights_only=False)
+    for key in ("model", "optimizer", "scheduler", "scaler", "sampler", "rng", "patience_counter"):
+        equal(actual[key], expected[key])
+
+
+def test_fit_custom_evaluate_fn_keeps_old_call(
+    monkeypatch, fresh, panel_long, plan_long, encoder_long
+):
+    from demand_forecast.core import training
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("custom evaluator must not prepare validation")
+
+    monkeypatch.setattr(training, "prepare_validation", forbidden)
+    model, forecast, calls = fresh(), ForecastConfig(horizon=4), []
+
+    def custom(*args):
+        calls.append(args)
+        return {"SQL": 1.0}
+
+    result = Trainer(model, TrainConfig(base_steps=2, amp=False), cpu, RUN_ID, SEED).fit(
+        panel_long, plan_long, forecast, encoder_long, evaluate_fn=custom
+    )
+    assert len(calls) == 2 and result.best_score == 1.0
+    for args in calls:
+        assert len(args) == 8
+        assert args[0] is model and args[1] is panel_long and args[2] is plan_long.val_items
+        assert args[3:6] == (plan_long.val_origin, 4, forecast.max_context)
+        assert args[6] is encoder_long and args[7] is forecast.quantiles
+
+
+def test_prepare_time_charged_once(
+    tmp_path, monkeypatch, fresh, panel_long, plan_long, encoder_long
+):
+    from demand_forecast.core import training
+
+    now = [0.0]
+    prepare, score = training.prepare_validation, training.evaluate_prepared
+    monkeypatch.setattr(training.time, "perf_counter", lambda: now[0])
+
+    def timed_prepare(*args, **kwargs):
+        result = prepare(*args, **kwargs)
+        now[0] += 7.0
+        return result
+
+    def timed_score(*args, **kwargs):
+        result = score(*args, **kwargs)
+        now[0] += 3.0
+        return result
+
+    monkeypatch.setattr(training, "prepare_validation", timed_prepare)
+    monkeypatch.setattr(training, "evaluate_prepared", timed_score)
+    cfg, forecast = TrainConfig(base_steps=4, amp=False), ForecastConfig(horizon=4)
+    first = Trainer(fresh(), cfg, cpu, RUN_ID, SEED).fit(
+        panel_long, plan_long, forecast, encoder_long, checkpoint_dir=tmp_path, stop_after=2
+    )
+    assert first.timings["eval_s"] == 13.0
+    resumed = Trainer(fresh(), cfg, cpu, RUN_ID, SEED).fit(
+        panel_long, plan_long, forecast, encoder_long, checkpoint_dir=tmp_path, resume=True
+    )
+    assert resumed.timings["eval_s"] == 26.0
+    assert [row["eval_s"] for row in resumed.telemetry] == [3.0] * 4
+
+
 @pytest.mark.parametrize(
     "capability,expected",
     [
@@ -816,6 +1037,7 @@ def test_timing_categories_sum_with_controlled_clock(
         "sessions": 1,
         "peak_cuda_mem_bytes": 0,
         "nonfinite_losses": 0,
+        "scaler_skips": 0,
         "cold_covariate_columns": 0,
         "clipped_covariate_values": 0,
         "floored_covariate_columns": 0,
@@ -909,7 +1131,7 @@ def test_fit_stops_after_consecutive_nonfinite_losses_with_checkpoint_and_progre
 
     monkeypatch.setattr(training, "pinball_loss", invalid_loss)
     monkeypatch.setattr(training.WindowSampler, "batches", counted_batches)
-    for name in ("scale", "unscale_", "step", "update"):
+    for name in ("scale", "unscale_", "step", "update", "get_scale"):
         monkeypatch.setattr(trainer.scaler, name, forbidden)
     monkeypatch.setattr(torch.optim.AdamW, "step", forbidden)
     monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", forbidden)
@@ -921,6 +1143,7 @@ def test_fit_stops_after_consecutive_nonfinite_losses_with_checkpoint_and_progre
     assert training.NONFINITE_STOP_AFTER == 20
     assert result.stop_reason == trainer.terminal_reason == "nonfinite_losses"
     assert result.steps == result.timings["nonfinite_losses"] == trainer.consecutive_nonfinite == 20
+    assert result.timings["scaler_skips"] == 0
     assert len(result.history) == 20 and all(not np.isfinite(r["loss"]) for r in result.history)
     assert result.timings["train_s"] > 0 and result.timings["checkpoint_s"] > 0
     for key, count in diagnostics.items():
@@ -1235,6 +1458,153 @@ def test_cuda_session_reset_and_sampling_points_without_gpu(
         )
     ]
     assert result.timings["peak_cuda_mem_bytes"] == 123
+
+
+class ScriptedScaler:
+    """Exercise overflow skips on CPU without changing AMP/device resolution."""
+
+    scales = (8, 4, 4, 8, 4, 4, 8)
+
+    def __init__(self):
+        self.index = 0
+        self.optimizer_steps = 0
+
+    def is_enabled(self):
+        return True
+
+    def get_scale(self):
+        return self.scales[self.index]
+
+    def scale(self, loss):
+        return loss
+
+    def unscale_(self, optimizer):
+        pass
+
+    def step(self, optimizer):
+        if self.scales[self.index + 1] >= self.get_scale():
+            optimizer.step()
+            self.optimizer_steps += 1
+
+    def update(self):
+        self.index += 1
+
+    def state_dict(self):
+        return {"index": self.index, "optimizer_steps": self.optimizer_steps}
+
+    def load_state_dict(self, state):
+        self.index = state["index"]
+        self.optimizer_steps = state["optimizer_steps"]
+
+
+def rewrite_scaler_timings(path, *, payload="absent", footer="absent"):
+    """Rewrite both timing sources, preserving other fields and serialization."""
+    import json
+    from zipfile import ZipFile
+
+    with ZipFile(path) as archive:
+        member = next(name for name in archive.namelist() if name.endswith("/timings.json"))
+        footer_timings = json.loads(archive.read(member))
+    state = torch.load(path, weights_only=False)
+    for timing, value in ((state["timings"], payload), (footer_timings, footer)):
+        timing.pop("scaler_skips", None)
+        if value != "absent":
+            timing["scaler_skips"] = value
+    torch.save(state, path)
+    with ZipFile(path, "a") as archive:
+        root = archive.namelist()[0].split("/")[0]
+        archive.writestr(f"{root}/timings.json", json.dumps(footer_timings))
+
+
+def test_scaler_skips_counted(fresh, panel_long, plan_long, encoder_long):
+    trainer = Trainer(fresh(), TrainConfig(base_steps=6, amp=False), cpu, RUN_ID, SEED)
+    trainer.scaler = ScriptedScaler()
+    with pytest.warns(UserWarning, match="lr_scheduler.step"):
+        result = trainer.fit(panel_long, plan_long, ForecastConfig(horizon=4), encoder_long)
+    assert type(result.timings["scaler_skips"]) is int
+    assert result.timings["scaler_skips"] == 2
+    assert trainer.scaler.optimizer_steps == 4
+    assert result.steps == trainer.scheduler.last_epoch == 6
+
+
+def test_scaler_skips_cumulative_across_resume(
+    tmp_path, fresh, panel_long, plan_long, encoder_long
+):
+    cfg = TrainConfig(base_steps=6, amp=False)
+    first = Trainer(fresh(), cfg, cpu, RUN_ID, SEED)
+    first.scaler = ScriptedScaler()
+    with pytest.warns(UserWarning, match="lr_scheduler.step"):
+        result = first.fit(
+            panel_long,
+            plan_long,
+            ForecastConfig(horizon=4),
+            encoder_long,
+            checkpoint_dir=tmp_path,
+            stop_after=3,
+        )
+    assert result.timings["scaler_skips"] == 1
+    resumed = Trainer(fresh(), cfg, cpu, RUN_ID, SEED)
+    resumed.scaler = ScriptedScaler()
+    result = resumed.fit(
+        panel_long,
+        plan_long,
+        ForecastConfig(horizon=4),
+        encoder_long,
+        checkpoint_dir=tmp_path,
+        resume=True,
+    )
+    assert result.timings["scaler_skips"] == 2
+    assert resumed.scaler.optimizer_steps == 4
+
+
+def test_scaler_skips_zero_without_scaler(fresh, panel_long, plan_long, encoder_long):
+    trainer = Trainer(fresh(), TrainConfig(base_steps=2, amp=False), cpu, RUN_ID, SEED)
+    assert not trainer.scaler.is_enabled()
+    result = trainer.fit(panel_long, plan_long, ForecastConfig(horizon=4), encoder_long)
+    assert type(result.timings["scaler_skips"]) is int
+    assert result.timings["scaler_skips"] == 0
+
+
+@pytest.mark.parametrize(
+    "payload,footer,expected",
+    [("absent", "absent", None), (7, "absent", 8), ("absent", 9, 10), (7, 9, 10), (7, None, None)],
+)
+def test_scaler_skips_unknown_after_legacy_resume(
+    tmp_path, fresh, panel_long, plan_long, encoder_long, payload, footer, expected
+):
+    cfg = TrainConfig(base_steps=6, amp=False)
+    first = Trainer(fresh(), cfg, cpu, RUN_ID, SEED)
+    first.scaler = ScriptedScaler()
+    with pytest.warns(UserWarning, match="lr_scheduler.step"):
+        first.fit(
+            panel_long,
+            plan_long,
+            ForecastConfig(horizon=4),
+            encoder_long,
+            checkpoint_dir=tmp_path,
+            stop_after=3,
+        )
+    rewrite_scaler_timings(tmp_path / "latest.pt", payload=payload, footer=footer)
+    resumed = Trainer(fresh(), cfg, cpu, RUN_ID, SEED)
+    resumed.scaler = ScriptedScaler()
+    result = resumed.fit(
+        panel_long,
+        plan_long,
+        ForecastConfig(horizon=4),
+        encoder_long,
+        checkpoint_dir=tmp_path,
+        resume=True,
+    )
+    assert result.timings["scaler_skips"] == expected
+    assert resumed.scaler.optimizer_steps == 4
+    import json
+    from zipfile import ZipFile
+
+    saved = torch.load(tmp_path / "latest.pt", weights_only=False)
+    assert saved["timings"]["scaler_skips"] == expected
+    with ZipFile(tmp_path / "latest.pt") as archive:
+        member = next(n for n in archive.namelist() if n.endswith("/timings.json"))
+        assert json.loads(archive.read(member))["scaler_skips"] == expected
 
 
 def test_covariate_counters_accumulate_and_resume(tmp_path, monkeypatch, fresh_for):

@@ -14,7 +14,7 @@ import torch
 from demand_forecast.core.bundle import Bundle, load_bundle
 from demand_forecast.data.frequency import grid_range, steps_between, to_offset, validate_on_grid
 from demand_forecast.data.panel import Panel, Roles
-from demand_forecast.data.sampler import align_to_origin, make_batch
+from demand_forecast.data.sampler import BatchBuilder, align_to_origin
 
 
 @dataclass
@@ -138,6 +138,7 @@ class Predictor:
             for i, series in enumerate(panel.series)
         ]
         batch_panel = align_to_origin(panel, items)
+        builder = BatchBuilder(batch_panel, cfg.horizon, cfg.max_context, self.bundle.encoder)
         predictions = np.empty((len(ids), cfg.horizon, len(cfg.quantiles)), dtype=np.float32)
         model = self.bundle.model
         model.eval()
@@ -151,13 +152,7 @@ class Predictor:
             "device": str(model.fallback_level.device),
         }
         for start in range(0, len(items), batch_size):
-            batch = make_batch(
-                batch_panel,
-                items[start : start + batch_size],
-                cfg.horizon,
-                cfg.max_context,
-                self.bundle.encoder,
-            ).to(model.fallback_level.device)
+            batch = builder.build(items[start : start + batch_size]).to(model.fallback_level.device)
             for name, flag in model.fallback_flags(batch).items():
                 diagnostics[f"fallback_{name}"] += int(flag.sum().item())
             diagnostics["cold_covariate_columns"] += int(batch.cold_covariates.sum().item())

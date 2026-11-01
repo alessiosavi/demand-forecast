@@ -5,7 +5,9 @@ This is the preregistered protocol for the new core path. Exact values come from
 with model and evaluation semantics from the [design, §§5–7](superpowers/specs/2026-10-30-fev-bench-v2-design.md).
 The plan takes precedence where the earlier design differs. PR 0 supplies profiling,
 seasonal-naive baselines and this specification; it does not implement the new trainer.
-**Phase 5 owns all real-data profiling, baselines and model runs on Colab.** Local
+**Phase 5 owns real-data execution: Colab holds the earlier profiling, baseline and quick-run
+evidence; EC2 hosts the frozen run and its environment-validation baselines, prerequisites
+and rehearsals (venue record, 2026-10-31).** Local
 verification uses synthetic fixtures only. No real-data results are claimed here.
 
 ## Tasks and scores
@@ -103,6 +105,23 @@ Use AdamW with linear warm-up over 100 steps, then cosine decay to zero at `max_
 Evaluate every resolved `eval_every` and at the final step when validation is available.
 Restore the absolute best checkpoint. Early stopping fires after five evaluations
 without improvement exceeding the relative tolerance 0.002.
+
+**Attempted-step clarification (2026-10-31).** The LR schedule, `eval_every`,
+`checkpoint_every` and `max_steps` count attempted optimizer steps. A step skipped
+by the fp16 GradScaler still advances the schedule, including warm-up; torch may
+warn `lr_scheduler.step() before optimizer.step()`. Cumulative `scaler_skips`
+reports these skips; legacy checkpoints without that telemetry remain unknown,
+never zero. bf16 and CPU runs do not use the scaler and never skip for this reason.
+Under the 2026-11-01 amendment, non-finite losses bypass backward, optimizer and
+scaler calls entirely; those attempts count in `nonfinite_losses`, not `scaler_skips`.
+No warm-up or schedule amendment is introduced.
+
+**Stop rule reaffirmed (2026-10-31, unchanged).** Early stopping (patience 5,
+`rel_tol=0.002`) operates within each task's frozen 500–12,000-step ceiling.
+Report `steps`, `max_steps`, `best_step` and `stop_reason` per task. No Optuna runs
+are part of this frozen execution. If inner validation still improves at the
+ceiling, any budget study belongs to phase 4, with a preregistered budget and
+decisions based on inner validation only.
 
 One epoch draws exactly one origin per series: a permutation determined by `(seed,
 epoch)`, then a uniform draw among that series' eligible origins. `Settings.seed=0`
@@ -219,6 +238,12 @@ required T4 fp16 acceptance check for the 1e3 covariate bound; these diagnostic
 observations do not claim that acceptance has passed.
 
 ## Persistence and execution evidence
+
+**Execution venue record (2026-10-31).** The user authorised one EC2 g4dn.4xlarge
+(T4, fp16) for the frozen phase-5 run, together with its environment-validation
+baselines, prerequisites and rehearsals. Colab retains the earlier profiling and
+baseline evidence and quick runs. Follow [the EC2 runbook](ec2.md) in gate order;
+this changes the venue, not the model, data, identity or frozen budget.
 
 The trainer persists model, optimizer, scheduler, scaler, RNG states, sampler
 position, step, history, best state/score/step and patience counter. Resume restores RNG

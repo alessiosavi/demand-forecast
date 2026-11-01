@@ -318,6 +318,7 @@ def run_fev(
                     "n_fit_ids": report.get("n_fit_ids"),
                     "n_val_items": report.get("n_val_items"),
                     "nonfinite_losses": cumulative.get("nonfinite_losses"),
+                    "scaler_skips": cumulative.get("scaler_skips"),
                     "sessions": cumulative.get("sessions"),
                 },
                 per_quantile_scores=True,
