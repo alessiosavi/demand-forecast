@@ -60,8 +60,9 @@ def test_boot_unit_and_standalone_bootstrap():
         assert directive in unit.splitlines()
     source = (EC2 / "pretrain-user-data.sh").read_text()
     assert "systemctl enable --now budget-deadline.service" in source
-    assert "/usr/local/sbin/arm-deadline.sh boot\n" in source
-    assert "install -d -o ubuntu -g ubuntu /home/ubuntu/fev/ops" in source
+    assert "/usr/local/sbin/arm-deadline.sh boot" not in source.splitlines()
+    for directory in ("/home/ubuntu/fev", "/home/ubuntu/fev/ops"):
+        assert f"install -d -o ubuntu -g ubuntu {directory}" in source.splitlines()
     assert not re.search(r"\b(python\d*|curl|wget|git|pip)\b", source)
 
 
@@ -77,29 +78,67 @@ def guest(tmp_path):
         "date": f'#!/bin/bash\nif [[ $# == 1 && $1 == +%s ]]; then echo 1793620800; else exec "{date}" "$@"; fi\n',
         "shutdown": '#!/bin/bash\nprintf "%s\\n" "$*" >> "$CALLS"\nif [[ $1 == --show ]]; then echo "$SHOW"; else echo noisy-shutdown; fi\n',
         "busctl": '#!/bin/bash\n[[ ${BUS_FAIL:-0} == 0 ]] || exit 1\nprintf \'(st) "poweroff" %s\\n\' "$SCHEDULED_US"\n',
+        "flock": '#!/bin/bash\n[[ $1 == 9 && -e /dev/fd/9 ]] || exit 1\nprintf "%s\\n" "$1" >> "$LOCK_CALLS"\n',
     }
     for name, source in scripts.items():
         path = tmp_path / name
         path.write_text(source)
         path.chmod(0o755)
     calls = tmp_path / "calls"
+    marker = tmp_path / "budget-deadline.booted"
+    marker.touch()  # Existing set tests model a boot that already completed.
+    lock = tmp_path / "budget-deadline.lock"
+    lock_calls = tmp_path / "lock-calls"
+    helper = tmp_path / "arm-deadline.sh"
+    helper.write_text(
+        (EC2 / "arm-deadline.sh")
+        .read_text()
+        .replace("/run/lock/budget-deadline.lock", str(lock))
+        .replace("/run/budget-deadline.booted", str(marker))
+    )
 
-    def invoke(*args, scheduled="1793622600000000", bus_fail="0", show=""):
+    def invoke(*args, scheduled="1793622600000000", bus_fail="0", show="", fresh_boot=False):
+        if fresh_boot:
+            marker.unlink(missing_ok=True)
         env = dict(
             os.environ,
             PATH=f"{tmp_path}:{os.environ['PATH']}",
             CALLS=str(calls),
+            LOCK_CALLS=str(lock_calls),
             SCHEDULED_US=scheduled,
             BUS_FAIL=bus_fail,
             SHOW=show,
             TZ="Pacific/Honolulu",
         )
-        result = subprocess.run(
-            [bash, str(EC2 / "arm-deadline.sh"), *args], env=env, capture_output=True, text=True
-        )
+        result = subprocess.run([bash, str(helper), *args], env=env, capture_output=True, text=True)
         return result, calls.read_text().splitlines() if calls.exists() else []
 
+    invoke.marker = marker
+    invoke.lock = lock
+    invoke.lock_calls = lock_calls
     return invoke
+
+
+def test_set_requires_current_boot_before_changing_shutdown(guest):
+    result, calls = guest("set", "2026-11-02T12:30:45Z", fresh_boot=True)
+    assert result.returncode == 3
+    assert result.stdout == "DEADLINE_NOT_READY 2026-11-02T12:30:45Z\n"
+    assert calls == []
+    result, _ = guest("boot", scheduled="1793622000000000")
+    assert result.returncode == 0, result.stderr
+    assert guest.marker.exists()
+    result, calls = guest("set", "2026-11-02T12:30:45Z")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "DEADLINE_SET 2026-11-02T12:30:00Z\n"
+    assert calls == ["-c", "-h +20", "-c", "-h 12:30"]
+    assert guest.lock.is_file()
+    assert guest.lock_calls.read_text().splitlines() == ["9", "9", "9"]
+
+
+def test_failed_boot_readback_does_not_mark_ready(guest):
+    result, _ = guest("boot", fresh_boot=True, bus_fail="1", show="no shutdown scheduled")
+    assert result.returncode != 0
+    assert not guest.marker.exists()
 
 
 def test_set_reads_back_utc_and_keeps_stdout_machine_readable(guest):

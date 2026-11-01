@@ -91,9 +91,11 @@ def label(value):
     return value
 
 
-def run_command(cmd):
+def run_command(cmd, timeout=None):
     env = dict(os.environ, AWS_DEFAULT_OUTPUT="json", AWS_PAGER="")
-    return subprocess.run(cmd, check=True, capture_output=True, text=True, env=env).stdout
+    return subprocess.run(
+        cmd, check=True, capture_output=True, text=True, env=env, timeout=timeout
+    ).stdout
 
 
 def missing(exc):
@@ -117,6 +119,8 @@ def ssh_failure(exc):
     # arm-deadline.sh prints its mismatch to stdout and then exits nonzero.
     if "DEADLINE_MISMATCH" in detail:
         return "DEADLINE_MISMATCH", detail, False
+    if re.fullmatch(r"DEADLINE_NOT_READY [^\r\n]+", output):
+        return "BOOT_NOT_READY", detail, True
     if output:
         return "BAD_OUTPUT", detail, False
     if exc.returncode == 127 or (
@@ -266,6 +270,13 @@ class Guard:
 
     def active(self):
         return [s for s in self.ledger["sessions"] if s["status"] in ("open", "pending")]
+
+    def obsolete_schedules(self):
+        return [
+            s
+            for s in self.ledger["sessions"]
+            if s["status"] in ("closed", "cancelled") and not s.get("schedule_deleted", False)
+        ]
 
     def init(self, args):
         if args.market == "spot":
@@ -463,6 +474,11 @@ class Guard:
             if not missing(exc):
                 raise
 
+    def delete_session_schedule(self, session):
+        self.delete_schedule(session["stop_schedule_name"])
+        session["schedule_deleted"] = True
+        self.stage("schedule_deleted")
+
     def discover(self, session=None):
         if session and session.get("instance_id"):
             args = ["--instance-ids", session["instance_id"]]
@@ -487,9 +503,16 @@ class Guard:
         session["instance_id"] = instance["InstanceId"]
         session["public_ip"] = instance.get("PublicIpAddress")
         self.ledger["instance_id"] = instance["InstanceId"]
-        self.ledger["volume_ids"] = [
-            b["Ebs"]["VolumeId"] for b in instance.get("BlockDeviceMappings", []) if "Ebs" in b
-        ]
+        self.ledger["volume_ids"] = list(
+            dict.fromkeys(
+                self.ledger.get("volume_ids", [])
+                + [
+                    b["Ebs"]["VolumeId"]
+                    for b in instance.get("BlockDeviceMappings", [])
+                    if "Ebs" in b
+                ]
+            )
+        )
 
     def volumes(self):
         response = self.aws(
@@ -543,7 +566,12 @@ class Guard:
             else:
                 self.save()
             try:
-                output = self.run(cmd)
+                remaining = (cutoff - self.now()).total_seconds()
+                if remaining <= 0:
+                    break
+                output = self.run(cmd, timeout=min(120, remaining))
+            except subprocess.TimeoutExpired as exc:
+                kind, detail, retry = "COMMAND_TIMEOUT", str(exc), True
             except subprocess.CalledProcessError as exc:
                 kind, detail, retry = ssh_failure(exc)
             except OSError as exc:
@@ -695,6 +723,8 @@ class Guard:
     def begin_session(self, args):
         if self.active():
             raise GuardError("an open or pending session already exists", 6)
+        if self.obsolete_schedules():
+            raise GuardError("obsolete stop schedule pending; run reconcile")
         if not self.config["ready"]:
             raise GuardError("init must confirm the scheduler role first")
         if args.minutes <= 0:
@@ -797,33 +827,107 @@ class Guard:
                     print(f"stop unconfirmed; reservation retained: {stop_error}")
             raise exc
 
-    def settle(self, session, cancelled=False):
+    def stop_time(self, session, instance):
+        """Use the observed transition, or flag the capped asynchronous-stop estimate."""
+        reason = instance.get("StateTransitionReason", "")
+        match = re.search(r"\((\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) GMT\)", reason)
+        called = self.session_txn(session).get("aws_called", session.get("aws_called"))
+        if match:
+            try:
+                stopped = instant(match[1].replace(" ", "T") + "Z")
+                if stopped <= self.now() and (not called or stopped >= instant(called)):
+                    session["stop_time_evidence"] = reason
+                    return stopped, False
+            except ValueError:
+                pass
+        return min(self.now(), instant(session["deadline"]) + timedelta(minutes=25)), True
+
+    def update_stop_time_flag(self):
+        self.ledger["flags"]["STOP_TIME_ESTIMATED"] = any(
+            s.get("stop_time_estimated", False) for s in self.ledger["sessions"]
+        )
+
+    def settle_session(self, session, cancelled=False, instance=None):
         if session["settled_cost_usd"] is None:
             called = self.session_txn(session).get("aws_called", session.get("aws_called"))
+            stopped, estimated = (
+                self.stop_time(session, instance) if instance is not None else (self.now(), False)
+            )
             session["settled_cost_usd"] = (
-                session_cost_usd((self.now() - instant(called)).total_seconds(), self.rate)
+                session_cost_usd((stopped - instant(called)).total_seconds(), self.rate)
                 if called
                 else 0.0
             )
-            session["stopped_at"] = stamp(self.now())
+            session["stopped_at"] = stamp(stopped)
+            session["stop_time_estimated"] = estimated and bool(called)
+            self.update_stop_time_flag()
             session["status"] = "cancelled" if cancelled else "closed"
+            session["schedule_deleted"] = False
             txn = self.session_txn(session)
             txn["status"] = session["status"]
             self.stage(session["status"], txn)
 
-    def stop_session(self, session, cancelled=False):
-        if not session.get("instance_id"):
-            instances = self.discover(session)
+    def stop_session(self, session, cancelled=False, instance=None):
+        if instance is None:
+            try:
+                instances = self.discover(session)
+            except (OSError, ValueError, KeyError, subprocess.CalledProcessError):
+                # Failed accounting discovery must not prevent stopping a known
+                # instance. Keep its reservation until stop-time evidence can
+                # be recovered; the waiter alone cannot date an earlier stop.
+                if session.get("instance_id"):
+                    self.aws(
+                        "ec2", "stop-instances", "--instance-ids", session["instance_id"], "--force"
+                    )
+                    self.aws(
+                        "ec2", "wait", "instance-stopped", "--instance-ids", session["instance_id"]
+                    )
+                raise
             if len(instances) != 1:
                 print("instance absent or ambiguous; pending reservation retained")
                 return
-            self.remember_instance(session, instances[0])
-        self.aws("ec2", "stop-instances", "--instance-ids", session["instance_id"], "--force")
-        self.aws("ec2", "wait", "instance-stopped", "--instance-ids", session["instance_id"])
-        self.settle(session, cancelled=cancelled)
-        self.delete_schedule(session["stop_schedule_name"])
-        session["schedule_deleted"] = True
-        self.stage("schedule_deleted")
+            instance = instances[0]
+        self.remember_instance(session, instance)
+        if instance["State"]["Name"] in ("stopped", "stopping", "terminated"):
+            if instance["State"]["Name"] == "stopping":
+                self.aws(
+                    "ec2", "wait", "instance-stopped", "--instance-ids", session["instance_id"]
+                )
+            self.settle_session(session, cancelled=cancelled, instance=instance)
+        else:
+            self.aws("ec2", "stop-instances", "--instance-ids", session["instance_id"], "--force")
+            self.aws("ec2", "wait", "instance-stopped", "--instance-ids", session["instance_id"])
+            self.settle_session(session, cancelled=cancelled)
+        self.delete_session_schedule(session)
+
+    def settle(self, args):
+        if not args.evidence.strip():
+            raise GuardError("settle requires console evidence")
+        session = next((s for s in self.ledger["sessions"] if s["txn_id"] == args.txn), None)
+        if (
+            session is None
+            or session["status"] not in ("closed", "cancelled")
+            or not session.get("stop_time_estimated")
+        ):
+            raise GuardError("settle requires a session with an estimated stop time")
+        txn = self.session_txn(session)
+        called = instant(txn.get("aws_called", session["aws_called"]))
+        stopped = instant(args.stopped_at)
+        if not called <= stopped <= instant(session["stopped_at"]):
+            raise GuardError("stopped-at must be between aws_called and the recorded estimate")
+        txn["stop_time_correction"] = {
+            "estimated_stopped_at": session["stopped_at"],
+            "stopped_at": stamp(stopped),
+            "evidence": args.evidence,
+        }
+        txn["evidence"] = args.evidence
+        session["stopped_at"] = stamp(stopped)
+        session["settled_cost_usd"] = session_cost_usd(
+            (stopped - called).total_seconds(), self.rate
+        )
+        session["stop_time_estimated"] = False
+        self.update_stop_time_flag()
+        self.stage("stop_time_corrected", txn)
 
     def stop(self, _args):
         self.transaction()
@@ -846,7 +950,7 @@ class Guard:
         txn["evidence"] = args.evidence
         session = next((s for s in self.ledger["sessions"] if s["txn_id"] == args.txn), None)
         if session:
-            self.settle(session, cancelled=True)
+            self.settle_session(session, cancelled=True)
         txn["status"] = "cancelled"
         self.stage("cancelled")
 
@@ -1000,13 +1104,14 @@ class Guard:
             state = instance["State"]["Name"]
             if session:
                 self.remember_instance(session, instance)
-                expired = self.now() > instant(session["deadline"]) + timedelta(minutes=20)
+                expired = state == "running" and self.now() > instant(
+                    session["deadline"]
+                ) + timedelta(minutes=20)
                 if expired:
                     self.ledger["flags"]["EXPIRED_SESSION"] = True
                     self.stage("expired_session")
-                if state in ("stopped", "terminated"):
-                    self.settle(session)
-                    self.delete_schedule(session["stop_schedule_name"])
+                if state in ("stopped", "stopping", "terminated"):
+                    self.stop_session(session, instance=instance)
                 elif state == "running" and not expired and session.get("aws_called"):
                     try:
                         self.read_schedule(self.session_schedule(session))
@@ -1061,7 +1166,7 @@ class Guard:
                 self.stop_session(session)
         # No result is not definitive for unresolved launches. In particular do
         # not clear an expired flag while an expired session is still pending.
-        unresolved_expired = any(
+        unresolved_expired = self.ledger["flags"].get("EXPIRED_SESSION", False) and any(
             self.now() > instant(s["deadline"]) + timedelta(minutes=20) for s in self.active()
         )
         self.ledger["flags"]["EXPIRED_SESSION"] = expired or unresolved_expired
@@ -1084,6 +1189,8 @@ class Guard:
         # stop. A pending extension may conservatively cause an open session to
         # stop until its cleanup schedule has been repaired and verified.
         self.reconcile_instances()
+        for session in self.obsolete_schedules():
+            self.delete_session_schedule(session)
         # An extension can die before or during update-schedule. Its enlarged
         # reservation remains in place and its full desired configuration is
         # replayable once captured. A crash before get-schedule needs discovery.
@@ -1107,6 +1214,7 @@ class Guard:
 
     def status(self, _args):
         self.transaction()
+        self.update_stop_time_flag()
         self.stage("reserved")
         self.storage_status()
         readings = {}
@@ -1153,19 +1261,39 @@ class Guard:
         self.stage("reserved")
         instance_id = self.ledger["instance_id"]
         instances = self.discover()
-        if len(instances) != 1:
-            raise GuardError("instance absence is not definitive; reconcile in the console")
-        if instances[0]["State"]["Name"] in ("running", "pending", "stopping"):
-            self.reconcile_instances()
-        if instances[0]["State"]["Name"] != "terminated":
-            self.aws("ec2", "terminate-instances", "--instance-ids", instance_id, "--force")
-        self.aws("ec2", "wait", "instance-terminated", "--instance-ids", instance_id)
+        if len(instances) > 1:
+            raise GuardError("instance discovery is ambiguous; reconcile in the console")
+        if instances:
+            if instances[0]["State"]["Name"] in ("running", "pending", "stopping"):
+                self.reconcile_instances()
+            if instances[0]["State"]["Name"] != "terminated":
+                self.aws("ec2", "terminate-instances", "--instance-ids", instance_id, "--force")
+            self.aws("ec2", "wait", "instance-terminated", "--instance-ids", instance_id)
         # Wait on each known root volume AND search the tag: a replacement or an
         # attached surviving volume must not silently release the storage hold.
         for volume_id in self.ledger.get("volume_ids", []):
-            self.aws("ec2", "wait", "volume-deleted", "--volume-ids", volume_id)
+            if instances:
+                self.aws("ec2", "wait", "volume-deleted", "--volume-ids", volume_id)
+            else:
+                try:
+                    volumes = self.aws("ec2", "describe-volumes", "--volume-ids", volume_id)[
+                        "Volumes"
+                    ]
+                except subprocess.CalledProcessError as exc:
+                    if "InvalidVolume.NotFound" not in (exc.stderr or ""):
+                        raise
+                else:
+                    if (
+                        len(volumes) != 1
+                        or volumes[0].get("VolumeId") != volume_id
+                        or volumes[0].get("State") != "deleted"
+                    ):
+                        raise GuardError("recorded volume deletion unconfirmed; EBS hold retained")
         if self.storage_status():
             raise GuardError("storage still exists; EBS hold retained")
+        if not instances:
+            self.txn["evidence"] = "instance no longer listed; recorded volumes confirmed deleted"
+            self.stage("termination_confirmed_from_evidence")
         if "ebs" in self.ledger["holds"]:
             hours = (self.now() - instant(self.config["created"])).total_seconds() / 3600
             usd = ebs_hold_usd(
@@ -1181,11 +1309,9 @@ class Guard:
             )
             del self.ledger["holds"]["ebs"]
             self.stage("storage_deleted")
-        for name in dict.fromkeys(
-            [s["stop_schedule_name"] for s in self.ledger["sessions"]]
-            + [self.config["cleanup_schedule_name"]]
-        ):
-            self.delete_schedule(name)
+        for session in self.ledger["sessions"]:
+            self.delete_session_schedule(session)
+        self.delete_schedule(self.config["cleanup_schedule_name"])
         self.ledger["terminated_at"] = stamp(self.now())
         self.finish()
         self.status(args)
@@ -1240,6 +1366,10 @@ def parser():
     cancel = commands.add_parser("cancel")
     cancel.add_argument("--txn", required=True)
     cancel.add_argument("--evidence", required=True)
+    settle = commands.add_parser("settle")
+    settle.add_argument("--txn", required=True)
+    settle.add_argument("--stopped-at", required=True)
+    settle.add_argument("--evidence", required=True)
     hold = commands.add_parser("hold")
     hold.add_argument("--label", type=label, required=True)
     hold.add_argument("--usd", type=finite, required=True)

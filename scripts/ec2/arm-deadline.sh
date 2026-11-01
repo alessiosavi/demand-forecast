@@ -34,12 +34,17 @@ utc_stamp() {
 }
 
 [[ $# -ge 1 ]] || fail 'usage: arm-deadline.sh boot|grace|set <UTC ISO-8601>'
+exec 9>/run/lock/budget-deadline.lock
+flock 9
 case "$1" in
     boot|grace)
         [[ $# == 1 ]] || fail 'boot/grace takes no arguments'
         shutdown -c >&2
         shutdown -h +20 >&2
         scheduled=$(scheduled_usec) || fail 'cannot read back grace deadline'
+        if [[ $1 == boot ]]; then
+            touch /run/budget-deadline.booted
+        fi
         printf 'DEADLINE_GRACE %s\n' "$(utc_stamp "$scheduled")"
         ;;
     set)
@@ -50,6 +55,10 @@ case "$1" in
         now=$(date +%s)
         (( requested > now )) || fail 'deadline must be in the future'
         requested_utc=$(date -u -d "@$requested" +%Y-%m-%dT%H:%M:%SZ)
+        if [[ ! -e /run/budget-deadline.booted ]]; then
+            printf 'DEADLINE_NOT_READY %s\n' "$requested_utc"
+            exit 3
+        fi
         if [[ $(date -u -d "@$requested" +%F) == "$(date -u -d "@$now" +%F)" ]]; then
             when=$(date -u -d "@$requested" +%H:%M)
             # HH:MM in the current minute would schedule tomorrow. Preserve the guard.

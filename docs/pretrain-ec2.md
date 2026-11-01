@@ -87,22 +87,31 @@ termination schedule at `cleanup_by`. On later `start`, the stop schedule is ver
 target and retry policy are checked; retain `status` showing both schedules `verified`.
 
 The self-contained user data installs the deadline helper and unit, creates
-`/home/ubuntu/fev/ops/` owned by `ubuntu`, and needs no repository, Python or network.
+both `/home/ubuntu/fev/` and `/home/ubuntu/fev/ops/` owned by `ubuntu`, and needs no
+repository, Python or network.
 The oneshot unit runs after `multi-user.target` on every boot, cancels any old timer
 and arms 20 minutes of grace. It reads no saved deadline. `DefaultDependencies=no`
 avoids the target ordering cycle. Standard output reaches the journal and console.
-Only `arm-deadline.sh` calls shutdown. Its `set` reply is exactly
+The helper serializes `boot`/`grace` and `set` with `/run/lock/budget-deadline.lock`.
+After arming grace, `boot` writes `/run/budget-deadline.booted`; tmpfs clears that marker
+on reboot. Until it exists, `set` exits 3 with `DEADLINE_NOT_READY <requested UTC>`.
+The user data starts the oneshot synchronously with `enable --now`, without a second
+`boot` call that could overwrite a verified deadline.
+Only `arm-deadline.sh` calls shutdown. Its successful `set` reply is exactly
 `DEADLINE_SET <UTC>`; a time later than requested or over 60 seconds early fails with
-`DEADLINE_MISMATCH`. The AWS stop schedule is the hard runtime backstop once verified.
+`DEADLINE_MISMATCH`. The verified AWS stop schedule provides an independent runtime
+backstop; delivery failure is disclosed in residual case A′ below.
 
 Extract `KEY` from `config.key_path`, `HOST` from the current session's `public_ip`,
 and `INSTANCE` from `instance_id` in the ledger. The guard arms the deadline over batch
 SSH with `StrictHostKeyChecking=accept-new` and a ledger-local known-hosts file
 (`config.known_hosts_path`): the first host key is pinned, a changed key is refused.
 It retries every 20 seconds while sshd or cloud-init is not ready (connection refused
-or timed out, helper not installed yet) until the earlier of the transaction's
-`aws_called + 15 min` and the session deadline, so arming always ends before the guest's
-own boot grace (boot + 20 min) can fire; a `DEADLINE_MISMATCH` or malformed reply fails
+or timed out, helper not installed yet, or `BOOT_NOT_READY`) until the earlier of the
+transaction's `aws_called + 15 min` and the session deadline. Every complete SSH call
+has a timeout of at most 120 seconds and at most the remaining window;
+`COMMAND_TIMEOUT` retries within that same cutoff. Arming therefore ends before the
+guest's own boot grace (boot + 20 min) can fire; a `DEADLINE_MISMATCH` or malformed reply fails
 immediately. Exhaustion or a final reply means exit 4 after a safe stop; the attempts
 are recorded in the session's `arm_attempts`. After the first successful arming, compare
 the pinned key in `known_hosts` with the instance console's host-key fingerprint and
@@ -617,9 +626,22 @@ While **any experiment resource exists**, the operator must run `guard reconcile
 (or `guard watch --interval 300`) **at least every 24 hours**, inspect flags and act.
 `OVERDUE_STORAGE` means storage exists after `cleanup_by`: reconcile/stop any session,
 then **`guard terminate --abandon`**, accepting loss of uncopied data to end exposure.
-`EXPIRED_SESSION` requires reconciliation; never clear the JSON flag by hand.
+`EXPIRED_SESSION` means reconciliation found a running instance past `deadline + 20 min`;
+never clear the JSON flag by hand. An already stopped/stopping/terminated instance
+settles at its UTC `StateTransitionReason` time. Without a usable timestamp, settlement
+uses `min(now, deadline + 25 min)` and `status` flags `STOP_TIME_ESTIMATED`.
+Replace an estimate with console evidence using
+`guard settle --txn "$TXN" --stopped-at "$STOPPED_UTC" --evidence "$EVIDENCE_TEXT"`.
+The evidenced time must be between that session's `aws_called` and recorded estimate,
+inclusive; the command recomputes cost, records the evidence and clears that session's
+estimate flag. It remains available over the enforcement limit.
 `OVER CAP` requires recording/reporting the $47 enforcement breach separately from
 the binding $50 cap. Recovery/recording commands are allowed even over the limit.
+
+Settlement persists `schedule_deleted: false` before deleting the stop schedule, then
+`true` after confirmed deletion. If deletion was interrupted, `start`/`provision`
+refuses with `obsolete stop schedule pending; run reconcile`. Reconciliation retries
+deletion for every settled/cancelled session; an already absent schedule counts as deleted.
 
 For ambiguous transactions, preserve console evidence, then use
 `guard cancel --txn "$TXN" --evidence "$EVIDENCE_TEXT"` only with confirmed disposition.
@@ -634,7 +656,8 @@ under the 24-hour operator recovery assumption, rate $1.0114/h and EBS ≈ $0.63
 
 | Failure | Incremental exposure | Bound | ≈ USD |
 |---|---|---|---|
-| A. Guest bootstrap stalls/fails and operator lost | compute from `deadline + 20` (already funded) until the stop schedule succeeds: 60 s precision + up to 10 retries within 60 min | session stop schedule | ≤ 61 min → **$1.03**; typical < $0.05 |
+| A. Guest bootstrap stalls/fails and operator lost, **while the stop schedule delivers within its retry window** | compute from `deadline + 20` (already funded) until the stop schedule succeeds: 60 s precision + up to 10 retries within 60 min | session stop schedule, conditional on delivery | ≤ 61 min → **$1.03**; typical < $0.05 |
+| A′. Stop schedule delivery fails after its 10 retries / 60 min **AND** the guest grace/deadline failed | compute from the funded reservation end until the next `reconcile` (≤ 24 h): for a 180-min session ≤ **$20.90** plus one EBS day | two independent failures; same class as B′ | **disclosed, not bounded** |
 | B. Operator process dies in the seconds between `run-instances` and schedule creation | the launch trap stops the instance; EBS until the operator's next `reconcile` (≤ 24 h) → `terminate --abandon` | launch trap; recovery assumption | **$0.64** (EBS one day); if the guest grace also fails but the trap ran: still $0.64 |
 | B′. Operator **host** lost in that window (no trap runs) **and** the guest grace fails | compute from the funded reservation end until the next `reconcile` (≤ 24 h): `(24 − (M + 20)/60) h × rate`, for the 180-min provisioning session ≤ **$20.90**, plus one EBS day | none inside the margin: two independent failures inside a window of seconds | **disclosed, not bounded** |
 | C. Termination at `cleanup_by` fails after retries | EBS from `cleanup_by + 24 h` (funded) until the operator's next `reconcile` (≤ 24 h) | `OVERDUE_STORAGE` flag; recovery assumption | **$0.64** |
@@ -642,7 +665,7 @@ under the 24-hour operator recovery assumption, rate $1.0114/h and EBS ≈ $0.63
 | E. Short sessions | none (60-s minimum is inside `session_cost_usd`) | I3 | **0** |
 | F. Transfer retries | none (each attempt reserved first) | I7 | **0** |
 
-Worst single failure **$1.03** (A); worst plausible pair inside the margin **$1.67** (A+B); margin $3 (`cap − enforce`). The double failure B′ is outside the margin and is disclosed as such rather than claimed bounded; the only further mitigation would be a pre-launch AWS-side guard, which this attempt does not build. Outside the recovery assumption the exposure grows at ≈ $0.64/day of EBS, which is why the runbook makes the 24-hour check an operator obligation.
+Worst single failure **$1.03** (A, while the stop schedule delivers within its retry window); worst plausible pair inside the margin **$1.67** (A+B under that condition); margin $3 (`cap − enforce`). A′ and B′ are the disclosed double failures outside the margin, not guaranteed bounds. A pre-launch AWS-side guard would address B′'s launch window; independent stop-delivery protection would be needed for A′. This attempt builds neither. Outside the recovery assumption EBS grows at ≈ $0.64/day, and compute continues if both guest shutdown and AWS stop delivery failed, which is why the runbook makes the 24-hour check an operator obligation.
 
 ## 13. Teardown and final evidence
 
@@ -652,6 +675,12 @@ open/pending session or absent copyback verification unless `--abandon` was expl
 It waits for instance termination and every recorded volume's deletion, checks tagged
 volumes, settles EBS and deletes the session/cleanup schedules. A failed operation
 retains evidence/holds; reconcile and inspect before retrying.
+If a known instance is no longer listed and no session is open/pending, teardown can
+still complete: each recorded volume must be `deleted` or return `InvalidVolume.NotFound`,
+and the tagged-volume search must be empty. The guard records
+`instance no longer listed; recorded volumes confirmed deleted` with the termination
+transaction. A surviving recorded volume retains the EBS hold even if it has lost its
+tag. A launch with no recorded instance ID remains fail-closed; absence alone is not evidence.
 
 **Operator**, after §11 verification:
 
