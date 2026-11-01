@@ -1,0 +1,47 @@
+# Phase B zero-shot evaluation with the placeholder L2 backbone.
+# Standard protocol values are preserved outside model capacity and zero_shot.
+# Supply the pretrained bundle with --init-from.
+data:
+  source: fev
+  id_columns: [item_id]
+  target: target
+  target_support: nonnegative
+forecast:
+  horizon: 13
+  quantiles: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+  max_context: 512
+  min_context: 1
+model:
+  family: v2
+  d_model: 256
+  nhead: 4
+  num_encoder_layers: 4
+  num_decoder_layers: 4
+  dim_feedforward: 1024
+  dropout: 0.1
+  cat_emb_dim: 16
+  hidden_continuous_size: 256
+  stochastic_depth_rate: 0.0
+  use_rope: true
+  use_patch_embedding: false
+  use_decomposition: false
+training:
+  zero_shot: true
+  base_steps: 3000
+  batch_size: 128
+  learning_rate: 0.001
+  weight_decay: 0.01
+  warmup_steps: 100
+  grad_clip: 1.0
+  eval_every: 200
+  patience: 5
+  rel_tol: 0.002
+  amp: true
+  checkpoint_every: 200
+  refit: none
+  min_train_history: null
+tuning:
+  enabled: false
+seed: 0
+device: null
+log_level: INFO

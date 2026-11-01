@@ -237,6 +237,53 @@ def test_quick_config_differs_from_frozen_only_in_declared_fields():
     assert quick == frozen
 
 
+@pytest.mark.parametrize(
+    ("filename", "training_changes"),
+    [
+        ("fev-v2-pretrained-zero-shot.yaml", {"training.zero_shot": True}),
+        (
+            "fev-v2-pretrained-finetune.yaml",
+            {"training.learning_rate": 0.0001, "training.eval_at_start": True},
+        ),
+        (
+            "fev-v2-wide-random.yaml",
+            {"training.learning_rate": 0.0001, "training.eval_at_start": True},
+        ),
+    ],
+)
+def test_experiment_configs_differ_from_standard_only_in_pinned_keys(filename, training_changes):
+    def flatten(values, prefix=""):
+        result = {}
+        for key, value in values.items():
+            name = f"{prefix}{key}"
+            if isinstance(value, dict):
+                result.update(flatten(value, f"{name}."))
+            else:
+                result[name] = value
+        return result
+
+    configs = Path(__file__).resolve().parents[1] / "configs"
+    standard = Settings.from_yaml(configs / "fev-v2-standard.yaml")
+    raw = yaml.safe_load((configs / filename).read_text(encoding="utf-8"))
+    experiment = Settings.model_validate(raw)
+    frozen = flatten(standard.model_dump())
+    actual = flatten(experiment.model_dump())
+    assert actual.keys() == frozen.keys()
+    differences = {key: value for key, value in actual.items() if value != frozen[key]}
+    assert differences == {
+        "model.d_model": 256,
+        "model.num_encoder_layers": 4,
+        "model.num_decoder_layers": 4,
+        "model.dim_feedforward": 1024,
+        "model.hidden_continuous_size": 256,
+        **training_changes,
+    }
+    assert experiment.model.nhead == 4
+    assert "max_steps" not in raw["training"]
+    assert "init_from" not in raw["training"]
+    assert experiment.training.init_from is None
+
+
 @pytest.mark.parametrize("field", ["max_steps_cap", "val_items_max"])
 @pytest.mark.parametrize("value", [0, -1])
 def test_training_config_rejects_nonpositive_quick_fields(field, value):
