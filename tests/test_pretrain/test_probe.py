@@ -16,6 +16,52 @@ pyarrow = pytest.importorskip("pyarrow")
 pytestmark = pytest.mark.bench
 
 
+def test_cli_pretrain_probe_reports_runtime_error(tmp_path, tiny_pretrain_yaml, monkeypatch):
+    from demand_forecast.pretrain import probe
+
+    def fail_probe(*args, **kwargs):
+        raise RuntimeError("probe failed: nonfinite_losses=1")
+
+    monkeypatch.setattr(probe, "pretrain_probe", fail_probe)
+    result = CliRunner().invoke(
+        app,
+        [
+            "pretrain",
+            "probe",
+            "--config",
+            str(tiny_pretrain_yaml),
+            "--out",
+            str(tmp_path / "probe.json"),
+        ],
+    )
+    assert result.exit_code == 1
+    assert result.stderr == "probe failed: nonfinite_losses=1\n"
+    assert result.stdout == ""
+
+
+def test_cli_probe_task_reports_runtime_error(tmp_path, tiny_experiment_yaml, monkeypatch):
+    from demand_forecast.pretrain import probe
+
+    def fail_probe(*args, **kwargs):
+        raise RuntimeError("task probe failed")
+
+    monkeypatch.setattr(probe, "task_probe", fail_probe)
+    result = CliRunner().invoke(
+        app,
+        [
+            "pretrain",
+            "probe-task",
+            "--config",
+            str(tiny_experiment_yaml),
+            "--out",
+            str(tmp_path / "task"),
+        ],
+    )
+    assert result.exit_code == 1
+    assert result.stderr == "task probe failed\n"
+    assert result.stdout == ""
+
+
 def test_cli_pretrain_run_and_probe(tmp_path, tiny_pretrain_yaml):
     out = tmp_path / "o"
     probe = tmp_path / "probe.json"

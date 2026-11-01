@@ -1,0 +1,73 @@
+# Source: https://github.com/autogluon/fev/blob/193e4fcdbafe37bd5f676a00db65cf02ca1f737e/benchmarks/fev_bench/tasks.yaml
+# Commit: 193e4fcdbafe37bd5f676a00db65cf02ca1f737e; five entries copied verbatim except task_name.
+# Held out for zero-shot evaluation and the frozen-config control only.
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0; see THIRD_PARTY_NOTICES.md.
+tasks:
+- dataset_path: autogluon/fev_datasets
+  horizon: 13
+  num_windows: 10
+  seasonality: 1
+  eval_metric: SQL
+  extra_metrics:
+  - MASE
+  - {name: WAPE, epsilon: 1.0}
+  - {name: WQL, epsilon: 1.0}
+  quantile_levels: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+  target: transactions
+  past_dynamic_columns: [oil_price]
+  static_columns: [store_nbr, city, state, type, cluster]
+  dataset_config: favorita_transactions_1W
+- dataset_path: autogluon/fev_datasets
+  horizon: 8
+  num_windows: 5
+  initial_cutoff: '2023-05-01'
+  seasonality: 1
+  eval_metric: SQL
+  extra_metrics:
+  - MASE
+  - {name: WAPE, epsilon: 1.0}
+  - {name: WQL, epsilon: 1.0}
+  quantile_levels: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+  target: orders
+  known_dynamic_columns: [holiday, shops_closed, winter_school_holidays, school_holidays]
+  past_dynamic_columns: [shutdown, mini_shutdown, blackout, mov_change, frankfurt_shutdown, precipitation, snow, user_activity_1, user_activity_2]
+  static_columns: []
+  dataset_config: rohlik_orders_1W
+- dataset_path: autogluon/fev_datasets
+  horizon: 13
+  num_windows: 16
+  seasonality: 1
+  eval_metric: SQL
+  extra_metrics:
+  - MASE
+  - {name: WAPE, epsilon: 1.0}
+  - {name: WQL, epsilon: 1.0}
+  quantile_levels: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+  static_columns: []
+  dataset_config: hospital_admissions_1W
+- dataset_path: autogluon/fev_datasets
+  horizon: 13
+  num_windows: 20
+  seasonality: 1
+  eval_metric: SQL
+  extra_metrics:
+  - MASE
+  - {name: WAPE, epsilon: 1.0}
+  - {name: WQL, epsilon: 1.0}
+  quantile_levels: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+  static_columns: []
+  dataset_config: ercot_1W
+- dataset_path: autogluon/fev_datasets
+  horizon: 13
+  num_windows: 5
+  seasonality: 1
+  eval_metric: SQL
+  extra_metrics:
+  - MASE
+  - {name: WAPE, epsilon: 1.0}
+  - {name: WQL, epsilon: 1.0}
+  quantile_levels: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+  target: cumulative_cases
+  static_columns: []
+  dataset_config: uk_covid_utla_1W

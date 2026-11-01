@@ -57,7 +57,11 @@ def merge_runs(root: Path, names: list[str], allow_partial: bool = False) -> Pat
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-root", type=Path, required=True)
-    parser.add_argument("--tasks", default="weekly")
+    parser.add_argument(
+        "--tasks",
+        default="weekly",
+        help="weekly, heldout, comma-separated weekly names, or task YAML",
+    )
     parser.add_argument("--profiles", type=Path)
     parser.add_argument("--allow-partial", action="store_true")
     args = parser.parse_args(argv)

@@ -153,10 +153,15 @@ def save_bundle(
             shutil.rmtree(backup)
 
 
+def load_bundle_manifest(directory: Path | str) -> dict:
+    """Read bundle provenance without loading or verifying model artifacts."""
+    return json.loads((Path(directory) / "manifest.json").read_text(encoding="utf-8"))
+
+
 def load_bundle(directory: Path | str, device: torch.device | str = "cpu") -> Bundle:
     """Verify artifacts and rebuild the architecture without unpickling Python objects."""
     directory = Path(directory)
-    manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
+    manifest = load_bundle_manifest(directory)
     if manifest["bundle_version"] != BUNDLE_VERSION:
         raise ValueError(f"Unsupported bundle version: {manifest['bundle_version']}")
     for name in _ARTIFACTS:

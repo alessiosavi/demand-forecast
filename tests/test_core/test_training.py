@@ -905,7 +905,7 @@ def test_checkpoint_cadence_warmup_cosine_and_gradient_clipping(
         original_checkpoint(path)
         saved = torch.load(path, weights_only=False)
         checkpoints.append(saved["step"])
-        assert len(saved["history"]) == saved["step"]
+        assert len(saved["history"]) == saved["step"] + int(saved["initial_eval_done"])
 
     monkeypatch.setattr(torch.optim.AdamW, "step", step)
     monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", clip)
@@ -1657,3 +1657,152 @@ def test_covariate_counters_accumulate_and_resume(tmp_path, monkeypatch, fresh_f
     progress = json.loads((tmp_path / "progress.json").read_text())
     for key, value in expected.items():
         assert resumed.timings[key] == progress["timings"][key] == value * 2
+
+
+def test_fit_eval_at_start_runs_once_checkpoints_and_can_select_step_zero(
+    tmp_path, fresh, panel_long, plan_long, encoder_long, monkeypatch
+):
+    model = fresh()
+    trainer = Trainer(
+        model, TrainConfig(base_steps=6, batch_size=4, patience=100, amp=False), cpu, RUN_ID, SEED
+    )
+    scores = iter([0.5, 0.9, 0.8, 0.7, 0.6, 0.6, 0.6])
+    initial = {}
+    forward = model.forward
+
+    def check_before_first_step(batch):
+        if not initial:
+            saved = torch.load(tmp_path / "latest.pt", weights_only=False)
+            assert saved["step"] == 0 and saved["initial_eval_done"] is True
+            assert saved["history"] == [{"step": 0, "SQL": 0.5}]
+            assert saved["optimizer"]["state"] == {}
+            assert saved["telemetry"][0]["train_s_per_step"] is None
+            initial.update(saved["model"])
+            progress = json.loads((tmp_path / "progress.json").read_text())
+            assert progress["step"] == 0 and progress["telemetry_tail"][0]["step"] == 0
+        return forward(batch)
+
+    monkeypatch.setattr(model, "forward", check_before_first_step)
+    result = trainer.fit(
+        panel_long,
+        plan_long,
+        ForecastConfig(horizon=4),
+        encoder_long,
+        checkpoint_dir=tmp_path,
+        eval_at_start=True,
+        evaluate_fn=lambda *a: {"SQL": next(scores)},
+    )
+    assert initial and result.best_step == 0 and result.best_score == 0.5
+    assert [row["step"] for row in result.history] == list(range(7))
+    assert_state_equal(model.state_dict(), initial)
+    assert_state_equal(result.best_state, initial)
+    assert result.telemetry[0]["train_s_per_step"] is None
+    assert all(row["train_s_per_step"] > 0 for row in result.telemetry[1:])
+    saved = torch.load(tmp_path / "latest.pt", weights_only=False)
+    assert len(saved["history"]) == saved["step"] + int(saved["initial_eval_done"])
+
+
+def test_eval_at_start_without_checkpoint_dir_uses_default_directory(
+    tmp_path, monkeypatch, fresh, panel_long, plan_long, encoder_long
+):
+    monkeypatch.chdir(tmp_path)
+    trainer = Trainer(fresh(), TrainConfig(base_steps=1, amp=False), cpu, RUN_ID, SEED)
+    result = trainer.fit(
+        panel_long,
+        plan_long,
+        ForecastConfig(horizon=4),
+        encoder_long,
+        eval_at_start=True,
+        evaluate_fn=lambda *a: {"SQL": 0.5},
+    )
+    saved = torch.load(tmp_path / "checkpoints/latest.pt", weights_only=False)
+    assert saved["initial_eval_done"] is True and result.best_step == 0
+    assert saved["history"][0] == {"step": 0, "SQL": 0.5}
+    assert (tmp_path / "checkpoints/progress.json").is_file()
+
+
+def test_resume_from_step_zero_checkpoint_does_not_reevaluate_but_keeps_schedule(
+    tmp_path, monkeypatch, fresh, panel_long, plan_long, encoder_long
+):
+    cfg = TrainConfig(base_steps=12, batch_size=4, eval_every=2, patience=100, amp=False)
+    args = (panel_long, plan_long, ForecastConfig(horizon=4), encoder_long)
+    trainer = Trainer(fresh(), cfg, cpu, RUN_ID, SEED)
+
+    def crash(batch):
+        raise RuntimeError("crash before first optimizer step")
+
+    monkeypatch.setattr(trainer.model, "forward", crash)
+    with pytest.raises(RuntimeError, match="crash before first"):
+        trainer.fit(
+            *args, checkpoint_dir=tmp_path, eval_at_start=True, evaluate_fn=lambda *a: {"SQL": 0.5}
+        )
+    saved = torch.load(tmp_path / "latest.pt", weights_only=False)
+    assert saved["step"] == 0 and saved["initial_eval_done"] is True
+    assert len(saved["history"]) == 1
+    resumed = Trainer(fresh(), cfg, cpu, RUN_ID, SEED)
+    eval_steps = []
+
+    def later(*args):
+        eval_steps.append(resumed.step)
+        return {"SQL": 0.9}
+
+    result = resumed.fit(
+        *args, checkpoint_dir=tmp_path, resume=True, eval_at_start=True, evaluate_fn=later
+    )
+    assert eval_steps == [2, 4, 6, 8, 10, 12]
+    assert [r["step"] for r in result.history if "SQL" in r] == [0, *eval_steps]
+    assert result.best_step == 0 and result.timings["sessions"] == 2
+    full_trainer = Trainer(fresh(), cfg, cpu, RUN_ID, SEED)
+    full = full_trainer.fit(
+        *args,
+        checkpoint_dir=tmp_path / "full",
+        eval_at_start=True,
+        evaluate_fn=lambda *a: {"SQL": 0.5 if full_trainer.step == 0 else 0.9},
+    )
+    assert result.history == full.history
+    assert_state_equal(result.best_state, full.best_state)
+    assert_state_equal(
+        torch.load(tmp_path / "latest.pt", weights_only=False)["model"],
+        torch.load(tmp_path / "full/latest.pt", weights_only=False)["model"],
+    )
+
+
+@pytest.mark.parametrize("case", ["resume", "legacy_resume", "exception", "no_origins"])
+def test_eval_at_start_skipped_on_resume_exception_plan_and_no_origins(
+    tmp_path, fresh, panel_long, plan_long, encoder_long, case
+):
+    cfg = TrainConfig(base_steps=6, batch_size=4, patience=100, amp=False)
+    plan = plan_long
+    if case == "exception":
+        plan = replace(plan, exception=True)
+    elif case == "no_origins":
+        plan = replace(plan, fit_ids=[])
+    args = (panel_long, plan, ForecastConfig(horizon=4), encoder_long)
+    if "resume" in case:
+        Trainer(fresh(), cfg, cpu, RUN_ID, SEED).fit(
+            *args, checkpoint_dir=tmp_path, stop_after=1, evaluate_fn=lambda *a: {"SQL": 1.0}
+        )
+        if case == "legacy_resume":
+            saved = torch.load(tmp_path / "latest.pt", weights_only=False)
+            saved.pop("initial_eval_done", None)
+            torch.save(saved, tmp_path / "latest.pt")
+    trainer = Trainer(fresh(), cfg, cpu, RUN_ID, SEED)
+
+    def evaluate_later(*args):
+        assert "resume" in case and trainer.step > 1
+        return {"SQL": 1.0}
+
+    result = trainer.fit(
+        *args,
+        checkpoint_dir=tmp_path,
+        resume="resume" in case,
+        eval_at_start=True,
+        evaluate_fn=evaluate_later,
+    )
+    assert all(row["step"] > 0 for row in result.history)
+    assert trainer.initial_eval_done is False
+    if case == "no_origins":
+        assert result.steps == 0 and result.stop_reason == "no_training_data"
+    else:
+        saved = torch.load(tmp_path / "latest.pt", weights_only=False)
+        assert len(saved["history"]) == saved["step"] and not saved["initial_eval_done"]

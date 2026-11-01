@@ -154,6 +154,46 @@ def test_aligned_fixture_identity_pinned_at_67d4bd7(tmp_path, config, expected):
     )
 
 
+@pytest.mark.parametrize(
+    "config,expected",
+    [
+        ("tiny", "0109546d94a7e19ca25a3d8e427e46af981b5f04ee5a5ca772cc610d0397e03a"),
+        ("frozen", "576741a436a27e53d0643128fc79169f9ccf0a1906c5141eed60c71f7c0a0250"),
+    ],
+)
+def test_identity_unchanged_with_new_fields_unset(tmp_path, config, expected):
+    spec = fixture_spec(write_fev_fixture(tmp_path))
+    settings = (
+        tiny_settings(base_steps=20, d_model=16)
+        if config == "tiny"
+        else Settings.from_yaml(
+            Path(__file__).resolve().parents[2] / "configs/fev-v2-standard.yaml"
+        )
+    )
+    settings.training = type(settings.training).model_validate(
+        {
+            **settings.training.model_dump(),
+            "init_from": None,
+            "zero_shot": False,
+            "eval_at_start": False,
+        }
+    )
+    task = spec.to_task()
+    _, future = task.get_window(0).get_input_data()
+    origin = resolved_origin(window_origins(future, spec.id_column, spec.timestamp_column))
+    assert (
+        run_identity(
+            settings_for_task(spec, settings, task.freq),
+            settings.seed,
+            dataset_fingerprint(task),
+            __version__,
+            origin,
+            spec.task_definition(),
+        )
+        == expected
+    )
+
+
 @pytest.mark.parametrize("quick", [False, True])
 def test_interrupted_training_before_first_bundle_resumes_and_changed_config_is_rejected(
     tmp_path,
@@ -1088,3 +1128,79 @@ def test_legacy_npz_keeps_original_diagnostics_and_sums_present_counters(
         else:
             assert pd.isna(rebuilt[key].iloc[0])
     assert file_states(out / spec.name) == before
+
+
+def test_cli_fev_run_zero_shot_tiny_end_to_end(tmp_path, tiny_pretrained_bundle_dir, monkeypatch):
+    pytest.importorskip("pyarrow")
+    from demand_forecast.core.bundle import load_bundle
+
+    spec = fixture_spec(write_fev_fixture(tmp_path / "data"))
+    definition = asdict(spec)
+    roles = {
+        spec.name: {key: definition.pop(key) for key in ("categorical_statics", "target_support")}
+    }
+    tasks, profiles = tmp_path / "tasks.yaml", tmp_path / "roles.yaml"
+    tasks.write_text(yaml.safe_dump({"tasks": [definition]}))
+    profiles.write_text(yaml.safe_dump(roles))
+    root = Path(__file__).resolve().parents[2]
+    raw = yaml.safe_load((root / "configs/fev-v2-pretrained-zero-shot.yaml").read_text())
+    raw["model"] = tiny_settings().model.model_dump(mode="json")
+    raw["device"] = "cpu"
+    raw["forecast"]["max_context"] = 64
+    config = tmp_path / "tiny.yaml"
+    config.write_text(yaml.safe_dump(raw))
+    out = tmp_path / "out"
+    monkeypatch.setattr(Trainer, "fit", lambda *a, **k: pytest.fail("zero-shot trained"))
+    args = [
+        "fev",
+        "run",
+        "--tasks",
+        str(tasks),
+        "--profiles",
+        str(profiles),
+        "--config",
+        str(config),
+        "--init-from",
+        str(tiny_pretrained_bundle_dir),
+        "--out-dir",
+        str(out),
+    ]
+    result = CliRunner().invoke(app, args)
+    assert result.exit_code == 0, result.output
+    frame = pd.read_csv(out / "summaries.csv")
+    assert len(frame) == 1 and frame.training_time_s.iloc[0] == 0.0
+    assert frame.num_forecasts.iloc[0] == 12 and np.isfinite(frame.SQL.iloc[0])
+    bundle = load_bundle(out / spec.name / "bundle")
+    report = json.loads((out / spec.name / "run.json").read_text())
+    assert bundle.manifest["zero_shot"] is True
+    assert report["fit_result"]["stop_reason"] == "zero_shot"
+    assert (
+        report["transfer"]["pretrain_identity"]
+        == load_bundle(tiny_pretrained_bundle_dir).manifest["pretrain_identity"]
+    )
+    before = file_states(out)
+    result = CliRunner().invoke(app, [*args, "--resume"])
+    assert result.exit_code == 0, result.output
+    assert file_states(out) == before
+    # Baseline fixtures add the evidence required by the strict report auditor.
+    run_baseline([spec], out)
+    process = subprocess.run(
+        [
+            sys.executable,
+            str(root / "scripts/fev_report.py"),
+            "--run-dir",
+            str(out),
+            "--tasks",
+            str(tasks),
+            "--profiles",
+            str(profiles),
+            "--out",
+            str(out / "report.md"),
+        ],
+        text=True,
+        capture_output=True,
+        timeout=60,
+    )
+    assert process.returncode == 0, process.stdout + process.stderr
+    text = (out / "report.md").read_text()
+    assert "zero_shot" in text and report["transfer"]["pretrain_identity"][:8] in text

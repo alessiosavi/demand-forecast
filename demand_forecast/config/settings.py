@@ -112,6 +112,9 @@ class TrainingConfig(BaseModel):
     min_train_history: int | None = Field(None, ge=1)
     max_steps_cap: int | None = Field(None, ge=1)
     val_items_max: int | None = Field(None, ge=1)
+    init_from: str | None = None
+    zero_shot: bool = False
+    eval_at_start: bool = False
 
 
 class TuningConfig(BaseModel):

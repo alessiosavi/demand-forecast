@@ -32,15 +32,15 @@ class PretrainTrainingConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     max_steps: int = Field(ge=1)
-    batch_size: int = 128
-    learning_rate: float = 5e-4
-    weight_decay: float = 0.01
-    warmup_steps: int = 2000
-    grad_clip: float = 1.0
-    eval_every: int = 5000
-    checkpoint_every: int = 1000
+    batch_size: int = Field(128, ge=1)
+    learning_rate: float = Field(5e-4, gt=0)
+    weight_decay: float = Field(0.01, ge=0)
+    warmup_steps: int = Field(2000, ge=0)
+    grad_clip: float = Field(1.0, gt=0)
+    eval_every: int = Field(5000, ge=1)
+    checkpoint_every: int = Field(1000, ge=1)
     amp: bool = True
-    val_batch_size: int = 128
+    val_batch_size: int = Field(128, ge=1)
 
 
 class _PretrainForecastConfig(ForecastConfig):

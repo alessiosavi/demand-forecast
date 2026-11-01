@@ -98,7 +98,7 @@ def _local_path(dataset_path: str | Path) -> Path | None:
 
 
 def load_task_specs(selector: str | Path, profiles: Path | None = None) -> list[FevTaskSpec]:
-    """Read ``weekly``, comma-separated weekly names, or a ``tasks:`` YAML file.
+    """Read ``weekly``, ``heldout``, comma-separated weekly names, or task YAML.
 
     Profiles map task names to ``target_support`` and ``categorical_statics``.
     Custom YAML may supply ``name`` (or fev's ``task_name``); otherwise the
@@ -111,7 +111,10 @@ def load_task_specs(selector: str | Path, profiles: Path | None = None) -> list[
     if custom_yaml:
         definitions = yaml.safe_load(path.read_text(encoding="utf-8"))
     else:
-        definitions = yaml.safe_load(resources.joinpath("fev_bench_weekly.yaml").read_text())
+        filename = (
+            "fev_bench_weekly_heldout.yaml" if selector == "heldout" else "fev_bench_weekly.yaml"
+        )
+        definitions = yaml.safe_load(resources.joinpath(filename).read_text())
     if not isinstance(definitions, dict) or not isinstance(definitions.get("tasks"), list):
         raise ValueError("task YAML must contain a tasks list")
 
@@ -136,7 +139,7 @@ def load_task_specs(selector: str | Path, profiles: Path | None = None) -> list[
 
     names = (
         list(named_tasks)
-        if custom_yaml or selector == "weekly"
+        if custom_yaml or selector in ("weekly", "heldout")
         else [name.strip() for name in str(selector).split(",")]
     )
     specs = []

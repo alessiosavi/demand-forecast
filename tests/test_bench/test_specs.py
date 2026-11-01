@@ -1,5 +1,6 @@
 from dataclasses import fields
 from importlib.resources import files
+from pathlib import Path
 
 import pytest
 import yaml
@@ -20,6 +21,81 @@ WEEKLY_NAMES = [
     "hermes",
     "hierarchical_sales_1W",
 ]
+
+HELDOUT_NAMES = [
+    "favorita_transactions_1W",
+    "rohlik_orders_1W",
+    "hospital_admissions_1W",
+    "ercot_1W",
+    "uk_covid_utla_1W",
+]
+
+
+def test_load_heldout_specs_preserve_preregistered_tasks():
+    specs = load_task_specs("heldout")
+    assert [spec.name for spec in specs] == HELDOUT_NAMES
+    assert [spec.horizon for spec in specs] == [13, 8, 13, 13, 13]
+    assert [spec.num_windows for spec in specs] == [10, 5, 16, 20, 5]
+    assert [spec.target for spec in specs] == [
+        "transactions",
+        "orders",
+        "target",
+        "target",
+        "cumulative_cases",
+    ]
+    assert [len(spec.known_dynamic) for spec in specs] == [0, 4, 0, 0, 0]
+    assert [len(spec.past_dynamic) for spec in specs] == [1, 9, 0, 0, 0]
+    assert [len(spec.static_columns) for spec in specs] == [5, 0, 0, 0, 0]
+    assert [spec.initial_cutoff for spec in specs] == [None, "2023-05-01", None, None, None]
+
+
+def test_heldout_profiles_declare_support():
+    profiles = yaml.safe_load(
+        files("demand_forecast.bench").joinpath("tasks/profiles.yaml").read_text()
+    )
+    for name in HELDOUT_NAMES:
+        categorical_statics = (
+            ["store_nbr", "city", "state", "type", "cluster"]
+            if name == "favorita_transactions_1W"
+            else []
+        )
+        assert profiles[name] == {
+            "target_support": "nonnegative",
+            "categorical_statics": categorical_statics,
+        }
+    for spec in load_task_specs("heldout"):
+        assert spec.target_support == profiles[spec.name]["target_support"]
+        assert spec.categorical_statics == profiles[spec.name]["categorical_statics"]
+
+
+def test_weekly_selector_still_seven():
+    specs = load_task_specs("weekly")
+    assert len(specs) == 7
+    assert [spec.name for spec in specs] == WEEKLY_NAMES
+    assert not set(HELDOUT_NAMES) & {spec.name for spec in specs}
+
+
+def test_heldout_to_task_matches_upstream_definition_except_task_name():
+    # Independent upstream excerpts retain the UK task_name that the local set drops.
+    upstream = yaml.safe_load(
+        (Path(__file__).parent / "fixtures/fev_heldout_193e4fc.yaml").read_text()
+    )["tasks"]
+    definitions = yaml.safe_load(
+        files("demand_forecast.bench").joinpath("tasks/fev_bench_weekly_heldout.yaml").read_text()
+    )["tasks"]
+    assert [definition["dataset_config"] for definition in upstream] == HELDOUT_NAMES
+    for spec, definition, original in zip(
+        load_task_specs("heldout"), definitions, upstream, strict=True
+    ):
+        assert definition == {key: value for key, value in original.items() if key != "task_name"}
+        actual, expected = spec.to_task(), fev.Task(**original)
+        assert actual.task_name == spec.name
+        for field in fields(fev.Task):
+            if field.name != "task_name":
+                assert getattr(actual, field.name) == getattr(expected, field.name), (
+                    spec.name,
+                    field.name,
+                )
 
 
 def test_load_weekly_specs_have_profiles():

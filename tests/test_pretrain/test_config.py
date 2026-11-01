@@ -100,6 +100,46 @@ def test_pretrain_training_rejects_nonpositive_max_steps(max_steps):
         PretrainTrainingConfig(max_steps=max_steps)
 
 
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("learning_rate", 0),
+        ("learning_rate", -1e-4),
+        ("grad_clip", 0),
+        ("grad_clip", -1),
+        ("weight_decay", -0.01),
+        ("warmup_steps", -1),
+        ("batch_size", 0),
+        ("eval_every", 0),
+        ("checkpoint_every", 0),
+        ("val_batch_size", 0),
+    ],
+)
+def test_pretrain_training_rejects_invalid_controls(field, value):
+    from demand_forecast.pretrain.config import PretrainTrainingConfig
+
+    with pytest.raises(ValidationError, match=field):
+        PretrainTrainingConfig(max_steps=1, **{field: value})
+
+
+def test_pretrain_training_accepts_boundary_controls():
+    from demand_forecast.pretrain.config import PretrainTrainingConfig
+
+    cfg = PretrainTrainingConfig(
+        max_steps=1,
+        learning_rate=1e-8,
+        grad_clip=1e-8,
+        weight_decay=0,
+        warmup_steps=0,
+        batch_size=1,
+        eval_every=1,
+        checkpoint_every=1,
+        val_batch_size=1,
+    )
+    assert cfg.weight_decay == cfg.warmup_steps == 0
+    assert cfg.learning_rate == cfg.grad_clip == 1e-8
+
+
 def test_pretrain_identity_ignores_root_and_tracks_shards():
     from demand_forecast.pretrain.config import PretrainConfig, pretrain_identity
 

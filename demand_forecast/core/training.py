@@ -47,6 +47,22 @@ def _empty_timings() -> dict:
     )
 
 
+def _set_fallback_level(model: ForecastModel, panel: Panel, fit_indices, train_upto) -> None:
+    """Use only observed fit targets through the permitted training boundary."""
+    observed = []
+    cutoff_positions = {}
+    for i in fit_indices:
+        series = panel.series[i]
+        key = (series.start, series.history_length)
+        if key not in cutoff_positions:
+            grid = grid_range(series.start, series.history_length, panel.freq)
+            cutoff_positions[key] = int(grid.searchsorted(train_upto, side="right"))
+        values = series.target[: cutoff_positions[key]]
+        observed.append(values[~np.isnan(values)])
+    values = np.concatenate(observed) if observed else np.empty(0)
+    model.fallback_level.fill_(float(np.median(values)) if values.size else 0.0)
+
+
 class InterruptedRun(RuntimeError):  # noqa: N818 - public interruption signal from the run protocol
     """A checkpointed training session ended before a bundle could be written."""
 
@@ -166,6 +182,7 @@ class Trainer:
         resume: bool = False,
         stop_after: int | None = None,
         evaluate_fn=evaluate,
+        eval_at_start: bool = False,
     ) -> FitResult:
         """Fit the permitted split, or continue its checkpoint without reseeding.
 
@@ -173,6 +190,8 @@ class Trainer:
         supplied without a directory, checkpoints default to ``checkpoints/``.
         Checkpoints retain the live optimizer/model pair; best weights are
         restored only when training completes, never on interruption.
+        ``eval_at_start`` selects and checkpoints the untrained model exactly
+        once before any optimizer step, also defaulting to ``checkpoints/``.
         Non-finite losses skip backward, optimizer and all scaler operations,
         but advance the scheduler and step count. Skipping the first optimizer
         update therefore produces PyTorch's expected scheduler-order warning.
@@ -186,7 +205,7 @@ class Trainer:
             raise ValueError("batch_size, checkpoint_every and patience must be positive")
         if self.cfg.warmup_steps < 0:
             raise ValueError("warmup_steps must be nonnegative")
-        if checkpoint_dir is None and (stop_after is not None or resume):
+        if checkpoint_dir is None and (stop_after is not None or resume or eval_at_start):
             checkpoint_dir = Path("checkpoints")
             logger.info("checkpoint_dir not supplied; using %s", checkpoint_dir)
         checkpoint_path = Path(checkpoint_dir) / "latest.pt" if checkpoint_dir is not None else None
@@ -201,18 +220,7 @@ class Trainer:
         fit_indices = [i for i, series in enumerate(panel.series) if series.series_id in fit_ids]
         origins = build_origins(panel, horizon, forecast_cfg.min_context, upto=plan.train_upto)
         origins = origins[np.isin(origins[:, 0], fit_indices)]
-        observed = []
-        cutoff_positions = {}
-        for i in fit_indices:
-            series = panel.series[i]
-            key = (series.start, series.history_length)
-            if key not in cutoff_positions:
-                grid = grid_range(series.start, series.history_length, panel.freq)
-                cutoff_positions[key] = int(grid.searchsorted(plan.train_upto, side="right"))
-            values = series.target[: cutoff_positions[key]]
-            observed.append(values[~np.isnan(values)])
-        values = np.concatenate(observed) if observed else np.empty(0)
-        self.model.fallback_level.fill_(float(np.median(values)) if values.size else 0.0)
+        _set_fallback_level(self.model, panel, fit_indices, plan.train_upto)
 
         self.sampler = WindowSampler(
             panel,
@@ -229,6 +237,7 @@ class Trainer:
         self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, self._lr_factor)
         self.step, self.best_step, self.patience_counter = 0, 0, 0
         self.consecutive_nonfinite = 0
+        self.initial_eval_done = False
         self.terminal_reason: str | None = None
         self.history: list[dict] = []
         self.best_score: float | None = None
@@ -273,6 +282,49 @@ class Trainer:
                 prepared.nbytes,
                 build_s,
             )
+
+        if (
+            eval_at_start
+            and not plan.exception
+            and origins.size > 0
+            and self.step == 0
+            and not self.initial_eval_done
+        ):
+            eval_started = time.perf_counter()
+            if prepared is not None:
+                metrics = evaluate_prepared(self.model, prepared, forecast_cfg.quantiles)
+            else:
+                metrics = evaluate_fn(
+                    self.model,
+                    panel,
+                    plan.val_items,
+                    plan.val_origin,
+                    horizon,
+                    max_context,
+                    encoder,
+                    forecast_cfg.quantiles,
+                )
+            self.history.append({"step": 0, **metrics})
+            self._select_best(float(metrics["SQL"]))
+            self.initial_eval_done = True
+            self.model.train()
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
+            eval_s = time.perf_counter() - eval_started
+            self.timings["eval_s"] += eval_s
+            self._sample_peak()
+            self.telemetry.append(
+                {
+                    "step": 0,
+                    "elapsed_s": sum(
+                        self.timings[key] for key in ("train_s", "eval_s", "checkpoint_s")
+                    ),
+                    "train_s_per_step": None,
+                    "eval_s": eval_s,
+                    "peak_cuda_mem_bytes": self.timings["peak_cuda_mem_bytes"],
+                }
+            )
+            self.checkpoint(checkpoint_path)
 
         quantiles = torch.tensor(forecast_cfg.quantiles, device=self.device)
         self.model.train()
@@ -494,6 +546,7 @@ class Trainer:
             "sampler": self.sampler.state(),
             "sampler_seed": self.sampler.seed,
             "history": self.history,
+            "initial_eval_done": self.initial_eval_done,
             "best_state": self.best_state,
             "best_score": self.best_score,
             "best_step": self.best_step,
@@ -555,6 +608,7 @@ class Trainer:
         # payload may supply it; the measured ZIP footer takes precedence.
         self.timings["scaler_skips"] = None
         self.consecutive_nonfinite = state.get("consecutive_nonfinite", 0)
+        self.initial_eval_done = state.get("initial_eval_done", False)
         self.terminal_reason = state.get("terminal_reason")
         self.timings.update(state.get("timings", {}))
         with ZipFile(path) as archive:

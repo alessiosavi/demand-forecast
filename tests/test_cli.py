@@ -272,6 +272,8 @@ def test_run_identity_canonical_json(run_settings):
     for key in ("max_steps_cap", "val_items_max"):
         if settings["training"][key] is None:
             del settings["training"][key]
+    for key in ("init_from", "zero_shot", "eval_at_start"):
+        del settings["training"][key]
     payload = {
         "settings": settings,
         "seed": 3,
@@ -606,3 +608,87 @@ def test_train_cli_nonfinite_training_exits_1_with_stderr_and_no_bundle(
     resumed = runner.invoke(app, [*args, "--resume"])
     assert resumed.exit_code == 1 and expected in resumed.stderr
     assert not (out / "bundle").exists() and not (out / "run.json").exists()
+
+
+@pytest.mark.parametrize("command", ["train", "fev"])
+def test_cli_init_from_merge_rejects_empty_and_list_roots_and_handles_missing_training(
+    tmp_path, monkeypatch, command
+):
+    import yaml
+
+    from tests.helpers.settings import tiny_settings
+
+    config = tmp_path / "config.yaml"
+    source = tmp_path / "pretrained"
+    source.mkdir()
+    args = ["train", "--out"] if command == "train" else ["fev", "run", "--out-dir"]
+    args += [str(tmp_path / "out"), "--config", str(config)]
+    target = (
+        "demand_forecast.core.run.train_from_settings"
+        if command == "train"
+        else "demand_forecast.bench.run.run_fev"
+    )
+    captured = []
+
+    def capture(*args, **kwargs):
+        captured.append(args[0] if command == "train" else args[1])
+        return tmp_path / "out/bundle"
+
+    monkeypatch.setattr(target, capture)
+    for raw, message in [
+        (None, "config root must be a mapping"),
+        ([], "config root must be a mapping"),
+        ({"training": []}, "training must be a mapping"),
+        ({"training": None}, "training must be a mapping"),
+    ]:
+        config.write_text(yaml.safe_dump(raw))
+        for override in ([], ["--init-from", str(source)]):
+            result = runner.invoke(app, [*args, *override])
+            assert result.exit_code == 2 and message in result.output, result.output
+    assert not captured
+    raw = tiny_settings().model_dump(mode="json")
+    del raw["training"]
+    config.write_text(yaml.safe_dump(raw))
+    result = runner.invoke(app, [*args, "--init-from", str(source)])
+    assert result.exit_code == 0, result.output
+    assert captured[-1].training.init_from == str(source)
+    raw["training"] = {"init_from": "yaml-source", "learning_rate": 0.0001}
+    config.write_text(yaml.safe_dump(raw))
+    result = runner.invoke(app, [*args, "--init-from", str(source)])
+    assert result.exit_code == 0, result.output
+    assert captured[-1].training.init_from == str(source)
+    assert captured[-1].training.learning_rate == 0.0001
+    result = runner.invoke(app, args)
+    assert result.exit_code == 0 and captured[-1].training.init_from == "yaml-source"
+
+
+def test_cli_shipped_zero_shot_yaml_resolves(tmp_path, monkeypatch):
+    from demand_forecast.config import Settings
+
+    config = Path(__file__).resolve().parents[1] / "configs/fev-v2-pretrained-zero-shot.yaml"
+    settings = Settings.from_yaml(config)
+    assert settings.training.zero_shot and settings.training.init_from is None
+    source = tmp_path / "pretrained"
+    source.mkdir()
+    captured = []
+
+    def capture(specs, settings, *args, **kwargs):
+        captured.append(settings)
+
+    monkeypatch.setattr("demand_forecast.bench.run.run_fev", capture)
+    result = runner.invoke(
+        app,
+        [
+            "fev",
+            "run",
+            "--config",
+            str(config),
+            "--out-dir",
+            str(tmp_path / "out"),
+            "--init-from",
+            str(source),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert captured[0].training.zero_shot and captured[0].training.init_from == str(source)
+    assert captured[0].model.d_model == 256

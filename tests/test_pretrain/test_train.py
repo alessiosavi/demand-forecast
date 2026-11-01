@@ -10,6 +10,34 @@ pyarrow = pytest.importorskip("pyarrow")
 pytestmark = pytest.mark.bench
 
 
+@pytest.mark.parametrize("kernel_synth_every", [1, 10])
+def test_pretrain_requires_kernel_shards_when_enabled(tiny_pretrain_cfg, kernel_synth_every):
+    from demand_forecast.pretrain.train import _PretrainLoop
+
+    cfg = tiny_pretrain_cfg
+    cfg.corpus.kernel_synth_shards = []
+    cfg.corpus.kernel_synth_every = kernel_synth_every
+    with pytest.raises(ValueError) as error:
+        loop = _PretrainLoop(cfg)
+        loop.sampler.close()
+    assert str(error.value) == "kernel_synth_every > 0 requires at least one kernel_synth shard"
+
+
+def test_pretrain_accepts_no_kernel_shards_when_disabled(tiny_pretrain_cfg):
+    from demand_forecast.pretrain.train import _PretrainLoop
+
+    cfg = tiny_pretrain_cfg
+    cfg.corpus.kernel_synth_shards = []
+    cfg.corpus.kernel_synth_every = 0
+    loop = _PretrainLoop(cfg)
+    try:
+        for _ in range(cfg.training.max_steps):
+            loop.next_batch()
+            assert loop.sampler.last_kind == "tsmixup"
+    finally:
+        loop.sampler.close()
+
+
 def test_pretrain_runs_saves_bundle_and_history(tmp_path, tiny_pretrain_cfg):
     from demand_forecast.core.bundle import load_bundle
     from demand_forecast.pretrain.train import pretrain

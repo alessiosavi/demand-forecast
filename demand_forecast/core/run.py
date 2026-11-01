@@ -18,14 +18,17 @@ import torch
 
 from demand_forecast import __version__
 from demand_forecast.config import Settings
-from demand_forecast.core.bundle import load_bundle, save_bundle
+from demand_forecast.core.bundle import load_bundle, load_bundle_manifest, save_bundle
 from demand_forecast.core.training import (
     NONFINITE_STOP_AFTER,
     InterruptedRun,
     NonFiniteTraining,
     TrainConfig,
     Trainer,
+    _empty_timings,
+    _set_fallback_level,
 )
+from demand_forecast.core.transfer import init_from_pretrained
 from demand_forecast.core.validation import plan_inner_validation, subsample_validation
 from demand_forecast.data.encoders import StaticEncoder
 from demand_forecast.data.frequency import grid_range, validate_on_grid
@@ -39,11 +42,24 @@ logger = logging.getLogger(__name__)
 
 
 def _identity_settings(settings: Settings) -> dict:
-    """Preserve legacy identities by omitting only unset quick-validation controls."""
+    """Preserve legacy defaults and identify initialization by bundle provenance."""
     payload = settings.model_dump(mode="json")
-    for key in ("max_steps_cap", "val_items_max"):
-        if payload["training"][key] is None:
-            payload["training"].pop(key)
+    training = payload["training"]
+    for key in ("max_steps_cap", "val_items_max", "init_from"):
+        if training[key] is None:
+            training.pop(key)
+    for key in ("zero_shot", "eval_at_start"):
+        if training[key] is False:
+            training.pop(key)
+    if settings.training.init_from is not None:
+        path = Path(settings.training.init_from)
+        manifest = load_bundle_manifest(path)
+        if "pretrain_identity" not in manifest:
+            raise ValueError(f"Bundle {path} is missing pretrain_identity")
+        training["init_from"] = {
+            "pretrain_identity": manifest["pretrain_identity"],
+            "model_sha256": manifest["sha256"]["model.pt"],
+        }
     return payload
 
 
@@ -125,6 +141,8 @@ def train_panel(
     ``earliest_origin`` defaults to ``origin`` and sets the bundle's global
     permissible forecast floor, not a guarantee about any individual item's past.
     """
+    if settings.training.zero_shot and not settings.training.init_from:
+        raise ValueError("zero_shot requires init_from")
     _check_refit(settings)
     started = time.perf_counter()
     origin, out_dir = pd.Timestamp(origin), Path(out_dir)
@@ -194,31 +212,98 @@ def train_panel(
     )
     backbone_kwargs = settings.model.backbone_kwargs()
     model = build_model(settings.model.family, spec, backbone_kwargs)
-    cfg = TrainConfig(
-        **settings.training.model_dump(exclude={"refit", "min_train_history", "val_items_max"})
-    )
+    transfer = None
+    if settings.training.init_from:
+        source = load_bundle(settings.training.init_from, device="cpu")
+        transferred = init_from_pretrained(model, source)
+        transfer = {
+            "pretrain_identity": source.manifest["pretrain_identity"],
+            "model_sha256": source.manifest["sha256"]["model.pt"],
+            "copied": transferred.copied,
+            "zeroed": transferred.zeroed,
+            "fresh": transferred.fresh,
+        }
+        del source
     device = resolve_device(settings)
-    trainer = Trainer(model, cfg, device, identity, settings.seed)
-    fit_started = time.perf_counter()
-    result = trainer.fit(
-        panel,
-        plan,
-        settings.forecast,
-        encoder,
-        checkpoint_dir=out_dir / "checkpoints",
-        resume=resume,
-        stop_after=stop_after,
-    )
-    training_time_s = time.perf_counter() - fit_started
-    if result.stop_reason == "nonfinite_losses":
-        raise NonFiniteTraining(
-            f"Training stopped after {NONFINITE_STOP_AFTER} consecutive non-finite losses "
-            f"at step {result.steps}; checkpoint {checkpoint}"
+    if settings.training.zero_shot:
+        fit_ids = set(plan.fit_ids)
+        fit_indices = [i for i, series in enumerate(panel.series) if series.series_id in fit_ids]
+        _set_fallback_level(model, panel, fit_indices, plan.train_upto)
+        model.to(device)
+        fit_started = time.perf_counter()
+        training_time_s = 0.0
+        fit_result = {
+            "steps": 0,
+            "best_step": 0,
+            "best_score": None,
+            "stop_reason": "zero_shot",
+            "nonfinite_losses": 0,
+        }
+        resolved_budget = {"max_steps": 0, "eval_every": 0}
+        n_val_items, amp_dtype, telemetry = 0, None, []
+        timings = _empty_timings() | {"sessions": 1}
+        _write_run(
+            out_dir / "checkpoints/progress.json",
+            {
+                "run_identity": identity,
+                "step": 0,
+                "stop_reason": "zero_shot",
+                **resolved_budget,
+                "n_fit_ids": len(plan.fit_ids),
+                "n_val_items": 0,
+                "exception": False,
+                "device": str(device),
+                "amp_dtype": None,
+                "timings": timings,
+                "telemetry_tail": [],
+            },
         )
-    if result.stop_reason == "interrupted":
-        raise InterruptedRun(
-            f"Training interrupted at step {result.steps}; resume from {checkpoint}"
+    else:
+        cfg = TrainConfig(
+            **settings.training.model_dump(
+                exclude={
+                    "refit",
+                    "min_train_history",
+                    "val_items_max",
+                    "init_from",
+                    "zero_shot",
+                    "eval_at_start",
+                }
+            )
         )
+        trainer = Trainer(model, cfg, device, identity, settings.seed)
+        fit_started = time.perf_counter()
+        result = trainer.fit(
+            panel,
+            plan,
+            settings.forecast,
+            encoder,
+            checkpoint_dir=out_dir / "checkpoints",
+            resume=resume,
+            stop_after=stop_after,
+            eval_at_start=settings.training.eval_at_start,
+        )
+        training_time_s = time.perf_counter() - fit_started
+        if result.stop_reason == "nonfinite_losses":
+            raise NonFiniteTraining(
+                f"Training stopped after {NONFINITE_STOP_AFTER} consecutive non-finite losses "
+                f"at step {result.steps}; checkpoint {checkpoint}"
+            )
+        if result.stop_reason == "interrupted":
+            raise InterruptedRun(
+                f"Training interrupted at step {result.steps}; resume from {checkpoint}"
+            )
+        fit_result = {
+            "steps": result.steps,
+            "best_step": result.best_step,
+            "best_score": result.best_score,
+            "stop_reason": result.stop_reason,
+            "nonfinite_losses": result.timings["nonfinite_losses"],
+        }
+        resolved_budget = {"max_steps": trainer.max_steps, "eval_every": trainer.eval_every}
+        n_val_items = len(plan.val_items)
+        amp_dtype = str(trainer.amp_dtype).removeprefix("torch.") if trainer.amp else None
+        timings, telemetry = result.timings, result.telemetry
 
     report = {
         "run_identity": identity,
@@ -231,13 +316,13 @@ def train_panel(
         "task_definition": task_definition,
         "resumed_from_step": resumed_from_step,
         "device": str(device),
-        "resolved_budget": {"max_steps": trainer.max_steps, "eval_every": trainer.eval_every},
+        "resolved_budget": resolved_budget,
         "n_fit_ids": len(plan.fit_ids),
-        "n_val_items": len(plan.val_items),
+        "n_val_items": n_val_items,
         "val_items_max": settings.training.val_items_max,
         "n_val_items_eligible": len(eligible.val_items),
-        "amp_dtype": str(trainer.amp_dtype).removeprefix("torch.") if trainer.amp else None,
-        "telemetry": result.telemetry,
+        "amp_dtype": amp_dtype,
+        "telemetry": telemetry,
         "plan": {
             "train_upto": plan.train_upto.isoformat(),
             "val_origin": plan.val_origin.isoformat(),
@@ -245,20 +330,16 @@ def train_panel(
             "exception": plan.exception,
             "fit_ids": plan.fit_ids,
         },
-        "fit_result": {
-            "steps": result.steps,
-            "best_step": result.best_step,
-            "best_score": result.best_score,
-            "stop_reason": result.stop_reason,
-            "nonfinite_losses": result.timings["nonfinite_losses"],
-        },
+        "fit_result": fit_result,
         # Session timings exclude serialization and earlier interrupted sessions.
         "timings": {
             "setup_time_s": fit_started - started,
             "training_time_s": training_time_s,
-            "cumulative": result.timings,
+            "cumulative": timings,
         },
     }
+    if transfer is not None:
+        report["transfer"] = transfer
     report = _finite_json(report)
     save_bundle(
         bundle_dir,
@@ -279,6 +360,7 @@ def train_panel(
             "resumed_from_step": resumed_from_step,
             "training_time_s": training_time_s,
             "run": report,
+            **({"zero_shot": True} if settings.training.zero_shot else {}),
         },
     )
     _write_run(report_path, report)
