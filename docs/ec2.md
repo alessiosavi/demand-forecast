@@ -836,7 +836,11 @@ parser.add_argument("--validation-bounds", type=Path, required=True)
 args = parser.parse_args()
 root = args.root
 tasks = args.tasks.split(",")
-assert tasks and len(tasks) == len(set(tasks)) and set(tasks) <= set(os.environ["ALL_TASKS"].split(","))
+assert (
+    tasks
+    and len(tasks) == len(set(tasks))
+    and set(tasks) <= set(os.environ["ALL_TASKS"].split(","))
+)
 tot_gpu = tot_rss = 0
 for task in tasks:
     base = root / task
@@ -868,7 +872,9 @@ for task in tasks:
         b = bounds[task]
         h, c = run["settings"]["forecast"]["horizon"], run["settings"]["forecast"]["max_context"]
         enc, dec, num, cats = (b[k] for k in ("n_enc", "n_dec", "n_numeric", "n_categorical"))
-        assert all(isinstance(v, int) and v >= 0 for v in (h, c, enc, dec, num, cats, b["max_history"]))
+        assert all(
+            isinstance(v, int) and v >= 0 for v in (h, c, enc, dec, num, cats, b["max_history"])
+        )
         assert h > 0 and c > 0
         per_item = (
             6 * c
