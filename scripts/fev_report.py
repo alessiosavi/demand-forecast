@@ -68,16 +68,16 @@ def _bytes(directory: Path) -> int:
     return sum(path.stat().st_size for path in directory.rglob("*") if path.is_file())
 
 
-def _window_evidence(task, spec, task_dir, identity, issues):
+def _window_evidence(task, task_dir, identity, issues):
     windows, diagnostics, metrics = [], [], []
     forecast_count = excluded_pairs = excluded_cells = excluded_sql = 0
     for index, window in enumerate(task.iter_windows()):
         past, _ = window.get_input_data()
         truth = window.get_ground_truth()
-        item_ids = [str(row[spec.id_column]) for row in truth]
+        item_ids = [str(row[task.id_column]) for row in truth]
         forecast_count += len(item_ids)
         row = {
-            "task": spec.name,
+            "task": task.task_name,
             "window": index,
             "fallback_no_context": None,
             "fallback_undefined_scale": None,
@@ -92,43 +92,46 @@ def _window_evidence(task, spec, task_dir, identity, issues):
                     raise ValueError("run identity mismatch")
                 # Reuse the runner's strict missing/duplicate/extra-id checks.
                 aligned = predictions_for_fev(
-                    saved["ids"].tolist(), saved["arrays"], item_ids, spec.quantile_levels
+                    saved["ids"].tolist(), saved["arrays"], item_ids, task.quantile_levels
                 )
                 arrays = np.asarray(
-                    [[item[str(q)] for q in spec.quantile_levels] for item in aligned],
+                    [[item[str(q)] for q in task.quantile_levels] for item in aligned],
                     dtype=np.float64,
                 ).transpose(0, 2, 1)
-                if arrays.shape != (len(item_ids), spec.horizon, len(spec.quantile_levels)):
+                if arrays.shape != (len(item_ids), task.horizon, len(task.quantile_levels)):
                     raise ValueError("forecast horizon does not match task")
                 diagnostic = prediction_diagnostics(saved)
             if diagnostic is None:
-                issues.append(f"{spec.name}: window_{index}.npz diagnostics unknown (legacy)")
+                issues.append(f"{task.task_name}: window_{index}.npz diagnostics unknown (legacy)")
             else:
                 row.update(diagnostic)
                 _required(
                     diagnostic,
                     ("fallback_no_context", "fallback_undefined_scale", "inference_time_s"),
-                    spec.name,
+                    task.task_name,
                     f"window_{index}",
                     issues,
                 )
                 if not diagnostic["device"]:
-                    issues.append(f"{spec.name}: window_{index} device unknown")
+                    issues.append(f"{task.task_name}: window_{index} device unknown")
             diagnostics.append(diagnostic)
-            if not np.isfinite(arrays).all():
-                issues.append(f"{spec.name}: window_{index} non-finite predictions")
-            labels = np.asarray([row[spec.target] for row in truth], dtype=np.float64)
+            finite_predictions = np.isfinite(arrays).all()
+            if not finite_predictions:
+                issues.append(f"{task.task_name}: window_{index} non-finite predictions")
+            labels = np.asarray([row[task.target] for row in truth], dtype=np.float64)
             past_by_id = {
-                str(row[spec.id_column]): np.asarray(row[spec.target], dtype=np.float64)
+                str(row[task.id_column]): np.asarray(row[task.target], dtype=np.float64)
                 for row in past
             }
             histories = [past_by_id[key] for key in item_ids]
             metrics.append(
-                summarize(labels, arrays, histories, spec.seasonality, spec.quantile_levels)
+                summarize(labels, arrays, histories, task.seasonality, task.quantile_levels)
             )
-            scales = seasonal_error_per_item(histories, spec.seasonality)
+            if finite_predictions:
+                row.update({key: metrics[-1][key] for key in ("coverage_80", "MASE")})
+            scales = seasonal_error_per_item(histories, task.seasonality)
             with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
-                scaled = quantile_loss(labels, arrays, spec.quantile_levels) / scales[:, None, None]
+                scaled = quantile_loss(labels, arrays, task.quantile_levels) / scales[:, None, None]
             nonfinite = ~np.isfinite(scaled)
             observed = ~np.isnan(labels)
             # Missing labels are counted separately, without inflating the pair count.
@@ -136,11 +139,11 @@ def _window_evidence(task, spec, task_dir, identity, issues):
             excluded_cells += int((~observed).sum())
             excluded_sql += int(nonfinite.sum())
         except (OSError, ValueError, KeyError, TypeError, RuntimeError) as exc:
-            issues.append(f"{spec.name}: window_{index}.npz missing/invalid: {exc}")
+            issues.append(f"{task.task_name}: window_{index}.npz missing/invalid: {exc}")
             # Keep one entry per expected window, including partial runs.
             if len(diagnostics) <= index:
                 diagnostics.append(None)
-    complete = len(metrics) == spec.num_windows
+    complete = len(metrics) == task.num_windows
     averaged = (
         {key: float(np.mean([m[key] for m in metrics])) for key in metrics[0]}
         if complete and metrics
@@ -148,13 +151,13 @@ def _window_evidence(task, spec, task_dir, identity, issues):
     )
     _required(
         averaged,
-        [*METRICS, "coverage_80", "width_80", *[f"pinball_{q}" for q in spec.quantile_levels]],
-        spec.name,
+        [*METRICS, "coverage_80", "width_80", *[f"pinball_{q}" for q in task.quantile_levels]],
+        task.task_name,
         "recomputed",
         issues,
     )
     total = {
-        "task": spec.name,
+        "task": task.task_name,
         "coverage_80": averaged.get("coverage_80"),
         "width_80": averaged.get("width_80"),
         "excluded_item_window_pairs": excluded_pairs if complete else None,
@@ -171,6 +174,33 @@ def _window_evidence(task, spec, task_dir, identity, issues):
         else None
     )
     return windows, total, averaged, forecast_count
+
+
+def window_metrics(run_dir: Path, task) -> dict:
+    """Recompute per-window coverage_80 and MASE from saved predictions for a fev.Task.
+
+    Also return the loaded dataset fingerprint, forecast count and run identity
+    so a caller can check that the metrics belong to its evaluation summaries.
+    Legacy timing diagnostics are not needed for these two metrics.
+    """
+    if not isinstance(task.target, str):
+        raise ValueError("window_metrics requires a univariate task")
+    task_dir = Path(run_dir) / task.task_name
+    issues: list[str] = []
+    report = _read_json(task_dir / "run.json", issues, task.task_name)
+    fingerprint = dataset_fingerprint(task)
+    rows, _, _, count = _window_evidence(task, task_dir, report.get("run_identity"), issues)
+    result = {key: [row.get(key) for row in rows] for key in ("coverage_80", "MASE")}
+    if len(rows) != task.num_windows or any(
+        not _finite(value) for values in result.values() for value in values
+    ):
+        raise ValueError(f"{task.task_name}: incomplete window metrics: {'; '.join(issues)}")
+    return {
+        **result,
+        "dataset_fingerprint": fingerprint,
+        "num_forecasts": count,
+        "run_identity": report.get("run_identity"),
+    }
 
 
 def build_report(
@@ -311,7 +341,7 @@ def build_report(
             # Guard the whole iteration, including failures creating or advancing
             # task.iter_windows() outside the helper's per-window handler.
             window_rows, total, averaged, forecast_count = _window_evidence(
-                task, spec, task_dir, identity, issues
+                task, task_dir, identity, issues
             )
             windows.extend(window_rows)
             diagnostics.append(total)
