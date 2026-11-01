@@ -6,12 +6,8 @@ batches → shared `ForecastModel` with a `V2Backbone` → trainer → inference
 
 Use these sources for the current contract:
 
-- [Design specification](superpowers/specs/2026-10-30-fev-bench-v2-design.md),
-  especially §§4–6 for data, model and training contracts and §8 for migration.
-- [Implementation plan](superpowers/plans/2026-10-31-fev-core-v2.md) for the exact
-  phase-0–3 scope, defaults and acceptance checks.
-- [Settings schema](../demand_forecast/config/settings.py) for the implemented
-  configuration, and the [README module inventory](../README.md#package-modules)
+- [Settings schema](https://github.com/alessiosavi/demand-forecast/blob/main/demand_forecast/config/settings.py) for the implemented
+  configuration, and the [README module inventory](https://github.com/alessiosavi/demand-forecast/blob/main/README.md#package-modules)
   for current package paths.
 - [Frozen evaluation protocol](protocol.md) and [Colab workflow](colab.md).
 

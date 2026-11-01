@@ -1,10 +1,8 @@
 # Frozen fev protocol
 
-This is the preregistered protocol for the new core path. Exact values come from the
-[implementation plan's Global Constraints](superpowers/plans/2026-10-31-fev-core-v2.md),
-with model and evaluation semantics from the [design, §§5–7](superpowers/specs/2026-10-30-fev-bench-v2-design.md).
-The plan takes precedence where the earlier design differs. PR 0 supplies profiling,
-seasonal-naive baselines and this specification; it does not implement the new trainer.
+This document is the sole authority for the preregistered frozen fev protocol on the
+core v2 path. It defines the configuration, model and evaluation contracts, execution
+rules and dated amendments. Runbooks apply these requirements to the authorised venues.
 **Phase 5 owns real-data execution: Colab holds the earlier profiling, baseline and quick-run
 evidence; EC2 hosts the frozen run and its environment-validation baselines, prerequisites
 and rehearsals (venue record, 2026-10-31).** Local
@@ -13,9 +11,9 @@ verification uses synthetic fixtures only. No real-data results are claimed here
 ## Tasks and scores
 
 Use the seven definitions pinned to `fev==0.10.0` in
-[`fev_bench_weekly.yaml`](../demand_forecast/bench/tasks/fev_bench_weekly.yaml).
+[`fev_bench_weekly.yaml`](https://github.com/alessiosavi/demand-forecast/blob/main/demand_forecast/bench/tasks/fev_bench_weekly.yaml).
 Supplementary roles and required target support come from
-[`profiles.yaml`](../demand_forecast/bench/tasks/profiles.yaml); all seven declare
+[`profiles.yaml`](https://github.com/alessiosavi/demand-forecast/blob/main/demand_forecast/bench/tasks/profiles.yaml); all seven declare
 `target_support: nonnegative`.
 
 | Task | Horizon H | Windows | Seasonality m |
@@ -163,9 +161,9 @@ Forecast fallbacks are deterministic, finite and logged:
 
 Standard training uses `max_context=512`. Optional future tuning may consider
 `[2H, max(64, 2H), 256, 512]`, deduplicated with a cap of 512. Selection remains on
-inner validation only; no tuning is authorized by prompt 00. Phase 4 owns tuning,
-`refit: full` and `per_window`; preregister any later tuning trial/time budget before
-running it. Other families and `dhf` need their own reviewed configurations.
+inner validation only; no tuning is authorized by prompt 00. Tuning,
+`refit: full` and `per_window` are deferred; preregister any later tuning trial/time
+budget before running it. Other families and `dhf` need their own reviewed configurations.
 
 The frozen policy is **`first_window`**, one seed (0). Train/select once on the first
 window's available past; reuse that bundle and learned preprocessing for later
@@ -262,11 +260,11 @@ model for baselines). They do not validate training run identities or checkpoint
 partially completed task. Use a new output directory whenever code, task definitions,
 role profiles or data change. Preserve the dataset cache between resumed sessions.
 
-Phase 5 must record the immutable code SHA, dependency lock, dataset revisions and
+For the frozen run, record the immutable code SHA, dependency lock, dataset revisions and
 fingerprints, task definitions, seed, policy, budgets, hardware/dtype, failures,
 fallback/exclusion counts, timings and measured peak RAM/VRAM. An interruption/resume
 trial precedes the frozen model run, and no frozen v2 score is viewed before the
-phase-5 prerequisites pass. Phase-5 evidence includes `checkpoints/progress.json`, per-window
+prerequisites pass. Execution evidence includes `checkpoints/progress.json`, per-window
 NPZ diagnostics and the tables produced by `scripts/fev_report.py`. Use [the Colab template](colab.md) and
 [prompt 00](colab/prompts/00-profile-and-baselines.md) for the first profiling/baseline
 session. No Timestral weights are downloaded.
@@ -300,3 +298,122 @@ fresh output path. Older twelve-column CSVs are rejected and left unchanged.
 The seven tasks are univariate. For custom multivariate tasks, shares cover all target
 columns, and scale pools observed lag differences across target columns within each
 item; item counts still count dataset rows. Profiles never train or evaluate a model.
+
+## Definitions and contracts
+
+### Inputs and sample frame
+
+Calendar features are sine/cosine pairs. Pandas weekly offsets use week-of-year and month. Day offsets and fixed-duration ticks of at least one day use weekday, day-of-month, day-of-year, week-of-year and month; fixed-duration ticks shorter than one day prepend hour. Month-begin/end offsets, including business and custom-business variants, use month and quarter. All other offsets, including business-day and business-hour offsets, use month.
+A timestamp must be on the frequency offset and an integral number of steps from
+the series start; day-or-coarser timestamps must also be normalised to midnight.
+Series IDs join the declared ID columns with `|`; raw IDs containing `|` are rejected.
+Target sums for duplicate aggregation and resampling use `min_count=1`, preserving
+all-missing groups as missing.
+
+The sample's affine frame is `(y - location) / scale`. Location is the observed
+context median, or zero with no observed context. The unfloored raw scale is the
+mean absolute m-lag difference over the whole permitted past before the origin,
+not just the cropped context. Lag positions are preserved; pairs with a missing
+endpoint are omitted, and no observed pair gives an undefined scale. A training
+sample is loss-eligible only with a positive finite raw scale and at least one
+observed label. Only eligible scales receive the `1e-6` arithmetic floor; this
+does not make zero or undefined scales eligible.
+
+### Model and loss
+
+The shared `ForecastModel` owns static categorical embeddings, numeric projection
+and conditioning inputs, encoder/decoder input projections, masks, the quantile
+head, affine output conversion and fallbacks. Its temporal backbone consumes the
+projected context, context-validity mask, projected known future and static vector,
+and returns horizon hidden states. The current registered family is `v2`.
+
+V2 uses a pre-norm encoder/decoder with RoPE, static variable selection, FiLM and
+static enrichment. Encoder inputs contain the normalised target, observed-target
+mask, calendars, known and past-only covariates and their masks. Decoder inputs
+contain only calendars, known-future covariates and their masks. Padding masks apply
+in encoder self-attention and every decoder cross-attention layer. Decoder
+self-attention is bidirectional; horizon length is explicit, without interpolation.
+Acceptance requires valid outputs to be invariant to withheld targets, future
+past-only covariates, padding content and padding length; later known-future inputs
+may affect earlier forecast steps.
+
+Quantile knots must contain `0.5`. Model output has shape `(B, H, Q)`, sorted along
+Q in the sample's affine frame; the point forecast selects the `0.5` knot. The
+monotone head has a free median, with lower/upper knots formed by subtracting/adding
+cumulative positive increments `width_factor × Δp × softplus(raw)`, where Δp is
+the gap to the adjacent knot toward the median and `width_factor=2.0`.
+Training averages doubled pinball over observed label cells of eligible samples
+and all knots. An empty eligible batch returns zero loss and a selected-cell count
+of zero. Any VSN diagnostics are diagnostic only and cannot inform configuration
+selection.
+
+### Metric reductions
+
+For label y, prediction q and knot p, doubled pinball is
+`2 × abs((y - q) × (1[y <= q] - p))`. Metrics use original target units and float64
+arithmetic. Missing labels are NaN; an empty reduction returns NaN.
+
+For scoring, seasonal error is the mean absolute m-lag difference over an item's
+full past, omitting NaN differences and applying no floor.
+SQL divides each cell's doubled pinball by its item's unfloored full-past seasonal
+error, then discards non-finite **quotients**. It pools the remaining cells separately
+for each knot and takes the ordinary mean of those knot scores. A knot with no
+finite quotient therefore makes SQL NaN. MASE applies the same divide-first,
+finite-quotient reduction to absolute errors of the median forecast. Zero or NaN
+scales contribute nothing; finite error divided by infinite scale contributes zero.
+These scoring exclusions are separate from training loss eligibility and never
+remove required forecasts.
+
+WAPE is pooled mean absolute median-forecast error divided by
+`max(pooled mean abs(label), 1.0)`. WQL divides each knot's pooled mean doubled
+pinball by that same denominator, then averages over knots. These pooled means omit
+NaNs. Per-knot pinball diagnostics are pooled mean doubled pinball in original units.
+
+The 80% interval uses knots 0.1 and 0.9, or the nearest available knots, choosing the
+first knot on a tie. Coverage is the mean of `lower <= label <= upper`; width is
+the mean of `upper - lower` in original units. Both use only cells with non-NaN
+labels and non-NaN endpoints, without SQL's scale exclusions. Both return NaN when no
+labelled interval contributes.
+
+### Identity, bundles and fev forecasts
+
+For the run identity, settings are serialised in JSON mode, omitting only
+`training.max_steps_cap` and `training.val_items_max` when unset; all other null
+fields remain. The payload contains `settings`, `seed`, `dataset_fingerprint`,
+`package_version`, the resolved `origin` in ISO format and `task_definition` (the
+fields listed above for fev, or `None` for user data). Serialize with sorted JSON
+keys and compact separators `(',', ':')`, encode as UTF-8 and hash with SHA-256.
+Git SHA is recorded as provenance, not included in this identity.
+
+The versioned inference bundle stores weights, architecture/configuration, family,
+quantile knots, target support, column roles, frequency and seasonality, fitted
+vocabularies and static preprocessing, training cutoff, earliest permissible origin
+and provenance including package version and Git SHA when available. Forecasts
+reject origins before that saved floor. Unseen IDs and categories map to the unknown
+slot. Bundle acceptance requires bit-identical forecast outputs after reload in a
+fresh CPU process.
+
+The fev adapter must provide exact item coverage in fev's item order. Each item has
+the median under `predictions` and quantile arrays under string knot keys such as
+`"0.1"` and `"0.9"`. Completed-window predictions are saved with their run identity
+and reused on resume after identity validation.
+
+### Dependencies and execution
+
+The optional `bench` extra pins `fev==0.10.0`, `datasets<5` and
+`statsforecast==2.0.1`. The recorded Colab numerical stack is numpy `2.0.2`, pandas
+`2.2.2`, torch `2.11.0+cu128`, pyarrow `18.1.0` and datasets `4.0.0`. The frozen EC2
+environment must match the recorded benchmark dependency closure, including exact
+version strings and CUDA local tags, and retain its dependency lock. These are
+execution-environment constraints; general package installation has no NumPy upper
+bound. Follow the [Colab](colab.md) and [EC2](ec2.md) environment gates.
+
+Real-data training runs only on the authorised hosts specified in the execution venue record. Local verification uses synthetic fixtures on CPU with `d_model ≤ 16` and at most 150 optimizer steps.
+Colab neural runs require a GPU/VRAM/dtype preflight, immutable
+checkout, pinned environment, durable source dataset cache with recorded revisions
+and fingerprints, and durable checkpoints, bundles, summaries and logs. Keep the
+Hub cache on Drive; regenerable dataset-map caches follow the Colab runbook's
+storage rules. Declare task/session partitioning and steps/time budgets before
+execution, preserving the venue split above.
+
+**Editorial amendment (2026-11-01).** Consolidated the protocol definitions and contracts in this document. The frozen experiment’s configuration, evaluation semantics and execution requirements are unchanged.
