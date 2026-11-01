@@ -121,3 +121,52 @@ def set_random_seed():
     torch.manual_seed(123)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(123)
+
+
+@pytest.fixture(scope="session")
+def tiny_pretrained_bundle_dir(tmp_path_factory):
+    pytest.importorskip("pyarrow")
+    from demand_forecast.pretrain.config import PretrainConfig
+    from demand_forecast.pretrain.corpus import corpus_manifest, write_manifest
+    from demand_forecast.pretrain.train import pretrain
+    from tests.helpers.corpus_fixture import write_corpus_fixture
+    from tests.helpers.settings import tiny_settings
+
+    directory = tmp_path_factory.mktemp("transfer-pretrain")
+    root = directory / "corpus"
+    for kind in ("tsmixup", "kernel_synth"):
+        for index in range(2):
+            write_corpus_fixture(root, kind=kind, index=index, seed=index)
+    write_manifest(corpus_manifest(root), root / "manifest.json")
+    cfg = PretrainConfig(
+        corpus=dict(
+            root=root,
+            tsmixup_shards=[0],
+            kernel_synth_shards=[0],
+            holdout_tsmixup=[1],
+            holdout_kernel_synth=[1],
+            val_pairs_per_kind=8,
+            external_validation=None,
+        ),
+        forecast=dict(horizon=4, max_context=16, min_context=8),
+        model=tiny_settings().model,
+        training=dict(
+            max_steps=12,
+            batch_size=4,
+            eval_every=6,
+            checkpoint_every=3,
+            amp=False,
+            warmup_steps=2,
+        ),
+        device="cpu",
+    )
+    result = pretrain(cfg, directory / "out")
+    assert result.steps == 12
+    return directory / "out/bundle"
+
+
+@pytest.fixture(scope="session")
+def pretrained_univariate_bundle(tiny_pretrained_bundle_dir):
+    from demand_forecast.core.bundle import load_bundle
+
+    return load_bundle(tiny_pretrained_bundle_dir)

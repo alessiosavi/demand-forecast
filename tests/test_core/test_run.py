@@ -346,3 +346,169 @@ def test_terminal_checkpoint_precedes_reuse_of_an_older_bundle(
     assert json.loads((tmp_path / "checkpoints/progress.json").read_text())["stop_reason"] == (
         "nonfinite_losses"
     )
+
+
+def test_train_panel_zero_shot_requires_init_from(tmp_path, tiny_panel_and_settings):
+    panel, origin, settings = tiny_panel_and_settings
+    settings.training.zero_shot = True
+    with pytest.raises(ValueError, match="^zero_shot requires init_from$"):
+        train_panel(panel, origin, settings, tmp_path, dataset_fingerprint="fp")
+    assert not (tmp_path / "bundle").exists()
+
+
+@pytest.mark.bench
+def test_train_panel_zero_shot_writes_bundle_progress_and_no_training(
+    tmp_path, panel29, origin29, tiny_pretrained_bundle_dir, monkeypatch
+):
+    pytest.importorskip("pyarrow")
+    from demand_forecast.core import run
+
+    def forbidden(*a, **k):
+        pytest.fail("zero-shot must not construct or fit a Trainer")
+
+    monkeypatch.setattr(run.Trainer, "fit", forbidden)
+    monkeypatch.setattr(run.Trainer, "__init__", forbidden)
+    settings = tiny_settings()
+    settings.training.init_from = str(tiny_pretrained_bundle_dir)
+    settings.training.zero_shot = True
+    settings.training.eval_at_start = True
+    bundle_dir = train_panel(panel29, origin29, settings, tmp_path, dataset_fingerprint="fp")
+    bundle = load_bundle(bundle_dir)
+    report = json.loads((tmp_path / "run.json").read_text())
+    progress = json.loads((tmp_path / "checkpoints/progress.json").read_text())
+    assert bundle.manifest["zero_shot"] is True and bundle.manifest["run"] == report
+    assert report["fit_result"] == {
+        "steps": 0,
+        "best_step": 0,
+        "best_score": None,
+        "stop_reason": "zero_shot",
+        "nonfinite_losses": 0,
+    }
+    assert report["resolved_budget"] == {"max_steps": 0, "eval_every": 0}
+    assert report["n_val_items"] == 0 and report["amp_dtype"] is None
+    assert report["timings"]["training_time_s"] == 0.0 and report["telemetry"] == []
+    cumulative = report["timings"]["cumulative"]
+    assert cumulative["sessions"] == 1
+    assert all(value == 0 for key, value in cumulative.items() if key != "sessions")
+    assert progress == {
+        "run_identity": report["run_identity"],
+        "step": 0,
+        "stop_reason": "zero_shot",
+        "max_steps": 0,
+        "eval_every": 0,
+        "n_fit_ids": len(report["plan"]["fit_ids"]),
+        "n_val_items": 0,
+        "exception": False,
+        "device": "cpu",
+        "amp_dtype": None,
+        "timings": cumulative,
+        "telemetry_tail": [],
+    }
+    assert not (tmp_path / "checkpoints/latest.pt").exists()
+    source = load_bundle(tiny_pretrained_bundle_dir)
+    transfer = report["transfer"]
+    assert set(transfer) == {"pretrain_identity", "model_sha256", "copied", "zeroed", "fresh"}
+    assert transfer["pretrain_identity"] == source.manifest["pretrain_identity"]
+    assert transfer["model_sha256"] == source.manifest["sha256"]["model.pt"]
+    assert set(transfer["copied"] + transfer["zeroed"] + transfer["fresh"]) == set(
+        dict(bundle.model.named_parameters())
+    )
+    plan = plan_inner_validation(panel29, origin29, settings.forecast.horizon)
+    observed = [
+        s.target[panel29.timestamps(i) <= plan.train_upto]
+        for i, s in enumerate(panel29.series)
+        if s.series_id in plan.fit_ids
+    ]
+    assert bundle.model.fallback_level.item() == pytest.approx(
+        np.nanmedian(np.concatenate(observed))
+    )
+    assert bundle.encoder.vocab_sizes["cat"] > 0
+    assert bundle.panel_metadata["training_cutoff"] == plan.train_upto.isoformat()
+    before = {p: p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()}
+    assert (
+        train_panel(panel29, origin29, settings, tmp_path, dataset_fingerprint="fp", resume=True)
+        == bundle_dir
+    )
+    assert all(p.read_bytes() == data for p, data in before.items())
+
+
+@pytest.mark.bench
+def test_zero_shot_predictor_close_to_source_on_targets_only(
+    tmp_path, panel29, origin29, tiny_pretrained_bundle_dir
+):
+    pytest.importorskip("pyarrow")
+    from dataclasses import replace
+
+    import torch
+
+    from demand_forecast.data.encoders import StaticEncoder
+    from demand_forecast.data.panel import Roles
+    from demand_forecast.data.sampler import make_batch
+    from demand_forecast.inference.predictor import Predictor
+
+    settings = tiny_settings()
+    settings.training.init_from = str(tiny_pretrained_bundle_dir)
+    settings.training.zero_shot = True
+    directory = train_panel(panel29, origin29, settings, tmp_path, dataset_fingerprint="fp")
+    ids, actual = Predictor.from_bundle(directory).forecast_arrays(panel29, origin29)
+    source = load_bundle(tiny_pretrained_bundle_dir)
+    uni = replace(
+        panel29,
+        roles=Roles(panel29.roles.target, (), (), (), ()),
+        series=[replace(s, dynamic={}, statics={}) for s in panel29.series],
+    )
+    batch = make_batch(
+        uni,
+        [(i, 29) for i in range(len(uni.series))],
+        4,
+        settings.forecast.max_context,
+        StaticEncoder().fit(uni, []),
+        calendar=False,
+    )
+    with torch.no_grad():
+        expected = (
+            (source.model.eval()(batch) * batch.scale[:, None, None] + batch.loc[:, None, None])
+            .clamp_min(0)
+            .numpy()
+        )
+    assert ids == [s.series_id for s in panel29.series]
+    assert np.allclose(actual, expected, rtol=0, atol=1e-4 * batch.scale.numpy()[:, None, None])
+
+
+@pytest.mark.bench
+def test_train_panel_init_from_transfers_then_trains(
+    tmp_path, panel29, origin29, tiny_pretrained_bundle_dir, monkeypatch
+):
+    pytest.importorskip("pyarrow")
+    import torch
+
+    from demand_forecast.core.run import Trainer
+
+    source = load_bundle(tiny_pretrained_bundle_dir)
+    settings = tiny_settings(base_steps=4)
+    settings.training.init_from = str(tiny_pretrained_bundle_dir)
+    settings.training.eval_at_start = True
+    fit = Trainer.fit
+
+    def verify_transferred(trainer, *a, **k):
+        for name, tensor in source.model.state_dict().items():
+            if name.startswith(("backbone.", "head.")):
+                assert torch.equal(trainer.model.state_dict()[name], tensor), name
+        assert torch.count_nonzero(trainer.model.enc_proj.weight[:, 2:]) == 0
+        assert torch.count_nonzero(trainer.model.dec_proj.weight) == 0
+        return fit(trainer, *a, **k)
+
+    monkeypatch.setattr(Trainer, "fit", verify_transferred)
+    directory = train_panel(panel29, origin29, settings, tmp_path, dataset_fingerprint="fp")
+    report = json.loads((tmp_path / "run.json").read_text())
+    saved = torch.load(tmp_path / "checkpoints/latest.pt", weights_only=False)
+    assert report["fit_result"]["steps"] == saved["step"] == 4
+    assert saved["initial_eval_done"] is True and saved["history"][0]["step"] == 0
+    assert saved["optimizer"]["state"]
+    assert any(
+        not torch.equal(value, saved["model"][key])
+        for key, value in source.model.state_dict().items()
+        if key.startswith("backbone.")
+    )
+    assert report["transfer"]["pretrain_identity"] == source.manifest["pretrain_identity"]
+    assert "zero_shot" not in load_bundle(directory).manifest

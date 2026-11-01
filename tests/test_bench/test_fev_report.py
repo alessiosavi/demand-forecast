@@ -455,3 +455,21 @@ def test_report_shows_scaler_skips(report_run, skips):
     assert {row["scaler_skips"] for row in table(rendered, "Timings")} == {
         "unknown" if skips in (None, "absent") else str(skips)
     }
+
+
+def test_report_accepts_zero_shot_run(tmp_path, tiny_pretrained_bundle_dir):
+    pytest.importorskip("pyarrow")
+    spec = fixture_spec(write_fev_fixture(tmp_path / "data"))
+    settings = tiny_settings()
+    settings.training.zero_shot = True
+    settings.training.init_from = str(tiny_pretrained_bundle_dir)
+    out = tmp_path / "out"
+    run_baseline([spec], out)
+    run_fev([spec], settings, out)
+    report, issues = report_module().build_report(out, [spec])
+    assert issues == []
+    row = table(report, "Training")[0]
+    assert row["stop_reason"] == "zero_shot"
+    assert row["steps"] == row["best_step"] == row["n_val_items"] == "0"
+    manifest = json.loads((tiny_pretrained_bundle_dir / "manifest.json").read_text())
+    assert row["transfer"] == manifest["pretrain_identity"][:8]

@@ -224,6 +224,9 @@ def build_report(
         training.append(
             {
                 "task": spec.name,
+                "transfer": report["transfer"]["pretrain_identity"][:8]
+                if report.get("transfer")
+                else "-",
                 **{key: budget.get(key) for key in ("max_steps", "eval_every")},
                 "n_fit_ids": report.get("n_fit_ids"),
                 "n_val_items": report.get("n_val_items"),

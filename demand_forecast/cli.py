@@ -18,6 +18,23 @@ pretrain_app = typer.Typer(help="Pretrain on local corpus shards and measure run
 app.add_typer(pretrain_app, name="pretrain")
 
 
+def _training_settings(config: Path, init_from: Path | None):
+    """Merge a CLI bundle override before validating the settings YAML."""
+    import yaml
+
+    from demand_forecast.config import Settings
+
+    raw = yaml.safe_load(config.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise typer.BadParameter("config root must be a mapping")
+    training = raw.setdefault("training", {})
+    if not isinstance(training, dict):
+        raise typer.BadParameter("training must be a mapping")
+    if init_from is not None:
+        training["init_from"] = str(init_from)
+    return Settings.model_validate(raw)
+
+
 @pretrain_app.command("run")
 def pretrain_run(
     config: Path = typer.Option(..., "--config", exists=True, dir_okay=False),
@@ -106,16 +123,18 @@ def train(
     ),
     out: Path = typer.Option(..., "--out", help="Run directory for bundle and checkpoints"),
     resume: bool = typer.Option(False, "--resume", help="Resume a matching run"),
+    init_from: Path | None = typer.Option(
+        None, "--init-from", exists=True, file_okay=False, help="Pretrained bundle directory"
+    ),
 ):
     """Train a quantile model and save its bundle and run report."""
     import yaml
 
-    from demand_forecast.config import Settings
     from demand_forecast.core.run import train_from_settings
     from demand_forecast.core.training import InterruptedRun, NonFiniteTraining
 
     try:
-        settings = Settings.from_yaml(config)
+        settings = _training_settings(config, init_from)
         configure_logging(settings.log_level)
         bundle = train_from_settings(settings, out, resume=resume)
     except (ValueError, OSError, ImportError, NotImplementedError, yaml.YAMLError) as exc:
@@ -171,17 +190,19 @@ def fev_run(
     stop_after: int | None = typer.Option(
         None, "--stop-after", min=1, help="Interrupt training at this step, saving a checkpoint"
     ),
+    init_from: Path | None = typer.Option(
+        None, "--init-from", exists=True, file_okay=False, help="Pretrained bundle directory"
+    ),
 ):
     """Evaluate model forecasts on fev tasks, reusing each task's first-window bundle."""
     import yaml
 
     from demand_forecast.bench.run import run_fev
     from demand_forecast.bench.specs import load_task_specs
-    from demand_forecast.config import Settings
     from demand_forecast.core.training import InterruptedRun, NonFiniteTraining
 
     try:
-        settings = Settings.from_yaml(config)
+        settings = _training_settings(config, init_from)
         configure_logging(settings.log_level)
         run_fev(
             load_task_specs(tasks, profiles),

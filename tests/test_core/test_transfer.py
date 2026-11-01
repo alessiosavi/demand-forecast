@@ -6,57 +6,15 @@ import pytest
 import torch
 
 from demand_forecast.config.settings import ForecastConfig
-from demand_forecast.core.bundle import load_bundle
 from demand_forecast.data.encoders import StaticEncoder
 from demand_forecast.data.panel import Panel, Roles
 from demand_forecast.data.sampler import make_batch
 from demand_forecast.models.base import ModelSpec
 from demand_forecast.models.losses import pinball_loss
 from tests.helpers.models import build_v2
-from tests.helpers.settings import tiny_settings
 
 pyarrow = pytest.importorskip("pyarrow")
 pytestmark = pytest.mark.bench
-
-
-@pytest.fixture(scope="session")
-def pretrained_univariate_bundle(tmp_path_factory):
-    from demand_forecast.pretrain.config import PretrainConfig
-    from demand_forecast.pretrain.corpus import corpus_manifest, write_manifest
-    from demand_forecast.pretrain.train import pretrain
-    from tests.helpers.corpus_fixture import write_corpus_fixture
-
-    directory = tmp_path_factory.mktemp("transfer-pretrain")
-    root = directory / "corpus"
-    for kind in ("tsmixup", "kernel_synth"):
-        for index in range(2):
-            write_corpus_fixture(root, kind=kind, index=index, seed=index)
-    write_manifest(corpus_manifest(root), root / "manifest.json")
-    cfg = PretrainConfig(
-        corpus=dict(
-            root=root,
-            tsmixup_shards=[0],
-            kernel_synth_shards=[0],
-            holdout_tsmixup=[1],
-            holdout_kernel_synth=[1],
-            val_pairs_per_kind=8,
-            external_validation=None,
-        ),
-        forecast=dict(horizon=4, max_context=16, min_context=8),
-        model=tiny_settings().model,
-        training=dict(
-            max_steps=12,
-            batch_size=4,
-            eval_every=6,
-            checkpoint_every=3,
-            amp=False,
-            warmup_steps=2,
-        ),
-        device="cpu",
-    )
-    result = pretrain(cfg, directory / "out")
-    assert result.steps == 12
-    return load_bundle(directory / "out/bundle")
 
 
 def strip_covariates(panel: Panel) -> Panel:
