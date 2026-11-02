@@ -142,7 +142,7 @@ def test_pretrain_config_loads_shipped_yaml():
 
     path = Path(__file__).resolve().parents[1] / "configs/pretrain-v2-first-try.yaml"
     config = PretrainConfig.from_yaml(path)
-    assert config.training.max_steps == 150000
+    assert config.training.max_steps == 78000
     assert config.forecast.horizon == 52
     assert config.corpus.external_validation == "monash_nn5_weekly"
 
@@ -271,14 +271,15 @@ def test_experiment_configs_differ_from_standard_only_in_pinned_keys(filename, t
     assert actual.keys() == frozen.keys()
     differences = {key: value for key, value in actual.items() if value != frozen[key]}
     assert differences == {
-        "model.d_model": 256,
+        "model.d_model": 320,
+        "model.nhead": 5,
         "model.num_encoder_layers": 4,
         "model.num_decoder_layers": 4,
-        "model.dim_feedforward": 1024,
-        "model.hidden_continuous_size": 256,
+        "model.dim_feedforward": 1280,
+        "model.hidden_continuous_size": 320,
         **training_changes,
     }
-    assert experiment.model.nhead == 4
+    assert experiment.model.nhead == 5
     assert "max_steps" not in raw["training"]
     assert "init_from" not in raw["training"]
     assert experiment.training.init_from is None
