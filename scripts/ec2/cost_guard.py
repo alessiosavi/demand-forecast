@@ -394,6 +394,29 @@ class Guard:
         self.config["ready"] = True
         self.finish()
 
+    def budget(self, args):
+        if args.cap <= 0 or args.enforce <= 0:
+            raise GuardError("cap and enforcement limit must be positive")
+        if args.enforce > args.cap:
+            raise GuardError("enforcement limit exceeds cap")
+        if args.enforce < committed(self.ledger):
+            raise GuardError("enforcement limit is below current commitments")
+        if not args.evidence.strip() or args.evidence.strip() == "trap":
+            raise GuardError("budget requires owner evidence; blank or trap is not accepted")
+        txn = self.transaction()
+        txn.update(
+            old_cap_usd=self.config["cap_usd"],
+            old_enforce_usd=self.config["enforce_usd"],
+            new_cap_usd=args.cap,
+            new_enforce_usd=args.enforce,
+            evidence=args.evidence,
+            utc=stamp(self.now()),
+        )
+        self.config.update(cap_usd=args.cap, enforce_usd=args.enforce)
+        self.stage("budget_updated")
+        self.finish()
+        self.status(args)
+
     def storage_hold(self, cleanup):
         hours = (
             cleanup + timedelta(hours=24) - instant(self.config["created"])
@@ -1469,6 +1492,10 @@ def parser():
     init.add_argument("--volume-gb", type=int, default=200)
     init.add_argument("--region", default="eu-central-1")
     init.add_argument("--create-role", action="store_true")
+    budget = commands.add_parser("budget")
+    budget.add_argument("--cap", type=finite, required=True)
+    budget.add_argument("--enforce", type=finite, required=True)
+    budget.add_argument("--evidence", required=True)
     for name in ("provision", "start"):
         command = commands.add_parser(name)
         command.add_argument("--label", type=label, required=True)

@@ -333,6 +333,106 @@ def test_init_defaults_and_iam_fail_closed(cg, tmp_path):
     assert any(c[2] == "put-role-policy" for c in cloud.calls)
 
 
+def test_budget_records_owner_ruling_and_admits_new_commitment(env, capsys):
+    assert env.run("hold", "--label", "eval", "--usd", 10) == 0
+    before = env.ledger()
+    assert env.run("hold", "--label", "training", "--usd", 35.55) == 2
+    assert "commitment would exceed enforcement limit" in capsys.readouterr().out
+    assert env.ledger() == before
+
+    assert (
+        env.run("budget", "--cap", 60, "--enforce", 57, "--evidence", "owner ruling 2026-11-02")
+        == 0
+    )
+    data = env.ledger()
+    assert data["config"] == dict(before["config"], cap_usd=60, enforce_usd=57)
+    for key in ("holds", "sessions", "transfers", "line_items"):
+        assert data[key] == before[key]
+    assert data["transactions"][: len(before["transactions"])] == before["transactions"]
+    txn = next(t for t in data["transactions"] if t["command"] == "budget")
+    assert txn["old_cap_usd"] == 50
+    assert txn["old_enforce_usd"] == 47
+    assert txn["new_cap_usd"] == 60
+    assert txn["new_enforce_usd"] == 57
+    assert txn["evidence"] == "owner ruling 2026-11-02"
+    assert txn["utc"] == "2026-11-02T12:00:00Z"
+    assert txn["status"] == "closed"
+    assert txn["stages"][-1] == {"stage": "complete", "utc": "2026-11-02T12:00:00Z"}
+    assert any(event.get("txn_id") == txn["id"] for event in data["events"])
+    output = json.loads(capsys.readouterr().out)
+    assert output["enforce"] == 57
+    assert output["cap"] == 60
+
+    assert env.run("hold", "--label", "training", "--usd", 35.55) == 0
+    assert env.cg.committed(env.ledger()) == pytest.approx(50)
+
+
+@pytest.mark.parametrize(
+    "cap,enforce,evidence,message",
+    [
+        (50, 57, "owner ruling", "enforcement limit exceeds cap"),
+        (60, 14, "owner ruling", "enforcement limit is below current commitments"),
+        (60, 57, "", "budget requires owner evidence"),
+        (60, 57, " \t\n", "budget requires owner evidence"),
+        (60, 57, "trap", "budget requires owner evidence"),
+        (60, 57, " trap ", "budget requires owner evidence"),
+        (0, 0, "owner ruling", "cap and enforcement limit must be positive"),
+        (0, 57, "owner ruling", "cap and enforcement limit must be positive"),
+        (60, 0, "owner ruling", "cap and enforcement limit must be positive"),
+        (-1, 57, "owner ruling", "expected a finite, nonnegative number"),
+        (60, -1, "owner ruling", "expected a finite, nonnegative number"),
+    ],
+)
+def test_budget_refusal_leaves_ledger_unchanged(env, capsys, cap, enforce, evidence, message):
+    assert env.run("hold", "--label", "eval", "--usd", 10) == 0
+    before = env.path.read_bytes()
+    calls = len(env.cloud.calls)
+    args = ("budget", "--cap", cap, "--enforce", enforce, "--evidence", evidence)
+    if cap < 0 or enforce < 0:
+        with pytest.raises(SystemExit) as exc:
+            env.run(*args)
+        assert exc.value.code == 2
+        assert message in capsys.readouterr().err
+    else:
+        assert env.run(*args) == 2
+        assert message in capsys.readouterr().out
+    assert env.path.read_bytes() == before
+    assert len(env.cloud.calls) == calls
+
+
+@pytest.mark.parametrize("state", ["open", "pending"])
+def test_budget_preserves_active_sessions_and_holds(env, state):
+    assert env.run("hold", "--label", "eval", "--usd", 10) == 0
+    if state == "pending":
+        env.cloud.crash = lambda cmd: cmd[2] == "run-instances"
+        with pytest.raises(Crash):
+            env.provision()
+        env.cloud.crash = None
+    else:
+        assert env.provision() == 0
+    before = env.ledger()
+    assert before["sessions"][0]["status"] == state
+    calls = len(env.cloud.calls)
+
+    assert env.run("budget", "--cap", 60, "--enforce", 57, "--evidence", "owner ruling") == 0
+    data = env.ledger()
+    assert data["config"] == dict(before["config"], cap_usd=60, enforce_usd=57)
+    assert data["sessions"] == before["sessions"]
+    assert data["holds"] == before["holds"]
+    assert data["transactions"][: len(before["transactions"])] == before["transactions"]
+    assert all(cmd[2] in ("describe-volumes", "get-schedule") for cmd in env.cloud.calls[calls:])
+
+
+def test_budget_can_lower_limits_to_commitments_and_reload(env, capsys):
+    assert env.run("hold", "--label", "eval", "--usd", 10) == 0
+    assert env.cg.committed(env.ledger()) == pytest.approx(14.45)
+    assert env.run("budget", "--cap", 14.45, "--enforce", 14.45, "--evidence", "owner ruling") == 0
+    capsys.readouterr()
+    assert env.run("status") == 0  # Reloads and validates the persisted ledger.
+    output = json.loads(capsys.readouterr().out)
+    assert output["cap"] == output["enforce"] == output["committed"] == 14.45
+
+
 @pytest.mark.parametrize(
     "command", ["provision", "start", "hold", "transfer-begin", "extend-cleanup"]
 )
