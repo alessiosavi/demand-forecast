@@ -1,4 +1,4 @@
-# Phase B random-initialization control with the placeholder L2 backbone.
+# Phase B random-initialization control with the L3 backbone chosen in Phase D §8 (d_model 320, 5 heads, 4+4 layers, ff 1280).
 # Matches the fine-tuning configuration; run without --init-from.
 data:
   source: fev

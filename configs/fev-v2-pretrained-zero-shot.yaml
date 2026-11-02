@@ -1,4 +1,4 @@
-# Phase B zero-shot evaluation with the placeholder L2 backbone.
+# Phase B zero-shot evaluation with the L3 backbone chosen in Phase D §8 (d_model 320, 5 heads, 4+4 layers, ff 1280).
 # Standard protocol values are preserved outside model capacity and zero_shot.
 # Supply the pretrained bundle with --init-from.
 data:

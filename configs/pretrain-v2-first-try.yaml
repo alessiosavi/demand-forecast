@@ -1,4 +1,4 @@
-# Initial L2 candidate; the capacity pilot will update model and training budgets here.
+# Phase D §8 size choice (2026-11-02): L3 backbone (d_model 320, 5 heads, 4+4 layers, ff 1280), 78k steps.
 # Hold out tsmixup shard 199 and kernel_synth shard 19 for validation.
 corpus:
   root: /home/ubuntu/fev/corpus

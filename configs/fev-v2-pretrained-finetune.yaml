@@ -1,4 +1,4 @@
-# Phase B fine-tuning with the placeholder L2 backbone.
+# Phase B fine-tuning with the L3 backbone chosen in Phase D §8 (d_model 320, 5 heads, 4+4 layers, ff 1280).
 # Standard protocol values are preserved outside model capacity, learning rate,
 # and evaluation at step zero. Supply the pretrained bundle with --init-from.
 data:
