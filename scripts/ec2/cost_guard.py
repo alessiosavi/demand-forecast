@@ -618,6 +618,18 @@ class Guard:
                 self.sleep(min(20, remaining))
         raise GuardError(f"deadline arming exhausted at {stamp(cutoff)}", 4)
 
+    def validate_launch_vpc(self):
+        if os.environ.get("SUBNET_ID"):
+            return
+        vpc_id = os.environ.get("VPC_ID")
+        if not vpc_id:
+            raise GuardError("missing environment variable VPC_ID")
+        vpcs = self.aws("ec2", "describe-vpcs", "--vpc-ids", vpc_id).get("Vpcs", [])
+        if len(vpcs) != 1 or vpcs[0].get("VpcId") != vpc_id or vpcs[0].get("IsDefault") is not True:
+            raise GuardError(
+                "empty SUBNET_ID requires the default VPC; set SUBNET_ID or use the default VPC"
+            )
+
     def prepare_launch(self, args):
         required = ("OPERATOR_IP", "VPC_ID", "AMI_ID")
         for name in required:
@@ -773,6 +785,8 @@ class Guard:
             raise GuardError("launch already attempted; use reconcile, then start")
         if self.command == "start" and not self.ledger.get("instance_id"):
             raise GuardError("no known instance; provision or reconcile first")
+        if self.command == "provision":
+            self.validate_launch_vpc()
         consume = getattr(args, "consume_hold", None)
         if consume:
             self.release_hold(consume)

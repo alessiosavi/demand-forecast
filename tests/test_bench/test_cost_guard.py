@@ -56,6 +56,7 @@ class Cloud:
         self.call_options = []
         self.schedules = {}
         self.instance = None
+        self.vpcs = None
         self.volumes = []
         self.tagged_volumes = None
         self.fail = None
@@ -144,6 +145,14 @@ class Cloud:
                 del self.schedules[name]
                 return "{}"
         if service == "ec2":
+            if action == "describe-vpcs":
+                return json.dumps(
+                    {
+                        "Vpcs": self.vpcs
+                        if self.vpcs is not None
+                        else [{"VpcId": option(cmd, "--vpc-ids"), "IsDefault": True}]
+                    }
+                )
             if action == "describe-key-pairs":
                 return json.dumps({"KeyPairs": [{"KeyName": "key"}] if self.key else []})
             if action == "create-key-pair":
@@ -401,6 +410,12 @@ def test_provision_without_subnet_omits_subnet_id_and_records_placement(
     assert env.provision() == 0
     data = env.ledger()
     call = next(c for c in env.cloud.calls if c[2] == "run-instances")
+    vpc_call = next(c for c in env.cloud.calls if c[2] == "describe-vpcs")
+    assert option(vpc_call, "--vpc-ids") == "vpc-test"
+    vpc_index = env.cloud.calls.index(vpc_call)
+    assert vpc_index < env.cloud.calls.index(call)
+    assert env.cloud.snapshots[vpc_index]["events"][-1]["stage"] == "aws:ec2:describe-vpcs"
+    assert env.cloud.call_options[vpc_index]["timeout"] == env.cg.AWS_TIMEOUT_S
     assert "--subnet-id" not in call
     assert "--associate-public-ip-address" in call
     assert option(call, "--client-token") == data["config"]["token"]
@@ -413,6 +428,7 @@ def test_provision_without_subnet_omits_subnet_id_and_records_placement(
 def test_provision_with_subnet_unchanged(env, monkeypatch):
     monkeypatch.setenv("SUBNET_ID", "subnet-selected")
     assert env.provision() == 0
+    assert not any(c[2] == "describe-vpcs" for c in env.cloud.calls)
     call = next(c for c in env.cloud.calls if c[2] == "run-instances")
     assert call[13:19] == [
         "--security-group-ids",
@@ -423,6 +439,36 @@ def test_provision_with_subnet_unchanged(env, monkeypatch):
         "--tag-specifications",
     ]
     assert call.count("--subnet-id") == 1
+
+
+@pytest.mark.parametrize("subnet_id", [None, ""], ids=["unset", "empty"])
+@pytest.mark.parametrize(
+    "vpcs",
+    [
+        [{"VpcId": "vpc-test", "IsDefault": False}],
+        [],
+        [{"VpcId": "vpc-other", "IsDefault": True}],
+        [{"VpcId": "vpc-test", "IsDefault": True}] * 2,
+        [{"VpcId": "vpc-test"}],
+    ],
+    ids=["non-default", "missing", "different-id", "multiple", "missing-default-flag"],
+)
+def test_provision_without_subnet_refuses_non_default_vpc(
+    env, monkeypatch, capsys, subnet_id, vpcs
+):
+    if subnet_id is None:
+        monkeypatch.delenv("SUBNET_ID")
+    else:
+        monkeypatch.setenv("SUBNET_ID", subnet_id)
+    env.cloud.vpcs = vpcs
+    first_call = len(env.cloud.calls)
+    assert env.provision() == 2
+    assert (
+        "empty SUBNET_ID requires the default VPC; set SUBNET_ID or use the default VPC"
+        in capsys.readouterr().out
+    )
+    assert [c[2] for c in env.cloud.calls[first_call:]] == ["describe-vpcs"]
+    assert env.ledger()["sessions"] == []
 
 
 @pytest.mark.parametrize("placement", [{}, {"Placement": {}}])

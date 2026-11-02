@@ -97,10 +97,14 @@ identical parameters return the same instance, changed parameters fail with
 When every Availability Zone refuses capacity in turn (AWS's error text then recommends
 "not specifying an Availability Zone"), set `SUBNET_ID` to the empty string before the next
 `provision`: the launch omits `--subnet-id` and EC2 places the instance in a default-VPC
-subnet of a zone that has capacity, with a public IPv4 address as before. The security
-group is VPC-wide, so SSH access is unchanged. The guard records the resulting
-`availability_zone` and `subnet_id` in the session; retain them with the launch evidence.
-A fixed `SUBNET_ID` keeps the previous behaviour byte for byte.
+subnet of a zone that has capacity, with a public IPv4 address as before. **Precondition:**
+`VPC_ID` must be the account's default VPC, because a subnet-less launch always lands in
+the default VPC and the guard's security group lives in `VPC_ID`; the guard checks
+`describe-vpcs` `IsDefault` before creating anything and refuses otherwise (exit 2, nothing
+created). Within that VPC the security group applies in every zone, so SSH access is
+unchanged. The guard records the resulting `availability_zone` and `subnet_id` in the
+session; retain them with the launch evidence. A fixed `SUBNET_ID` keeps the previous
+behaviour byte for byte.
 
 Task 14 passes `--client-token <token>` and both instance and volume tags
 `experiment=pretrain-<token>` in `--tag-specifications`. It creates/read-backs the
