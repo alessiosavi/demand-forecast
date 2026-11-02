@@ -750,9 +750,21 @@ class Guard:
         deadline = self.now() + timedelta(minutes=args.minutes)
         if deadline + timedelta(minutes=20) >= instant(self.config["cleanup_by"]):
             raise GuardError("session backstop must precede cleanup-by")
+        # Reuse the experiment client token: a hidden successful launch returns the
+        # same instance, or changed parameters fail with IdempotentParameterMismatch.
         if self.command == "provision" and (
             self.ledger.get("instance_id")
-            or any(s.get("aws_called") for s in self.ledger["sessions"])
+            or any(
+                s.get("aws_called")
+                and not (
+                    s["status"] == "cancelled"
+                    and not s.get("instance_id")
+                    and isinstance(evidence := self.session_txn(s).get("evidence"), str)
+                    and evidence.strip()
+                    and evidence != "trap"
+                )
+                for s in self.ledger["sessions"]
+            )
         ):
             raise GuardError("launch already attempted; use reconcile, then start")
         if self.command == "start" and not self.ledger.get("instance_id"):

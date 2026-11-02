@@ -388,6 +388,109 @@ def test_provision_backstops_deadline_tags_and_timestamps(env):
             assert snapshot["sessions"][0]["aws_called"] == session["aws_called"]
 
 
+def test_provision_retries_after_evidenced_no_launch_cancellation(env, capsys):
+    def insufficient_capacity(cmd):
+        if cmd[2] == "run-instances":
+            raise subprocess.CalledProcessError(254, cmd, stderr="InsufficientInstanceCapacity")
+        return False
+
+    env.cloud.fail = insufficient_capacity
+    assert env.provision() == 2
+    session = env.ledger()["sessions"][0]
+    assert session["status"] == "pending"
+    assert session["instance_id"] is None
+    assert session["aws_called"] is not None
+    assert env.run("launch-trap") == 0
+    assert "instance absent or ambiguous; pending reservation retained" in capsys.readouterr().out
+    assert env.ledger()["sessions"][0] == session
+    assert env.provision(label="other") == 6
+    assert "an open or pending session already exists" in capsys.readouterr().out
+
+    txn_id = session["txn_id"]
+    assert env.run("cancel", "--txn", txn_id, "--evidence", " ") == 2
+    assert "cancel requires console evidence" in capsys.readouterr().out
+    assert env.ledger()["sessions"][0] == session
+    env.clock.advance(120)
+    evidence = "CloudTrail: RunInstances InsufficientInstanceCapacity; no instance exists"
+    assert env.run("cancel", "--txn", txn_id, "--evidence", evidence) == 0
+    assert env.provision(label="setup2") == 2
+    assert "obsolete stop schedule pending" in capsys.readouterr().out
+    assert env.run("reconcile") == 0
+    cancelled = env.ledger()["sessions"][0]
+    txn = next(t for t in env.ledger()["transactions"] if t["id"] == txn_id)
+    assert cancelled["status"] == "cancelled"
+    assert cancelled["instance_id"] is None
+    assert cancelled["settled_cost_usd"] > 0
+    assert cancelled["schedule_deleted"] is True
+    assert txn["evidence"] == evidence
+    assert env.provision() == 2
+    assert "session labels cannot be reused" in capsys.readouterr().out
+    assert env.run("start", "--label", "other", "--minutes", 180) == 2
+    assert "no known instance" in capsys.readouterr().out
+
+    env.cloud.fail = None
+    assert env.provision(label="setup2") == 0
+    data = env.ledger()
+    assert len(data["sessions"]) == 2
+    assert data["sessions"][0] == cancelled
+    assert next(t for t in data["transactions"] if t["id"] == txn_id) == txn
+    retry = data["sessions"][1]
+    assert retry["status"] == "open"
+    assert retry["instance_id"] == data["instance_id"] == "i-test"
+    assert retry["stop_schedule_verified"] is True
+    assert set(env.cloud.schedules) == {
+        retry["stop_schedule_name"],
+        data["config"]["cleanup_schedule_name"],
+    }
+    for schedule in env.cloud.schedules.values():
+        assert json.loads(schedule["Target"]["Input"])["InstanceIds"] == ["i-test"]
+    launches = [c for c in env.cloud.calls if c[2] == "run-instances"]
+    assert len(launches) == 2
+    assert all(option(c, "--client-token") == data["config"]["token"] for c in launches)
+
+
+def test_provision_still_refused_after_trap_cancellation_with_instance(env, capsys):
+    env.cloud.crash = lambda c: c[2] == "create-schedule"
+    with pytest.raises(Crash):
+        env.provision()
+    env.cloud.crash = None
+    assert env.run("launch-trap") == 0
+    data = env.ledger()
+    session = data["sessions"][0]
+    assert session["status"] == "cancelled"
+    assert session["instance_id"] == data["instance_id"] == "i-test"
+    txn = next(t for t in data["transactions"] if t["id"] == session["txn_id"])
+    assert txn["evidence"] == "trap"
+    before = env.path.read_bytes(), len(env.cloud.calls)
+    assert env.provision(label="other") == 2
+    assert "launch already attempted" in capsys.readouterr().out
+    assert (env.path.read_bytes(), len(env.cloud.calls)) == before
+
+
+@pytest.mark.parametrize("evidence", [None, "", " ", "trap", 123])
+def test_provision_still_refused_when_cancelled_session_lacks_evidence(env, capsys, evidence):
+    env.cloud.fail = lambda c: c[2] == "run-instances"
+    assert env.provision() == 2
+    txn_id = env.ledger()["sessions"][0]["txn_id"]
+    assert env.run("cancel", "--txn", txn_id, "--evidence", "CloudTrail: no instance") == 0
+    assert env.run("reconcile") == 0
+
+    # The cancel API rejects blank evidence; model incomplete/corrupt persisted evidence.
+    def remove_evidence(data):
+        txn = next(t for t in data["transactions"] if t["id"] == txn_id)
+        if evidence is None:
+            del txn["evidence"]
+        else:
+            txn["evidence"] = evidence
+
+    env.edit(remove_evidence)
+    env.cloud.fail = None
+    before = env.path.read_bytes(), len(env.cloud.calls)
+    assert env.provision(label="other") == 2
+    assert "launch already attempted" in capsys.readouterr().out
+    assert (env.path.read_bytes(), len(env.cloud.calls)) == before
+
+
 def test_start_order_and_hold_consumption_are_atomic(env):
     assert env.provision() == 0
     assert env.run("stop") == 0
