@@ -39,15 +39,15 @@ def test_pretrain_config_loads_shipped_yaml_and_rejects_unknown_keys(tmp_path, s
         == ForecastConfig(horizon=52, max_context=512, min_context=8).model_dump()
     )
     assert cfg.model == ModelConfig(
-        d_model=256,
-        nhead=4,
+        d_model=320,
+        nhead=5,
         num_encoder_layers=4,
         num_decoder_layers=4,
-        dim_feedforward=1024,
-        hidden_continuous_size=256,
+        dim_feedforward=1280,
+        hidden_continuous_size=320,
     )
     assert cfg.training.model_dump() == {
-        "max_steps": 150000,
+        "max_steps": 78000,
         "batch_size": 128,
         "learning_rate": 5e-4,
         "weight_decay": 0.01,
@@ -212,7 +212,7 @@ def test_pretrain_config_imports_without_bench():
                 from demand_forecast.pretrain.config import PretrainConfig, pretrain_identity
 
                 cfg = PretrainConfig.from_yaml("configs/pretrain-v2-first-try.yaml")
-                assert cfg.training.max_steps == 150000
+                assert cfg.training.max_steps == 78000
                 assert len(pretrain_identity(cfg, "2.0.0", {})) == 64
             """),
         ],

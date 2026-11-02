@@ -1,4 +1,4 @@
-# Phase B zero-shot evaluation with the placeholder L2 backbone.
+# Phase B zero-shot evaluation with the L3 backbone chosen in Phase D §8 (d_model 320, 5 heads, 4+4 layers, ff 1280).
 # Standard protocol values are preserved outside model capacity and zero_shot.
 # Supply the pretrained bundle with --init-from.
 data:
@@ -13,14 +13,14 @@ forecast:
   min_context: 1
 model:
   family: v2
-  d_model: 256
-  nhead: 4
+  d_model: 320
+  nhead: 5
   num_encoder_layers: 4
   num_decoder_layers: 4
-  dim_feedforward: 1024
+  dim_feedforward: 1280
   dropout: 0.1
   cat_emb_dim: 16
-  hidden_continuous_size: 256
+  hidden_continuous_size: 320
   stochastic_depth_rate: 0.0
   use_rope: true
   use_patch_embedding: false

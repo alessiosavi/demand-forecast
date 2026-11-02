@@ -691,4 +691,4 @@ def test_cli_shipped_zero_shot_yaml_resolves(tmp_path, monkeypatch):
     )
     assert result.exit_code == 0, result.output
     assert captured[0].training.zero_shot and captured[0].training.init_from == str(source)
-    assert captured[0].model.d_model == 256
+    assert captured[0].model.d_model == 320
