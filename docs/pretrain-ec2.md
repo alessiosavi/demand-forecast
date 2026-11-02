@@ -79,6 +79,21 @@ failed stop retains the reservation. Loss of the **host** prevents the trap; see
 in §12. Do not call `run-instances` directly or repeat `provision` after an ambiguous
 launch. Use `reconcile` and the recorded transaction instead.
 
+A `run-instances` failure before any instance exists (for example
+`InsufficientInstanceCapacity` in the chosen Availability Zone) leaves the session
+pending with its reservation retained; the trap reports `instance absent or ambiguous`.
+Confirm the disposition before anything else: every CloudTrail `RunInstances` event for
+the experiment client token carries an `errorCode`, and
+`describe-instances --filters Name=client-token,Values=<token>` returns nothing. Then
+`guard cancel --txn "$TXN" --evidence "<those event times and identifiers>"`,
+`guard reconcile`, change `SUBNET_ID` to another public subnet of the same VPC if
+capacity was the cause, and repeat `provision` with a **new** label. The guard admits a
+repeated `provision` only while no instance is known and every launched session is such
+an evidenced cancellation. The experiment token remains the `run-instances` client token,
+so a repeat cannot create a second instance if the first launch did succeed unnoticed:
+identical parameters return the same instance, changed parameters fail with
+`IdempotentParameterMismatch`.
+
 Task 14 passes `--client-token <token>` and both instance and volume tags
 `experiment=pretrain-<token>` in `--tag-specifications`. It creates/read-backs the
 session stop schedule at `deadline + 20 min` immediately after launch and the
