@@ -62,6 +62,11 @@ its tag-conditioned stop/terminate policy. Admission fails closed on errors; do 
 reset or edit the ledger to remove a commitment. `--ledger` is a **global** guard
 option, before its subcommand; the launch wrapper accepts it after the operation.
 
+Apply an owner-approved budget change with
+`guard budget --cap <usd> --enforce <usd> --evidence "<owner ruling>"`.
+The guard records the old and new ceilings, owner ruling and UTC time in the ledger;
+the enforcement limit must cover current commitments. Never edit the ledger by hand.
+
 ## 3. Provision as the first reserved session
 
 **Operator**, in a supervised terminal, never a detached laptop job:
@@ -424,6 +429,14 @@ Claude makes the reviewed size commit/PR: `model.*`, `training.max_steps` and
 `training.eval_every = max(5000, steps // 30)` in the pretrain YAML, **model.* only** in
 the three experiment YAMLs. Owner-approved merge gives **P2**. This runbook does not
 authorise changing the frozen standard/quick YAML, weekly definitions or profiles.
+
+**Owner budget rulings.** The owner may change the experiment budget or the candidate
+rule at any point. Record the ruling verbatim in the plan ledger, apply the new
+ceilings with `guard budget` (§2) and redo the arithmetic above from the new total; the
+`$30`/`$12` split and the 150k/60k step rule then serve as guidelines, not gates. On
+2026-11-02 the owner raised the target to 50 USD (ceiling 60 USD) and asked for a
+bigger model relying on best-checkpoint selection; the recorded choice is L3 with
+78,000 steps (PR #39).
 
 ## 9. Pretrain and resume
 
