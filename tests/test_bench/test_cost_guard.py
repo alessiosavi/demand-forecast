@@ -182,6 +182,8 @@ class Cloud:
                     "InstanceId": "i-test",
                     "State": {"Name": "running"},
                     "PublicIpAddress": "203.0.113.10",
+                    "Placement": {"AvailabilityZone": "eu-central-1b"},
+                    "SubnetId": "subnet-test",
                     "LaunchTime": "2020-01-01T00:00:00Z",
                     "BlockDeviceMappings": [{"Ebs": {"VolumeId": "vol-test"}}],
                 }
@@ -388,6 +390,52 @@ def test_provision_backstops_deadline_tags_and_timestamps(env):
             assert snapshot["sessions"][0]["aws_called"] == session["aws_called"]
 
 
+@pytest.mark.parametrize("subnet_id", [None, ""], ids=["unset", "empty"])
+def test_provision_without_subnet_omits_subnet_id_and_records_placement(
+    env, monkeypatch, subnet_id
+):
+    if subnet_id is None:
+        monkeypatch.delenv("SUBNET_ID")
+    else:
+        monkeypatch.setenv("SUBNET_ID", subnet_id)
+    assert env.provision() == 0
+    data = env.ledger()
+    call = next(c for c in env.cloud.calls if c[2] == "run-instances")
+    assert "--subnet-id" not in call
+    assert "--associate-public-ip-address" in call
+    assert option(call, "--client-token") == data["config"]["token"]
+    session = data["sessions"][0]
+    assert session["status"] == "open"
+    assert session["availability_zone"] == "eu-central-1b"
+    assert session["subnet_id"] == "subnet-test"
+
+
+def test_provision_with_subnet_unchanged(env, monkeypatch):
+    monkeypatch.setenv("SUBNET_ID", "subnet-selected")
+    assert env.provision() == 0
+    call = next(c for c in env.cloud.calls if c[2] == "run-instances")
+    assert call[13:19] == [
+        "--security-group-ids",
+        "sg-test",
+        "--subnet-id",
+        "subnet-selected",
+        "--associate-public-ip-address",
+        "--tag-specifications",
+    ]
+    assert call.count("--subnet-id") == 1
+
+
+@pytest.mark.parametrize("placement", [{}, {"Placement": {}}])
+def test_remember_instance_tolerates_missing_placement(env, placement):
+    guard = env.cg.Guard(env.path)
+    guard.ledger = env.ledger()
+    session = {}
+    guard.remember_instance(session, {"InstanceId": "i-test", **placement})
+    assert session["instance_id"] == "i-test"
+    assert "availability_zone" not in session
+    assert "subnet_id" not in session
+
+
 def test_provision_retries_after_evidenced_no_launch_cancellation(env, capsys):
     def insufficient_capacity(cmd):
         if cmd[2] == "run-instances":
@@ -550,6 +598,8 @@ def test_launch_crash_recovery_never_adopts_without_both_backstops(env, after_sc
     env.clock.advance(120)
     assert env.run("reconcile") == 0
     s = env.ledger()["sessions"][0]
+    assert s["availability_zone"] == "eu-central-1b"
+    assert s["subnet_id"] == "subnet-test"
     if after_schedules:
         assert s["status"] == "open"
     else:

@@ -7,7 +7,7 @@ fail() { echo "Launch refused: $*" >&2; exit 2; }
 operation=$1
 shift
 case "$operation" in provision|start|stop|terminate) ;; *) fail "unknown command $operation";; esac
-for variable in OPERATOR_IP VPC_ID SUBNET_ID AMI_ID; do
+for variable in OPERATOR_IP VPC_ID AMI_ID; do   # SUBNET_ID is optional: empty omits the AZ (docs/pretrain-ec2.md §3)
     [[ -n ${!variable:-} ]] || fail "missing environment variable $variable"
 done
 export AWS_DEFAULT_OUTPUT=json

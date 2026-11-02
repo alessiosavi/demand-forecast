@@ -44,7 +44,7 @@ export AWS_PROFILE=veliu-staging AWS_REGION=eu-central-1 AWS_DEFAULT_OUTPUT=json
 export PYTHON=python3
 : "${LOCAL_CODE:?absolute checkout at P}" "${EXPERIMENT:?absolute operator evidence directory}"
 : "${OPERATOR_IP:?current public IPv4}" "${VPC_ID:?inspected VPC}"
-: "${SUBNET_ID:?public subnet}" "${AMI_ID:?inspected AMI ID}"
+: "${SUBNET_ID=}" "${AMI_ID:?inspected AMI ID}"   # SUBNET_ID may be empty: see §3
 export OPERATOR_IP VPC_ID SUBNET_ID AMI_ID
 mkdir -p "$EXPERIMENT/ops"
 export LEDGER="$EXPERIMENT/ops/cost-ledger.json"
@@ -93,6 +93,14 @@ an evidenced cancellation. The experiment token remains the `run-instances` clie
 so a repeat cannot create a second instance if the first launch did succeed unnoticed:
 identical parameters return the same instance, changed parameters fail with
 `IdempotentParameterMismatch`.
+
+When every Availability Zone refuses capacity in turn (AWS's error text then recommends
+"not specifying an Availability Zone"), set `SUBNET_ID` to the empty string before the next
+`provision`: the launch omits `--subnet-id` and EC2 places the instance in a default-VPC
+subnet of a zone that has capacity, with a public IPv4 address as before. The security
+group is VPC-wide, so SSH access is unchanged. The guard records the resulting
+`availability_zone` and `subnet_id` in the session; retain them with the launch evidence.
+A fixed `SUBNET_ID` keeps the previous behaviour byte for byte.
 
 Task 14 passes `--client-token <token>` and both instance and volume tags
 `experiment=pretrain-<token>` in `--tag-specifications`. It creates/read-backs the

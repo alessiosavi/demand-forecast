@@ -518,6 +518,10 @@ class Guard:
     def remember_instance(self, session, instance):
         session["instance_id"] = instance["InstanceId"]
         session["public_ip"] = instance.get("PublicIpAddress")
+        if "AvailabilityZone" in instance.get("Placement", {}):
+            session["availability_zone"] = instance["Placement"]["AvailabilityZone"]
+        if "SubnetId" in instance:
+            session["subnet_id"] = instance.get("SubnetId")
         self.ledger["instance_id"] = instance["InstanceId"]
         self.ledger["volume_ids"] = list(
             dict.fromkeys(
@@ -615,7 +619,7 @@ class Guard:
         raise GuardError(f"deadline arming exhausted at {stamp(cutoff)}", 4)
 
     def prepare_launch(self, args):
-        required = ("OPERATOR_IP", "VPC_ID", "SUBNET_ID", "AMI_ID")
+        required = ("OPERATOR_IP", "VPC_ID", "AMI_ID")
         for name in required:
             if not os.environ.get(name):
                 raise GuardError(f"missing environment variable {name}")
@@ -710,6 +714,7 @@ class Guard:
             }
             for resource in ("instance", "volume")
         ]
+        subnet_id = os.environ.get("SUBNET_ID")
         return [
             "--image-id",
             os.environ["AMI_ID"],
@@ -723,8 +728,7 @@ class Guard:
             key_name,
             "--security-group-ids",
             group_id,
-            "--subnet-id",
-            os.environ["SUBNET_ID"],
+            *(["--subnet-id", subnet_id] if subnet_id else []),
             "--associate-public-ip-address",
             "--tag-specifications",
             json.dumps(tags),
