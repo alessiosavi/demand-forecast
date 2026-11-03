@@ -804,3 +804,90 @@ costs, retain all earlier snapshots, and record any remaining resources or uncer
 Claude reviews actual artifacts and obtains an independent read-only evidence review;
 report the comparison, leakage verdict, external diagnostic, spend and residual events
 to the owner. No fev success threshold or post-hoc configuration selection is permitted.
+
+## 14. Fine-tune recipe study (owner-approved follow-up)
+
+The owner approved this follow-up on 2026-11-03 after the original comparison.
+It searches **one shared fine-tune recipe** for the pretrained V2 bundle across
+all seven weekly tasks. It does not revise the frozen original comparison above.
+Each trial uses only the **inner validation split** that `train_panel` already
+uses for early stopping, within window 0's available history. The fev test windows
+never enter the objective, and tuning produces no predictions or fev scores.
+
+For each scored task, the objective contribution is its best inner-validation
+SQL divided by its untouched, step-0 inner SQL; `best_step == 0` contributes 1.0.
+The study minimizes the arithmetic mean of these ratios. Tasks with no inner
+validation, such as rossmann_1W in the original run, are recorded as
+`skipped_no_inner_validation` and excluded from the mean. They still get a
+`train_panel` run report. Tasks run in ascending order of fitting-item count,
+and the median pruner can stop an unpromising trial after partial task results.
+The Optuna seed controls recipe sampling; every model retains the config's seed.
+
+The first trial is the current recipe: learning rate `1e-4`, warmup `100`, weight
+decay `0.01`, batch size `128`, patience `5`, and base steps `3000`. Subsequent
+trials search learning rate `[1e-5, 3e-4]` and weight decay `[1e-4, 1e-1]` on log
+scales, warmup `{0, 100, 300, 600}`, batch size `{64, 128, 256}`, patience
+`{3, 5, 8}`, and base steps `{1500, 3000, 6000}`. All other training controls and
+model settings remain fixed, with pretrained initialization, step-0 evaluation,
+and fine-tuning enabled for every trial.
+
+Under the existing operator session and budget controls, run on the guest:
+
+```bash
+export TUNE="$RUNS/finetune-study"
+demand-forecast fev tune --tasks weekly \
+  --config configs/fev-v2-pretrained-finetune.yaml \
+  --init-from "$PRETRAIN/bundle" --out-dir "$TUNE" \
+  --trials 20 --timeout-s 7200 --seed 0
+```
+
+`--timeout-s` stops launching new trials after the elapsed Optuna optimization
+budget; an ongoing trial can finish after that time. It excludes initial panel
+preparation and is not a replacement for the operator's stop deadline.
+
+Outputs in `$TUNE`:
+
+- `study.db`: persistent Optuna trials, task scores, study inputs, and sampler
+  state. Sampler state is saved before training so resume continues its random
+  stream instead of repeating startup recipe draws; keep the pinned environment.
+- `trials/<number>/<task>/run.json` and `score.json`: training metadata, step-0
+  and best inner scores, ratio, actual steps, best step, and skip status. Bundles
+  and checkpoints are deleted after score extraction, including on pruning.
+- `trials.csv`: trial number, state, JSON parameters and per-task scores/steps,
+  objective, and duration. A PRUNED objective is a partial running mean and is
+  never eligible as the winner.
+- `best-params.json` and `best-finetune.yaml`: winning parameters and source
+  configuration with only the six tuned training keys replaced. YAML comments
+  and formatting are not retained. The YAML loads with `Settings.from_yaml`;
+  pass the bundle separately with `--init-from`.
+- `tune.json`: summary including baseline and best completed-trial objectives.
+  Until a trial completes, best parameters/objective are null and there is no
+  winning YAML. Reports are refreshed after each trial and on handled failure.
+
+After a stop, use the same config, bundle, task selection, seed, and output
+folder with `--resume`. Keep the bundle contents fixed and ensure the previous
+process has stopped; a study directory has one writer. `--trials` is the **total**
+attempted-trial budget, including COMPLETE, PRUNED, and FAIL, not an additional
+number. COMPLETE and PRUNED trial numbers are not rerun. Any trial left RUNNING
+by a crash is marked FAIL and its weights are removed; it need not be repeated.
+The timeout is a fresh budget for each invocation.
+
+```bash
+demand-forecast fev tune --tasks weekly \
+  --config configs/fev-v2-pretrained-finetune.yaml \
+  --init-from "$PRETRAIN/bundle" --out-dir "$TUNE" \
+  --trials 20 --timeout-s 7200 --seed 0 --resume
+```
+
+When the study is finished, freeze the winning recipe and measure it **once**
+using the separate fev runner:
+
+```bash
+demand-forecast fev run --tasks weekly --config "$TUNE/best-finetune.yaml" \
+  --init-from "$PRETRAIN/bundle" \
+  --model-name demand-forecast-v2-finetuned-tuned --out-dir "$RUNS/finetune-tuned"
+```
+
+Report this result as a **post-hoc row**, alongside the original frozen rows,
+with the study's baseline and best inner objectives and total trial count. Do
+not use this fev measurement to select another recipe or replace an original row.

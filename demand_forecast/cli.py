@@ -221,6 +221,49 @@ def fev_run(
     typer.echo(f"Summaries saved to {out_dir / 'summaries.csv'}")
 
 
+@fev_app.command("tune")
+def fev_tune(
+    tasks: str = typer.Option(
+        "weekly", "--tasks", help="weekly, heldout, comma-separated weekly names, or task YAML"
+    ),
+    config: Path = typer.Option(..., "--config", exists=True, dir_okay=False),
+    init_from: Path = typer.Option(
+        ..., "--init-from", exists=True, file_okay=False, help="Pretrained bundle directory"
+    ),
+    out_dir: Path = typer.Option(..., "--out-dir", help="Study database, trial reports and recipe"),
+    trials: int = typer.Option(..., "--trials", min=1, help="Total trials, including resumed ones"),
+    timeout_s: float | None = typer.Option(None, "--timeout-s", min=0),
+    seed: int = typer.Option(0, "--seed", min=0, max=2**32 - 1, help="Optuna sampler seed"),
+    resume: bool = typer.Option(False, "--resume", help="Continue an existing study"),
+):
+    """Tune one shared recipe on inner validation only; never evaluate fev test windows."""
+    import yaml
+
+    from demand_forecast.bench.specs import load_task_specs
+    from demand_forecast.bench.tune import tune_finetune
+    from demand_forecast.config import Settings
+
+    try:
+        settings = Settings.from_yaml(config)
+        configure_logging(settings.log_level)
+        tune_finetune(
+            load_task_specs(tasks),
+            settings,
+            init_from,
+            out_dir,
+            n_trials=trials,
+            timeout_s=timeout_s,
+            seed=seed,
+            resume=resume,
+        )
+    except (ValueError, OSError, ImportError, NotImplementedError, yaml.YAMLError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    except RuntimeError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"Study saved to {out_dir / 'tune.json'}")
+
+
 @fev_app.command("baseline")
 def fev_baseline(
     tasks: str = typer.Option(
