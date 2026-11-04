@@ -503,7 +503,21 @@ class Guard:
         self.aws("scheduler", operation, *argv)
 
     def create_schedule(self, expected):
-        self.write_schedule("create-schedule", expected)
+        # Scheduler may not yet be able to assume a freshly created IAM role.
+        for attempt in range(15):
+            try:
+                self.write_schedule("create-schedule", expected)
+                break
+            except subprocess.CalledProcessError as exc:
+                error = exc.stderr or ""
+                if (
+                    attempt == 14
+                    or "ValidationException" not in error
+                    or not any(word in error.lower() for word in ("role", "assume"))
+                ):
+                    raise
+                self.stage("aws:scheduler:create-schedule:retry")
+                self.sleep(10)
         return self.read_schedule(expected)
 
     def delete_schedule(self, name):
@@ -954,6 +968,15 @@ class Guard:
             txn["status"] = session["status"]
             self.stage(session["status"], txn)
 
+    def stop_instance(self, instance_id):
+        try:
+            self.aws("ec2", "stop-instances", "--instance-ids", instance_id, "--force")
+        except subprocess.CalledProcessError as exc:
+            if "IncorrectInstanceState" not in (exc.stderr or ""):
+                raise
+            self.aws("ec2", "wait", "instance-running", "--instance-ids", instance_id)
+            self.aws("ec2", "stop-instances", "--instance-ids", instance_id, "--force")
+
     def stop_session(self, session, cancelled=False, instance=None):
         if instance is None:
             try:
@@ -969,9 +992,7 @@ class Guard:
                 # instance. Keep its reservation until stop-time evidence can
                 # be recovered; the waiter alone cannot date an earlier stop.
                 if session.get("instance_id"):
-                    self.aws(
-                        "ec2", "stop-instances", "--instance-ids", session["instance_id"], "--force"
-                    )
+                    self.stop_instance(session["instance_id"])
                     self.aws(
                         "ec2", "wait", "instance-stopped", "--instance-ids", session["instance_id"]
                     )
@@ -996,7 +1017,11 @@ class Guard:
                 self.remember_instance(session, instance)
             self.settle_session(session, cancelled=cancelled, instance=instance)
         else:
-            self.aws("ec2", "stop-instances", "--instance-ids", session["instance_id"], "--force")
+            if instance["State"]["Name"] == "pending":
+                self.aws(
+                    "ec2", "wait", "instance-running", "--instance-ids", session["instance_id"]
+                )
+            self.stop_instance(session["instance_id"])
             self.aws("ec2", "wait", "instance-stopped", "--instance-ids", session["instance_id"])
             self.settle_session(session, cancelled=cancelled)
         self.delete_session_schedule(session)

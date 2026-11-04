@@ -225,6 +225,8 @@ class Cloud:
                 return "{}"
             if action == "wait":
                 self.clock.advance(5)
+                if cmd[3] == "instance-running" and self.instance:
+                    self.instance["State"]["Name"] = "running"
                 if cmd[3] == "instance-stopped" and self.instance:
                     self.instance["State"]["Name"] = "stopped"
                     if self.post_stop_reason is not None:
@@ -806,6 +808,206 @@ def test_launch_error_stops_and_cancels_after_schedule_creation_failure(env):
     assert env.ledger()["sessions"][0]["settled_cost_usd"] > 0
     stop = next(c for c in env.cloud.calls if c[2] == "stop-instances")
     assert "--force" in stop
+
+
+@pytest.mark.parametrize("schedule_kind", ["stop-setup", "cleanup"])
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "ValidationException: The execution ROLE is not ready",
+        "ValidationException: Scheduler cannot ASSUME the execution identity",
+    ],
+)
+def test_provision_retries_scheduler_role_propagation(env, schedule_kind, stderr):
+    attempts = []
+
+    def fail(cmd):
+        if cmd[2] == "create-schedule" and option(cmd, "--name").endswith(schedule_kind):
+            attempts.append(cmd)
+            if len(attempts) <= 2:
+                raise subprocess.CalledProcessError(254, cmd, stderr=stderr)
+
+    env.cloud.fail = fail
+    assert env.provision() == 0
+    data = env.ledger()
+    session = data["sessions"][0]
+    assert session["status"] == "open"
+    assert session["stop_schedule_verified"] is True
+    assert set(env.cloud.schedules) == {
+        session["stop_schedule_name"],
+        data["config"]["cleanup_schedule_name"],
+    }
+    assert len(attempts) == 3
+    assert env.clock.sleeps == [10, 10]
+    retries = [
+        stage
+        for stage in data["transactions"][-1]["stages"]
+        if stage["stage"] == "aws:scheduler:create-schedule:retry"
+    ]
+    assert [stage["utc"] for stage in retries] == [
+        "2026-11-02T12:00:00Z",
+        "2026-11-02T12:00:10Z",
+    ]
+
+
+@pytest.mark.parametrize("stop_fails", [False, True])
+def test_provision_scheduler_retry_exhaustion_preserves_error_and_stops(
+    env, capsys, monkeypatch, stop_fails
+):
+    failures, propagated = [], []
+    begin_session = env.cg.Guard.begin_session
+
+    def capture_error(guard, args):
+        try:
+            return begin_session(guard, args)
+        except subprocess.CalledProcessError as exc:
+            propagated.append(exc)
+            raise
+
+    monkeypatch.setattr(env.cg.Guard, "begin_session", capture_error)
+
+    def fail(cmd):
+        if cmd[2] == "create-schedule":
+            assert len(failures) < 15, "scheduler retry exceeded its attempt bound"
+            error = subprocess.CalledProcessError(
+                254, cmd, stderr="ValidationException: execution role cannot be assumed"
+            )
+            failures.append(error)
+            raise error
+        return stop_fails and cmd[2] == "stop-instances"
+
+    env.cloud.fail = fail
+    assert env.provision() == 2
+    assert len(failures) == 15
+    assert propagated == [failures[-1]]  # The AWS exception escapes unchanged.
+    assert env.clock.sleeps == [10] * 14
+    data = env.ledger()
+    assert (
+        sum(
+            stage["stage"] == "aws:scheduler:create-schedule:retry"
+            for stage in data["transactions"][-1]["stages"]
+        )
+        == 14
+    )
+    assert any(c[2] == "stop-instances" for c in env.cloud.calls)
+    session = data["sessions"][0]
+    output = capsys.readouterr().out
+    assert "operation failed; inspect ledger and reconcile" in output
+    if stop_fails:
+        assert "stop unconfirmed; reservation retained" in output
+        assert session["status"] == "pending"
+        assert session["settled_cost_usd"] is None
+        assert session["reservation_usd"] == pytest.approx(3.3713333333333333)
+    else:
+        assert env.cloud.instance["State"]["Name"] == "stopped"
+        assert session["status"] == "cancelled"
+        assert session["settled_cost_usd"] > 0
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    ["AccessDeniedException: execution role", "ValidationException: invalid expression", None],
+)
+def test_provision_does_not_retry_other_scheduler_errors(env, stderr):
+    def fail(cmd):
+        if cmd[2] == "create-schedule":
+            raise subprocess.CalledProcessError(254, cmd, stderr=stderr)
+
+    env.cloud.fail = fail
+    assert env.provision() == 2
+    assert sum(c[2] == "create-schedule" for c in env.cloud.calls) == 1
+    assert env.clock.sleeps == []
+    assert env.ledger()["sessions"][0]["status"] == "cancelled"
+
+
+@pytest.mark.parametrize("wait_fails", [False, True])
+def test_provision_fail_closed_waits_for_pending_instance(env, capsys, wait_fails):
+    def fail(cmd):
+        if cmd[2] == "describe-instances":
+            env.cloud.instance["State"]["Name"] = "pending"
+        if cmd[2] == "stop-instances":
+            assert env.cloud.instance["State"]["Name"] == "running"
+        return cmd[2] == "create-schedule" or (wait_fails and "instance-running" in cmd)
+
+    env.cloud.fail = fail
+    assert env.provision() == 2
+    actions = [c[2:4] for c in env.cloud.calls if c[2] in ("wait", "stop-instances")]
+    session = env.ledger()["sessions"][0]
+    if wait_fails:
+        assert actions == [["wait", "instance-running"]]
+        assert session["status"] == "pending"
+        assert session["settled_cost_usd"] is None
+        assert "stop unconfirmed; reservation retained" in capsys.readouterr().out
+    else:
+        assert actions == [
+            ["wait", "instance-running"],
+            ["stop-instances", "--instance-ids"],
+            ["wait", "instance-stopped"],
+        ]
+        assert env.cloud.instance["State"]["Name"] == "stopped"
+        assert session["status"] == "cancelled"
+    for cmd, options in zip(env.cloud.calls, env.cloud.call_options, strict=True):
+        if cmd[2] == "wait":
+            assert option(cmd, "--instance-ids") == "i-test"
+            assert options["timeout"] == 600
+
+
+@pytest.mark.parametrize("discovery_fails", [False, True])
+@pytest.mark.parametrize(
+    "stop_errors,expected_actions",
+    [
+        (
+            ["IncorrectInstanceState: pending"],
+            ["stop-instances", "instance-running", "stop-instances", "instance-stopped"],
+        ),
+        (
+            ["IncorrectInstanceState: pending"] * 2,
+            ["stop-instances", "instance-running", "stop-instances"],
+        ),
+        (["AccessDeniedException"], ["stop-instances"]),
+    ],
+)
+def test_stop_retries_incorrect_instance_state_once(
+    env, capsys, discovery_fails, stop_errors, expected_actions
+):
+    assert env.provision() == 0
+    before = env.ledger()["sessions"][0]
+    start = len(env.cloud.calls)
+    failures = []
+
+    def fail(cmd):
+        if cmd[2] == "stop-instances" and len(failures) < len(stop_errors):
+            error = subprocess.CalledProcessError(254, cmd, stderr=stop_errors[len(failures)])
+            failures.append(error)
+            raise error
+        return discovery_fails and cmd[2] == "describe-instances"
+
+    env.cloud.fail = fail
+    stopped = expected_actions[-1] == "instance-stopped"
+    assert env.run("stop") == (0 if stopped and not discovery_fails else 2)
+    calls = env.cloud.calls[start:]
+    assert [c[3] if c[2] == "wait" else c[2] for c in calls if c[2] != "describe-instances"] == (
+        expected_actions + (["delete-schedule"] if stopped and not discovery_fails else [])
+    )
+    assert env.clock.sleeps == []
+    session = env.ledger()["sessions"][0]
+    if stopped:
+        assert env.cloud.instance["State"]["Name"] == "stopped"
+    if stopped and not discovery_fails:
+        assert session["status"] == "closed"
+        assert session["settled_cost_usd"] > 0
+    else:
+        assert session["status"] == "open"
+        assert session["settled_cost_usd"] is None
+        assert session["reservation_usd"] == before["reservation_usd"]
+        assert session["stop_schedule_name"] in env.cloud.schedules
+        assert "operation failed; inspect ledger and reconcile" in capsys.readouterr().out
+    for cmd, options in zip(calls, env.cloud.call_options[start:], strict=True):
+        if cmd[2] == "stop-instances":
+            assert option(cmd, "--instance-ids") == "i-test"
+            assert "--force" in cmd
+        if cmd[2] == "wait":
+            assert options["timeout"] == 600
 
 
 def test_failed_trap_stop_retains_pending_reservation(env):
