@@ -40,6 +40,8 @@ corpus recipe, licences, deterministic conversion, manifests and weighted mixing
 pip install -e '.[corpus]'
 demand-forecast pretrain corpus build --config configs/corpus-v2.yaml --root /data/corpus
 demand-forecast pretrain corpus verify --root /data/corpus
+demand-forecast pretrain corpus audit --root /data/corpus --out /data/audit --workers 4 --resume
+demand-forecast pretrain corpus audit --controls
 ```
 
 The build adds real-data kinds alongside existing TSMixup/KernelSynth shards.

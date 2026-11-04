@@ -69,6 +69,99 @@ def pretrain_corpus_verify(root: Path = typer.Option(..., "--root")):
         raise typer.Exit(code=1)
 
 
+@corpus_app.command("audit")
+def pretrain_corpus_audit(
+    root: Path | None = typer.Option(None, "--root"),
+    out: Path | None = typer.Option(None, "--out"),
+    tasks: str = typer.Option("fev100", "--tasks"),
+    kinds: str = typer.Option("chronos_real,gifteval_pretrain", "--kinds"),
+    workers: int | None = typer.Option(None, "--workers", min=1),
+    resume: bool = typer.Option(False, "--resume"),
+    controls: bool = typer.Option(False, "--controls"),
+    control_constants: Path | None = typer.Option(
+        None,
+        "--control-constants",
+        exists=True,
+        dir_okay=False,
+        help="JSON constant overrides for --controls only; never changes a corpus audit.",
+    ),
+):
+    """Match corpus values against every fev target and numeric covariate."""
+    import json
+
+    from demand_forecast.pretrain import audit_match
+    from demand_forecast.pretrain.audit import _write_json, constants, run_audit
+
+    if control_constants is not None and not controls:
+        raise typer.BadParameter("--control-constants requires --controls")
+    if controls:
+        from demand_forecast.pretrain.audit_controls import run_controls
+
+        original = constants()
+        try:
+            if control_constants is not None:
+                overrides = json.loads(control_constants.read_text())
+                if not isinstance(overrides, dict) or set(overrides) - original.keys():
+                    raise typer.BadParameter("control overrides must name matcher constants")
+                for key, value in overrides.items():
+                    previous = original[key]
+                    if isinstance(previous, dict):
+                        valid = (
+                            isinstance(value, dict)
+                            and value.keys() == previous.keys()
+                            and all(isinstance(v, int) and v >= 0 for v in value.values())
+                        )
+                    else:
+                        valid = (
+                            isinstance(value, (int, float)) and value > 0 and value < float("inf")
+                        )
+                        if isinstance(previous, int):
+                            valid = valid and isinstance(value, int)
+                    if not valid:
+                        raise typer.BadParameter(f"invalid value for {key}")
+                    setattr(audit_match, key, value)
+            result = run_controls()
+            result["constants"] = constants()
+            if out is not None:
+                _write_json(out / "controls.json", result)
+        finally:
+            for key, value in original.items():
+                setattr(audit_match, key, value)
+        typer.echo(
+            f"{result['positive_passed']}/26 positive detected, "
+            f"{result['negative_passed']}/14 negative rejected, "
+            f"{result['self_tests_passed']}/10 self-tests"
+        )
+        if (result["positive_passed"], result["negative_passed"], result["self_tests_passed"]) != (
+            26,
+            14,
+            10,
+        ):
+            raise typer.Exit(code=1)
+        return
+    if root is None or out is None:
+        raise typer.BadParameter("--root and --out are required unless running --controls")
+    try:
+        result = run_audit(
+            root,
+            out,
+            tasks=tasks,
+            kinds=[kind.strip() for kind in kinds.split(",") if kind.strip()],
+            workers=workers,
+            resume=resume,
+            progress=typer.echo,
+        )
+    except (ValueError, OSError, ImportError) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(
+        f"Audit: {result['summary']['copies']} copy pairs; "
+        f"{result['summary']['unresolved_rows']} unresolved rows; {out / 'audit.md'}"
+    )
+    if result["summary"]["unresolved_rows"]:
+        raise typer.Exit(code=2)
+
+
 def _training_settings(config: Path, init_from: Path | None):
     """Merge a CLI bundle override before validating the settings YAML."""
     import yaml

@@ -17,6 +17,7 @@ from demand_forecast.data.sampler import BatchBuilder, _items_array, _positive
 from demand_forecast.models.base import ForecastModel
 from demand_forecast.pretrain.config import PretrainConfig
 from demand_forecast.pretrain.corpus import (
+    CHRONOS_REVISION,
     CORPUS_REPO,
     CORPUS_ROLES,
     PRETRAIN_FREQ,
@@ -41,12 +42,14 @@ def holdout_pairs(
     return shard_panel(selected), origins
 
 
-def download_external(config_name: str, root: Path) -> Path:
+def download_external(
+    config_name: str, root: Path, revision: str | None = CHRONOS_REVISION
+) -> Path:
     """Download and persist a Chronos config during EC2 setup, never evaluation."""
     from datasets import load_dataset
 
     destination = Path(root) / config_name
-    dataset = load_dataset(CORPUS_REPO, config_name, split="train")
+    dataset = load_dataset(CORPUS_REPO, config_name, split="train", revision=revision)
     dataset.save_to_disk(str(destination))
     return destination
 
