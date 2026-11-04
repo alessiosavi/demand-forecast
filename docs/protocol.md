@@ -274,7 +274,10 @@ fingerprints, task definitions, seed, policy, budgets, hardware/dtype, failures,
 fallback/exclusion counts, timings and measured peak RAM/VRAM. An interruption/resume
 trial precedes the frozen model run, and no frozen v2 score is viewed before the
 prerequisites pass. Execution evidence includes `checkpoints/progress.json`, per-window
-NPZ diagnostics and the tables produced by `scripts/fev_report.py`. Use [the Colab template](colab.md) and
+NPZ diagnostics and the tables produced by `scripts/fev_report.py`. The auditor supports
+both `first_window` and `per_window`: for the latter it checks each window's identity,
+bundle and progress against its predictions, verifies the combined summary identity,
+and prints training steps, best step and stop reason for each window. Use [the Colab template](colab.md) and
 [prompt 00](colab/prompts/00-profile-and-baselines.md) for the first profiling/baseline
 session. No Timestral weights are downloaded.
 

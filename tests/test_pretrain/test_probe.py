@@ -6,6 +6,7 @@ import time
 import weakref
 from contextlib import nullcontext
 
+import numpy as np
 import pytest
 import torch
 from typer.testing import CliRunner
@@ -291,3 +292,64 @@ def test_pretrain_duration_counts_overheads(tiny_pretrain_cfg):
     assert result["minutes"] == math.ceil(result["total_s"] / 60)
     cfg.corpus.kernel_synth_every = 0
     assert pretrain_duration(cfg, probe)["steps_ks"] == 0
+
+
+@pytest.mark.parametrize("series_embedding", [False, True])
+def test_task_probe_honours_series_embedding(tmp_path, monkeypatch, series_embedding):
+    from demand_forecast.core import evaluation
+    from demand_forecast.pretrain.probe import task_probe
+    from tests.helpers.fev_fixture import write_fev_fixture
+    from tests.helpers.fev_spec import fixture_spec
+    from tests.helpers.settings import tiny_settings
+
+    spec = fixture_spec(write_fev_fixture(tmp_path / "data"))
+    settings = tiny_settings(base_steps=2, d_model=8)
+    settings.training.series_embedding = series_embedding
+    prepare = evaluation.prepare_validation
+    encoders = []
+
+    def observe_prepare(panel, items, origin, horizon, max_context, encoder, **kwargs):
+        encoders.append(encoder)
+        return prepare(panel, items, origin, horizon, max_context, encoder, **kwargs)
+
+    monkeypatch.setattr(evaluation, "prepare_validation", observe_prepare)
+    task_probe([spec], settings, steps=2, out=tmp_path / "out")
+    assert len(encoders) == 1
+    assert ("__series__" in encoders[0].vocabularies) == series_embedding
+    assert encoders[0].vocabularies["cat"] == {"A": 2, "B": 3}
+
+
+def test_task_probe_honours_validation_scale_floor(tmp_path, monkeypatch):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from demand_forecast.core import evaluation
+    from demand_forecast.pretrain.probe import task_probe
+    from tests.helpers.fev_fixture import write_fev_fixture
+    from tests.helpers.fev_spec import fixture_spec
+    from tests.helpers.settings import tiny_settings
+
+    parquet = write_fev_fixture(tmp_path / "data")
+    rows = pq.read_table(parquet).to_pylist()
+    for row in rows:
+        row["target"] = [1000.0 + i % 2 for i in range(40)]
+    pq.write_table(pa.Table.from_pylist(rows), parquet)
+    settings = tiny_settings(base_steps=2, d_model=8)
+    settings.forecast.scale_floor_frac = 0.1
+    prepare = evaluation.prepare_validation
+    scales, expected = [], []
+
+    def observe_prepare(*args, **kwargs):
+        prepared = prepare(*args, **kwargs)
+        scales.extend(batch.scale.numpy().reshape(-1) for batch in prepared.batches)
+        expected.extend(
+            0.1 * np.mean(np.abs(past[-settings.forecast.max_context :]))
+            for past in prepared.y_past
+        )
+        return prepared
+
+    monkeypatch.setattr(evaluation, "prepare_validation", observe_prepare)
+    task_probe([fixture_spec(parquet)], settings, steps=2, out=tmp_path / "out")
+    assert len(expected) == 6
+    assert min(expected) > 100  # The unfloored seasonal scale is exactly 1.
+    np.testing.assert_allclose(np.concatenate(scales), expected)

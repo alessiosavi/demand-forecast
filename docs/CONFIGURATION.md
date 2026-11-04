@@ -70,6 +70,10 @@ The summary `policy` column distinguishes the two policies; older model summarie
 without that column load as `first_window`. Each window uses its own latest origin
 for training and earliest item origin for the bundle's forecast floor, with fev's
 item-specific truncation unchanged.
+`scripts/fev_report.py` audits both layouts, checking each window's run, bundle,
+progress and prediction identity plus the combined summary identity. It prints
+per-window training steps, best step and stop reason, sums artifact sizes across
+windows, and retains task-level metrics and baseline comparisons.
 
 Defaults for `trainable`, `series_embedding` and `scale_floor_frac` are omitted
 from canonical identity settings; only `per_window` adds `policy` to the identity
