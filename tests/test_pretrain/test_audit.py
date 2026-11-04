@@ -356,6 +356,28 @@ def test_cli_exit_codes(monkeypatch, tmp_path):
     assert runner.invoke(app, ["pretrain", "corpus", "audit"]).exit_code == 2
 
 
+@pytest.mark.parametrize(
+    "manifest,error",
+    [
+        ({"path": "shard.parquet"}, "string indices must be integers"),
+        ([{}], "'path'"),
+    ],
+    ids=["object_root", "missing_key"],
+)
+def test_cli_reports_malformed_manifest(tmp_path, manifest, error):
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest))
+    result = CliRunner().invoke(
+        app,
+        ["pretrain", "corpus", "audit", "--root", str(tmp_path), "--out", str(tmp_path / "out")],
+    )
+    assert result.exit_code == 1
+    assert isinstance(result.exception, SystemExit)
+    assert error in result.stderr
+    assert len(result.stderr.splitlines()) == 1
+    assert result.stdout == ""
+    assert "Traceback" not in result.output
+
+
 def test_rejection_records_are_scan_local_and_target_records_uncapped(monkeypatch):
     x = np.array([1.0, 2.0, 1.0] + [0.0] * 23)
     index = match.Index([2 * x + 100], ["policy"])

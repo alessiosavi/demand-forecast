@@ -151,7 +151,7 @@ def pretrain_corpus_audit(
             resume=resume,
             progress=typer.echo,
         )
-    except (ValueError, OSError, ImportError) as exc:
+    except (ValueError, OSError, ImportError, KeyError, TypeError) as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=1) from exc
     typer.echo(

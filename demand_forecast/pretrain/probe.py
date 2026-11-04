@@ -219,6 +219,8 @@ def task_probe(
         model = build_model(settings.model.family, model_spec, settings.model.backbone_kwargs()).to(
             device
         )
+        if settings.training.trainable == "heads_only":
+            model.backbone.requires_grad_(False)
         _sync(device)
         init_s = time.perf_counter() - started
         resolved_steps, resolved_eval = resolve_budget(
@@ -345,6 +347,8 @@ def task_probe(
             infer_peak_cuda_mem_bytes=_cuda_peak(device),
             val_peak_cuda_mem_bytes=val_peak,
             peak_rss_bytes=_peak_rss(),
+            params_trainable=sum(p.numel() for p in model.parameters() if p.requires_grad),
+            params_total=sum(p.numel() for p in model.parameters()),
         )
         _write_run(out / f"{spec.name}.json", report)
         reports[spec.name] = report
