@@ -31,6 +31,7 @@ def test_pretrain_command_set_and_help():
         "corpus",
     }
     assert set(get_command(app).commands["pretrain"].commands["corpus"].commands) == {
+        "audit",
         "build",
         "verify",
     }

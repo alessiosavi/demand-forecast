@@ -37,5 +37,16 @@ The separate `configs/corpus-v2.yaml` build recipe pins source revisions and
 records include/exclude lists, attribution, filters and shard limits. It loads
 offline and rejects unknown fields. `local_path` on a build source enables
 offline conversion from a saved snapshot. See [Corpus v2](corpus.md) for build
-and verify commands, a weighted pretraining example, reproducibility limits,
+verify and content-audit commands, a weighted pretraining example, reproducibility limits,
 and the research-only licence position.
+
+`demand-forecast pretrain corpus audit --root /data/corpus --out /data/audit
+--tasks fev100 --workers 4 --resume` compares all numeric benchmark sequences
+against `chronos_real,gifteval_pretrain` by default. `--tasks` also accepts
+`weekly`, `heldout`, or a task YAML with optional per-task `local_path` parquet
+overrides (relative to the YAML). No model role profiles are needed. `--kinds`
+selects a comma-separated list of corpus kinds. `--controls` runs the offline
+40 matcher controls and ten rule self-tests without a corpus. Constant overrides
+are restricted to `--controls --control-constants <json>`; production audits
+always use the documented run-11 defaults. See [Audit](corpus.md#audit) for the
+copy definition, declaration output, limits and resource requirements.

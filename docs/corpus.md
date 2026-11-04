@@ -28,7 +28,7 @@ remaining folders are excluded by one catch-all rule covering climate
 simulations, cloud traces, PEMS/metro traffic, very large building collections,
 and other unselected data. The exact names and reasons live in the YAML;
 the converter downloads only its explicit include list. This screening is
-**not a content-overlap audit**: value matching against fev tasks is a later task.
+**not a content-overlap audit**: run the value-matching audit below separately.
 
 ## Licence position
 
@@ -211,3 +211,112 @@ selects a model. Supply both legacy hold-out kinds for a finite selection score;
 a missing score still makes the selection mean NaN, as before. New-kind scores
 appear as `val_sql_chronos_real` / `val_sql_gifteval_pretrain` diagnostics.
 The local `monash_nn5_weekly` external diagnostic is unchanged.
+
+## Audit
+
+The audit compares corpus **values** with every numeric sequence column of all
+100 fev-bench tasks at fev commit `193e4fc`, including every target of multivariate
+tasks and all numeric covariates. The task YAML is preserved byte-identically;
+its adjacent `.PROVENANCE.md` records the source, digest and the four intentional
+repeated dataset/config pairs. Dataset reads use the train split at
+`autogluon/fev_datasets` revision
+`d3e7e720f4158eab03ebcb021f1cce779cd92acc`, without benchmark cutoff filtering.
+
+```bash
+demand-forecast pretrain corpus audit --controls
+demand-forecast pretrain corpus audit --root /data/corpus --out /data/audit \
+  --tasks fev100 --kinds chronos_real,gifteval_pretrain --workers 4 --resume
+```
+
+`--tasks weekly` and `--tasks heldout` select the existing seven and five tasks.
+A custom task YAML needs no role profiles and can override each task with
+`local_path: ./fixture.parquet`; the same datasets train-split loader reads it.
+The YAML target field is `target`, a column name or a list. ID and timestamp
+columns default to `id` and `timestamp`. Optional `freq` resolves short local
+series whose timestamps alone cannot establish frequency. The audit scans every
+numeric sequence feature, even when it has no explicit role annotation.
+
+A **copy** is an identifying segment of at least 24 overlapping finite points
+under `corpus = slope * benchmark + intercept`, with either an exact fraction
+of at least 0.99 or maximum absolute residual at most
+`max(0.01, 0.005 * corpus segment range)`. Run 11 measures the exact fraction
+with `isclose(atol=0.005, rtol=1e-6)`. It covers additive shifts, unit changes,
+negation, rounding, slices and qualifying pieces of spliced sequences.
+Both segments must have at least two levels and range above 64 float32 ulps
+of their magnitude; after quantisation to the copy tolerance they must have
+at least four off-modal observations and seven degrees of freedom
+`(runs - 1) + (distinct levels - 2)`. Monthly sequences and calendar-month
+aggregates also must carry information beyond days-in-month. These information
+rules are policies, and excluded target fits are reported separately.
+
+Four fingerprint families apply to every row: eight rounded values, eight
+normalised values, four runs and eight runs. The direct multiplicity caps are
+1,024 / 1,024 / 64 / 8,192. Candidate groups need at least three hits or summed
+window spans of at least 24 at one offset. Verification uses least-squares
+fits of merged intervals, intervals regrouped by their implied affine maps,
+and piecewise refinement with twice the copy tolerance. Rows with only
+above-cap hits expand all four families; a 512-group first-pass limit is
+removed in the automatic post-pass. An expansion exceeding 50 million postings
+remains explicitly unresolved rather than exhausting memory silently.
+
+Frequency classes are `15T`, `30T`, `1H`, `1D`, `1W`, `1M`, `1Q`, `1Y`.
+Weekly anchors share a class, month-start/end aliases share a class, and business
+days belong to `1D`. Daily columns also produce weekly sums at all seven anchors
+and full calendar-month sums and means. Non-calendar-daily grids such as business
+days are scanned natively and counted as ineligible for daily aggregation.
+Unsupported frequencies and corpus classes without benchmark columns are
+counted. Legacy `tsmixup` and `kernel_synth` are excluded by default; selecting
+them requires their timestamp metadata, whose calendar values are synthetic.
+
+Read `audit.md` for the task × kind summary, folders containing copies,
+benchmark and corpus date ranges, method, constants and limitations.
+`audit.json` holds every scan's coverage counters, copy and near-pair segments,
+rejection reasons, policy-excluded target fits and unresolved IDs. Segment
+bounds are zero-based and half-open in the scanned sequence or aggregate;
+`coef` maps benchmark values to corpus values. Duplicate sequences are scanned
+once with counters multiplied by the number of rows, and records retain all
+original IDs. Pair counters can be smaller than the number of segment records.
+Nonfinite residuals in rejected fits are represented as JSON `null`.
+
+`declaration.json` supplies `trained_on_datasets`: **a task is included if any
+of its target or covariate columns has a qualifying copy**. Preserve explicit
+names such as `uk_covid_utla_1W/cumulative`. Feed this list into the model's fev
+training-data declaration; provenance may require additional entries, so an
+empty list does not establish source isolation. The command exits 0 on a
+completed audit, including one that finds copies, and exits 2 if the post-pass
+leaves unresolved rows. An incomplete declaration is marked `complete: false`.
+
+Each column/variant/kind scan is atomically saved under `<out>/scans/`.
+`--resume` reuses only complete scans with matching shard-manifest, task-YAML,
+dataset-revision, local-input, constants, library-version and implementation
+fingerprints. Actual shard bytes are verified against the manifest first.
+Corrupted, incomplete or mismatched scans are recomputed. Run one audit at a
+time per output directory, and keep the corpus unchanged while it runs.
+
+Shards stream into temporary disk-backed float64 arrays; one index per kind and
+frequency class is built and shared with scan processes through read-only memory
+maps. Targets are not copied into each worker. Allow temporary disk space for
+float64 values and four posting tables, plus the datasets Arrow cache and scan
+reports. `--workers` defaults to one fewer than the CPU count (minimum one);
+reduce it when worker candidate expansions use too much RAM. Runtime depends
+strongly on series lengths, repeated fingerprints and fallback candidate counts.
+Small synthetic fixtures complete in seconds, but a full 100-task audit can
+take hours to days; fixture throughput is not a reliable prediction of the
+uncapped post-pass cost. No full corpus audit is performed by the unit tests.
+
+The 26 positive, 14 negative and ten rule controls run offline. Two inputs that
+previously loaded M4 rows use deterministic synthetic surrogates: a varying
+200-point base and a 119-point, three-level/four-run policy-negative shape.
+The 1,100-duplicate fallback control uses a seven-run synthetic base so the
+eight-run family cannot bypass the masked-row path.
+The remaining constructions and expectations are ported from run 11.
+`--controls --control-constants overrides.json --out /tmp/controls` supports
+experiments and records every constant in `controls.json`. Overrides never
+apply to a corpus audit; there is no method-changing fast mode.
+
+The report includes the specification's known matcher limits: refinement can
+miss splices of three or more very similar affine maps; an unrelated informative
+hit can suppress fallback for above-cap short run patterns; clipped runs and
+boundary noise can remove fingerprints; and rounding bins and the calendar
+predicate are not fully shift invariant. A lack of detected copies is an
+empirical result under this definition, not proof of source-level non-overlap.

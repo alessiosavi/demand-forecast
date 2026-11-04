@@ -386,3 +386,24 @@ def test_validation_set_requires_configured_external_directory(tmp_path):
     with pytest.raises(FileNotFoundError) as error:
         ValidationSet.build(cfg, [], encoder)
     assert str(directory) in str(error.value)
+
+
+@pytest.mark.parametrize("unpinned", [False, True])
+def test_download_external_revision_pin(monkeypatch, tmp_path, unpinned):
+    from unittest.mock import Mock
+
+    from demand_forecast.pretrain.corpus import CHRONOS_REVISION, CORPUS_REPO
+    from demand_forecast.pretrain.validate import download_external
+
+    dataset = Mock()
+    loader = Mock(return_value=dataset)
+    monkeypatch.setattr("datasets.load_dataset", loader)
+    kwargs = {"revision": None} if unpinned else {}
+    destination = download_external("monash_nn5_weekly", tmp_path, **kwargs)
+    loader.assert_called_once_with(
+        CORPUS_REPO,
+        "monash_nn5_weekly",
+        split="train",
+        revision=None if unpinned else CHRONOS_REVISION,
+    )
+    dataset.save_to_disk.assert_called_once_with(str(destination))

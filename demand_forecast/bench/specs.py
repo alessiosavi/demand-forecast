@@ -13,6 +13,74 @@ from typing import Any, Literal
 
 import yaml
 
+FEV_DATASETS_REVISION = "d3e7e720f4158eab03ebcb021f1cce779cd92acc"
+
+
+@dataclass(frozen=True)
+class FevDatasetTask:
+    """Dataset identity and column roles for content audits; no model profiles."""
+
+    name: str
+    dataset_path: str
+    dataset_config: str | None = None
+    target: str | list[str] = "target"
+    known_dynamic_columns: list[str] = field(default_factory=list)
+    past_dynamic_columns: list[str] = field(default_factory=list)
+    id_column: str = "id"
+    timestamp_column: str = "timestamp"
+    local_path: str | None = None
+    freq: str | None = None
+
+    @property
+    def targets(self) -> list[str]:
+        return [self.target] if isinstance(self.target, str) else self.target
+
+
+def fev_bench_tasks_path(selector: str | Path = "fev100"):
+    """Locate the byte-identical upstream YAML or an explicitly selected subset."""
+    filenames = {
+        "fev100": "fev_bench_100_193e4fc.yaml",
+        "weekly": "fev_bench_weekly.yaml",
+        "heldout": "fev_bench_weekly_heldout.yaml",
+    }
+    if str(selector) in filenames:
+        return files("demand_forecast.bench").joinpath("tasks", filenames[str(selector)])
+    return Path(selector)
+
+
+def fev_bench_tasks(selector: str | Path = "fev100") -> list[FevDatasetTask]:
+    """Read all 100 upstream tasks, a subset, or local YAML without role profiles.
+
+    Upstream calls the target field ``target`` (including multivariate lists).
+    A local_path override points to a parquet file, relative to custom YAML.
+    Explicit task names distinguish different targets of the same dataset.
+    """
+    path = fev_bench_tasks_path(selector)
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict) or not isinstance(data.get("tasks"), list):
+        raise ValueError("task YAML must contain a tasks list")
+    tasks = []
+    for definition in data["tasks"]:
+        name = definition.get("name") or definition.get("task_name")
+        name = name or definition.get("dataset_config") or Path(definition["dataset_path"]).stem
+        values = {
+            key: definition[key]
+            for key in FevDatasetTask.__dataclass_fields__
+            if key != "name" and key in definition
+        }
+        local = values.get("local_path") or _local_path(values["dataset_path"])
+        if local is not None:
+            local = Path(local).expanduser()
+            if not local.is_absolute():
+                local = Path(str(path)).parent / local
+            values["local_path"] = str(local.resolve())
+        tasks.append(FevDatasetTask(name=name, **values))
+    if len({task.name for task in tasks}) != len(tasks):
+        raise ValueError("duplicate task names in audit YAML")
+    if not tasks:
+        raise ValueError("task YAML must not be empty")
+    return tasks
+
 
 @dataclass
 class FevTaskSpec:
