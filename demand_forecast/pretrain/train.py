@@ -103,9 +103,9 @@ class _PretrainLoop:
         self.identity = pretrain_identity(cfg, __version__, self.shards)
         selected = {}
         holdout = []
-        for kind in ("tsmixup", "kernel_synth"):
-            wanted = set(getattr(cfg.corpus, f"{kind}_shards"))
-            held_out = set(getattr(cfg.corpus, f"holdout_{kind}"))
+        for kind, (training_indices, holdout_indices) in cfg.corpus.selections().items():
+            wanted = set(training_indices)
+            held_out = set(holdout_indices)
             available = {ref.index for ref in self.refs if ref.kind == kind}
             if missing := (wanted | held_out) - available:
                 raise ValueError(f"missing {kind} shards in manifest: {sorted(missing)}")
@@ -113,10 +113,21 @@ class _PretrainLoop:
             holdout.extend(ref for ref in self.refs if ref.kind == kind and ref.index in held_out)
         if not selected["tsmixup"]:
             raise ValueError("pretraining requires a tsmixup shard for the model specification")
-        if cfg.corpus.kernel_synth_every > 0 and not selected["kernel_synth"]:
+        if (
+            cfg.corpus.sources is None
+            and cfg.corpus.kernel_synth_every > 0
+            and not selected["kernel_synth"]
+        ):
             raise ValueError("kernel_synth_every > 0 requires at least one kernel_synth shard")
+        mixing = (
+            selected
+            if cfg.corpus.sources is None
+            else dict(
+                sources=selected, weights={k: v.weight for k, v in cfg.corpus.sources.items()}
+            )
+        )
         self.sampler = CorpusSampler(
-            **selected,
+            **mixing,
             horizon=cfg.forecast.horizon,
             max_context=cfg.forecast.max_context,
             min_context=cfg.forecast.min_context,
@@ -185,8 +196,8 @@ class _PretrainLoop:
         started = time.perf_counter()
         batch = next(self.batches)
         elapsed = time.perf_counter() - started
-        old = getattr(before, self.sampler.last_kind)
-        new = getattr(self.sampler.state(), self.sampler.last_kind)
+        old = before.stream(self.sampler.last_kind)
+        new = self.sampler.state().stream(self.sampler.last_kind)
         transition = old.batch_cursor == 0 or (old.pass_index, old.shard_cursor) != (
             new.pass_index,
             new.shard_cursor,
@@ -315,7 +326,7 @@ class _PretrainLoop:
         )
 
     def restore(self, path: Path) -> None:
-        from demand_forecast.pretrain.sampler import CorpusSamplerState, StreamState
+        from demand_forecast.pretrain.sampler import sampler_state_from_dict
 
         state = torch.load(path, map_location="cpu", weights_only=False)
         if state["identity"] != self.identity:
@@ -327,13 +338,7 @@ class _PretrainLoop:
         self.scheduler.load_state_dict(state["scheduler"])
         self.scaler.load_state_dict(state["scaler"])
         sampler = state["sampler_state"]
-        self.sampler.load_state(
-            CorpusSamplerState(
-                step=sampler["step"],
-                tsmixup=StreamState(**sampler["tsmixup"]),
-                kernel_synth=StreamState(**sampler["kernel_synth"]),
-            )
-        )
+        self.sampler.load_state(sampler_state_from_dict(sampler))
         for key in (
             "step",
             "history",

@@ -6,8 +6,10 @@ from collections.abc import Iterator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import dataclass
+from fractions import Fraction
+from math import lcm
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 from weakref import finalize
 
 import numpy as np
@@ -18,8 +20,8 @@ from demand_forecast.data.sampler import Batch, BatchBuilder, _positive
 from demand_forecast.pretrain import corpus
 from demand_forecast.pretrain.corpus import ShardRef
 
-Kind = Literal["tsmixup", "kernel_synth"]
-KIND_CODE = {"tsmixup": 0, "kernel_synth": 1}
+Kind = str
+KIND_CODE = {"tsmixup": 0, "kernel_synth": 1, "chronos_real": 2, "gifteval_pretrain": 3}
 
 
 @dataclass
@@ -43,6 +45,34 @@ class CorpusSamplerState:
     step: int
     tsmixup: StreamState
     kernel_synth: StreamState
+
+    def stream(self, kind: str) -> StreamState:
+        return getattr(self, kind)
+
+
+@dataclass
+class WeightedSamplerState:
+    """Independent stream positions and exact integer scheduling credits."""
+
+    step: int
+    streams: dict[str, StreamState]
+    credits: dict[str, int]
+    weights: dict[str, int]
+    last_kind: str
+
+    def stream(self, kind: str) -> StreamState:
+        return self.streams[kind]
+
+
+def sampler_state_from_dict(value: dict) -> CorpusSamplerState | WeightedSamplerState:
+    """Read legacy checkpoints as well as weighted checkpoints."""
+    if "streams" in value:
+        return WeightedSamplerState(
+            **(value | {"streams": {k: StreamState(**v) for k, v in value["streams"].items()}})
+        )
+    return CorpusSamplerState(
+        value["step"], StreamState(**value["tsmixup"]), StreamState(**value["kernel_synth"])
+    )
 
 
 class ShardStream(Iterator[Batch]):
@@ -259,12 +289,18 @@ class CorpusSampler:
     ``kernel_synth_every=0`` disables the auxiliary stream; 1 selects it every
     time. Public ``tsmixup`` and ``kernel_synth`` streams expose their load
     counters. Call ``close()`` when training finishes or is interrupted.
+
+    With ``sources`` and ``weights``, use smooth weighted round-robin: add
+    each weight to its credit, select the largest credit (ties by KIND_CODE),
+    and subtract the sum of weights from that kind. Decimal weights are
+    converted to exact integers; checkpoints store credits and every stream.
+    The legacy constructor retains its original schedule and RNG seeds.
     """
 
     def __init__(
         self,
-        tsmixup: Sequence[ShardRef],
-        kernel_synth: Sequence[ShardRef],
+        tsmixup: Sequence[ShardRef] = (),
+        kernel_synth: Sequence[ShardRef] = (),
         *,
         horizon: int,
         max_context: int,
@@ -273,6 +309,8 @@ class CorpusSampler:
         seed: int,
         kernel_synth_every: int = 10,
         holdout: Sequence[ShardRef] = (),
+        sources: dict[str, Sequence[ShardRef]] | None = None,
+        weights: dict[str, float] | None = None,
     ) -> None:
         _positive(kernel_synth_every + 1, "kernel_synth_every + 1")
         primary = {(ref.kind, ref.index) for ref in tsmixup}
@@ -280,6 +318,26 @@ class CorpusSampler:
         held_out = {(ref.kind, ref.index) for ref in holdout}
         if primary & auxiliary or (primary | auxiliary) & held_out:
             raise ValueError("overlapping corpus refs between streams or holdout")
+        self.weights = None
+        if sources is not None:
+            if tsmixup or kernel_synth:
+                raise ValueError("use sources or legacy positional streams, not both")
+            if not sources or weights is None or sources.keys() != weights.keys():
+                raise ValueError("sources and weights must name the same nonempty set of kinds")
+            if set(sources) - KIND_CODE.keys() or any(not refs for refs in sources.values()):
+                raise ValueError("weighted sources require nonempty registered kinds")
+            if any((ref.kind, ref.index) in held_out for refs in sources.values() for ref in refs):
+                raise ValueError("overlapping corpus refs between streams or holdout")
+            fractions = {k: Fraction(str(v)) for k, v in weights.items()}
+            if any(v <= 0 for v in fractions.values()):
+                raise ValueError("weights must be finite and positive")
+            denominator = lcm(*(v.denominator for v in fractions.values()))
+            self.weights = {
+                k: int(fractions[k] * denominator) for k in sorted(sources, key=KIND_CODE.get)
+            }
+            self.credits = dict.fromkeys(self.weights, 0)
+        elif weights is not None:
+            raise ValueError("weights require sources")
         # Corpus roles contain no statics; fitting an empty panel avoids an
         # eager shard read and leaves every series in the unknown-id bucket.
         self.encoder = StaticEncoder().fit(corpus.shard_panel([]), [])
@@ -291,8 +349,19 @@ class CorpusSampler:
             seed=seed,
             encoder=self.encoder,
         )
-        self.tsmixup = ShardStream(tsmixup, "tsmixup", **kwargs)
-        self.kernel_synth = ShardStream(kernel_synth, "kernel_synth", **kwargs)
+        refs_by_kind = (
+            sources if sources is not None else {"tsmixup": tsmixup, "kernel_synth": kernel_synth}
+        )
+        self.streams = {}
+        try:
+            for kind, refs in refs_by_kind.items():
+                self.streams[kind] = ShardStream(refs, kind, **kwargs)
+        except BaseException:
+            for stream in self.streams.values():
+                stream.close()
+            raise
+        self.tsmixup = self.streams.get("tsmixup")
+        self.kernel_synth = self.streams.get("kernel_synth")
         self.kernel_synth_every = kernel_synth_every
         self.step = 0
         self.last_kind = ""
@@ -305,9 +374,15 @@ class CorpusSampler:
     def batches(self) -> Iterator[Batch]:
         """Yield batches, advancing the mixing step before exposing each one."""
         while not self._closed:
-            kind = self._kind(self.step)
+            if self.weights is None:
+                kind = self._kind(self.step)
+            else:
+                for kind, weight in self.weights.items():
+                    self.credits[kind] += weight
+                kind = max(self.weights, key=self.credits.get)
+                self.credits[kind] -= sum(self.weights.values())
             try:
-                batch = next(self.kernel_synth if kind == "kernel_synth" else self.tsmixup)
+                batch = next(self.streams[kind])
             except Exception:
                 self.close()
                 raise
@@ -315,13 +390,36 @@ class CorpusSampler:
             self.step += 1
             yield batch
 
-    def state(self) -> CorpusSamplerState:
+    def state(self) -> CorpusSamplerState | WeightedSamplerState:
         """Snapshot both streams, including an auxiliary stream not yet consumed."""
+        if self.weights is not None:
+            return WeightedSamplerState(
+                self.step,
+                {k: v.state() for k, v in self.streams.items()},
+                self.credits.copy(),
+                self.weights.copy(),
+                self.last_kind,
+            )
         return CorpusSamplerState(self.step, self.tsmixup.state(), self.kernel_synth.state())
 
-    def load_state(self, state: CorpusSamplerState) -> None:
+    def load_state(self, state: CorpusSamplerState | WeightedSamplerState) -> None:
         """Restore both streams and the schedule from a detached checkpoint."""
         _positive(state.step + 1, "step + 1")
+        if self.weights is not None:
+            if (
+                not isinstance(state, WeightedSamplerState)
+                or state.weights != self.weights
+                or state.streams.keys() != self.streams.keys()
+                or state.credits.keys() != self.weights.keys()
+            ):
+                raise ValueError("weighted checkpoint does not match the sampler")
+            for kind, stream in self.streams.items():
+                stream.load_state(state.streams[kind])
+            self.step, self.last_kind = state.step, state.last_kind
+            self.credits = state.credits.copy()
+            return
+        if not isinstance(state, CorpusSamplerState):
+            raise ValueError("legacy sampler requires a legacy checkpoint")
         self.tsmixup.load_state(state.tsmixup)
         self.kernel_synth.load_state(state.kernel_synth)
         self.step = state.step
@@ -330,5 +428,5 @@ class CorpusSampler:
     def close(self) -> None:
         """Stop both streams and release their current and prefetched shards."""
         self._closed = True
-        self.tsmixup.close()
-        self.kernel_synth.close()
+        for stream in self.streams.values():
+            stream.close()

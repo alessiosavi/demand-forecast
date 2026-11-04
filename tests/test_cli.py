@@ -25,8 +25,17 @@ def test_pretrain_command_set_and_help():
         "generate-sales",
         "version",
     }
-    assert set(get_command(app).commands["pretrain"].commands) == {"run", "probe", "probe-task"}
-    for command in ("run", "probe", "probe-task"):
+    assert set(get_command(app).commands["pretrain"].commands) == {
+        "run",
+        "probe",
+        "probe-task",
+        "corpus",
+    }
+    assert set(get_command(app).commands["pretrain"].commands["corpus"].commands) == {
+        "build",
+        "verify",
+    }
+    for command in ("run", "probe", "probe-task", "corpus"):
         result = runner.invoke(app, ["pretrain", command, "--help"])
         assert result.exit_code == 0, result.output
 

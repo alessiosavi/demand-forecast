@@ -84,3 +84,20 @@ and numerical frames therefore remain compatible.
 trial 11 (2026-11-03) for the post-hoc confirmation sweep. Supply the pretrained
 bundle with `--init-from`; it leaves the ablation switches at their defaults.
 These options and the tuned recipe do not replace the frozen official row.
+
+## Pretraining corpus configuration
+
+Pretraining uses its own `PretrainConfig`. The existing
+`configs/pretrain-v2-first-try.yaml` retains its legacy shard lists, hold-outs,
+`kernel_synth_every` schedule and run identity. Optional `corpus.sources` maps
+registered kind names to `{shards: [...], holdout: [...], weight: ...}` for
+deterministic weighted mixing. It must include `tsmixup`; weights must be finite
+and positive and hold-outs disjoint from training shards. Omit the legacy
+controls in weighted configs; conflicting specifications are rejected.
+
+The separate `configs/corpus-v2.yaml` build recipe pins source revisions and
+records include/exclude lists, attribution, filters and shard limits. It loads
+offline and rejects unknown fields. `local_path` on a build source enables
+offline conversion from a saved snapshot. See [Corpus v2](corpus.md) for build
+and verify commands, a weighted pretraining example, reproducibility limits,
+and the research-only licence position.

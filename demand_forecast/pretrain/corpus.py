@@ -6,7 +6,6 @@ import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
 
 import numpy as np
 import pandas as pd
@@ -15,15 +14,18 @@ from numpy.typing import DTypeLike
 from demand_forecast.data.panel import Panel, Roles, Series
 
 CORPUS_REPO = "autogluon/chronos_datasets"
+CHRONOS_REVISION = "eeecad0b82a8c237e212ce6f8d1abecb513e2cec"
 TSMIXUP_PREFIX = "training_corpus/tsmixup_10m/"
 KERNEL_SYNTH_PREFIX = "training_corpus/kernel_synth_1m/"
 PRETRAIN_START = pd.Timestamp("2000-01-02")
 PRETRAIN_FREQ = "W-SUN"
 CORPUS_ROLES = Roles("target", (), (), (), ())
 
-_CORPORA: dict[Literal["tsmixup", "kernel_synth"], tuple[str, int]] = {
-    "tsmixup": (TSMIXUP_PREFIX, 200),
-    "kernel_synth": (KERNEL_SYNTH_PREFIX, 20),
+CORPUS_KINDS = {
+    "tsmixup": TSMIXUP_PREFIX.rstrip("/"),
+    "kernel_synth": KERNEL_SYNTH_PREFIX.rstrip("/"),
+    "chronos_real": "training_corpus/chronos_real",
+    "gifteval_pretrain": "training_corpus/gifteval_pretrain",
 }
 
 
@@ -62,7 +64,7 @@ class ShardRef:
     """A shard's location, corpus identity, content digest, and size in bytes."""
 
     path: Path
-    kind: Literal["tsmixup", "kernel_synth"]
+    kind: str
     index: int
     sha256: str
     size: int
@@ -79,13 +81,14 @@ def _sha256(path: Path) -> str:
 def corpus_manifest(root: Path) -> list[ShardRef]:
     """Hash the local corpus shards, returning absolute paths in sorted order.
 
-    Only the two corpus prefixes and their exact five-digit shard filenames
-    are considered. Hashing reads bounded blocks rather than entire files.
+    Legacy kinds retain their exact shard counts; new kinds accept any
+    five-digit count. Hashing reads bounded blocks rather than entire files.
     """
     root = Path(root).resolve()
     refs = []
-    for kind, (prefix, count) in _CORPORA.items():
-        pattern = "train-" + "[0-9]" * 5 + f"-of-{count:05d}.parquet"
+    for kind, prefix in CORPUS_KINDS.items():
+        count = {"tsmixup": "00200", "kernel_synth": "00020"}.get(kind, "[0-9]" * 5)
+        pattern = "train-" + "[0-9]" * 5 + f"-of-{count}.parquet"
         for path in (root / prefix).glob(pattern):
             if path.is_file():
                 refs.append(
@@ -143,7 +146,12 @@ def read_manifest(path: Path) -> list[ShardRef]:
     return refs
 
 
-def download_shards(root: Path, tsmixup: list[int], kernel_synth: list[int]) -> list[Path]:
+def download_shards(
+    root: Path,
+    tsmixup: list[int],
+    kernel_synth: list[int],
+    revision: str | None = CHRONOS_REVISION,
+) -> list[Path]:
     """Download only the selected shard filenames; intended for EC2 setup."""
     patterns = [f"{TSMIXUP_PREFIX}train-{index:05d}-of-00200.parquet" for index in tsmixup]
     patterns += [
@@ -154,5 +162,21 @@ def download_shards(root: Path, tsmixup: list[int], kernel_synth: list[int]) -> 
 
     from huggingface_hub import snapshot_download
 
-    snapshot_download(CORPUS_REPO, repo_type="dataset", local_dir=root, allow_patterns=patterns)
+    snapshot_download(
+        CORPUS_REPO, repo_type="dataset", revision=revision, local_dir=root, allow_patterns=patterns
+    )
     return [Path(root) / name for name in patterns]
+
+
+def verify_manifest(root: Path) -> dict[str, tuple[int, int]]:
+    """Rehash every manifest entry; return (valid, failed) counts by kind."""
+    counts = {}
+    for ref in read_manifest(Path(root) / "manifest.json"):
+        valid, failed = counts.get(ref.kind, (0, 0))
+        matches = (
+            ref.path.is_file()
+            and ref.path.stat().st_size == ref.size
+            and _sha256(ref.path) == ref.sha256
+        )
+        counts[ref.kind] = (valid + int(matches), failed + int(not matches))
+    return counts

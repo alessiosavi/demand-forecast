@@ -33,6 +33,20 @@ data-flow diagram, artifact table, fallback rules and per-item-origin semantics.
 
 ## Quick start
 
+For pretraining data, [Corpus v2](docs/corpus.md) documents the pinned research
+corpus recipe, licences, deterministic conversion, manifests and weighted mixing:
+
+```bash
+pip install -e '.[corpus]'
+demand-forecast pretrain corpus build --config configs/corpus-v2.yaml --root /data/corpus
+demand-forecast pretrain corpus verify --root /data/corpus
+```
+
+The build adds real-data kinds alongside existing TSMixup/KernelSynth shards.
+It is a research release with `commercial_use: false`; see the
+[attribution notice](docs/NOTICE-corpus.md). Existing pretraining configs retain
+their behavior and identity.
+
 Install from this checkout with Python 3.10+ and generate a small weekly panel:
 
 ```bash
