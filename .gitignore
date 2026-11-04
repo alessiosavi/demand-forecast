@@ -139,6 +139,7 @@ cython_debug/
 dataset/
 plotly/
 *.csv
+!tests/test_world_signals/fixtures/*.csv
 *.pt
 *.pth
 *.joblib
@@ -161,3 +162,6 @@ config.yaml
 # OS files
 .DS_Store
 Thumbs.db
+
+# Private finance probe downloads and bundles
+data/world-signals/

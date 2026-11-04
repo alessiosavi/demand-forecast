@@ -1,0 +1,36 @@
+{
+  "chart": {
+    "result": [
+      {
+        "meta": {
+          "symbol": "SYNTHETIC"
+        },
+        "timestamp": [
+          1709874000,
+          1710129600,
+          1710212400,
+          1710216000
+        ],
+        "indicators": {
+          "quote": [
+            {
+              "close": [
+                20,
+                30,
+                null,
+                40
+              ],
+              "volume": [
+                1,
+                2,
+                3,
+                null
+              ]
+            }
+          ]
+        }
+      }
+    ],
+    "error": null
+  }
+}

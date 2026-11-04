@@ -1,0 +1,7 @@
+id,title,description,sourceId,sourceDomain,sourceUrl,newsDatetime,url,negative,positive,important,liked,disliked,lol,toxic,saved,comments,currencies
+1,Synthetic one,Fixture,1,example.invalid,https://example.invalid,2024-01-01 23:59:59,https://example.invalid/1,0,99,15,0,0,0,0,0,0,"BTC,ETH"
+2,Synthetic two,Fixture,1,example.invalid,https://example.invalid,2024-01-02 00:00:00,https://example.invalid/2,0,1,0,0,0,0,0,0,0,BTC
+3,Synthetic three,Fixture,1,example.invalid,https://example.invalid,2024-01-04 12:00:00,https://example.invalid/3,0,1,0,0,0,0,0,0,0,BTC
+4,Synthetic four,Fixture,1,example.invalid,https://example.invalid,2023-12-31 12:00:00,https://example.invalid/4,0,0,0,0,0,0,0,0,0,NULL
+5,Synthetic five,Fixture,1,example.invalid,https://example.invalid,2024-01-05 12:00:00,https://example.invalid/5,0,0,0,0,0,0,0,0,0,ETH
+1,Synthetic duplicate,Fixture,1,example.invalid,https://example.invalid,2024-01-01 23:59:59,https://example.invalid/1,0,999,150,0,0,0,0,0,0,"BTC,ETH"

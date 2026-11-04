@@ -1,0 +1,5 @@
+year,startDate,endDate,type,unscheduled,cancelled,projections,label,statementDate,statementTimeET,timeSource,statementUrl,status
+2020,2020-03-03,2020-03-03,call,true,false,false,Synthetic unscheduled,2020-03-03,10:00,fixture,https://example.invalid/a,held
+2020,2020-03-15,2020-03-15,call,true,false,false,Synthetic emergency,2020-03-15,17:00,fixture,https://example.invalid/b,held
+2020,2020-03-17,2020-03-18,meeting,false,true,true,Synthetic scheduled cancelled,2020-03-19,14:00,fixture,https://example.invalid/c,cancelled
+2020,2020-04-28,2020-04-29,meeting,false,false,false,Synthetic scheduled,2020-04-30,14:00,fixture,https://example.invalid/d,held
