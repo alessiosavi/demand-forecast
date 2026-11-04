@@ -25,7 +25,10 @@ median point forecast.
 Only `v2` is accepted by the current model configuration. Standard, advanced,
 TCN and mixer models remain in a separate legacy registry; they are not yet on
 this trainer, bundle or fev path. Clustering, tuning, export and DHF are not
-integrated into this pipeline. Full refit and per-window training are rejected.
+integrated into this pipeline. Optional full-history refit, per-window training,
+backbone freezing, removal of series embeddings and a relative target scale floor
+are available for ablations; the official protocol keeps its original defaults.
+See [configuration](CONFIGURATION.md).
 The [architecture guide](ARCHITECTURE.md) explains the family boundaries, data
 flow, masks, covariate guards and artifacts.
 

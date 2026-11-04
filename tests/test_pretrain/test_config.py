@@ -152,6 +152,7 @@ def test_pretrain_identity_ignores_root_and_tracks_shards():
     shards_before = shards.copy()
     portable = deepcopy(before)
     del portable["corpus"]["root"]
+    del portable["forecast"]["scale_floor_frac"]  # Preserve the pre-switch identity.
     payload = {"config": portable, "package_version": "2.0.0", "shards": shards}
     expected = hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -222,3 +223,12 @@ def test_pretrain_config_imports_without_bench():
         timeout=30,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_pretrain_rejects_task_only_scale_floor():
+    from demand_forecast.pretrain.config import PretrainConfig
+
+    raw = yaml.safe_load(SHIPPED_CONFIG.read_text())
+    raw["forecast"]["scale_floor_frac"] = 0.1
+    with pytest.raises(ValidationError, match="only supported for task training"):
+        PretrainConfig.model_validate(raw)

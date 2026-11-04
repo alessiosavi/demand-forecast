@@ -166,9 +166,13 @@ Forecast fallbacks are deterministic, finite and logged:
 
 Standard training uses `max_context=512`. Optional future tuning may consider
 `[2H, max(64, 2H), 256, 512]`, deduplicated with a cap of 512. Selection remains on
-inner validation only; no tuning is authorized by prompt 00. Tuning,
-`refit: full` and `per_window` are deferred; preregister any later tuning trial/time
-budget before running it. Other families and `dhf` need their own reviewed configurations.
+inner validation only; no tuning is authorized by prompt 00. Preregister any later
+tuning trial/time budget before running it. `refit: full` and `per_window` are now
+implemented as optional ablations, together with `training.trainable: heads_only`,
+`training.series_embedding: false`, and `forecast.scale_floor_frac > 0`. These
+switches do not change the frozen official row (`first_window` / `refit: none`,
+all parameters trainable, series embeddings enabled, relative floor disabled).
+See [configuration](CONFIGURATION.md) for their artifacts and resume semantics. Other families and `dhf` need their own reviewed configurations.
 
 The frozen policy is **`first_window`**, one seed (0). Train/select once on the first
 window's available past; reuse that bundle and learned preprocessing for later
@@ -270,7 +274,10 @@ fingerprints, task definitions, seed, policy, budgets, hardware/dtype, failures,
 fallback/exclusion counts, timings and measured peak RAM/VRAM. An interruption/resume
 trial precedes the frozen model run, and no frozen v2 score is viewed before the
 prerequisites pass. Execution evidence includes `checkpoints/progress.json`, per-window
-NPZ diagnostics and the tables produced by `scripts/fev_report.py`. Use [the Colab template](colab.md) and
+NPZ diagnostics and the tables produced by `scripts/fev_report.py`. The auditor supports
+both `first_window` and `per_window`: for the latter it checks each window's identity,
+bundle and progress against its predictions, verifies the combined summary identity,
+and prints training steps, best step and stop reason for each window. Use [the Colab template](colab.md) and
 [prompt 00](colab/prompts/00-profile-and-baselines.md) for the first profiling/baseline
 session. No Timestral weights are downloaded.
 

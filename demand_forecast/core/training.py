@@ -44,6 +44,7 @@ def _empty_timings() -> dict:
         cold_covariate_columns=0,
         clipped_covariate_values=0,
         floored_covariate_columns=0,
+        floored_target_samples=0,
     )
 
 
@@ -183,6 +184,9 @@ class Trainer:
         stop_after: int | None = None,
         evaluate_fn=evaluate,
         eval_at_start: bool = False,
+        *,
+        step_limit: int | None = None,
+        schedule_max_steps: int | None = None,
     ) -> FitResult:
         """Fit the permitted split, or continue its checkpoint without reseeding.
 
@@ -192,6 +196,8 @@ class Trainer:
         restored only when training completes, never on interruption.
         ``eval_at_start`` selects and checkpoints the untrained model exactly
         once before any optimizer step, also defaulting to ``checkpoints/``.
+        ``step_limit`` stops a full-history refit at the selected step while
+        ``schedule_max_steps`` retains the selection run's LR schedule length.
         Non-finite losses skip backward, optimizer and all scaler operations,
         but advance the scheduler and step count. Skipping the first optimizer
         update therefore produces PyTorch's expected scheduler-order warning.
@@ -215,6 +221,11 @@ class Trainer:
         self.max_steps, self.eval_every = resolve_budget(
             self.cfg.base_steps, len(plan.fit_ids), self.cfg.eval_every, self.cfg.max_steps_cap
         )
+        if schedule_max_steps is not None:
+            self.max_steps = schedule_max_steps
+        self.step_limit = self.max_steps if step_limit is None else step_limit
+        if not 1 <= self.step_limit <= self.max_steps:
+            raise ValueError("step_limit must be between 1 and max_steps")
         self.warmup_steps = self.cfg.warmup_steps
         fit_ids = set(plan.fit_ids)
         fit_indices = [i for i, series in enumerate(panel.series) if series.series_id in fit_ids]
@@ -230,9 +241,11 @@ class Trainer:
             encoder,
             seed=self.seed,
             label_upto=plan.train_upto,
+            scale_floor_frac=forecast_cfg.scale_floor_frac,
         )
+        parameters = [p for p in self.model.parameters() if p.requires_grad]
         self.optimizer = torch.optim.AdamW(
-            self.model.parameters(), lr=self.cfg.learning_rate, weight_decay=self.cfg.weight_decay
+            parameters, lr=self.cfg.learning_rate, weight_decay=self.cfg.weight_decay
         )
         self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, self._lr_factor)
         self.step, self.best_step, self.patience_counter = 0, 0, 0
@@ -271,7 +284,13 @@ class Trainer:
         if evaluate_fn is evaluate and not plan.exception and len(plan.val_items):
             prepare_started = time.perf_counter()
             prepared = prepare_validation(
-                panel, plan.val_items, plan.val_origin, horizon, max_context, encoder
+                panel,
+                plan.val_items,
+                plan.val_origin,
+                horizon,
+                max_context,
+                encoder,
+                scale_floor_frac=forecast_cfg.scale_floor_frac,
             )
             build_s = time.perf_counter() - prepare_started
             self.timings["eval_s"] += build_s
@@ -329,7 +348,8 @@ class Trainer:
         quantiles = torch.tensor(forecast_cfg.quantiles, device=self.device)
         self.model.train()
         session_steps = 0
-        while self.step < self.max_steps and (
+        floored_before = self.sampler.builder.floored_target_samples
+        while self.step < self.step_limit and (
             plan.exception or self.patience_counter < self.cfg.patience
         ):
             if self.sampler.position == len(self.sampler):
@@ -351,7 +371,7 @@ class Trainer:
                 if finite_loss:
                     self.scaler.scale(loss).backward()
                     self.scaler.unscale_(self.optimizer)
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip)
+                    torch.nn.utils.clip_grad_norm_(parameters, self.cfg.grad_clip)
                     self.scaler.step(self.optimizer)
                     scale_before = self.scaler.get_scale() if self.scaler.is_enabled() else None
                     self.scaler.update()
@@ -375,6 +395,9 @@ class Trainer:
                 self.timings["floored_covariate_columns"] += int(
                     batch.floored_covariates.sum().item()
                 )
+                floored_now = self.sampler.builder.floored_target_samples
+                self.timings["floored_target_samples"] += floored_now - floored_before
+                floored_before = floored_now
                 self.history.append(record)
                 if self.consecutive_nonfinite >= NONFINITE_STOP_AFTER:
                     self.terminal_reason = "nonfinite_losses"
@@ -445,7 +468,7 @@ class Trainer:
                         elapsed_s,
                         self.timings["peak_cuda_mem_bytes"] // 2**20,
                     )
-                finished = self.step == self.max_steps or (
+                finished = self.step == self.step_limit or (
                     not plan.exception and self.patience_counter >= self.cfg.patience
                 )
                 interrupted = stop_after is not None and session_steps >= stop_after
@@ -554,6 +577,7 @@ class Trainer:
             "consecutive_nonfinite": self.consecutive_nonfinite,
             "terminal_reason": self.terminal_reason,
             "max_steps": self.max_steps,
+            "step_limit": self.step_limit,
             "eval_every": self.eval_every,
             "warmup_steps": self.warmup_steps,
             "timings": self.timings,
@@ -592,6 +616,7 @@ class Trainer:
         self.scaler.load_state_dict(state["scaler"])
         self.sampler.seed = state["sampler_seed"]
         self.sampler.load_state(state["sampler"])
+        self.step_limit = state.get("step_limit", state["max_steps"])
         for name in (
             "step",
             "history",

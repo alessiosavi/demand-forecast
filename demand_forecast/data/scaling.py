@@ -31,9 +31,17 @@ class Frame:
     scale_raw: float
     eligible: bool
     has_context: bool
+    scale_floored: bool = False
 
 
-def sample_frame(context: np.ndarray, past: np.ndarray, m: int, min_scale: float = 1e-6) -> Frame:
+def sample_frame(
+    context: np.ndarray,
+    past: np.ndarray,
+    m: int,
+    min_scale: float = 1e-6,
+    *,
+    scale_floor_frac: float = 0.0,
+) -> Frame:
     """Use the context median and full-past seasonal error, flooring eligible scales only."""
     context = np.asarray(context, dtype=float)
     has_context = bool((~np.isnan(context)).any())
@@ -41,6 +49,16 @@ def sample_frame(context: np.ndarray, past: np.ndarray, m: int, min_scale: float
     scale_raw = seasonal_error(past, m)
     eligible = bool(np.isfinite(scale_raw) and scale_raw > 0)
     scale = max(scale_raw, min_scale) if eligible else 1.0
+    scale_floored = False
+    if scale_floor_frac > 0 and eligible and has_context:
+        floor = scale_floor_frac * float(np.nanmean(np.abs(context)))
+        scale_floored = floor > scale
+        scale = max(scale, floor)
     return Frame(
-        loc=loc, scale=scale, scale_raw=scale_raw, eligible=eligible, has_context=has_context
+        loc=loc,
+        scale=scale,
+        scale_raw=scale_raw,
+        eligible=eligible,
+        has_context=has_context,
+        scale_floored=scale_floored,
     )
