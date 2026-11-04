@@ -308,3 +308,69 @@ def test_provenance_includes_verified_cache_identity(tmp_path):
     (tmp_path / cache["cache_path"]).write_bytes(b"modified")
     with pytest.raises(ValueError, match="integrity"):
         builder.source_provenance(tmp_path)
+
+
+def test_offline_build_needs_no_network(monkeypatch, tmp_path):
+    def forbidden(*args, **kwargs):
+        raise AssertionError("network called")
+
+    monkeypatch.setattr("urllib.request.urlopen", forbidden)
+    with pytest.raises(Exception, match="[Oo]ffline.*cache"):
+        builder.fetch_inputs(tmp_path, "2018-01-01", "2025-12-31", offline=True)
+    frame, decision = builder.fetch_gdelt_with_retry(
+        tmp_path / "gdelt", "2018-01-01", "2025-12-31", offline=True
+    )
+    assert not decision["keep"]
+    assert frame[list(fetch_signals.GDELT_COLUMNS)].isna().all().all()
+    with pytest.raises(ValueError, match="refresh"):
+        builder.fetch_inputs(tmp_path, "2018-01-01", "2025-12-31", offline=True, refresh=True)
+
+
+def test_offline_gdelt_uses_cached_chunks_and_counts_missing(monkeypatch, tmp_path):
+    import io
+    from urllib.parse import urlencode
+
+    monkeypatch.setattr(sources, "_pace", lambda *args: None)
+    grid = pd.date_range("2025-01-01", "2025-01-10")
+    urls = []
+    for query in fetch_signals.GDELT_QUERIES:
+        for mode, series in (("TimelineVolRaw", "Article Count"), ("TimelineTone", "Average Tone")):
+            url = (
+                fetch_signals.GDELT_URL
+                + "?"
+                + urlencode(
+                    {
+                        "query": query,
+                        "mode": mode,
+                        "format": "json",
+                        "STARTDATETIME": "20250101000000",
+                        "ENDDATETIME": "20250110235959",
+                    }
+                )
+            )
+            body = json.dumps(
+                {
+                    "timeline": [
+                        {
+                            "series": series,
+                            "data": [
+                                {"date": day.strftime("%Y%m%dT%H%M%SZ"), "value": 2.0}
+                                for day in grid
+                            ],
+                        }
+                    ]
+                }
+            ).encode()
+            sources.cached_download(
+                url, tmp_path, opener=lambda *args, body=body, **kwargs: io.BytesIO(body)
+            )
+            urls.append(url)
+    frame, decision = builder.fetch_gdelt_with_retry(tmp_path, grid[0], grid[-1], offline=True)
+    assert decision["keep"]
+    assert frame[list(fetch_signals.GDELT_COLUMNS)].eq(2).all().all()
+    key = hashlib.sha256(urls[-1].encode()).hexdigest()
+    (tmp_path / f"{key}.json").unlink()
+    frame, decision = builder.fetch_gdelt_with_retry(tmp_path, grid[0], grid[-1], offline=True)
+    assert not decision["keep"]
+    assert frame["gdelt_gold_tone"].isna().all()
+    assert "Offline cache miss" in decision["errors"][0]["error"]

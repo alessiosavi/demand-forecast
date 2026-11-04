@@ -8,6 +8,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.error import URLError
 
 import numpy as np
 import pandas as pd
@@ -166,12 +167,28 @@ def build_long(raw, start, end):
     )
 
 
-def fetch_gdelt_with_retry(raw_dir, start, end, *, refresh=False):
+def _offline_opener(request, **kwargs):
+    raise URLError(f"Offline cache miss: {request.full_url}")
+
+
+def fetch_gdelt_with_retry(raw_dir, start, end, *, refresh=False, offline=False):
     """One normal pass and, only after HTTP 429, one slower cached retry pass.
 
     Stop a pass on exhausted 429 retries: hitting the remaining history endpoints
     under a host rate limit cannot establish complete coverage. Never loop passes.
     """
+    if offline and refresh:
+        raise ValueError("--offline cannot be combined with --refresh")
+    # An empty cache is common after the historical preflight was rate limited.
+    # Avoid pacing dozens of requests that cannot possibly be answered offline.
+    if offline and not list(Path(raw_dir).glob("*.meta.json")):
+        frame = pd.DataFrame({"date": pd.date_range(start, end, freq="D")})
+        frame[list(fetch_signals.GDELT_COLUMNS)] = np.nan
+        return frame, {
+            **fetch_signals.gdelt_preflight(frame, start, end),
+            "attempts": [],
+            "errors": [{"error": "Offline cache miss: no cached GDELT chunks"}],
+        }
     attempts = []
     for attempt in range(2):
         if attempt:
@@ -185,6 +202,7 @@ def fetch_gdelt_with_retry(raw_dir, start, end, *, refresh=False):
             interval=5 if not attempt else 10,
             retry_wait=0 if not attempt else 60,
             stop_on_rate_limit=True,
+            opener=_offline_opener if offline else None,
         )
         result = fetch_signals.gdelt_preflight(frame, start, end)
         errors = frame.attrs.get("errors", [])
@@ -206,9 +224,12 @@ def fetch_gdelt_with_retry(raw_dir, start, end, *, refresh=False):
     }
 
 
-def fetch_inputs(raw_dir, start, end, *, refresh=False):
+def fetch_inputs(raw_dir, start, end, *, refresh=False, offline=False):
     """Fetch sequentially with the shared cache transport; no models imported."""
     raw_dir = Path(raw_dir)
+    if offline and refresh:
+        raise ValueError("--offline cannot be combined with --refresh")
+    opener = _offline_opener if offline else None
     print("Fetching Yahoo panel and cross-market quotes", flush=True)
     prices = fetch_prices.fetch_panel(
         {**fetch_prices.PANEL_SYMBOLS, **fetch_prices.CROSS_SYMBOLS},
@@ -216,10 +237,11 @@ def fetch_inputs(raw_dir, start, end, *, refresh=False):
         end,
         raw_dir=raw_dir / "yahoo",
         refresh=refresh,
+        opener=opener,
     )
     print("Loading pinned CryptoPanic archive", flush=True)
     files = fetch_news.download_archive(
-        raw_dir / "news", revision=fetch_news.CRYPTOPANIC_REVISION, refresh=refresh
+        raw_dir / "news", revision=fetch_news.CRYPTOPANIC_REVISION, refresh=refresh, opener=opener
     )
     articles = fetch_news.normalize_articles(
         [
@@ -231,15 +253,15 @@ def fetch_inputs(raw_dir, start, end, *, refresh=False):
     news = fetch_news.aggregate_daily(articles, coins, fetch_news.coverage(articles, coins))
     print("Fetching F&G, GPR, calendars and cross-market features", flush=True)
     signals = (
-        fetch_signals.fetch_fng(raw_dir / "fng", refresh=refresh)
+        fetch_signals.fetch_fng(raw_dir / "fng", refresh=refresh, opener=opener)
         .merge(
-            fetch_signals.fetch_gpr(raw_dir / "gpr", refresh=refresh),
+            fetch_signals.fetch_gpr(raw_dir / "gpr", refresh=refresh, opener=opener),
             on="date",
             how="outer",
             validate="1:1",
         )
         .merge(
-            fetch_signals.cross_series(start, end, raw_dir / "yahoo", refresh=False),
+            fetch_signals.cross_series(start, end, raw_dir / "yahoo", refresh=False, opener=opener),
             on="date",
             how="outer",
             validate="1:1",
@@ -247,12 +269,14 @@ def fetch_inputs(raw_dir, start, end, *, refresh=False):
     )
     dates = pd.date_range(start, end, freq="D")
     calendar = fetch_calendars.holiday_flags(dates).merge(
-        fetch_calendars.fomc_flags(dates, raw_dir / "fomc", refresh=refresh),
+        fetch_calendars.fomc_flags(dates, raw_dir / "fomc", refresh=refresh, opener=opener),
         on="date",
         validate="1:1",
     )
     print("Running GDELT historical preflight", flush=True)
-    gdelt, decision = fetch_gdelt_with_retry(raw_dir / "gdelt", start, end, refresh=refresh)
+    gdelt, decision = fetch_gdelt_with_retry(
+        raw_dir / "gdelt", start, end, refresh=refresh, offline=offline
+    )
     if decision["keep"]:
         signals = signals.merge(gdelt, on="date", how="outer", validate="1:1")
     return BuildInputs(prices, news, signals, calendar, decision)
@@ -358,7 +382,7 @@ def source_provenance(raw_dir):
     return records
 
 
-def write_bundle(raw, out, *, start, end, raw_dir=None, refresh=False):
+def write_bundle(raw, out, *, start, end, raw_dir=None, refresh=False, offline=False):
     """Write seven payload files, then manifest and non-circular checksums."""
     start, end = fetch_prices._day(start), fetch_prices._day(end)
     last_future = pd.Timestamp(CUTOFFS[2025]) + pd.Timedelta(
@@ -407,11 +431,19 @@ def write_bundle(raw, out, *, start, end, raw_dir=None, refresh=False):
             "start": str(start.date()),
             "end": str(end.date()),
             "refresh": refresh,
+            "offline": offline,
         },
         "built_at": datetime.now(timezone.utc).isoformat(),
         "repo_sha": subprocess.check_output(
             ["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parents[2], text=True
         ).strip(),
+        "repo_dirty": bool(
+            subprocess.check_output(
+                ["git", "status", "--porcelain", "--untracked-files=no"],
+                cwd=Path(__file__).resolve().parents[2],
+                text=True,
+            ).strip()
+        ),
         "sources": source_provenance(raw_dir) if raw_dir is not None else [],
         "assumptions": list(dict.fromkeys([*ASSUMPTIONS, *raw.assumptions])),
         "features": roles,
@@ -503,10 +535,21 @@ def main(argv=None):
     parser.add_argument("--start", default="2018-01-01")
     parser.add_argument("--end", required=True, help="Fixed inclusive end date, e.g. 2025-12-31")
     parser.add_argument("--refresh", action="store_true")
+    parser.add_argument(
+        "--offline", action="store_true", help="Use cached responses only; never open the network"
+    )
     args = parser.parse_args(argv)
-    raw = fetch_inputs(args.raw, args.start, args.end, refresh=args.refresh)
+    if args.offline and args.refresh:
+        parser.error("--offline cannot be combined with --refresh")
+    raw = fetch_inputs(args.raw, args.start, args.end, refresh=args.refresh, offline=args.offline)
     manifest = write_bundle(
-        raw, args.out, start=args.start, end=args.end, raw_dir=args.raw, refresh=args.refresh
+        raw,
+        args.out,
+        start=args.start,
+        end=args.end,
+        raw_dir=args.raw,
+        refresh=args.refresh,
+        offline=args.offline,
     )
     print(
         json.dumps(
