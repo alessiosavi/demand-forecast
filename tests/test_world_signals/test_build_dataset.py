@@ -7,15 +7,21 @@ from urllib.error import HTTPError
 
 import numpy as np
 import pandas as pd
-import pyarrow.parquet as pq
 import pytest
 import yaml
 
-from demand_forecast.bench.specs import load_task_specs
-from scripts.world_signals import build_dataset as builder
-from scripts.world_signals import fetch_news, fetch_signals, sources
-from scripts.world_signals.fetch_prices import PANEL_SYMBOLS
-from scripts.world_signals.fev_io import read_fev_parquet
+pytest.importorskip("pyarrow")
+pytest.importorskip("datasets")
+pytest.importorskip("fev")
+pytestmark = pytest.mark.bench
+
+import pyarrow.parquet as pq  # noqa: E402
+
+from demand_forecast.bench.specs import load_task_specs  # noqa: E402
+from scripts.world_signals import build_dataset as builder  # noqa: E402
+from scripts.world_signals import fetch_news, fetch_signals, sources  # noqa: E402
+from scripts.world_signals.fetch_prices import PANEL_SYMBOLS  # noqa: E402
+from scripts.world_signals.fev_io import read_fev_parquet  # noqa: E402
 
 
 @pytest.fixture

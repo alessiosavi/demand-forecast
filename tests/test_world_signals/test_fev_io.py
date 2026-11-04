@@ -1,10 +1,13 @@
 import numpy as np
 import pandas as pd
-import pyarrow as pa
-import pyarrow.parquet as pq
 import pytest
 
-from scripts.world_signals.fev_io import read_fev_parquet, write_fev_parquet
+pa = pytest.importorskip("pyarrow")
+pytestmark = pytest.mark.bench
+
+import pyarrow.parquet as pq  # noqa: E402
+
+from scripts.world_signals.fev_io import read_fev_parquet, write_fev_parquet  # noqa: E402
 
 
 def test_fev_parquet_roundtrip_preserves_lists_and_nans(tmp_path):

@@ -6,10 +6,16 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from demand_forecast.bench.run import predictions_for_fev
-from demand_forecast.bench.specs import FevTaskSpec
-from scripts.world_signals.fev_io import write_fev_parquet
-from scripts.world_signals.report import (
+pytest.importorskip("pyarrow")
+pytest.importorskip("datasets")
+pytest.importorskip("fev")
+pytest.importorskip("statsforecast")
+pytestmark = pytest.mark.bench
+
+from demand_forecast.bench.run import predictions_for_fev  # noqa: E402
+from demand_forecast.bench.specs import FevTaskSpec  # noqa: E402
+from scripts.world_signals.fev_io import write_fev_parquet  # noqa: E402
+from scripts.world_signals.report import (  # noqa: E402
     block_bootstrap,
     price_point_path,
     return_window_metrics,
