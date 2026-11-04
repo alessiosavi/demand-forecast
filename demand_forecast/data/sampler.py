@@ -252,12 +252,15 @@ class BatchBuilder:
         encoder: StaticEncoder,
         *,
         calendar: bool = True,
+        scale_floor_frac: float = 0.0,
     ) -> None:
         _positive(horizon, "horizon")
         _positive(max_context, "max_context")
         self.panel, self.encoder = panel, encoder
         self.horizon, self.max_context = horizon, max_context
         self.calendar = calendar
+        self.scale_floor_frac = scale_floor_frac
+        self.floored_target_samples = 0
         self._lengths = {}
         for series in panel.series:
             # Timestamp equality compares instants, while calendar features use
@@ -340,7 +343,13 @@ class BatchBuilder:
             context_length = origin - start
             dest = slice(length - context_length, length)
             context = np.asarray(series.target[start:origin], dtype=np.float64)
-            frame = sample_frame(context, series.target[:origin], panel.seasonal_period)
+            frame = sample_frame(
+                context,
+                series.target[:origin],
+                panel.seasonal_period,
+                scale_floor_frac=self.scale_floor_frac,
+            )
+            self.floored_target_samples += int(frame.scale_floored)
             observed = ~np.isnan(context)
             arrays["target"][row, dest] = np.where(
                 observed, (context - frame.loc) / frame.scale, 0
@@ -406,11 +415,12 @@ def make_batch(
     label_upto: pd.Timestamp | None = None,
     *,
     calendar: bool = True,
+    scale_floor_frac: float = 0.0,
 ) -> Batch:
     """Build one batch; retain a BatchBuilder to reuse features across calls."""
-    return BatchBuilder(panel, horizon, max_context, encoder, calendar=calendar).build(
-        items, label_upto
-    )
+    return BatchBuilder(
+        panel, horizon, max_context, encoder, calendar=calendar, scale_floor_frac=scale_floor_frac
+    ).build(items, label_upto)
 
 
 class WindowSampler:
@@ -430,6 +440,7 @@ class WindowSampler:
         encoder: StaticEncoder,
         seed: int = 0,
         label_upto: pd.Timestamp | None = None,
+        scale_floor_frac: float = 0.0,
     ) -> None:
         _positive(horizon, "horizon")
         _positive(max_context, "max_context")
@@ -448,7 +459,9 @@ class WindowSampler:
         self.panel, self.encoder = panel, encoder
         self.horizon, self.max_context = horizon, max_context
         self.seed, self.label_upto = int(seed), label_upto
-        self.builder = BatchBuilder(panel, horizon, max_context, encoder)
+        self.builder = BatchBuilder(
+            panel, horizon, max_context, encoder, scale_floor_frac=scale_floor_frac
+        )
         self.set_epoch(0)
 
     def __len__(self) -> int:

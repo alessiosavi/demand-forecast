@@ -72,6 +72,14 @@ def report_module():
     return module
 
 
+@pytest.fixture
+def per_window_run(report_run):
+    specs, out, _, _ = report_run
+    shutil.rmtree(out / specs[0].name)
+    run_fev([specs[0]], tiny_settings(base_steps=2, d_model=8), out, policy="per_window")
+    return report_run
+
+
 def invoke_report(run, *extra):
     _, out, tasks, roles = run
     process = subprocess.run(
@@ -473,3 +481,88 @@ def test_report_accepts_zero_shot_run(tmp_path, tiny_pretrained_bundle_dir):
     assert row["steps"] == row["best_step"] == row["n_val_items"] == "0"
     manifest = json.loads((tiny_pretrained_bundle_dir / "manifest.json").read_text())
     assert row["transfer"] == manifest["pretrain_identity"][:8]
+
+
+@pytest.mark.parametrize("detection", ["summary", "layout"])
+def test_report_accepts_per_window_run(per_window_run, detection):
+    specs, out, _, _ = per_window_run
+    task_dir = out / "first"
+    summary = pd.read_csv(out / "summaries.csv", float_precision="round_trip")
+    model = summary.loc[
+        (summary.task == "first") & (summary.model_name == "demand-forecast-v2")
+    ].iloc[0]
+    metrics = report_module().window_metrics(out, specs[0].to_task())
+    assert metrics["run_identity"] == model.run_identity
+    assert metrics["num_forecasts"] == model.num_forecasts
+    assert len(metrics["MASE"]) == len(metrics["coverage_80"]) == 2
+    assert np.isfinite(metrics["MASE"]).all()
+    if detection == "summary":
+        # The explicit policy wins even if a stale task-level report remains.
+        (task_dir / "run.json").write_text("{}")
+    else:
+        summary.drop(columns="policy").to_csv(out / "summaries.csv", index=False)
+    process, rendered = invoke_report(per_window_run)
+    assert process.returncode == 0, process.stdout + process.stderr + rendered
+    training = table(rendered, "Training")
+    assert [row["task"] for row in training] == ["first/window_0", "first/window_1", "second"]
+    for index, row in enumerate(training[:2]):
+        directory = task_dir / f"window_{index}"
+        report = json.loads((directory / "run.json").read_text())
+        progress = json.loads((directory / "checkpoints/progress.json").read_text())
+        assert int(row["steps"]) == progress["step"]
+        assert int(row["best_step"]) == report["fit_result"]["best_step"]
+        assert row["stop_reason"] == progress["stop_reason"]
+    baseline = summary.loc[
+        (summary.task == "first") & (summary.model_name == "seasonal_naive")
+    ].iloc[0]
+    scores = table(rendered, "Scores")[0]
+    assert float(scores["v2/baseline SQL ratio"]) == pytest.approx(model.SQL / baseline.SQL)
+    assert table(rendered, "Identities")[0]["run_identity"] == model.run_identity
+    windows = [row for row in table(rendered, "Window diagnostics") if row["task"] == "first"]
+    for key in ("coverage_80", "MASE"):
+        assert [float(row[key]) for row in windows] == pytest.approx(metrics[key])
+    sizes = table(rendered, "Artifact sizes")[0]
+    for artifact in ("checkpoints", "bundle"):
+        expected = sum(
+            path.stat().st_size
+            for index in range(2)
+            for path in (task_dir / f"window_{index}" / artifact).rglob("*")
+            if path.is_file()
+        )
+        assert int(sizes[f"{artifact}_bytes"]) == expected > 0
+
+
+@pytest.mark.parametrize("artifact", ["prediction", "summary", "progress", "bundle", "missing_run"])
+def test_report_rejects_per_window_identity_mismatch(per_window_run, artifact):
+    specs, out, _, _ = per_window_run
+    task_dir = out / "first"
+    if artifact == "prediction":
+        path = task_dir / "window_1.npz"
+        with np.load(path, allow_pickle=False) as saved:
+            payload = dict(saved)
+        np.savez(path, **{**payload, "identity": "wrong"})
+        with pytest.raises(ValueError, match="run identity mismatch"):
+            report_module().window_metrics(out, specs[0].to_task())
+    elif artifact == "summary":
+        path = out / "summaries.csv"
+        summary = pd.read_csv(path)
+        summary.loc[
+            (summary.task == "first") & (summary.model_name == "demand-forecast-v2"),
+            "run_identity",
+        ] = "wrong"
+        summary.to_csv(path, index=False)
+    elif artifact == "missing_run":
+        (task_dir / "window_1/run.json").unlink()
+    else:
+        relative = "checkpoints/progress.json" if artifact == "progress" else "bundle/manifest.json"
+        path = task_dir / "window_1" / relative
+        payload = json.loads(path.read_text())
+        payload["run_identity"] = "wrong"
+        path.write_text(json.dumps(payload))
+    process, rendered = invoke_report(per_window_run)
+    assert process.returncode == 1, process.stdout + process.stderr
+    assert "run identity mismatch" in rendered
+    if artifact == "prediction":
+        assert "window_1.npz missing/invalid: run identity mismatch" in rendered
+    else:
+        assert table(rendered, "Scores")[0]["v2/baseline SQL ratio"] == "not comparable"

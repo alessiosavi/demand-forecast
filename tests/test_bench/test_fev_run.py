@@ -266,14 +266,9 @@ def test_interrupted_training_before_first_bundle_resumes_and_changed_config_is_
         run_fev([replace(spec, num_windows=1)], settings, out, resume=True)
 
 
-def test_per_window_is_explicitly_unimplemented(tmp_path):
-    with pytest.raises(NotImplementedError, match="per_window arrives with the phase-4 plan"):
-        run_fev(
-            [fixture_spec(write_fev_fixture(tmp_path))],
-            tiny_settings(),
-            tmp_path / "o",
-            policy="per_window",
-        )
+def test_unknown_policy_is_rejected(tmp_path):
+    with pytest.raises(ValueError, match="unknown fev policy"):
+        run_fev([], tiny_settings(), tmp_path / "out", policy="unknown")
 
 
 def test_settings_for_task_copies_base_and_all_roles(tmp_path):
@@ -720,9 +715,9 @@ def test_cli_run_interrupt_resume_policy_and_missing_bench(tmp_path, monkeypatch
     skipped = runner.invoke(app, [*args, "--resume"])
     assert skipped.exit_code == 0 and f"Skipping completed task {spec.name}" in skipped.output
     assert file_states(out) == before
-    unimplemented = runner.invoke(app, [*args, "--policy", "per_window"])
-    assert unimplemented.exit_code == 2
-    assert "per_window arrives with the phase-4 plan" in unimplemented.output
+    per_window = runner.invoke(app, [*args, "--policy", "per_window"])
+    assert per_window.exit_code == 0, per_window.output
+    assert (out / spec.name / "window_1/run.json").exists()
     monkeypatch.setitem(sys.modules, "fev", None)
     unavailable = runner.invoke(app, args)
     assert unavailable.exit_code == 2 and "install demand-forecast[bench]" in unavailable.output

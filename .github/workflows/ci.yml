@@ -89,10 +89,19 @@ jobs:
       - name: Run tests with bench
         run: python -m pytest -q --no-cov
 
+      - name: Free runner disk before the second environment
+        # The bench environment plus the restored pip cache (torch and the CUDA
+        # libraries) leave too little space for a second venv on hosted runners.
+        run: |
+          df -h / "$RUNNER_TEMP" || true
+          pip cache purge || true
+          rm -rf /tmp/pytest-of-* "$RUNNER_TEMP"/pytest-of-* .pytest_cache
+          df -h / "$RUNNER_TEMP" || true
+
       - name: Install dev-only dependencies in a fresh venv
         run: |
           python -m venv "$RUNNER_TEMP/dfc-devonly"
-          "$RUNNER_TEMP/dfc-devonly/bin/python" -m pip install -e ".[dev]"
+          "$RUNNER_TEMP/dfc-devonly/bin/python" -m pip install --no-cache-dir -e ".[dev]"
 
       - name: Run tests without bench
         run: '"$RUNNER_TEMP/dfc-devonly/bin/python" -m pytest -q --no-cov'

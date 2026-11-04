@@ -1041,6 +1041,7 @@ def test_timing_categories_sum_with_controlled_clock(
         "cold_covariate_columns": 0,
         "clipped_covariate_values": 0,
         "floored_covariate_columns": 0,
+        "floored_target_samples": 0,
     }
     resumed = Trainer(fresh(), cfg, cpu, RUN_ID, SEED).fit(
         panel_long,

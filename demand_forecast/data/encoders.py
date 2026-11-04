@@ -30,8 +30,11 @@ class StaticEncoder:
         self.vocabularies: dict[str, dict[str, int]] = {}
         self.means: dict[str, float] = {}
         self.stds: dict[str, float] = {}
+        self._fitted = False
 
-    def fit(self, panel: Panel, train_ids: Iterable[str]) -> StaticEncoder:
+    def fit(
+        self, panel: Panel, train_ids: Iterable[str], *, series_embedding: bool = True
+    ) -> StaticEncoder:
         """Fit once per distinct training id; an id absent from the panel raises KeyError."""
         if "__series__" in panel.roles.static_categorical:
             raise ValueError("__series__ is reserved for the series id vocabulary")
@@ -41,7 +44,8 @@ class StaticEncoder:
             name: _vocabulary(series.statics.get(name) for series in training)
             for name in panel.roles.static_categorical
         }
-        vocabularies["__series__"] = _vocabulary(series.series_id for series in training)
+        if series_embedding:
+            vocabularies["__series__"] = _vocabulary(series.series_id for series in training)
 
         means, stds = {}, {}
         for name in panel.roles.static_numeric:
@@ -55,6 +59,7 @@ class StaticEncoder:
         self.vocabularies = vocabularies
         self.means = means
         self.stds = stds
+        self._fitted = True
         return self
 
     @property
@@ -68,7 +73,7 @@ class StaticEncoder:
         return len(self.static_numeric)
 
     def _require_fitted(self) -> None:
-        if not self.vocabularies:
+        if not self._fitted:
             raise RuntimeError("StaticEncoder must be fitted before use")
 
     def transform(self, series: Series) -> tuple[dict[str, int], np.ndarray, np.ndarray]:
@@ -105,10 +110,11 @@ class StaticEncoder:
         encoder = cls()
         encoder.static_categorical = tuple(d["static_categorical"])
         encoder.static_numeric = tuple(d["static_numeric"])
-        encoder.vocabularies = {
-            name: dict(d["vocabularies"][name])
-            for name in (*encoder.static_categorical, "__series__")
-        }
+        names = [*encoder.static_categorical]
+        if "__series__" in d["vocabularies"]:
+            names.append("__series__")
+        encoder.vocabularies = {name: dict(d["vocabularies"][name]) for name in names}
         encoder.means = {name: float(d["means"][name]) for name in encoder.static_numeric}
         encoder.stds = {name: float(d["stds"][name]) for name in encoder.static_numeric}
+        encoder._fitted = True
         return encoder

@@ -35,6 +35,8 @@ def plan_inner_validation(
     horizon: int,
     min_train_history: int | None = None,
     seasonal_period: int | None = None,
+    *,
+    full_history: bool = False,
 ) -> ValidationPlan:
     """Reserve the last horizon grid steps before an on-grid forecast origin.
 
@@ -42,6 +44,7 @@ def plan_inner_validation(
     and at least one historical label. If no series qualifies, the training
     split includes all history before ``origin``. Fit ids include any series
     observed in the chosen split, independently of validation eligibility.
+    ``full_history`` explicitly selects that full split with no validation items.
     """
     min_train_history = horizon + 8 if min_train_history is None else min_train_history
     seasonal_period = panel.seasonal_period if seasonal_period is None else seasonal_period
@@ -78,11 +81,11 @@ def plan_inner_validation(
             if np.isfinite(error) and error > 0:
                 val_items.append(i)
 
-    exception = len(val_items) == 0
+    exception = full_history or len(val_items) == 0
     return ValidationPlan(
         train_upto=boundaries[-2] if exception else boundaries[0],
         val_origin=val_origin,
-        val_items=np.asarray(val_items, dtype=np.int64),
+        val_items=np.asarray([] if full_history else val_items, dtype=np.int64),
         exception=exception,
         fit_ids=fit_before_origin if exception else fit_before_validation,
     )

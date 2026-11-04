@@ -137,11 +137,18 @@ demand-forecast fev leaderboard fev-results/summaries.csv
 
 `--tasks` also accepts comma-separated task names or a local task YAML. Baselines
 skip completed tasks; model runs with `--resume` reuse matching bundles and saved
-windows. Each task trains on its first window, then forecasts later windows at
+windows. By default each task trains on its first window, then forecasts later windows at
 each item's own origin. Identity checks cover configuration, data and the
 resolved training origin. Training progress, checkpoints, window predictions and
-summaries retain timing and diagnostic information. `training.refit: full`
-and `--policy per_window` are currently unimplemented and rejected.
+summaries retain timing and diagnostic information. Optional ablations support
+`training.refit: full` (retrain from the same initialization on all permitted past
+for the selected step count), `--policy per_window` (one bundle per window),
+`training.trainable: heads_only`, `training.series_embedding: false`, and
+`forecast.scale_floor_frac` (a context-relative target scale floor). Defaults and
+existing run identities are preserved. The frozen official protocol remains
+`first_window` / `refit: none`; see [configuration](docs/CONFIGURATION.md).
+`configs/fev-v2-pretrained-finetune-tuned.yaml` contains the trial-11 confirmation
+recipe with the new switches at their defaults.
 
 ## Commands
 

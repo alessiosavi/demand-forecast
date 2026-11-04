@@ -77,6 +77,7 @@ class Predictor:
             "cold_covariate_columns": 0,
             "clipped_covariate_values": 0,
             "floored_covariate_columns": 0,
+            "floored_target_samples": 0,
             "n_items": 0,
             "device": str(self.bundle.model.fallback_level.device),
             "n_origins": len(groups),
@@ -97,6 +98,7 @@ class Predictor:
                 "cold_covariate_columns",
                 "clipped_covariate_values",
                 "floored_covariate_columns",
+                "floored_target_samples",
                 "n_items",
             ):
                 diagnostics[key] += diag[key]
@@ -138,7 +140,13 @@ class Predictor:
             for i, series in enumerate(panel.series)
         ]
         batch_panel = align_to_origin(panel, items)
-        builder = BatchBuilder(batch_panel, cfg.horizon, cfg.max_context, self.bundle.encoder)
+        builder = BatchBuilder(
+            batch_panel,
+            cfg.horizon,
+            cfg.max_context,
+            self.bundle.encoder,
+            scale_floor_frac=cfg.scale_floor_frac,
+        )
         predictions = np.empty((len(ids), cfg.horizon, len(cfg.quantiles)), dtype=np.float32)
         model = self.bundle.model
         model.eval()
@@ -163,4 +171,5 @@ class Predictor:
         # Each .cpu().numpy() above waits for its CUDA output, so this includes
         # device work and host transfer rather than only asynchronous launches.
         diagnostics["inference_time_s"] = time.perf_counter() - started
+        diagnostics["floored_target_samples"] = builder.floored_target_samples
         return ids, predictions, diagnostics

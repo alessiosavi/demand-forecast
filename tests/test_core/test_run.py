@@ -64,8 +64,9 @@ def test_identity_ignores_unset_quick_fields_and_changes_when_set(field):
     assert dumped["training"]["val_items_max"] is None
     expected = settings.model_dump(mode="json")
     del expected["training"]["max_steps_cap"], expected["training"]["val_items_max"]
-    for key in ("init_from", "zero_shot", "eval_at_start"):
+    for key in ("init_from", "zero_shot", "eval_at_start", "trainable", "series_embedding"):
         del expected["training"][key]
+    del expected["forecast"]["scale_floor_frac"]
     assert _identity_settings(settings) == expected
     assert settings.model_dump(mode="json") == dumped
     quick = settings.model_copy(deep=True)
@@ -157,7 +158,13 @@ def test_canonical_identity_payload_omits_unset_new_fields():
     assert dumped["training"]["zero_shot"] is False
     assert dumped["training"]["eval_at_start"] is False
     payload = _identity_settings(settings)
-    assert {"init_from", "zero_shot", "eval_at_start"}.isdisjoint(payload["training"])
+    assert {"init_from", "zero_shot", "eval_at_start", "trainable", "series_embedding"}.isdisjoint(
+        payload["training"]
+    )
+    assert "scale_floor_frac" not in payload["forecast"]
+    assert (
+        payload["training"]["refit"] == "none"
+    )  # This existing field remains in legacy identities.
     assert settings.model_dump(mode="json") == dumped
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -68,7 +69,19 @@ def _bytes(directory: Path) -> int:
     return sum(path.stat().st_size for path in directory.rglob("*") if path.is_file())
 
 
-def _window_evidence(task, task_dir, identity, issues):
+def _per_window(task_dir: Path, model: dict | None = None) -> bool:
+    return (model or {}).get("policy") == "per_window" or (
+        (task_dir / "window_0/run.json").exists() and not (task_dir / "run.json").exists()
+    )
+
+
+def _combined_identity(identities: list) -> str | None:
+    if not identities or not all(isinstance(value, str) and value for value in identities):
+        return None
+    return hashlib.sha256(json.dumps(identities, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _window_evidence(task, task_dir, identities, issues):
     windows, diagnostics, metrics = [], [], []
     forecast_count = excluded_pairs = excluded_cells = excluded_sql = 0
     for index, window in enumerate(task.iter_windows()):
@@ -88,6 +101,7 @@ def _window_evidence(task, task_dir, identity, issues):
         path = task_dir / f"window_{index}.npz"
         try:
             with np.load(path, allow_pickle=False) as saved:
+                identity = identities[index]
                 if identity is None or saved["identity"].item() != identity:
                     raise ValueError("run identity mismatch")
                 # Reuse the runner's strict missing/duplicate/extra-id checks.
@@ -187,9 +201,20 @@ def window_metrics(run_dir: Path, task) -> dict:
         raise ValueError("window_metrics requires a univariate task")
     task_dir = Path(run_dir) / task.task_name
     issues: list[str] = []
-    report = _read_json(task_dir / "run.json", issues, task.task_name)
+    if _per_window(task_dir):
+        identities = [
+            _read_json(
+                task_dir / f"window_{index}/run.json", issues, f"{task.task_name}/window_{index}"
+            ).get("run_identity")
+            for index in range(task.num_windows)
+        ]
+        identity = _combined_identity(identities)
+    else:
+        report = _read_json(task_dir / "run.json", issues, task.task_name)
+        identity = report.get("run_identity")
+        identities = [identity] * task.num_windows
     fingerprint = dataset_fingerprint(task)
-    rows, _, _, count = _window_evidence(task, task_dir, report.get("run_identity"), issues)
+    rows, _, _, count = _window_evidence(task, task_dir, identities, issues)
     result = {key: [row.get(key) for row in rows] for key in ("coverage_80", "MASE")}
     if len(rows) != task.num_windows or any(
         not _finite(value) for values in result.values() for value in values
@@ -199,7 +224,7 @@ def window_metrics(run_dir: Path, task) -> dict:
         **result,
         "dataset_fingerprint": fingerprint,
         "num_forecasts": count,
-        "run_identity": report.get("run_identity"),
+        "run_identity": identity,
     }
 
 
@@ -225,99 +250,135 @@ def build_report(
         frame = pd.DataFrame(columns=["task", "model_name"])
     for spec in specs:
         task_dir = run_dir / spec.name
+        model = _one_row(frame, spec.name, model_name, "model", issues)
+        reference = _one_row(frame, spec.name, baseline, "baseline", issues)
+        per_window = _per_window(task_dir, model)
+        directories = (
+            [task_dir / f"window_{index}" for index in range(spec.num_windows)]
+            if per_window
+            else [task_dir]
+        )
         sizes.append(
             {
                 "task": spec.name,
-                "checkpoints_bytes": _bytes(task_dir / "checkpoints"),
-                "bundle_bytes": _bytes(task_dir / "bundle"),
+                "checkpoints_bytes": sum(
+                    _bytes(directory / "checkpoints") for directory in directories
+                ),
+                "bundle_bytes": sum(_bytes(directory / "bundle") for directory in directories),
                 "NPZ_bytes": sum(path.stat().st_size for path in task_dir.glob("window_*.npz")),
             }
         )
-        model = _one_row(frame, spec.name, model_name, "model", issues)
-        reference = _one_row(frame, spec.name, baseline, "baseline", issues)
-        report = _read_json(task_dir / "run.json", issues, spec.name)
-        manifest = _read_json(task_dir / "bundle/manifest.json", issues, spec.name)
-        progress = _read_json(task_dir / "checkpoints/progress.json", issues, spec.name)
-        identity = report.get("run_identity")
-        identity_ok = bool(identity) and all(
-            value.get("run_identity") == identity for value in (model, manifest, progress)
-        )
-        if not identity_ok:
-            issues.append(
-                f"{spec.name}: run identity mismatch or unknown in model/run/bundle/progress"
+        reports, manifests, identities = [], [], []
+        identity_ok = True
+        for directory in directories:
+            label = f"{spec.name}/{directory.name}" if per_window else spec.name
+            report = _read_json(directory / "run.json", issues, label)
+            manifest = _read_json(directory / "bundle/manifest.json", issues, label)
+            progress = _read_json(directory / "checkpoints/progress.json", issues, label)
+            identity = report.get("run_identity")
+            window_identity_ok = bool(identity) and all(
+                value.get("run_identity") == identity
+                for value in ((manifest, progress) if per_window else (model, manifest, progress))
             )
-        fit, budget = report.get("fit_result", {}), report.get("resolved_budget", {})
-        cumulative = report.get("timings", {}).get("cumulative", {})
-        nonfinite_losses = fit.get("nonfinite_losses", cumulative.get("nonfinite_losses"))
-        if _finite(nonfinite_losses) and nonfinite_losses > 0:
-            issues.append(f"{spec.name}: {nonfinite_losses} non-finite training losses")
-        training.append(
-            {
-                "task": spec.name,
-                "transfer": report["transfer"]["pretrain_identity"][:8]
-                if report.get("transfer")
-                else "-",
-                **{key: budget.get(key) for key in ("max_steps", "eval_every")},
-                "n_fit_ids": report.get("n_fit_ids"),
-                "n_val_items": report.get("n_val_items"),
-                **{
-                    key: report[key]
-                    for key in ("val_items_max", "n_val_items_eligible")
-                    if key in report
-                },
-                "exception": report.get("plan", {}).get("exception"),
-                **{
-                    key: fit.get(key) for key in ("steps", "best_step", "best_score", "stop_reason")
-                },
-                "nonfinite_losses": nonfinite_losses,
-                **{
-                    key: cumulative.get(key)
-                    for key in (
-                        "cold_covariate_columns",
-                        "floored_covariate_columns",
-                        "clipped_covariate_values",
-                    )
-                },
-                "resumed_from_step": report.get("resumed_from_step"),
-            }
-        )
-        timing.append(
-            {
-                "task": spec.name,
-                **{
-                    key: cumulative.get(key)
-                    for key in (
-                        "sessions",
-                        "train_s",
-                        "eval_s",
-                        "checkpoint_s",
-                        "nonfinite_losses",
-                        "scaler_skips",
-                    )
-                },
-                "peak_cuda_mem_MiB": cumulative["peak_cuda_mem_bytes"] / 2**20
-                if _finite(cumulative.get("peak_cuda_mem_bytes"))
-                else None,
-                "amp_dtype": report.get("amp_dtype")
-                or ("disabled" if "amp_dtype" in report else None),
-            }
-        )
-        _required(budget, ("max_steps", "eval_every"), spec.name, "resolved_budget", issues)
-        _required(report, ("n_fit_ids", "n_val_items"), spec.name, "run", issues)
-        _required(
-            cumulative,
-            (
-                "sessions",
-                "train_s",
-                "eval_s",
-                "checkpoint_s",
-                "peak_cuda_mem_bytes",
-                "nonfinite_losses",
-            ),
-            spec.name,
-            "timings.cumulative",
-            issues,
-        )
+            identity_ok &= window_identity_ok
+            reports.append(report)
+            manifests.append(manifest)
+            identities.append(identity)
+            if not window_identity_ok:
+                issues.append(
+                    f"{label}: run identity mismatch or unknown in model/run/bundle/progress"
+                )
+            if per_window:
+                _required(progress, ("step",), label, "progress", issues)
+                if not progress.get("stop_reason"):
+                    issues.append(f"{label}: progress.stop_reason unknown")
+            fit, budget = report.get("fit_result", {}), report.get("resolved_budget", {})
+            cumulative = report.get("timings", {}).get("cumulative", {})
+            nonfinite_losses = fit.get("nonfinite_losses", cumulative.get("nonfinite_losses"))
+            if _finite(nonfinite_losses) and nonfinite_losses > 0:
+                issues.append(f"{label}: {nonfinite_losses} non-finite training losses")
+            training.append(
+                {
+                    "task": label,
+                    "transfer": report["transfer"]["pretrain_identity"][:8]
+                    if report.get("transfer")
+                    else "-",
+                    **{key: budget.get(key) for key in ("max_steps", "eval_every")},
+                    "n_fit_ids": report.get("n_fit_ids"),
+                    "n_val_items": report.get("n_val_items"),
+                    **{
+                        key: report[key]
+                        for key in ("val_items_max", "n_val_items_eligible")
+                        if key in report
+                    },
+                    "exception": report.get("plan", {}).get("exception"),
+                    **{
+                        key: fit.get(key)
+                        for key in ("steps", "best_step", "best_score", "stop_reason")
+                    },
+                    "nonfinite_losses": nonfinite_losses,
+                    **{
+                        key: cumulative.get(key)
+                        for key in (
+                            "cold_covariate_columns",
+                            "floored_covariate_columns",
+                            "clipped_covariate_values",
+                        )
+                    },
+                    "resumed_from_step": report.get("resumed_from_step"),
+                    **(
+                        {"steps": progress.get("step"), "stop_reason": progress.get("stop_reason")}
+                        if per_window
+                        else {}
+                    ),
+                }
+            )
+            timing.append(
+                {
+                    "task": label,
+                    **{
+                        key: cumulative.get(key)
+                        for key in (
+                            "sessions",
+                            "train_s",
+                            "eval_s",
+                            "checkpoint_s",
+                            "nonfinite_losses",
+                            "scaler_skips",
+                        )
+                    },
+                    "peak_cuda_mem_MiB": cumulative["peak_cuda_mem_bytes"] / 2**20
+                    if _finite(cumulative.get("peak_cuda_mem_bytes"))
+                    else None,
+                    "amp_dtype": report.get("amp_dtype")
+                    or ("disabled" if "amp_dtype" in report else None),
+                }
+            )
+            _required(budget, ("max_steps", "eval_every"), label, "resolved_budget", issues)
+            _required(report, ("n_fit_ids", "n_val_items"), label, "run", issues)
+            _required(
+                cumulative,
+                (
+                    "sessions",
+                    "train_s",
+                    "eval_s",
+                    "checkpoint_s",
+                    "peak_cuda_mem_bytes",
+                    "nonfinite_losses",
+                ),
+                label,
+                "timings.cumulative",
+                issues,
+            )
+        identity = _combined_identity(identities) if per_window else identities[0]
+        if per_window:
+            if identity is None or model.get("run_identity") != identity:
+                issues.append(
+                    f"{spec.name}: combined run identity mismatch or unknown in model/windows"
+                )
+                identity_ok = False
+        else:
+            identities *= spec.num_windows
         _required(
             model,
             [
@@ -341,7 +402,7 @@ def build_report(
             # Guard the whole iteration, including failures creating or advancing
             # task.iter_windows() outside the helper's per-window handler.
             window_rows, total, averaged, forecast_count = _window_evidence(
-                task, task_dir, identity, issues
+                task, task_dir, identities, issues
             )
             windows.extend(window_rows)
             diagnostics.append(total)
@@ -349,7 +410,7 @@ def build_report(
             issues.append(f"{spec.name}: task could not be audited: {exc}")
         fp_ok = actual_fp is not None and all(
             row.get("dataset_fingerprint") == actual_fp
-            for row in (model, reference, report, manifest)
+            for row in (model, reference, *reports, *manifests)
         )
         if not fp_ok:
             issues.append(f"{spec.name}: dataset fingerprint mismatch or unknown")

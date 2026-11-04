@@ -210,7 +210,9 @@ def task_probe(
             panel, resolved_origin(origins), forecast.horizon, settings.training.min_train_history
         )
         plan = subsample_validation(plan, settings.training.val_items_max, settings.seed)
-        encoder = StaticEncoder().fit(panel, plan.fit_ids)
+        encoder = StaticEncoder().fit(
+            panel, plan.fit_ids, series_embedding=settings.training.series_embedding
+        )
         model_spec = ModelSpec.from_panel(
             panel, encoder, forecast, settings.model.d_model, settings.model.cat_emb_dim
         )
@@ -237,6 +239,8 @@ def task_probe(
                     "init_from",
                     "zero_shot",
                     "eval_at_start",
+                    "trainable",
+                    "series_embedding",
                 }
             )
         )
@@ -274,6 +278,7 @@ def task_probe(
             forecast.max_context,
             encoder,
             batch_size=512,
+            scale_floor_frac=forecast.scale_floor_frac,
         )
         prep_s = time.perf_counter() - started
         _reset_peak(device)
