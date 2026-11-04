@@ -104,7 +104,15 @@ def _atomic_write(path, body):
 
 
 def cached_download(
-    url, raw_dir=None, *, suffix=".json", refresh=False, opener=None, interval=0, validate=None
+    url,
+    raw_dir=None,
+    *,
+    suffix=".json",
+    refresh=False,
+    opener=None,
+    interval=0,
+    validate=None,
+    retry_wait=0,
 ):
     """Fetch bytes with a URL-addressed cache and adjacent provenance JSON.
 
@@ -139,7 +147,7 @@ def cached_download(
         except HTTPError as error:
             if error.code != 429 or attempt == 2:
                 raise
-            time.sleep(max(interval, 2**attempt))
+            time.sleep(max(interval, retry_wait, 2**attempt))
     if validate is not None:
         validate(body)
     metadata = {

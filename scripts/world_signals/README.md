@@ -6,8 +6,8 @@ belong under `data/world-signals/` (ignored); Yahoo-derived data stays private.
 Fixtures contain synthetic observations in the providers' schemas.
 
 Pipeline sequence: fetch prices → news → world-state signals → calendars → build
-ON/OFF datasets → private bundle → Colab GPU runs → report. The builder, bundle and
-report entry points are later handoffs; this handoff provides the fetcher APIs.
+ON/OFF datasets → private bundle → Colab GPU runs → report. The bundle and report
+entry points are later handoffs; the builder is available below.
 No local training. The eventual task profiles must set `target_support: real`;
 the supplied recipe bases retain their original defaults for exact comparison.
 
@@ -19,7 +19,7 @@ the supplied recipe bases retain their original defaults for exact comparison.
   conservatively excluded. `session_returns` runs before daily reindexing; it
   never fills missing prices, and a non-positive close invalidates both adjacent
   returns. Explicit null quote dates remain in `frame.attrs['missing_quote_dates']`;
-  unreported expected sessions still require the later builder's session calendar.
+  the sidecar does not infer unreported expected sessions from a calendar.
 - `fetch_news.download_archive(dest, revision=CRYPTOPANIC_REVISION)` extracts the
   joined CSV using `bsdtar -xf`. Read it with `pd.read_csv(..., dtype={'id': str})`,
   then call `normalize_articles`, `coverage`, and `aggregate_daily`. Dedupe by ID,
@@ -56,8 +56,8 @@ CryptoPanic is pinned to commit
 The joined RAR alone contains all fields needed for these features. Its SHA,
 revision, extracted CSV SHA, and assumptions are in `archive_manifest.json`.
 The FOMC ZIP and embedded CSV hashes are in `fomc_manifest.json`; download times
-are in their adjacent cache metadata. The future bundle manifest must incorporate
-these records, `SOURCES`, and each frame's `assumptions`/`errors` attributes.
+are in their adjacent cache metadata. The bundle manifest incorporates
+these records, `SOURCES`, source assumptions, and GDELT errors.
 
 Offset-free news timestamps are **assumed UTC**. Coverage is empirical first/last
 publication per coin (plus ALL); zeros between those bounds assume a complete
@@ -66,3 +66,67 @@ GPR is revised weekly-published history, not vintage-exact availability. F&G,
 GDELT, and FOMC historical publication/schedule vintages are also not verified.
 Yahoo GC/SI are continuous futures proxies; close/settlement and roll semantics
 are not established. No halving, macro-release, dominance or vote features exist.
+
+## Build the private bundle (no model)
+
+```bash
+./.venv/bin/python -m scripts.world_signals.build_dataset \
+  --raw data/world-signals/raw --out data/world-signals/built \
+  --start 2018-01-01 --end 2025-12-31
+```
+
+The inclusive `--end` is required and fixed; use `--refresh` only to deliberately
+refetch sources. The builder uses cached successes, never fills missing values,
+and puts each asset on its own daily grid from its first valid close through end.
+Metals returns are computed between observed sessions before reindexing. The
+first target per asset and all non-session metals targets are NaN.
+
+Outputs under `built/`:
+
+- `panel_on.parquet` and `panel_off.parquet`: one row per sorted ID, scalar string
+  ID/asset class, timezone-naive nanosecond timestamp lists and float64 lists.
+  OFF has identical columns and dates, with all world-signal dynamics set to NaN.
+- `prices.parquet`: daily long `id,date,close,session,quote_missing`. `session`
+  means a valid Yahoo close; `quote_missing` means an explicitly returned null
+  quote. This retrospective mask is used for evaluation, not model features.
+- `probe_on.yaml`, `probe_off.yaml`, `probe_smoke.yaml`, `profiles.yaml`: portable
+  relative dataset paths, explicit roles, and fixed 2022–2025 folds (18 windows,
+  stride 18, horizon 13, seasonality 7). Smoke is the full 2022 ON task.
+- `manifest.json`: build arguments, checkout HEAD, source/cache identities and
+  assumptions, GDELT decisions/errors, per-asset feature coverage and target
+  counts, missing-quote dates, and hashes of the seven files above. The checkout
+  SHA is the committed base; commit the reviewed builder before remote execution.
+- `SHA256SUMS`: hashes of the seven payloads plus the manifest. The manifest and
+  checksum file cannot hash themselves, so neither includes a self digest.
+
+GDELT is retained only if all six columns have at least 99% finite days over the
+requested interval. Each pass stops on exhausted HTTP 429 retries. One slower
+retry pass follows a 60-second wait, reusing cached successes, with at least
+10 seconds between requests and 60 seconds between 429 retries. No further pass
+is made; incomplete GDELT is omitted from both twins and YAMLs.
+
+Coverage includes first/last finite dates, counts and ratios for each feature,
+including target and static availability. Fold train periods are build start
+through the inclusive initial cutoff; test periods run from the next day through
+the last future day, including days between evaluation windows. Pre-listing days
+count as unavailable in fold ratios; overall ratios cover each asset's own grid.
+News coverage uses the pinned archive's empirical bounds: this is not an audit of
+when the archive historically became available.
+
+`build_long(BuildInputs(...), start, end)` is the pure assembly API used by tests;
+`write_bundle` uses it for the real outputs. `fev_io.write_fev_parquet` accepts a
+long frame and roles with `static`, `known_dynamic`, `past_dynamic` lists;
+`read_fev_parquet` expands it back to a long frame. Arrow serialization preserves
+IEEE NaNs within lists and rejects varying statics, duplicate dates and gaps.
+
+```bash
+(cd data/world-signals/built && shasum -a 256 -c SHA256SUMS)
+HF_HOME=data/world-signals/hf-cache ./.venv/bin/python -c \
+  'from scripts.world_signals.build_dataset import validate_bundle_windows; print(validate_bundle_windows("data/world-signals/built"))'
+```
+
+The second command audits all ON/OFF/smoke windows via the shipped fev task loader
+without executing a model. It checks all ten IDs, inclusive past cutoffs and all
+13 future timestamps. The optional reference test reads normalized
+`raw/reference/closes.csv` (`id,date,close`, BTC/ETH); it reports discrepancies
+without treating that reference as an input or an authoritative replacement.

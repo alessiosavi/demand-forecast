@@ -110,6 +110,9 @@ def fetch_gdelt_daily(
     *,
     refresh=False,
     opener=None,
+    interval=5,
+    retry_wait=0,
+    stop_on_rate_limit=False,
 ):
     """Fetch raw counts and average tone; return inclusive daily grid plus errors.
 
@@ -124,10 +127,19 @@ def fetch_gdelt_daily(
     if len(set(queries)) != len(queries) or any(q not in GDELT_QUERIES for q in queries):
         raise ValueError("queries must be unique members of bitcoin, ethereum, gold")
     grid = pd.date_range(start, end, freq="D", name="date")
-    frame = pd.DataFrame(index=grid)
+    frame = pd.DataFrame(
+        np.nan,
+        index=grid,
+        columns=[f"gdelt_{GDELT_QUERIES[q]}_{kind}" for q in queries for kind in ("vol", "tone")],
+    )
     errors = []
+    stopped = False
     for query in queries:
+        if stopped:
+            break
         for kind, mode in (("vol", "TimelineVolRaw"), ("tone", "TimelineTone")):
+            if stopped:
+                break
             column = f"gdelt_{GDELT_QUERIES[query]}_{kind}"
             frame[column] = np.nan
             first = start
@@ -148,7 +160,8 @@ def fetch_gdelt_daily(
                         raw_dir,
                         refresh=refresh,
                         opener=opener,
-                        interval=5,
+                        interval=max(5, interval),
+                        retry_wait=retry_wait,
                         validate=lambda b: _timeline(b, mode, request_start, last),
                     )
                     series = _timeline(body, mode, request_start, last)
@@ -162,11 +175,16 @@ def fetch_gdelt_daily(
                             "start": str(first.date()),
                             "end": str(last.date()),
                             "error": str(error),
+                            "http_status": getattr(error, "code", None),
                         }
                     )
+                    if stop_on_rate_limit and getattr(error, "code", None) == 429:
+                        stopped = True
+                        break
                 first = last + pd.Timedelta(days=1)
     result = frame.reset_index()
     result.attrs["errors"] = errors
+    result.attrs["stopped_on_rate_limit"] = stopped
     result.attrs["assumptions"] = [
         "GDELT reconstructed raw counts/tone; ingestion-time vintages are not verified."
     ]
