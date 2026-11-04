@@ -42,6 +42,15 @@ https://github.com/autogluon/fev/blob/193e4fcdbafe37bd5f676a00db65cf02ca1f737e/b
 
 These entries define the held-out weekly tasks for the opt-in pretraining experiment.
 
+`demand_forecast/bench/tasks/fev_bench_100_193e4fc.yaml` is a byte-identical copy
+of fev's `benchmarks/fev_bench/tasks.yaml` (all 100 fev-bench task definitions) at
+commit `193e4fcdbafe37bd5f676a00db65cf02ca1f737e`:
+https://github.com/autogluon/fev/blob/193e4fcdbafe37bd5f676a00db65cf02ca1f737e/benchmarks/fev_bench/tasks.yaml
+Its SHA-256 and fetch date are recorded in the adjacent
+`fev_bench_100_193e4fc.PROVENANCE.md`. The file is used by the corpus content
+audit and carries no header so that it stays identical to upstream; it is
+redistributed under Apache-2.0 as below.
+
 `demand_forecast/metrics.py` is adapted from fev's `src/fev/metrics.py` at tag
 `v0.10.0`: https://github.com/autogluon/fev/blob/v0.10.0/src/fev/metrics.py
 The port uses a univariate NumPy API, supports ragged histories and quiet empty
