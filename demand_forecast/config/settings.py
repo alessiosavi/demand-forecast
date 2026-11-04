@@ -35,6 +35,7 @@ class ForecastConfig(BaseModel):
     )
     max_context: int = 512
     min_context: int = 1
+    scale_floor_frac: float = Field(0.0, ge=0, lt=1)
 
     @field_validator("quantiles")
     @classmethod
@@ -115,6 +116,15 @@ class TrainingConfig(BaseModel):
     init_from: str | None = None
     zero_shot: bool = False
     eval_at_start: bool = False
+    trainable: Literal["all", "heads_only"] = "all"
+    series_embedding: bool = True
+
+    @model_validator(mode="after")
+    def validate_refit(self):
+        """Reject a refit request when optimizer training is disabled."""
+        if self.zero_shot and self.refit == "full":
+            raise ValueError("zero_shot is incompatible with refit=full")
+        return self
 
 
 class TuningConfig(BaseModel):

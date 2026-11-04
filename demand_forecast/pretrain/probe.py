@@ -237,6 +237,8 @@ def task_probe(
                     "init_from",
                     "zero_shot",
                     "eval_at_start",
+                    "trainable",
+                    "series_embedding",
                 }
             )
         )

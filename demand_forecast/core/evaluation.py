@@ -44,6 +44,8 @@ def prepare_validation(
     max_context: int,
     encoder: StaticEncoder,
     batch_size: int = 512,
+    *,
+    scale_floor_frac: float = 0.0,
 ) -> PreparedValidation:
     """Build ordered CPU batches and metric inputs once, without model work.
 
@@ -56,7 +58,9 @@ def prepare_validation(
     y_true = np.full((len(positions), horizon), np.nan, dtype=np.float64)
     y_past = []
     batch_panel = align_to_origin(panel, positions)
-    builder = BatchBuilder(batch_panel, horizon, max_context, encoder)
+    builder = BatchBuilder(
+        batch_panel, horizon, max_context, encoder, scale_floor_frac=scale_floor_frac
+    )
     for row, (i, pos) in enumerate(positions):
         series = panel.series[i]
         target = series.target[: series.history_length]
@@ -104,10 +108,21 @@ def evaluate(
     encoder: StaticEncoder,
     quantiles: Sequence[float],
     batch_size: int = 512,
+    *,
+    scale_floor_frac: float = 0.0,
 ) -> dict[str, float]:
     """Prepare and score validation inputs for callers that do not retain them."""
     return evaluate_prepared(
         model,
-        prepare_validation(panel, items, origin, horizon, max_context, encoder, batch_size),
+        prepare_validation(
+            panel,
+            items,
+            origin,
+            horizon,
+            max_context,
+            encoder,
+            batch_size,
+            scale_floor_frac=scale_floor_frac,
+        ),
         quantiles,
     )

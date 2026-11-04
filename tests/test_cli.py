@@ -1,5 +1,6 @@
 """Tests for CLI commands."""
 
+import json
 from pathlib import Path
 from unittest.mock import patch
 
@@ -272,8 +273,9 @@ def test_run_identity_canonical_json(run_settings):
     for key in ("max_steps_cap", "val_items_max"):
         if settings["training"][key] is None:
             del settings["training"][key]
-    for key in ("init_from", "zero_shot", "eval_at_start"):
+    for key in ("init_from", "zero_shot", "eval_at_start", "trainable", "series_embedding"):
         del settings["training"][key]
+    del settings["forecast"]["scale_floor_frac"]
     payload = {
         "settings": settings,
         "seed": 3,
@@ -518,7 +520,8 @@ def test_train_cli_resume_and_errors(tmp_path, run_settings):
     run_settings.training.refit = "full"
     run_settings.to_yaml(tmp_path / "cfg.yaml")
     result = runner.invoke(app, args)
-    assert result.exit_code != 0 and "phase-4" in result.output
+    assert result.exit_code == 0, result.output
+    assert json.loads((tmp_path / "run/run.json").read_text())["refit"]["mode"] == "full"
     result = runner.invoke(
         app,
         [

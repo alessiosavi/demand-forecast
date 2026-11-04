@@ -19,8 +19,9 @@ The current registry is in `demand_forecast/models/registry.py`;
 `demand_forecast/models/wrapper.py`, remain on the legacy contract and are not
 integrated into the shared pipeline. Legacy tuning, clustering and export code does not
 make those features available through this pipeline. DHF is not integrated.
-Full-history refitting and training separately for each fev window are also
-unimplemented: `training.refit: full` and `--policy per_window` are rejected.
+Full-history refitting (`training.refit: full`) and separate training for each
+fev window (`--policy per_window`) are supported ablations. The official protocol
+retains `refit: none` and `first_window`.
 
 See the [frozen evaluation protocol](protocol.md) for benchmark rules,
 [configuration guide](CONFIGURATION.md) for input settings, and
@@ -110,7 +111,11 @@ one; daily, hourly and monthly grids use seven, 24 and 12 respectively.
 
 A sample is loss-eligible only when its raw scale is finite and positive and it
 has an observed label. Eligible arithmetic floors scale at `1e-6`; an ineligible
-frame uses scale one. Targets and labels share this affine frame.
+frame uses scale one. Targets and labels share this affine frame. The optional
+`forecast.scale_floor_frac` also floors eligible scales relative to mean absolute
+observed context; its default zero preserves the original arithmetic. Training,
+validation and inference use the same setting. Training and inference count
+`floored_target_samples` when this additional floor changes the scale.
 `pinball_loss` averages doubled pinball loss over eligible observed cells and
 quantile knots. An empty selection returns a graph-connected zero loss.
 
@@ -139,7 +144,10 @@ without optimizer steps. Ordinary completion restores the selected best state.
 ### Static categories, series IDs and numeric attributes
 
 `StaticEncoder` builds a vocabulary for each categorical static and a separate
-`__series__` vocabulary for series IDs. Code zero means unknown, code one means
+`__series__` vocabulary for series IDs by default. Setting
+`training.series_embedding: false` omits that vocabulary without removing other
+statics; an empty set of static inputs still supports the static projection bias.
+Code zero means unknown, code one means
 missing, and observed training categories start at two. New IDs and unseen
 categories therefore have a defined embedding slot when a bundle is reused.
 
@@ -225,12 +233,13 @@ measurements. For example, Favorita declares promotions as known and oil prices
 as past-only; Rossmann separates known promotions from past customer counts;
 Walmart combines store/department/type categories with numeric size; hierarchical
 sales declares no statics. Even without explicit static columns, series IDs have
-their own embeddings.
+their own embeddings by default.
 
 Roles prevent unavailable future measurements from entering forecasts, masks
 preserve missingness, and scale normalization lets one shared model train across
 different target magnitudes. Frozen vocabularies and guarded covariates let later
-windows reuse the first-window model without refitting preprocessing. These are
+windows reuse the first-window model without refitting preprocessing under the
+default policy. Per-window training fits preprocessing anew for each window. These are
 input and reproducibility properties, not a claim of benchmark accuracy.
 
 ## Bundles and prediction
@@ -251,11 +260,16 @@ item, horizon and quantile axes.
 
 ## fev orchestration, identity and resume
 
-`run_fev` implements `first_window`: train once per task and reuse that bundle
+`run_fev` defaults to `first_window`: train once per task and reuse that bundle
 with each later window's expanded past. `window_origins` reads every item's first
 future timestamp. `resolved_origin` uses their latest timestamp for training,
 inner validation and run identity; the bundle's permissible origin floor is the
-earliest timestamp in the first window.
+earliest timestamp in the first window. With `per_window`, each window uses its
+own panel, latest training origin, earliest forecast origin, encoder and bundle
+under `<task>/window_<w>/`; predictions remain at `<task>/window_<w>.npz`.
+Window identities include `policy: per_window`. Summary identity is SHA256 of the
+ordered window identities as a compact UTF-8 JSON list, and training time sums
+all windows. Default first-window identity payloads are unchanged.
 
 `Predictor.forecast_per_item_origins` groups items by their own origins and
 restores input order. An early-ending item can be forecast for calendar periods
@@ -277,7 +291,9 @@ resamples and a configurable reference model.
 settings, seed, dataset fingerprint, package version, resolved origin in ISO
 format and task definition. Unset `training.max_steps_cap`,
 `training.val_items_max` and `training.init_from`, and false `training.zero_shot`
-and `training.eval_at_start`, are omitted from settings. A set `training.init_from`
+and `training.eval_at_start`, are omitted from settings. The default
+`training.trainable: all`, `training.series_embedding: true` and
+`forecast.scale_floor_frac: 0.0` are also omitted. A set `training.init_from`
 is replaced by `{pretrain_identity, model_sha256}` from its bundle manifest. Git
 revision is provenance, not an identity input.
 User-data runs use a null task definition and hash the long/static file bytes
@@ -296,18 +312,36 @@ non-finite checkpoint remains terminal on resume.
 
 Telemetry includes cumulative training/evaluation/checkpoint seconds, session
 count, peak allocated CUDA bytes, non-finite losses, scaler skips and the
-covariate counters. Evaluation snapshots add step, elapsed time, training seconds
+covariate and target-floor counters. Evaluation snapshots add step, elapsed time, training seconds
 per step and evaluation seconds. Progress retains the last three snapshots.
-Prediction windows persist inference time, device, fallback and covariate counts.
+Prediction windows persist inference time, device, fallback, covariate and target-floor counts.
 Missing diagnostics in older prediction windows are read as unknown. Summary
 covariate totals sum available measurements and stay unknown when none were
 recorded; required timing/fallback totals stay unknown if any window lacks them.
 A legacy checkpoint without a scaler-skip total also retains an unknown total.
 
+With `training.trainable: heads_only`, all parameters in the backbone module are
+frozen and excluded from AdamW. Input projections, static conditioning and the
+quantile head remain trainable. `run.json.trainable` records the mode and parameter
+counts; optimizer checkpoints contain only trainable parameters.
+
+With `refit: full`, a positive selected step and an available inner validation
+trigger a second training phase from the same seeded initialization (including
+pretrained transfer), retaining the selection encoder. Labels extend through the
+last grid step before the origin, with no validation or selection. The refit
+runs for `best_step` using the original schedule length and warmup. Step-zero
+selection and the no-validation path skip refit with a recorded reason; zero-shot
+plus full refit is invalid. Selection completion is stored in
+`checkpoints/selection.json`, then refit uses `checkpoints/refit/`. Resume bypasses
+completed selection. `run.json.refit` describes the phase, while selection results
+and `validation_history` remain available. The saved bundle has the refit weights
+and cutoff; cumulative timings include both phases.
+
 ### Written artifacts
 
 Training paths below are relative to the `train --out` directory, or to the
-task-named directory under `fev run --out-dir`. Window indices start at zero.
+task-named directory under `fev run --out-dir` (with an extra `window_<w>/`
+component for per-window training artifacts). Window indices start at zero.
 
 | Stage | Artifact | Contents and publication |
 | --- | --- | --- |
@@ -350,7 +384,7 @@ Training and forecasting commands require long-panel settings. fev execution
 requires the optional benchmark dependencies. Its task selector accepts
 `weekly`, `heldout`, comma-separated weekly names, or a task YAML; `--profiles`
 overrides the target-support/static-role profiles. `--policy` defaults to
-`first_window`; `per_window` is recognized but rejected. `--stop-after` interrupts
+`first_window`; `per_window` trains a separate bundle per window. `--stop-after` interrupts
 after that many training steps in the current call, saving a checkpoint if
 training has not already finished. `fev baseline` is resumable without a resume
 flag. `fev leaderboard` defaults to the `seasonal_naive` reference model.

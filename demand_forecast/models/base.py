@@ -91,7 +91,9 @@ class ForecastModel(nn.Module):
         )
         static_channels = len(spec.vocab_sizes) * spec.cat_emb_dim + 2 * spec.n_numeric
         n_blocks = len(spec.vocab_sizes) + int(spec.n_numeric > 0)
-        self.static_gate = nn.Linear(static_channels, n_blocks) if spec.use_vsn else None
+        self.static_gate = (
+            nn.Linear(static_channels, n_blocks) if spec.use_vsn and n_blocks else None
+        )
         self.static_proj = nn.Linear(static_channels, spec.d_model)
         self.head = MonotoneQuantileHead(spec.d_model, spec.quantiles, spec.width_factor)
         self.register_buffer("fallback_level", torch.tensor(0.0))
@@ -127,6 +129,8 @@ class ForecastModel(nn.Module):
         ]
         if self.spec.n_numeric:
             blocks.append(torch.cat([batch.num, batch.num_mask.to(batch.num.dtype)], dim=-1))
+        if not blocks:
+            return self.static_proj(batch.num.new_empty((batch.size, 0)))
         combined = torch.cat(blocks, dim=-1)
         if self.static_gate is not None:
             weights = self.static_gate(combined).softmax(dim=-1)

@@ -48,6 +48,14 @@ class _PretrainForecastConfig(ForecastConfig):
 
     model_config = ConfigDict(extra="forbid")
 
+    @field_validator("scale_floor_frac")
+    @classmethod
+    def reject_relative_floor(cls, value: float) -> float:
+        """Keep the pretraining protocol unchanged; the relative floor is task-only."""
+        if value != 0.0:
+            raise ValueError("scale_floor_frac is only supported for task training")
+        return value
+
 
 class PretrainConfig(BaseModel):
     """Standalone pretraining configuration; loading never accesses corpus files."""
@@ -93,6 +101,9 @@ def pretrain_identity(
         "package_version": package_version,
         "shards": shard_sha256,
     }
+    # The shared forecast schema gained a task-only switch. Do not invalidate
+    # existing pretraining checkpoints by hashing its inactive default.
+    payload["config"]["forecast"].pop("scale_floor_frac", None)
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()

@@ -51,6 +51,11 @@ def _identity_settings(settings: Settings) -> dict:
     for key in ("zero_shot", "eval_at_start"):
         if training[key] is False:
             training.pop(key)
+    for key, default in (("trainable", "all"), ("series_embedding", True)):
+        if training[key] == default:
+            training.pop(key)
+    if payload["forecast"]["scale_floor_frac"] == 0.0:
+        payload["forecast"].pop("scale_floor_frac")
     if settings.training.init_from is not None:
         path = Path(settings.training.init_from)
         manifest = load_bundle_manifest(path)
@@ -70,6 +75,8 @@ def run_identity(
     package_version: str,
     origin: pd.Timestamp | str,
     task_definition: dict | None,
+    *,
+    policy: str = "first_window",
 ) -> str:
     """Hash canonical configuration, data, software and resolved training boundary."""
     payload = {
@@ -80,6 +87,10 @@ def run_identity(
         "origin": pd.Timestamp(origin).isoformat(),
         "task_definition": task_definition,
     }
+    if policy not in {"first_window", "per_window"}:
+        raise ValueError(f"unknown fev policy: {policy}")
+    if policy == "per_window":
+        payload["policy"] = policy
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
@@ -91,8 +102,56 @@ def resolve_device(settings: Settings) -> torch.device:
 
 
 def _check_refit(settings: Settings) -> None:
-    if settings.training.refit == "full":
-        raise NotImplementedError("refit=full arrives with the phase-4 plan")
+    if settings.training.zero_shot and settings.training.refit == "full":
+        raise ValueError("zero_shot is incompatible with refit=full")
+
+
+def _initial_model(settings: Settings, spec: ModelSpec):
+    """Reproduce the task initialization, including transfer and frozen parameters."""
+    torch.manual_seed(settings.seed)
+    np.random.seed(settings.seed)
+    random.seed(settings.seed)
+    model = build_model(settings.model.family, spec, settings.model.backbone_kwargs())
+    transfer = None
+    if settings.training.init_from:
+        source = load_bundle(settings.training.init_from, device="cpu")
+        transferred = init_from_pretrained(model, source)
+        transfer = {
+            "pretrain_identity": source.manifest["pretrain_identity"],
+            "model_sha256": source.manifest["sha256"]["model.pt"],
+            "copied": transferred.copied,
+            "zeroed": transferred.zeroed,
+            "fresh": transferred.fresh,
+        }
+    if settings.training.trainable == "heads_only":
+        model.backbone.requires_grad_(False)
+    return model, transfer
+
+
+def _check_fit_result(result, checkpoint: Path) -> None:
+    if result.stop_reason == "nonfinite_losses":
+        raise NonFiniteTraining(
+            f"Training stopped after {NONFINITE_STOP_AFTER} consecutive non-finite losses "
+            f"at step {result.steps}; checkpoint {checkpoint}"
+        )
+    if result.stop_reason == "interrupted":
+        raise InterruptedRun(
+            f"Training interrupted at step {result.steps}; resume from {checkpoint}"
+        )
+
+
+def _combine_timings(selection: dict, refit: dict) -> dict:
+    """Sum measured phase counters and durations, retaining the peak memory maximum."""
+    return {
+        key: (
+            None
+            if value is None or refit[key] is None
+            else max(value, refit[key])
+            if key == "peak_cuda_mem_bytes"
+            else value + refit[key]
+        )
+        for key, value in selection.items()
+    }
 
 
 def _finite_json(value):
@@ -132,6 +191,7 @@ def train_panel(
     resume: bool = False,
     stop_after: int | None = None,
     earliest_origin: pd.Timestamp | None = None,
+    policy: str = "first_window",
 ) -> Path:
     """Fit the permitted history, checkpoint interruptions and save the selected model.
 
@@ -144,6 +204,8 @@ def train_panel(
     if settings.training.zero_shot and not settings.training.init_from:
         raise ValueError("zero_shot requires init_from")
     _check_refit(settings)
+    if stop_after is not None and stop_after < 1:
+        raise ValueError("stop_after must be positive")
     started = time.perf_counter()
     origin, out_dir = pd.Timestamp(origin), Path(out_dir)
     validate_on_grid(pd.DatetimeIndex([origin]), panel.freq, "training origin")
@@ -155,32 +217,63 @@ def train_panel(
     for series in panel.series:
         validate_on_grid(pd.DatetimeIndex([series.start, origin]), panel.freq, series.series_id)
     identity = run_identity(
-        settings, settings.seed, dataset_fingerprint, __version__, origin, task_definition
+        settings,
+        settings.seed,
+        dataset_fingerprint,
+        __version__,
+        origin,
+        task_definition,
+        policy=policy,
     )
     bundle_dir = out_dir / "bundle"
     checkpoint = out_dir / "checkpoints/latest.pt"
     report_path = out_dir / "run.json"
+    selection_path = out_dir / "checkpoints/selection.json"
+    refit_checkpoint = out_dir / "checkpoints/refit/latest.pt"
+    selection = None
     resumed_from_step = 0
+    if not resume and settings.training.refit == "full":
+        selection_path.unlink(missing_ok=True)
+        refit_checkpoint.unlink(missing_ok=True)
     if resume:
         # A completed bundle must not hide a mismatched checkpoint or report.
         failed_checkpoint = False
-        if checkpoint.exists():
-            state = torch.load(checkpoint, map_location="cpu", weights_only=False)
+        unfinished_phase = False
+        for existing_checkpoint in (checkpoint, refit_checkpoint):
+            if not existing_checkpoint.exists():
+                continue
+            state = torch.load(existing_checkpoint, map_location="cpu", weights_only=False)
             if state.get("run_identity") != identity:
                 raise ValueError("run identity mismatch")
-            resumed_from_step = state["step"]
-            failed_checkpoint = (
+            if existing_checkpoint == checkpoint:
+                resumed_from_step = state["step"]
+            failed_checkpoint |= (
                 state.get("terminal_reason") == "nonfinite_losses"
                 or state.get("consecutive_nonfinite", 0) >= NONFINITE_STOP_AFTER
             )
+            if settings.training.refit == "full":
+                limit = state.get("step_limit", state["max_steps"])
+                unfinished_phase |= state["step"] < limit and (
+                    existing_checkpoint == refit_checkpoint
+                    or state["patience_counter"] < settings.training.patience
+                )
             del state
+        if selection_path.exists():
+            selection = json.loads(selection_path.read_text(encoding="utf-8"))
+            if selection.get("run_identity") != identity:
+                raise ValueError("run identity mismatch")
+            unfinished_phase |= not refit_checkpoint.exists()
         for path in (report_path, bundle_dir / "manifest.json"):
             if path.exists():
                 if json.loads(path.read_text(encoding="utf-8")).get("run_identity") != identity:
                     raise ValueError("run identity mismatch")
         # A failed rerun's checkpoint takes precedence over an older bundle;
         # let the trainer restore and publish its terminal result below.
-        if not failed_checkpoint and (bundle_dir / "manifest.json").exists():
+        if (
+            not failed_checkpoint
+            and not unfinished_phase
+            and (bundle_dir / "manifest.json").exists()
+        ):
             bundle = load_bundle(bundle_dir)
             if explicit_earliest_origin and earliest_origin != pd.Timestamp(
                 bundle.panel_metadata["earliest_origin"]
@@ -206,25 +299,24 @@ def train_panel(
         len(plan.val_items),
         len(eligible.val_items),
     )
-    encoder = StaticEncoder().fit(panel, plan.fit_ids)
+    encoder = StaticEncoder().fit(
+        panel, plan.fit_ids, series_embedding=settings.training.series_embedding
+    )
     spec = ModelSpec.from_panel(
         panel, encoder, settings.forecast, settings.model.d_model, settings.model.cat_emb_dim
     )
     backbone_kwargs = settings.model.backbone_kwargs()
-    model = build_model(settings.model.family, spec, backbone_kwargs)
-    transfer = None
-    if settings.training.init_from:
-        source = load_bundle(settings.training.init_from, device="cpu")
-        transferred = init_from_pretrained(model, source)
-        transfer = {
-            "pretrain_identity": source.manifest["pretrain_identity"],
-            "model_sha256": source.manifest["sha256"]["model.pt"],
-            "copied": transferred.copied,
-            "zeroed": transferred.zeroed,
-            "fresh": transferred.fresh,
-        }
-        del source
+    model, transfer = _initial_model(settings, spec)
     device = resolve_device(settings)
+    refit = {
+        "mode": settings.training.refit,
+        "performed": False,
+        "steps": None,
+        "train_upto": None,
+        "reason": None,
+    }
+    training_cutoff = plan.train_upto
+    validation_history = []
     if settings.training.zero_shot:
         fit_ids = set(plan.fit_ids)
         fit_indices = [i for i, series in enumerate(panel.series) if series.series_id in fit_ids]
@@ -268,46 +360,101 @@ def train_panel(
                     "init_from",
                     "zero_shot",
                     "eval_at_start",
+                    "trainable",
+                    "series_embedding",
                 }
             )
         )
-        trainer = Trainer(model, cfg, device, identity, settings.seed)
         fit_started = time.perf_counter()
-        result = trainer.fit(
-            panel,
-            plan,
-            settings.forecast,
-            encoder,
-            checkpoint_dir=out_dir / "checkpoints",
-            resume=resume,
-            stop_after=stop_after,
-            eval_at_start=settings.training.eval_at_start,
-        )
-        training_time_s = time.perf_counter() - fit_started
-        if result.stop_reason == "nonfinite_losses":
-            raise NonFiniteTraining(
-                f"Training stopped after {NONFINITE_STOP_AFTER} consecutive non-finite losses "
-                f"at step {result.steps}; checkpoint {checkpoint}"
+        selection_steps_this_call = 0
+        if selection is None:
+            trainer = Trainer(model, cfg, device, identity, settings.seed)
+            result = trainer.fit(
+                panel,
+                plan,
+                settings.forecast,
+                encoder,
+                checkpoint_dir=out_dir / "checkpoints",
+                resume=resume,
+                stop_after=stop_after,
+                eval_at_start=settings.training.eval_at_start,
             )
-        if result.stop_reason == "interrupted":
-            raise InterruptedRun(
-                f"Training interrupted at step {result.steps}; resume from {checkpoint}"
-            )
-        fit_result = {
-            "steps": result.steps,
-            "best_step": result.best_step,
-            "best_score": result.best_score,
-            "stop_reason": result.stop_reason,
-            "nonfinite_losses": result.timings["nonfinite_losses"],
-        }
-        resolved_budget = {"max_steps": trainer.max_steps, "eval_every": trainer.eval_every}
+            _check_fit_result(result, checkpoint)
+            selection_steps_this_call = result.steps - resumed_from_step
+            selection = {
+                "run_identity": identity,
+                "fit_result": {
+                    "steps": result.steps,
+                    "best_step": result.best_step,
+                    "best_score": result.best_score,
+                    "stop_reason": result.stop_reason,
+                    "nonfinite_losses": result.timings["nonfinite_losses"],
+                },
+                "resolved_budget": {
+                    "max_steps": trainer.max_steps,
+                    "eval_every": trainer.eval_every,
+                },
+                "amp_dtype": str(trainer.amp_dtype).removeprefix("torch.") if trainer.amp else None,
+                "timings": result.timings,
+                "telemetry": result.telemetry,
+                "validation_history": [entry for entry in result.history if "SQL" in entry],
+            }
+            # A completed selection is durable before the first refit step.
+            if settings.training.refit == "full" and not plan.exception and result.best_step > 0:
+                _write_run(selection_path, selection)
+            del trainer, result
+        fit_result = selection["fit_result"]
+        resolved_budget = selection["resolved_budget"]
         n_val_items = len(plan.val_items)
-        amp_dtype = str(trainer.amp_dtype).removeprefix("torch.") if trainer.amp else None
-        timings, telemetry = result.timings, result.telemetry
+        amp_dtype = selection["amp_dtype"]
+        timings, telemetry = selection["timings"], selection["telemetry"]
+        validation_history = selection["validation_history"]
+        if settings.training.refit == "full":
+            if plan.exception:
+                refit["reason"] = "no_inner_validation"
+            elif fit_result["best_step"] == 0:
+                refit["reason"] = "best_step_zero"
+            else:
+                remaining = None if stop_after is None else stop_after - selection_steps_this_call
+                if remaining is not None and remaining <= 0:
+                    raise InterruptedRun(f"Selection complete; resume refit from {selection_path}")
+                full_plan = plan_inner_validation(
+                    panel,
+                    origin,
+                    settings.forecast.horizon,
+                    settings.training.min_train_history,
+                    full_history=True,
+                )
+                # Keep the selection encoder/spec so initial weights and vocabularies
+                # are identical. Newly observed fit ids use its unknown codes.
+                del model
+                model, _ = _initial_model(settings, spec)
+                trainer = Trainer(model, cfg, device, identity, settings.seed)
+                refit_result = trainer.fit(
+                    panel,
+                    full_plan,
+                    settings.forecast,
+                    encoder,
+                    checkpoint_dir=refit_checkpoint.parent,
+                    resume=resume,
+                    stop_after=remaining,
+                    step_limit=fit_result["best_step"],
+                    schedule_max_steps=resolved_budget["max_steps"],
+                )
+                _check_fit_result(refit_result, refit_checkpoint)
+                timings = _combine_timings(timings, refit_result.timings)
+                training_cutoff = full_plan.train_upto
+                refit.update(
+                    performed=True,
+                    steps=refit_result.steps,
+                    train_upto=training_cutoff.isoformat(),
+                )
+        training_time_s = time.perf_counter() - fit_started
 
     report = {
         "run_identity": identity,
         "settings": settings.model_dump(mode="json"),
+        "policy": policy,
         "seed": settings.seed,
         "dataset_fingerprint": dataset_fingerprint,
         "package_version": __version__,
@@ -323,6 +470,13 @@ def train_panel(
         "n_val_items_eligible": len(eligible.val_items),
         "amp_dtype": amp_dtype,
         "telemetry": telemetry,
+        "validation_history": validation_history,
+        "refit": refit,
+        "trainable": {
+            "mode": settings.training.trainable,
+            "params_trainable": sum(p.numel() for p in model.parameters() if p.requires_grad),
+            "params_total": sum(p.numel() for p in model.parameters()),
+        },
         "plan": {
             "train_upto": plan.train_upto.isoformat(),
             "val_origin": plan.val_origin.isoformat(),
@@ -350,7 +504,7 @@ def train_panel(
         dataset_cfg=settings.data,
         encoder=encoder,
         panel=panel,
-        training_cutoff=plan.train_upto,
+        training_cutoff=training_cutoff,
         earliest_origin=earliest_origin,
         manifest={
             "run_identity": identity,

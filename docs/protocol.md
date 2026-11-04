@@ -166,9 +166,13 @@ Forecast fallbacks are deterministic, finite and logged:
 
 Standard training uses `max_context=512`. Optional future tuning may consider
 `[2H, max(64, 2H), 256, 512]`, deduplicated with a cap of 512. Selection remains on
-inner validation only; no tuning is authorized by prompt 00. Tuning,
-`refit: full` and `per_window` are deferred; preregister any later tuning trial/time
-budget before running it. Other families and `dhf` need their own reviewed configurations.
+inner validation only; no tuning is authorized by prompt 00. Preregister any later
+tuning trial/time budget before running it. `refit: full` and `per_window` are now
+implemented as optional ablations, together with `training.trainable: heads_only`,
+`training.series_embedding: false`, and `forecast.scale_floor_frac > 0`. These
+switches do not change the frozen official row (`first_window` / `refit: none`,
+all parameters trainable, series embeddings enabled, relative floor disabled).
+See [configuration](CONFIGURATION.md) for their artifacts and resume semantics. Other families and `dhf` need their own reviewed configurations.
 
 The frozen policy is **`first_window`**, one seed (0). Train/select once on the first
 window's available past; reuse that bundle and learned preprocessing for later

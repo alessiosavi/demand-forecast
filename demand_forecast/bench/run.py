@@ -1,5 +1,6 @@
 """Resumable model and reference forecasts with official fev evaluation."""
 
+import hashlib
 import json
 import logging
 import time
@@ -23,11 +24,13 @@ DIAGNOSTIC_DTYPES = {
     "cold_covariate_columns": np.int64,
     "clipped_covariate_values": np.int64,
     "floored_covariate_columns": np.int64,
+    "floored_target_samples": np.int64,
 }
 OPTIONAL_DIAGNOSTICS = {
     "cold_covariate_columns",
     "clipped_covariate_values",
     "floored_covariate_columns",
+    "floored_target_samples",
 }
 
 
@@ -130,6 +133,7 @@ def _save_predictions(
                 **{
                     key: np.asarray(diagnostics[key], dtype=dtype)
                     for key, dtype in DIAGNOSTIC_DTYPES.items()
+                    if key in diagnostics or key not in OPTIONAL_DIAGNOSTICS
                 },
             )
             stream.close()
@@ -147,7 +151,10 @@ def run_fev(
     model_name: str | None = None,
     stop_after: int | None = None,
 ) -> pd.DataFrame:
-    """Train once per task, extend context per window, and replace summary rows.
+    """Train once per task or once per window, and replace summary rows.
+
+    For per_window, the summary identity is SHA256 of the ordered window
+    identities encoded as a compact JSON list (UTF-8, separators=(',', ':')).
 
     Resume validates saved identities and computes only missing artifacts.
     Timings come from persisted trainer and prediction measurements, including
@@ -166,9 +173,7 @@ def run_fev(
     from demand_forecast.data.loader_fev import item_ids, panel_from_window
     from demand_forecast.inference.predictor import Predictor
 
-    if policy == "per_window":
-        raise NotImplementedError("per_window arrives with the phase-4 plan")
-    if policy != "first_window":
+    if policy not in {"first_window", "per_window"}:
         raise ValueError(f"unknown fev policy: {policy}")
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -178,6 +183,8 @@ def run_fev(
         if path.exists()
         else pd.DataFrame(columns=["task", "model_name"])
     )
+    if "policy" not in summaries:
+        summaries["policy"] = "first_window"
     model_name = model_name or f"demand-forecast-{settings.model.family}"
     for spec in specs:
         task = spec.to_task()
@@ -189,6 +196,10 @@ def run_fev(
         diagnostics_per_window = []
         max_distinct_origins = 0
         skipped = False
+        window_identities = []
+        training_times = []
+        reports = []
+        all_reused = resume
         for index, window in enumerate(task.iter_windows()):
             past, future = window.get_input_data()
             started = time.perf_counter()
@@ -213,29 +224,47 @@ def run_fev(
                 earliest,
                 origin,
             )
-            if index == 0:
+            if index == 0 or policy == "per_window":
+                training_dir = (
+                    task_dir if policy == "first_window" else task_dir / f"window_{index}"
+                )
                 identity = run_identity(
-                    task_settings, task_settings.seed, fp, __version__, origin, definition
+                    task_settings,
+                    task_settings.seed,
+                    fp,
+                    __version__,
+                    origin,
+                    definition,
+                    policy=policy,
                 )
                 logger.info("identity: task=%s %s", spec.name, identity)
                 if resume:
                     # Check even later windows before doing any training or inference.
-                    for prediction_path in task_dir.glob("window_*.npz"):
+                    paths = (
+                        task_dir.glob("window_*.npz")
+                        if policy == "first_window"
+                        else [task_dir / f"window_{index}.npz"]
+                    )
+                    for prediction_path in paths:
+                        if not prediction_path.exists():
+                            continue
                         with np.load(prediction_path, allow_pickle=False) as saved:
                             _check_prediction_identity(saved, identity)
-                reused = resume and (task_dir / "bundle/manifest.json").exists()
+                reused = resume and (training_dir / "bundle/manifest.json").exists()
+                all_reused &= reused and (task_dir / f"window_{index}.npz").exists()
                 train_panel(
                     panel,
                     origin,
                     task_settings,
-                    task_dir,
+                    training_dir,
                     dataset_fingerprint=fp,
                     task_definition=definition,
                     resume=resume,
                     stop_after=stop_after,
                     earliest_origin=earliest,
+                    policy=policy,
                 )
-                report = json.loads((task_dir / "run.json").read_text(encoding="utf-8"))
+                report = json.loads((training_dir / "run.json").read_text(encoding="utf-8"))
                 cumulative = report["timings"].get("cumulative", {})
                 training_time_s = (
                     sum(cumulative[key] for key in ("train_s", "eval_s", "checkpoint_s"))
@@ -245,10 +274,18 @@ def run_fev(
                     )
                     else None
                 )
+                training_times.append(training_time_s)
+                reports.append(report)
+                window_identities.append(identity)
                 rows = summaries.loc[
                     (summaries.task == spec.name) & (summaries.model_name == model_name)
                 ]
-                if reused and len(rows) == 1 and rows.iloc[0].get("run_identity") == identity:
+                if (
+                    policy == "first_window"
+                    and reused
+                    and len(rows) == 1
+                    and rows.iloc[0].get("run_identity") == identity
+                ):
                     complete = True
                     for i in range(spec.num_windows):
                         saved_path = task_dir / f"window_{i}.npz"
@@ -271,7 +308,7 @@ def run_fev(
                     diagnostics = prediction_diagnostics(saved)
             else:
                 predictor = Predictor.from_bundle(
-                    task_dir / "bundle", device=resolve_device(settings)
+                    training_dir / "bundle", device=resolve_device(settings)
                 )
                 ids, arrays, diagnostics = predictor.forecast_per_item_origins(panel, origins)
                 _save_predictions(prediction_path, ids, arrays, identity, diagnostics)
@@ -281,6 +318,29 @@ def run_fev(
             )
         if skipped:
             continue
+        if policy == "per_window":
+            identity = hashlib.sha256(
+                json.dumps(window_identities, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            if (
+                all_reused
+                and all(d is not None for d in diagnostics_per_window)
+                and len(rows) == 1
+                and rows.iloc[0].get("run_identity") == identity
+            ):
+                print(f"Skipping completed task {spec.name}", flush=True)
+                continue
+            training_time_s = (
+                sum(training_times) if all(t is not None for t in training_times) else None
+            )
+            cumulative = {
+                key: (
+                    sum(r["timings"]["cumulative"][key] for r in reports)
+                    if all(r["timings"].get("cumulative", {}).get(key) is not None for r in reports)
+                    else None
+                )
+                for key in ("nonfinite_losses", "scaler_skips", "sessions")
+            }
 
         def diagnostic_sum(key):
             if key in OPTIONAL_DIAGNOSTICS:
@@ -305,12 +365,14 @@ def run_fev(
                 inference_time_s=diagnostic_sum("inference_time_s"),
                 extra_info={
                     "run_identity": identity,
+                    "policy": policy,
                     "max_distinct_origins": max_distinct_origins,
                     "fallback_no_context": diagnostic_sum("fallback_no_context"),
                     "fallback_undefined_scale": diagnostic_sum("fallback_undefined_scale"),
                     "cold_covariate_columns": diagnostic_sum("cold_covariate_columns"),
                     "clipped_covariate_values": diagnostic_sum("clipped_covariate_values"),
                     "floored_covariate_columns": diagnostic_sum("floored_covariate_columns"),
+                    "floored_target_samples": diagnostic_sum("floored_target_samples"),
                     "inference_device": ",".join(sorted(devices))
                     if all(d is not None for d in diagnostics_per_window)
                     else "unknown",
@@ -330,7 +392,7 @@ def run_fev(
         row = pd.DataFrame([summary])
         summaries = row if summaries.empty else pd.concat([summaries, row], ignore_index=True)
         _save_summaries(summaries, path)
-    if not path.exists():
+    if not path.exists() or "policy" not in pd.read_csv(path, nrows=0).columns:
         _save_summaries(summaries, path)
     return pd.read_csv(path, float_precision="round_trip")
 

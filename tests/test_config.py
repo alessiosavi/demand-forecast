@@ -87,6 +87,8 @@ def test_training_defaults_match_trainer():
             "init_from",
             "zero_shot",
             "eval_at_start",
+            "trainable",
+            "series_embedding",
         }
     ) == asdict(TrainConfig())
     assert config.min_train_history is None and config.refit == "none"
@@ -169,12 +171,10 @@ def test_legacy_tuning_settings_preserved():
     assert TuningConfig(n_trials=0).n_trials == 0
 
 
-def test_refit_full_is_explicitly_unimplemented(tmp_path):
-    from demand_forecast.core.run import train_from_settings
-
-    with pytest.raises(NotImplementedError, match="refit=full arrives with the phase-4 plan"):
-        train_from_settings(settings_with(refit="full"), tmp_path)
-    assert not list(tmp_path.iterdir())
+def test_refit_full_is_supported_and_incompatible_with_zero_shot():
+    assert settings_with(refit="full").training.refit == "full"
+    with pytest.raises(ValidationError, match="zero_shot.*refit"):
+        TrainingConfig(zero_shot=True, refit="full")
 
 
 def test_dataset_config_requires_target_support():
