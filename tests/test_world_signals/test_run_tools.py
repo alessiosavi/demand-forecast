@@ -1,3 +1,4 @@
+import hashlib
 import json
 
 import numpy as np
@@ -30,6 +31,17 @@ def setup_run(tmp_path):
     return task, state
 
 
+def write_bundle(task):
+    bundle = task / "bundle"
+    bundle.mkdir()
+    hashes = {}
+    for name in ("model.pt", "config.json", "encoder.json", "panel.json"):
+        payload = f"synthetic bytes: {name}".encode()
+        (bundle / name).write_bytes(payload)
+        hashes[name] = hashlib.sha256(payload).hexdigest()
+    (bundle / "manifest.json").write_text(json.dumps({"run_identity": "test", "sha256": hashes}))
+
+
 def test_finalize_refuses_incomplete_and_extracts_history(tmp_path):
     task, state = setup_run(tmp_path)
     rows = finalize(tmp_path)
@@ -40,8 +52,7 @@ def test_finalize_refuses_incomplete_and_extracts_history(tmp_path):
     pd.DataFrame([{"task": task.name, "model_name": "fake", "run_identity": "test"}]).to_csv(
         tmp_path / "summaries.csv", index=False
     )
-    (task / "bundle").mkdir()
-    (task / "bundle/manifest.json").write_text('{"run_identity": "test"}')
+    write_bundle(task)
     for i in range(2):
         np.savez(
             task / f"window_{i}.npz", ids=["BTC"], arrays=np.zeros((1, 13, 9)), identity="test"
@@ -72,8 +83,7 @@ def test_finalize_preserves_checkpoints_when_a_window_is_missing(tmp_path):
     pd.DataFrame([{"task": task.name, "model_name": "fake", "run_identity": "test"}]).to_csv(
         tmp_path / "summaries.csv", index=False
     )
-    (task / "bundle").mkdir()
-    (task / "bundle/manifest.json").write_text('{"run_identity": "test"}')
+    write_bundle(task)
     np.savez(task / "window_0.npz", ids=["BTC"], arrays=np.zeros((1, 13, 9)), identity="test")
     with pytest.raises(SystemExit) as exc:
         main(["finalize", "--run-dir", str(tmp_path)])
@@ -81,3 +91,32 @@ def test_finalize_preserves_checkpoints_when_a_window_is_missing(tmp_path):
     assert (task / "history.json").exists()
     assert (task / "checkpoints/latest.pt").exists()
     assert "window set" in finalize(tmp_path)[0]["detail"]
+
+
+@pytest.mark.parametrize("damage", ["missing", "corrupt", "intact"])
+def test_finalize_verifies_bundle_payloads_before_pruning(tmp_path, monkeypatch, damage):
+    task, _ = setup_run(tmp_path)
+    write_bundle(task)
+    pd.DataFrame([{"task": task.name, "model_name": "fake", "run_identity": "test"}]).to_csv(
+        tmp_path / "summaries.csv", index=False
+    )
+    for i in range(2):
+        np.savez(
+            task / f"window_{i}.npz", ids=["BTC"], arrays=np.zeros((1, 13, 9)), identity="test"
+        )
+    if damage == "missing":
+        (task / "bundle/model.pt").unlink()
+    elif damage == "corrupt":
+        (task / "bundle/config.json").write_bytes(b"corrupted")
+    original_load = torch.load
+
+    def checkpoint_only(path, **kwargs):
+        assert path == task / "checkpoints/latest.pt", "must not load bundle/model.pt"
+        return original_load(path, **kwargs)
+
+    monkeypatch.setattr(torch, "load", checkpoint_only)
+    row = finalize(tmp_path)[0]
+    assert row["status"] == ("complete" if damage == "intact" else "incomplete")
+    assert (task / "checkpoints/latest.pt").exists() is (damage != "intact")
+    if damage != "intact":
+        assert ("model.pt" if damage == "missing" else "config.json") in row["detail"]

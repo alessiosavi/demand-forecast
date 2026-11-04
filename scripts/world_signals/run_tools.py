@@ -9,6 +9,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from .colab_bundle import _check_file
 from .sources import _atomic_write
 
 
@@ -65,8 +66,25 @@ def _finalize_task(directory, summaries, dry_run):
     manifest_path = directory / "bundle/manifest.json"
     if not manifest_path.exists():
         reasons.append("bundle/manifest.json missing")
-    elif identity is None or _read(manifest_path).get("run_identity") != identity:
-        raise ValueError("bundle/run identity mismatch or missing identity")
+    else:
+        manifest = _read(manifest_path)
+        if identity is None or manifest.get("run_identity") != identity:
+            raise ValueError("bundle/run identity mismatch or missing identity")
+        hashes = manifest.get("sha256")
+        # These are the inference bundle's required payloads, not trainer state.
+        required = {"model.pt", "config.json", "encoder.json", "panel.json"}
+        if not isinstance(hashes, dict) or not required.issubset(hashes):
+            reasons.append("bundle sha256 map missing required payloads")
+        if isinstance(hashes, dict):
+            for name, digest in hashes.items():
+                path = Path(name)
+                if path.is_absolute() or ".." in path.parts or str(path) != name:
+                    reasons.append(f"unsafe bundle payload path: {name}")
+                    continue
+                try:
+                    _check_file(manifest_path.parent, name, digest)
+                except (OSError, ValueError) as exc:
+                    reasons.append(f"bundle {exc}")
     count = report.get("task_definition", {}).get("num_windows")
     if not isinstance(count, int) or count <= 0:
         reasons.append("run.json num_windows missing/invalid")

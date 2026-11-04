@@ -25,6 +25,23 @@ from .colab_bundle import verify
 from .fetch_prices import PANEL_SYMBOLS
 
 RUN_NAMES = ("scratch-on", "scratch-off", "scratch-off-s1", "l3-on", "l3-off", "l3-off-s1")
+L3_PRETRAIN_IDENTITY = "83d6acb1f7f2c1b57ba33c0ca0a870775369d52bf8fb739a9e3f7e28858826c2"
+MODEL_GEOMETRY = {
+    "l3": {
+        "d_model": 320,
+        "nhead": 5,
+        "num_encoder_layers": 4,
+        "num_decoder_layers": 4,
+        "dim_feedforward": 1280,
+    },
+    "scratch": {
+        "d_model": 64,
+        "nhead": 4,
+        "num_encoder_layers": 2,
+        "num_decoder_layers": 2,
+        "dim_feedforward": 256,
+    },
+}
 FOLDS = (2022, 2023, 2024, 2025)
 METRICS = ("SQL", "MASE", "WQL", "WAPE")
 NOISE_METRICS = (*METRICS, "directional_accuracy", "macroWAPE", "price_WAPE", "price_MASE")
@@ -393,6 +410,81 @@ def _training(run, spec, summary, report, directory):
     return result
 
 
+def _validate_arm(run, report, directory):
+    """Check registered controls; return settings eligible for paired comparison."""
+    smoke = run in {"smoke", "probe_smoke"}
+    if run not in RUN_NAMES and not smoke:
+        raise ValueError(f"{directory}: unregistered run directory {run!r}")
+    arm = "smoke" if smoke else run.split("-")[0]
+    settings = report.get("settings")
+    if not isinstance(settings, dict) or not isinstance(settings.get("training"), dict):
+        raise ValueError(f"{directory}: missing effective settings/training")
+    seed = 1 if run.endswith("-s1") else 0
+    if report.get("seed") != seed or settings.get("seed") != seed:
+        raise ValueError(f"{directory}: {run} requires seed {seed} in run.json and settings")
+    model = settings.get("model", {})
+    for key, expected in MODEL_GEOMETRY["scratch" if smoke else arm].items():
+        if model.get(key) != expected:
+            raise ValueError(f"{directory}: {run} requires model.{key} == {expected}")
+    budget = 150 if smoke else 500
+    if report.get("resolved_budget", {}).get("max_steps") != budget:
+        raise ValueError(f"{directory}: {run} requires resolved_budget.max_steps == {budget}")
+    if arm == "l3":
+        transfer = report.get("transfer")
+        if (
+            not isinstance(transfer, dict)
+            or transfer.get("pretrain_identity") != L3_PRETRAIN_IDENTITY
+        ):
+            raise ValueError(
+                f"{directory}: L3 transfer.pretrain_identity must be {L3_PRETRAIN_IDENTITY}"
+            )
+    elif "transfer" in report:
+        raise ValueError(f"{directory}: {run} must have no transfer metadata")
+    return arm, {key: value for key, value in settings.items() if key not in {"data", "seed"}}
+
+
+def _run_metadata(directories):
+    """Validate every supplied task's controls before any predictions are scored."""
+    reports, arm_settings = {}, {}
+    for run, directory in directories:
+        paths = sorted(directory.glob("*/run.json"))
+        if not paths:
+            raise ValueError(f"{directory}: no task run.json files")
+        for path in paths:
+            report = json.loads(path.read_text())
+            arm, settings = _validate_arm(run, report, path.parent)
+            if arm in arm_settings and settings != arm_settings[arm][1]:
+                raise ValueError(
+                    f"{path}: effective settings differ within {arm} arm from {arm_settings[arm][0]} "
+                    "after removing data roles and seed"
+                )
+            arm_settings.setdefault(arm, (path, settings))
+            reports[path.parent] = report
+    return reports
+
+
+def _step0_checks(diagnostics, *, partial):
+    issues = []
+    for fold in FOLDS:
+        pairs = [
+            next((row for row in diagnostics if row["run"] == run and row["fold"] == fold), None)
+            for run in ("l3-on", "l3-off")
+        ]
+        if all(row is not None and row["history_present"] for row in pairs):
+            a, b = [row["step0_SQL"] for row in pairs]
+            finite = a is not None and b is not None and np.isfinite([a, b]).all()
+            equal = bool(finite and np.isclose(a, b, rtol=1e-4, atol=0))
+            for row in pairs:
+                row["step0_pair_equal"] = equal
+            if not equal:
+                issues.append(f"L3 {fold}: finite step-0 SQL equality check failed ({a}, {b})")
+        elif not partial:
+            issues.append(f"L3 {fold}: history.json with finite step-0 SQL required for ON and OFF")
+    if issues and not partial:
+        raise ValueError("Full report requires all four L3 step-0 checks: " + "; ".join(issues))
+    return issues
+
+
 def score_task(run, spec, contexts, forecasts, cell_frames, path_frames):
     """Aggregate task scores from windows and price ratios from all fold cells."""
     quantiles = spec.quantile_levels
@@ -643,6 +735,8 @@ def _markdown(frame):
 
 def build_report(bundle, runs, out, *, partial=False):
     bundle, runs, out = map(Path, (bundle, runs, out))
+    # An unsuccessful rerun must not leave an earlier verdict looking current.
+    (out / "verdict.json").unlink(missing_ok=True)
     verify(bundle)
     specs = {
         spec.name: spec
@@ -653,6 +747,20 @@ def build_report(bundle, runs, out, *, partial=False):
     prices["date"] = pd.to_datetime(prices.date)
     if prices.duplicated(["id", "date"]).any():
         raise ValueError("Duplicate sidecar id/date")
+    if (runs / "summaries.csv").is_file():
+        present = [(runs.name, runs)]
+    else:
+        present = [
+            (path.name, path)
+            for path in sorted(runs.iterdir())
+            if path.is_dir()
+            and path.name != "baseline"
+            and (
+                path.name in {*RUN_NAMES, "smoke", "probe_smoke"}
+                or (path / "summaries.csv").is_file()
+                or any(path.glob("*/run.json"))
+            )
+        ]
     if not partial:
         missing = [name for name in RUN_NAMES if not (runs / name).is_dir()]
         if missing:
@@ -660,16 +768,11 @@ def build_report(bundle, runs, out, *, partial=False):
                 f"Missing required run directories: {missing}; use --partial for smoke"
             )
         directories = [(name, runs / name) for name in RUN_NAMES]
-    elif (runs / "summaries.csv").is_file():
-        directories = [(runs.name, runs)]
     else:
-        directories = [
-            (path.name, path)
-            for path in sorted(runs.iterdir())
-            if path.is_dir() and path.name != "baseline" and (path / "summaries.csv").is_file()
-        ]
+        directories = present
     if not directories:
         raise ValueError("No runs with summaries.csv found")
+    reports = _run_metadata(present)
     cache, used, results = {}, set(), {}
     tasks, assets, diagnostics, baseline_rows, cells, paths, issues = [], [], [], [], [], [], []
     synthetic = False
@@ -706,7 +809,9 @@ def build_report(bundle, runs, out, *, partial=False):
                     "Full report requires 18 windows × 13 steps × the ten registered assets"
                 )
             task_dir = directory / name
-            report = json.loads((task_dir / "run.json").read_text())
+            if task_dir not in reports:
+                raise ValueError(f"{task_dir}: run.json missing")
+            report = reports[task_dir]
             synthetic |= bool(report.get("synthetic", False))
             identity = report.get("run_identity")
             if not identity or summary.get("run_identity") != identity:
@@ -823,18 +928,7 @@ def build_report(bundle, runs, out, *, partial=False):
             )
             assets.extend(scored["assets"])
 
-    for fold in FOLDS:
-        pairs = [
-            next((row for row in diagnostics if row["run"] == run and row["fold"] == fold), None)
-            for run in ("l3-on", "l3-off")
-        ]
-        if all(row is not None and row["history_present"] for row in pairs):
-            a, b = [row["step0_SQL"] for row in pairs]
-            equal = a is not None and b is not None and bool(np.isclose(a, b, rtol=1e-4, atol=0))
-            for row in pairs:
-                row["step0_pair_equal"] = equal
-            if not equal:
-                issues.append(f"L3 {fold}: step-0 SQL equality check failed ({a}, {b})")
+    issues = _step0_checks(diagnostics, partial=partial)
     folds, bootstrap, noise = comparison_tables(results, diagnostics)
     decision = None
     if not partial:

@@ -220,6 +220,62 @@ def test_manifest_coverage_and_checksums(bundle):
         assert hashlib.sha256((bundle / name).read_bytes()).hexdigest() == digest
 
 
+@pytest.mark.parametrize(
+    "start,missing,end,holiday",
+    [
+        ("2024-01-08", "2024-01-09", "2024-01-10", False),
+        ("2023-07-03", "2023-07-04", "2023-07-05", True),
+        ("2024-03-28", "2024-03-29", "2024-04-01", True),
+        ("2021-12-30", "2021-12-31", "2022-01-03", True),
+    ],
+)
+def test_null_quote_classification_and_next_target(inputs, start, missing, end, holiday):
+    prices = pd.concat(
+        [
+            pd.DataFrame({"id": asset, "date": pd.to_datetime([start, end]), "close": [100, 121]})
+            for asset in PANEL_SYMBOLS
+        ],
+        ignore_index=True,
+    )
+    prices.attrs["missing_quote_dates"] = {"GOLD": [missing]}
+    panel, _, sidecar = builder.build_long(replace(inputs, prices=prices), start, end)
+    gold = panel.loc[panel.id == "GOLD"].set_index("timestamp")
+    if holiday:
+        assert gold.loc[end, "target"] == pytest.approx(np.log(121 / 100))
+    else:
+        assert np.isnan(gold.loc[end, "target"])
+    assert np.isnan(gold.loc[missing, "target"])
+    null = sidecar.loc[(sidecar.id == "GOLD") & (sidecar.date == missing)].iloc[0]
+    assert null.quote_missing and not null.session
+    assert bool(null.unexplained_null) is not holiday
+    assert sidecar.unexplained_null.dtype == bool
+
+
+@pytest.mark.parametrize("count", [5, 6])
+def test_unexplained_null_limit_and_manifest(inputs, tmp_path, count):
+    dates = pd.bdate_range("2022-01-04", periods=count)
+    prices = inputs.prices.loc[
+        ~((inputs.prices.id == "GOLD") & inputs.prices.date.isin(dates))
+    ].copy()
+    prices.attrs["missing_quote_dates"] = {"GOLD": ["2022-01-17", *dates.strftime("%Y-%m-%d")]}
+    raw = replace(inputs, prices=prices)
+    if count > 5:
+        with pytest.raises(ValueError, match="GOLD.*unexplained.*5"):
+            builder.write_bundle(raw, tmp_path, start="2021-12-01", end="2025-12-31")
+        assert not (tmp_path / "manifest.json").exists()
+    else:
+        manifest = builder.write_bundle(raw, tmp_path, start="2021-12-01", end="2025-12-31")
+        assert manifest["null_quote_dates"]["GOLD"] == {
+            "holiday_null": ["2022-01-17"],
+            "unexplained_null": dates.strftime("%Y-%m-%d").tolist(),
+        }
+        assert set(manifest["null_quote_dates"]) == set(PANEL_SYMBOLS)
+        panel = read_fev_parquet(tmp_path / "panel_on.parquet")
+        gold = panel.loc[panel.id == "GOLD"].set_index("timestamp")
+        assert np.isnan(gold.loc["2022-01-11", "target"])
+        assert np.isfinite(gold.loc["2022-01-12", "target"])
+
+
 def test_gdelt_kept_only_after_preflight(inputs, tmp_path):
     signals = inputs.signals.copy()
     for name in fetch_signals.GDELT_COLUMNS:

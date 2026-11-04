@@ -77,23 +77,32 @@ are not established. No halving, macro-release, dominance or vote features exist
 The inclusive `--end` is required and fixed; use `--refresh` only to deliberately
 refetch sources. The builder uses cached successes, never fills missing values,
 and puts each asset on its own daily grid from its first valid close through end.
-Metals returns are computed between observed sessions before reindexing. The
-first target per asset and all non-session metals targets are NaN.
+Metals returns are computed between observed sessions before reindexing. Explicit
+null quotes on observed US federal holidays or Good Friday are classified as
+`holiday_null`: these non-sessions are bridged. Other explicit nulls are
+`unexplained_null`: both that day's target and the next observed session's target
+are NaN, so a target never spans the hole. Crypto nulls are always unexplained
+because crypto trades daily. More than five unexplained nulls for any panel ID
+within the build interval fails the build. Cross-market feature returns retain
+their existing observed-quote convention. The first target per asset and all
+non-session metals targets are NaN.
 
 Outputs under `built/`:
 
 - `panel_on.parquet` and `panel_off.parquet`: one row per sorted ID, scalar string
   ID/asset class, timezone-naive nanosecond timestamp lists and float64 lists.
   OFF has identical columns and dates, with all world-signal dynamics set to NaN.
-- `prices.parquet`: daily long `id,date,close,session,quote_missing`. `session`
+- `prices.parquet`: daily long `id,date,close,session,quote_missing,unexplained_null`. `session`
   means a valid Yahoo close; `quote_missing` means an explicitly returned null
-  quote. This retrospective mask is used for evaluation, not model features.
+  quote; `unexplained_null` marks explicit nulls that invalidate the next target.
+  This retrospective mask is used for evaluation, not model features.
 - `probe_on.yaml`, `probe_off.yaml`, `probe_smoke.yaml`, `profiles.yaml`: portable
   relative dataset paths, explicit roles, and fixed 2022–2025 folds (18 windows,
   stride 18, horizon 13, seasonality 7). Smoke is the full 2022 ON task.
 - `manifest.json`: build arguments, checkout HEAD, source/cache identities and
   assumptions, GDELT decisions/errors, per-asset feature coverage and target
-  counts, missing-quote dates, and hashes of the seven files above. The checkout
+  counts, missing-quote dates, per-panel-ID `null_quote_dates` lists (`holiday_null`
+  and `unexplained_null`), and hashes of the seven files above. The checkout
   SHA is the committed base; `repo_dirty` records tracked uncommitted changes
   (`git status --porcelain --untracked-files=no`). Commit the reviewed builder
   before remote execution.
@@ -136,20 +145,21 @@ without treating that reference as an input or an authoritative replacement.
 
 ```bash
 ./.venv/bin/python -m scripts.world_signals.build_dataset --offline \
-  --raw data/world-signals/raw --out data/world-signals/offline-rebuild \
+  --raw data/world-signals/raw --out data/world-signals/built-final \
   --start 2018-01-01 --end 2025-12-31
 ./.venv/bin/python -m scripts.world_signals.colab_bundle build \
-  --built data/world-signals/built --out data/world-signals/colab-bundle
+  --built data/world-signals/built-final --out data/world-signals/colab-bundle-final
 ./.venv/bin/python -m scripts.world_signals.colab_bundle verify \
-  --bundle data/world-signals/colab-bundle
+  --bundle data/world-signals/colab-bundle-final
 ```
 
 `--offline` uses cached response bytes only. A missing required source fails
 with an offline cache-miss error; uncached GDELT chunks remain missing and count
 against its coverage threshold. `--offline --refresh` is rejected. Match the
-original start/end dates to reuse URL-addressed Yahoo caches. Parquet/YAML hashes
-should match; manifest build time, paths, checkout provenance and offline GDELT
-error evidence can differ, so manifest/SHA256SUMS hashes can differ too.
+original start/end dates to reuse URL-addressed Yahoo caches. With the same builder
+revision, Parquet/YAML hashes should match; manifest build time, paths, checkout
+provenance and offline GDELT error evidence can differ, so manifest/SHA256SUMS
+hashes can differ too.
 
 The bundle copier copies exactly the files listed in `SHA256SUMS`, plus that
 checksum file. Verification rejects changed, missing or extra payload files,
@@ -206,12 +216,20 @@ Drive space is tight. It extracts `history.json` from `checkpoints/latest.pt`
 before pruning any `checkpoints/*.pt`; `progress.json` survives. It loads only
 our trusted trainer checkpoints with `torch.load(weights_only=False)`. A summary
 row, matching identities, bundle manifest, every expected window and saved
-history are required for pruning. Incomplete/inconsistent tasks retain every
+history are required for pruning. Every bundle payload listed in the manifest's
+`sha256` map must exist and match its hash; model weights are hashed without
+loading the model. Incomplete/inconsistent tasks retain every
 checkpoint and cause a nonzero exit; other complete tasks can still be finalized.
 `--dry-run` loads and checks evidence but writes/deletes nothing.
 
 Full reports require the six directories `scratch-on`, `scratch-off`,
 `scratch-off-s1`, `l3-on`, `l3-off`, `l3-off-s1`, each with all four fold tasks.
+Before scoring, every supplied run must match its registered seed (1 for `-s1`,
+otherwise 0), model geometry (L3: 320/5 heads/4+4 layers/1280 FF; scratch and
+smoke: 64/4/2+2/256) and budget (500 steps, or 150 in `smoke`). L3 requires transfer
+identity `83d6acb1f7f2c1b57ba33c0ca0a870775369d52bf8fb739a9e3f7e28858826c2`;
+scratch/smoke must have no transfer metadata. Within each arm, effective settings
+must match across runs/folds after removing `data` roles and `seed`.
 `baseline/` summaries are cross-checked when supplied; seasonal naive and random
 walk are always recomputed. Random-walk CLI results also save window NPZs and
 resume by task/model, verifying identity and restoring missing prediction files.
@@ -221,10 +239,13 @@ Use a new baseline directory if changing the bundle/task definition.
 with missing runs/folds. Present tasks must still have complete, valid artifacts.
 It writes no verdict and removes any stale verdict at that output path. Changed
 identities, task definitions, window sets, fingerprints, or metric discrepancies
-fail reporting. Supplied SQL/MASE/WQL/WAPE scores must match within relative
-`1e-6`; L3 step-0 SQL must agree within relative `1e-4` when both histories exist.
-Missing histories remain unknown. A failed step-0 comparison is written to the
-report and causes a nonzero exit.
+fail reporting, including arm/seed/settings violations under `--partial`.
+Supplied SQL/MASE/WQL/WAPE scores must match within relative `1e-6`. A full report
+requires histories with finite step-0 SQL for all four L3 ON/OFF pairs, agreeing
+within relative `1e-4`; absent or failed evidence stops reporting before any
+verdict is written. Only `--partial` allows unknown L3 ON/OFF history. A failed
+comparison between supplied partial histories is reported and causes a nonzero
+CLI exit.
 
 Outputs are seven CSV tables under `tables/`, `verdict.json` for full reports,
 and `REPORT.md` embedding every table and the limitations. `return_cells.parquet`

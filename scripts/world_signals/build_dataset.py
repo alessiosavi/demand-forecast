@@ -43,7 +43,11 @@ ASSUMPTIONS = [
     "GDELT reconstructed raw counts/tone; ingestion-time vintages are not verified.",
     "Yahoo GC=F and SI=F are continuous futures proxies; close/settlement and roll semantics are unverified.",
     "Issuance is after UTC day T closes; past features use source labels through T without filling.",
-    "Session returns use consecutive observed closes; non-positive endpoints invalidate the return.",
+    "Panel targets bridge holiday nulls for metals; unexplained explicit nulls invalidate the "
+    "next observed session's return. Non-positive endpoints invalidate the return.",
+    "Explicit metals nulls on observed US federal holidays or Good Friday are holiday_null; "
+    "all other panel nulls are unexplained_null. At most five unexplained nulls per id are allowed.",
+    "Cross-market feature returns use consecutive observed closes, unchanged by panel target null classification.",
     "Session masks in evaluation come from valid Yahoo closes, not a prospective exchange calendar; "
     "compound metals price paths only over those slots. Unreported missing sessions cannot be identified.",
     "quote_missing means Yahoo explicitly returned a null close; it does not infer expected sessions.",
@@ -91,6 +95,26 @@ def _dates(frame, keys):
     return data
 
 
+def classify_null_quotes(prices, start, end):
+    """Classify explicit panel nulls in the build interval, without inferring gaps."""
+    missing = prices.attrs.get("missing_quote_dates", {})
+    result = {}
+    for asset in sorted(fetch_prices.PANEL_SYMBOLS):
+        dates = pd.DatetimeIndex(pd.to_datetime(missing.get(asset, []))).unique().sort_values()
+        dates = dates[(dates >= start) & (dates <= end)]
+        flags = fetch_calendars.holiday_flags(dates)
+        holiday = (flags.holiday_us.eq(1) | flags.holiday_gf.eq(1)).to_numpy()
+        if asset not in {"GOLD", "SILVER"}:
+            holiday[:] = False  # Crypto trades on holidays as well.
+        result[asset] = {
+            "holiday_null": dates[holiday].strftime("%Y-%m-%d").tolist(),
+            "unexplained_null": dates[~holiday].strftime("%Y-%m-%d").tolist(),
+        }
+        if len(result[asset]["unexplained_null"]) > 5:
+            raise ValueError(f"{asset}: unexplained null count {len(dates[~holiday])} exceeds 5")
+    return result
+
+
 def build_long(raw, start, end):
     """Assemble BuildInputs into (panel with statics, scalar statics, price sidecar).
 
@@ -104,7 +128,22 @@ def build_long(raw, start, end):
     quotes = quotes.loc[quotes.date.between(start, end)].copy()
     if not np.isfinite(quotes.close.to_numpy(dtype=float)).all():
         raise ValueError("Input prices must contain only valid observed quotes")
-    returns = fetch_prices.session_returns(quotes)
+    nulls = classify_null_quotes(raw.prices, start, end)
+    # Insert only unexplained nulls into the differencing sequence. Holidays and
+    # unreported calendar gaps still bridge; a null breaks both adjacent returns.
+    holes = pd.DataFrame(
+        [
+            {"id": asset, "date": pd.Timestamp(day), "close": np.nan}
+            for asset, kinds in nulls.items()
+            for day in kinds["unexplained_null"]
+        ],
+        columns=["id", "date", "close"],
+    )
+    returns = fetch_prices.session_returns(
+        pd.concat([quotes[["id", "date", "close"]], holes], ignore_index=True)
+        if not holes.empty
+        else quotes
+    )
     news = _dates(raw.news, ["id", "date"])
     signals = _dates(raw.signals, ["date"])
     calendar = _dates(raw.calendar, ["date"])
@@ -128,9 +167,14 @@ def build_long(raw, start, end):
         price["close"] = price.close.astype(np.float64)
         price["session"] = price.close.notna()
         price["quote_missing"] = price.date.isin(pd.to_datetime(missing.get(asset, [])))
+        price["unexplained_null"] = price.date.isin(
+            pd.to_datetime(nulls[asset]["unexplained_null"])
+        )
         if (price.session & price.quote_missing).any():
             raise ValueError(f"Conflicting valid/missing quote for {asset}")
-        sidecars.append(price[["id", "date", "close", "session", "quote_missing"]])
+        sidecars.append(
+            price[["id", "date", "close", "session", "quote_missing", "unexplained_null"]]
+        )
         target = returns.loc[returns.id == asset, ["date", "ret"]].rename(columns={"ret": "target"})
         item = grid.merge(target, on="date", how="left", validate="1:1")
         per_asset = news.loc[news.id == asset, ["date", "news_count_1d", "news_count_3d"]]
@@ -461,6 +505,7 @@ def write_bundle(raw, out, *, start, end, raw_dir=None, refresh=False, offline=F
         "missing_quote_dates": {
             symbol: missing.get(asset, []) for asset, symbol in symbols.items()
         },
+        "null_quote_dates": classify_null_quotes(raw.prices, start, end),
         "output_sha256": {name: sha256(out / name) for name in sorted(payloads)},
         "checksum_convention": "manifest hashes all seven payloads; SHA256SUMS hashes payloads plus manifest. Neither file hashes itself, avoiding circular digests.",
     }
