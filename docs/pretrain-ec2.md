@@ -84,6 +84,12 @@ failed stop retains the reservation. Loss of the **host** prevents the trap; see
 in §12. Do not call `run-instances` directly or repeat `provision` after an ambiguous
 launch. Use `reconcile` and the recorded transaction instead.
 
+For a new Scheduler execution role, `create-schedule` retries role-related
+`ValidationException` errors every 10 seconds for up to 15 total attempts, recording
+each retry in the ledger. A fail-closed stop waits for a `pending` instance to become
+`running` before stopping it; an `IncorrectInstanceState` stop error also triggers one
+wait for `running` and one stop retry, with the reservation retained if recovery fails.
+
 A `run-instances` failure before any instance exists (for example
 `InsufficientInstanceCapacity` in the chosen Availability Zone) leaves the session
 pending with its reservation retained; the trap reports `instance absent or ambiguous`.
