@@ -319,6 +319,51 @@ def test_task_probe_honours_series_embedding(tmp_path, monkeypatch, series_embed
     assert encoders[0].vocabularies["cat"] == {"A": 2, "B": 3}
 
 
+@pytest.mark.parametrize("heads_only", [False, True], ids=["default", "heads_only"])
+def test_task_probe_honours_trainable(tmp_path, monkeypatch, heads_only):
+    from demand_forecast.core import training
+    from demand_forecast.pretrain.probe import task_probe
+    from tests.helpers.fev_fixture import write_fev_fixture
+    from tests.helpers.fev_spec import fixture_spec
+    from tests.helpers.settings import tiny_settings
+
+    spec = fixture_spec(write_fev_fixture(tmp_path / "data"))
+    settings = tiny_settings(base_steps=2, d_model=8)
+    if heads_only:
+        settings.training.trainable = "heads_only"
+    fit = training.Trainer.fit
+    counts = []
+
+    def observe_fit(self, *args, **kwargs):
+        backbone = list(self.model.backbone.parameters())
+        assert backbone
+        assert all(p.requires_grad == (not heads_only) for p in backbone)
+        backbone_ids = {id(p) for p in backbone}
+        expected = [
+            p for p in self.model.parameters() if not heads_only or id(p) not in backbone_ids
+        ]
+        assert expected and all(p.requires_grad for p in expected)
+        result = fit(self, *args, **kwargs)
+        assert result.steps == 2
+        optimized = [p for group in self.optimizer.param_groups for p in group["params"]]
+        assert {id(p) for p in optimized} == {id(p) for p in expected}
+        counts.append(
+            (sum(p.numel() for p in optimized), sum(p.numel() for p in self.model.parameters()))
+        )
+        return result
+
+    monkeypatch.setattr(training.Trainer, "fit", observe_fit)
+    out = tmp_path / "out"
+    reports = task_probe([spec], settings, steps=2, out=out)
+    assert len(counts) == 1
+    trainable, total = counts[0]
+    assert (trainable < total) if heads_only else (trainable == total)
+    report = reports[spec.name]
+    assert report["params_trainable"] == trainable
+    assert report["params_total"] == total
+    assert json.loads((out / f"{spec.name}.json").read_text()) == report
+
+
 def test_task_probe_honours_validation_scale_floor(tmp_path, monkeypatch):
     import pyarrow as pa
     import pyarrow.parquet as pq
