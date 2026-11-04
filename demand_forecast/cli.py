@@ -16,6 +16,57 @@ fev_app = typer.Typer(help="Run fev benchmarks and compare evaluation summaries.
 app.add_typer(fev_app, name="fev")
 pretrain_app = typer.Typer(help="Pretrain on local corpus shards and measure run costs.")
 app.add_typer(pretrain_app, name="pretrain")
+corpus_app = typer.Typer(help="Build and verify a pinned pretraining corpus.")
+pretrain_app.add_typer(corpus_app, name="corpus")
+
+
+@corpus_app.command("build")
+def pretrain_corpus_build(
+    config: Path = typer.Option(..., "--config", exists=True, dir_okay=False),
+    root: Path = typer.Option(..., "--root"),
+    source: list[str] | None = typer.Option(None, "--source", help="Select a source; repeatable"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+    keep_downloads: bool = typer.Option(False, "--keep-downloads"),
+):
+    """Convert selected pinned sources, or list their files without downloading."""
+    import yaml
+
+    from demand_forecast.pretrain.build import build_corpus, select_sources, source_files
+    from demand_forecast.pretrain.build_config import CorpusBuildConfig
+
+    try:
+        cfg = CorpusBuildConfig.from_yaml(config)
+        if dry_run:
+            for selected in select_sources(cfg, source or ()):
+                files = source_files(selected)
+                for item in files:
+                    typer.echo(f"{selected.name}\t{item['path']}\t{item['size']} bytes")
+                typer.echo(
+                    f"{selected.name}: {len(files)} files, {sum(f['size'] for f in files)} bytes"
+                )
+            return
+        report = build_corpus(config, root, names=source or (), keep_downloads=keep_downloads)
+    except (ValueError, OSError, ImportError, yaml.YAMLError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    typer.echo(
+        f"Built {report['totals']['series_kept']} series; manifest: {root / 'manifest.json'}"
+    )
+
+
+@corpus_app.command("verify")
+def pretrain_corpus_verify(root: Path = typer.Option(..., "--root")):
+    """Rehash every manifest shard and fail on changed or missing files."""
+    from demand_forecast.pretrain.corpus import verify_manifest
+
+    try:
+        counts = verify_manifest(root)
+    except (ValueError, OSError, KeyError, TypeError) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    for kind, (valid, failed) in sorted(counts.items()):
+        typer.echo(f"{kind}: {valid} verified, {failed} failed")
+    if any(failed for _, failed in counts.values()):
+        raise typer.Exit(code=1)
 
 
 def _training_settings(config: Path, init_from: Path | None):

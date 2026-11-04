@@ -109,6 +109,8 @@ nav:
       - API Reference: API.md
       - Frozen fev on EC2: ec2.md
       - Pretraining on EC2: pretrain-ec2.md
+      - Corpus v2: corpus.md
+      - Corpus attributions: NOTICE-corpus.md
   - Development:
       - Contributing: DEVELOPMENT.md
       - Changelog: CHANGELOG.md

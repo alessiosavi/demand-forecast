@@ -25,6 +25,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+corpus = [
+    "huggingface_hub>=0.24",
+    "datasets<5",
+    "pyarrow<26",
+]
 bench = [
     "fev==0.10.0",
     "datasets<5",

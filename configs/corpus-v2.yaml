@@ -1,0 +1,361 @@
+# Research corpus v2. Source buckets do not override bundle-level research terms.
+# Target-column overrides reflect the pinned Chronos dataset card.
+version: 2
+commercial_use: false
+sources:
+- name: chronos_real
+  repo: autogluon/chronos_datasets
+  revision: eeecad0b82a8c237e212ce6f8d1abecb513e2cec
+  kind: chronos_real
+  include:
+  - config: electricity_15min
+    licence: CC BY 4.0
+    bucket: 'yes'
+    attribution: UCI ElectricityLoadDiagrams20112014 contributors. Distributed by Amazon Chronos authors;
+      converted to float32 and filtered.
+    url: https://archive.ics.uci.edu/dataset/321/electricityloaddiagrams20112014
+    target_column: consumption_kW
+    licence_url: https://creativecommons.org/licenses/by/4.0/
+  - config: exchange_rate
+    licence: MIT
+    bucket: 'yes'
+    attribution: Lai et al., multivariate time-series exchange-rate dataset. Distributed by Amazon
+      Chronos authors; converted to float32 and filtered.
+    url: https://github.com/laiguokun/multivariate-time-series-data/tree/master/exchange_rate
+  - config: monash_australian_electricity
+    licence: CC BY 4.0
+    bucket: 'yes'
+    attribution: Australian Energy Market Operator; Monash Time Series Forecasting Archive. Distributed
+      by Amazon Chronos authors; converted to float32 and filtered.
+    url: https://zenodo.org/communities/forecasting
+    licence_url: https://creativecommons.org/licenses/by/4.0/
+  - config: monash_car_parts
+    licence: CC BY 4.0
+    bucket: 'yes'
+    attribution: Car parts dataset contributors; Monash Time Series Forecasting Archive. Distributed
+      by Amazon Chronos authors; converted to float32 and filtered.
+    url: https://zenodo.org/communities/forecasting
+    licence_url: https://creativecommons.org/licenses/by/4.0/
+  - config: monash_covid_deaths
+    licence: CC BY 4.0
+    bucket: 'yes'
+    attribution: Johns Hopkins University COVID-19 data; Monash Time Series Forecasting Archive. Distributed
+      by Amazon Chronos authors; converted to float32 and filtered.
+    url: https://zenodo.org/communities/forecasting
+    licence_url: https://creativecommons.org/licenses/by/4.0/
+  - config: monash_electricity_hourly
+    licence: CC BY 4.0
+    bucket: 'yes'
+    attribution: UCI ElectricityLoadDiagrams20112014; Monash Time Series Forecasting Archive. Distributed
+      by Amazon Chronos authors; converted to float32 and filtered.
+    url: https://zenodo.org/communities/forecasting
+    licence_url: https://creativecommons.org/licenses/by/4.0/
+  - config: monash_electricity_weekly
+    licence: CC BY 4.0
+    bucket: 'yes'
+    attribution: UCI ElectricityLoadDiagrams20112014; Monash Time Series Forecasting Archive. Distributed
+      by Amazon Chronos authors; converted to float32 and filtered.
+    url: https://zenodo.org/communities/forecasting
+    licence_url: https://creativecommons.org/licenses/by/4.0/
+  - config: monash_london_smart_meters
+    licence: CC BY 4.0
+    bucket: 'yes'
+    attribution: UK Power Networks, London Datastore; Monash Time Series Forecasting Archive. Distributed
+      by Amazon Chronos authors; converted to float32 and filtered.
+    url: https://zenodo.org/communities/forecasting
+    licence_url: https://creativecommons.org/licenses/by/4.0/
+  - config: monash_saugeenday
+    licence: CC BY 4.0
+    bucket: 'yes'
+    attribution: Saugeen River daily flow contributors; Monash Time Series Forecasting Archive. Distributed
+      by Amazon Chronos authors; converted to float32 and filtered.
+    url: https://zenodo.org/communities/forecasting
+    target_column: T1
+    licence_url: https://creativecommons.org/licenses/by/4.0/
+  - config: monash_temperature_rain
+    licence: CC BY-SA 3.0 AU
+    bucket: sa
+    attribution: Australian Bureau of Meteorology, TemperatureRain; Monash Time Series Forecasting
+      Archive. Distributed by Amazon Chronos authors; converted to float32 and filtered.
+    url: https://researchdata.edu.au/rainfall-temperature-forecast-2017-04/3786562
+    card_licence: CC BY 4.0
+    target_column: t_mean
+    licence_url: https://creativecommons.org/licenses/by-sa/3.0/au/
+  - config: monash_traffic
+    licence: CC BY 4.0
+    bucket: 'yes'
+    attribution: UCI PEMS-SF contributors; Monash Time Series Forecasting Archive. Distributed by
+      Amazon Chronos authors; converted to float32 and filtered.
+    url: https://zenodo.org/communities/forecasting
+    licence_url: https://creativecommons.org/licenses/by/4.0/
+  - config: monash_weather
+    licence: CC BY 4.0
+    bucket: 'yes'
+    attribution: Weather dataset contributors; Monash Time Series Forecasting Archive. Distributed
+      by Amazon Chronos authors; converted to float32 and filtered.
+    url: https://zenodo.org/communities/forecasting
+    licence_url: https://creativecommons.org/licenses/by/4.0/
+  - config: wiki_daily_100k
+    licence: CC0
+    bucket: 'yes'
+    attribution: Wikimedia pageview statistics contributors. Distributed by Amazon Chronos authors;
+      converted to float32 and filtered.
+    url: https://dumps.wikimedia.org/other/pageviews/readme.html
+    licence_url: https://creativecommons.org/publicdomain/zero/1.0/
+  - config: wind_farms_daily
+    licence: CC BY 4.0
+    bucket: 'yes'
+    attribution: Australian wind farm data contributors; Monash Time Series Forecasting Archive. Distributed
+      by Amazon Chronos authors; converted to float32 and filtered.
+    url: https://zenodo.org/communities/forecasting
+    licence_url: https://creativecommons.org/licenses/by/4.0/
+  - config: wind_farms_hourly
+    licence: CC BY 4.0
+    bucket: 'yes'
+    attribution: Australian wind farm data contributors; Monash Time Series Forecasting Archive. Distributed
+      by Amazon Chronos authors; converted to float32 and filtered.
+    url: https://zenodo.org/communities/forecasting
+    licence_url: https://creativecommons.org/licenses/by/4.0/
+  excluded:
+    fev_overlap:
+    - m5
+    - ercot
+    - solar
+    - solar_1h
+    - monash_hospital
+    - monash_fred_md
+    external_validation:
+    - monash_nn5_weekly
+    unlicensed_or_unverified:
+    - dominick
+    - m4_daily
+    - m4_hourly
+    - m4_monthly
+    - m4_quarterly
+    - m4_weekly
+    - m4_yearly
+    - mexico_city_bikes
+    - nn5
+    - uber_tlc_daily
+    - uber_tlc_hourly
+    - ushcn_daily
+    - taxi_1h
+    - taxi_30min
+    - monash_kdd_cup_2018
+    unclear_competition_grant:
+    - monash_m1_monthly
+    - monash_m1_quarterly
+    - monash_m1_yearly
+    - monash_m3_monthly
+    - monash_m3_quarterly
+    - monash_m3_yearly
+    - monash_tourism_monthly
+    - monash_tourism_quarterly
+    - monash_tourism_yearly
+    - monash_cif_2016
+    - monash_rideshare
+    - monash_pedestrian_counts
+    ruled_out:
+    - weatherbench_*
+    existing_corpus:
+    - training_corpus_tsmixup_10m
+    - training_corpus_kernel_synth_1m
+- name: gifteval_pretrain
+  repo: Salesforce/GiftEvalPretrain
+  revision: 6830b624de7ed2b3d3e5b85bb6959d81dcc5d874
+  kind: gifteval_pretrain
+  bundle_terms: research-only (dataset card)
+  include:
+  - folder: beijing_air_quality
+    licence: CC BY 4.0
+    bucket: 'yes'
+    attribution: UCI Beijing multi-site air quality. Credit, licence link, indicate changes. Distributed
+      by Salesforce GiftEvalPretrain; converted to float32, split into components and filtered.
+    url: https://archive.ics.uci.edu/dataset/501/beijing+multi+site+air+quality+data
+    licence_url: https://archive.ics.uci.edu/dataset/501/beijing+multi+site+air+quality+data
+  - folder: cdc_fluview_ilinet
+    licence: Federal public-domain policy, with third-party exceptions
+    bucket: 'yes'
+    attribution: CDC FluView. Credit CDC; no endorsement; preserve accuracy; check exceptions. Distributed
+      by Salesforce GiftEvalPretrain; converted to float32, split into components and filtered.
+    url: https://www.cdc.gov/fluview/
+    licence_url: https://www.cdc.gov/other/agencymaterials.html
+  - folder: cdc_fluview_who_nrevss
+    licence: Federal public-domain policy, with third-party exceptions
+    bucket: 'yes'
+    attribution: CDC FluView. Credit CDC; no endorsement; preserve accuracy; check exceptions. Distributed
+      by Salesforce GiftEvalPretrain; converted to float32, split into components and filtered.
+    url: https://www.cdc.gov/fluview/
+    licence_url: https://www.cdc.gov/other/agencymaterials.html
+  - folder: ideal
+    licence: CC BY 4.0
+    bucket: 'yes'
+    attribution: Edinburgh IDEAL household energy. Credit, licence link, indicate changes. Distributed
+      by Salesforce GiftEvalPretrain; converted to float32, split into components and filtered.
+    url: https://datashare.ed.ac.uk/handle/10283/3647
+    licence_url: https://datashare.ed.ac.uk/server/api/core/bitstreams/bf517e12-73a8-47e2-874f-4474ab200298/content
+  - folder: lcl
+    licence: Creative Commons Attribution; version unspecified
+    bucket: 'yes'
+    attribution: UK Power Networks / London Datastore. Credit UK Power Networks and source. Distributed
+      by Salesforce GiftEvalPretrain; converted to float32, split into components and filtered.
+    url: https://data.london.gov.uk/dataset/smartmeter-energy-consumption-data-in-london-households-vqm0d
+    licence_url: https://data.london.gov.uk/dataset/smartmeter-energy-consumption-data-in-london-households-vqm0d
+  - folder: project_tycho
+    licence: CC BY 4.0 stated by dataset authors
+    bucket: 'yes'
+    attribution: University of Pittsburgh Project Tycho. Credit Tycho/source records; confirm downloaded
+      version. Distributed by Salesforce GiftEvalPretrain; converted to float32, split into components
+      and filtered.
+    url: https://www.tycho.pitt.edu/
+    licence_url: https://pmc.ncbi.nlm.nih.gov/articles/PMC6289551/
+  - folder: sceaux
+    licence: CC BY 4.0
+    bucket: 'yes'
+    attribution: UCI individual household electric power. Credit, licence link, indicate changes.
+      Distributed by Salesforce GiftEvalPretrain; converted to float32, split into components and
+      filtered.
+    url: https://archive.ics.uci.edu/dataset/235/individual+household+electric+power+consumption
+    licence_url: https://archive.ics.uci.edu/dataset/235/individual+household+electric+power+consumption
+  - folder: solar_power
+    licence: Any-purpose reuse permission, subject to exceptions
+    bucket: 'yes'
+    attribution: Australian Energy Market Operator. Attribute AEMO accurately; check third-party material.
+      Distributed by Salesforce GiftEvalPretrain; converted to float32, split into components and
+      filtered.
+    url: https://www.aemo.com.au/
+    licence_url: https://www.aemo.com.au/privacy-and-legal-notices/copyright-permissions
+  - folder: wiki-rolling_nips
+    licence: CC0
+    bucket: 'yes'
+    attribution: Wikimedia pageview statistics. No attribution condition; provenance recommended.
+      Distributed by Salesforce GiftEvalPretrain; converted to float32, split into components and
+      filtered.
+    url: https://analytics.wikimedia.org/
+    licence_url: https://doc.wikimedia.org/generated-data-platform/aqs/analytics-api/documentation/access-policy.html
+  - folder: wind_power
+    licence: Any-purpose reuse permission, subject to exceptions
+    bucket: 'yes'
+    attribution: Australian Energy Market Operator. Attribute AEMO accurately; check third-party material.
+      Distributed by Salesforce GiftEvalPretrain; converted to float32, split into components and
+      filtered.
+    url: https://www.aemo.com.au/
+    licence_url: https://www.aemo.com.au/privacy-and-legal-notices/copyright-permissions
+  - folder: residential_load_power
+    licence: CC BY-NC 3.0
+    bucket: nc
+    attribution: SwitchDin/Monash residential power. Attribution; non-commercial only. Distributed
+      by Salesforce GiftEvalPretrain; converted to float32, split into components and filtered.
+    url: https://zenodo.org/records/8219786
+    licence_url: https://www.racefor2030.com.au/content/uploads/0171-Final-Report-1.pdf
+  - folder: residential_pv_power
+    licence: CC BY-NC 3.0
+    bucket: nc
+    attribution: SwitchDin/Monash residential power. Attribution; non-commercial only. Distributed
+      by Salesforce GiftEvalPretrain; converted to float32, split into components and filtered.
+    url: https://zenodo.org/records/8219786
+    licence_url: https://www.racefor2030.com.au/content/uploads/0171-Final-Report-1.pdf
+  - folder: sunspot_with_missing
+    licence: CC BY-NC 4.0
+    bucket: nc
+    attribution: Royal Observatory of Belgium SILSO. Credit WDC-SILSO; non-commercial only. Distributed
+      by Salesforce GiftEvalPretrain; converted to float32, split into components and filtered.
+    url: https://www.sidc.be/SILSO/
+    licence_url: https://www.sidc.be/SILSO/citations
+  - folder: bdg-2_bear
+    licence: Attribution-ShareAlike 4.0 stated; inconsistent boilerplate
+    bucket: sa
+    attribution: Building Data Genome 2. Commercial permitted; attribution and SA; resolve malformed
+      version text. Distributed by Salesforce GiftEvalPretrain; converted to float32, split into components
+      and filtered.
+    url: https://github.com/buds-lab/building-data-genome-project-2
+    licence_url: https://raw.githubusercontent.com/buds-lab/building-data-genome-project-2/master/LICENSE
+  - folder: bdg-2_fox
+    licence: Attribution-ShareAlike 4.0 stated; inconsistent boilerplate
+    bucket: sa
+    attribution: Building Data Genome 2. Commercial permitted; attribution and SA; resolve malformed
+      version text. Distributed by Salesforce GiftEvalPretrain; converted to float32, split into components
+      and filtered.
+    url: https://github.com/buds-lab/building-data-genome-project-2
+    licence_url: https://raw.githubusercontent.com/buds-lab/building-data-genome-project-2/master/LICENSE
+  - folder: bdg-2_panther
+    licence: Attribution-ShareAlike 4.0 stated; inconsistent boilerplate
+    bucket: sa
+    attribution: Building Data Genome 2. Commercial permitted; attribution and SA; resolve malformed
+      version text. Distributed by Salesforce GiftEvalPretrain; converted to float32, split into components
+      and filtered.
+    url: https://github.com/buds-lab/building-data-genome-project-2
+    licence_url: https://raw.githubusercontent.com/buds-lab/building-data-genome-project-2/master/LICENSE
+  - folder: bdg-2_rat
+    licence: Attribution-ShareAlike 4.0 stated; inconsistent boilerplate
+    bucket: sa
+    attribution: Building Data Genome 2. Commercial permitted; attribution and SA; resolve malformed
+      version text. Distributed by Salesforce GiftEvalPretrain; converted to float32, split into components
+      and filtered.
+    url: https://github.com/buds-lab/building-data-genome-project-2
+    licence_url: https://raw.githubusercontent.com/buds-lab/building-data-genome-project-2/master/LICENSE
+  excluded:
+    fev_overlap:
+    - m5
+    - favorita_sales
+    - favorita_transactions
+    - kdd2022
+    - fred_md
+    - bull
+    - cockatoo
+    - hog
+    - pdb
+    - gfc12_load
+    - gfc14_load
+    - gfc17_load
+    duplicate_of_chronos:
+    - australian_electricity_demand
+    - london_smart_meters_with_missing
+    - traffic_hourly
+    - traffic_weekly
+    - weather
+    - wind_farms_with_missing
+    unclear:
+    - bitcoin_with_missing
+    - borealis
+    - china_air_quality
+    - cif_2016_12
+    - cif_2016_6
+    - covid19_energy
+    - covid_mobility
+    - elecdemand
+    - elf
+    - extended_web_traffic_with_missing
+    - kaggle_web_traffic_weekly
+    - m1_monthly
+    - m1_quarterly
+    - m1_yearly
+    - monash_m3_monthly
+    - monash_m3_other
+    - monash_m3_quarterly
+    - monash_m3_yearly
+    - nn5_daily_with_missing
+    - nn5_weekly
+    - oikolab_weather
+    - pedestrian_counts
+    - rideshare_with_missing
+    - smart
+    - spain
+    - taxi_30min
+    - tourism_monthly
+    - tourism_quarterly
+    - tourism_yearly
+    - uber_tlc_daily
+    - uber_tlc_hourly
+    - vehicle_trips_with_missing
+    not_relevant: every folder not named above (climate simulations, cloud traces, PEMS/metro traffic,
+      buildings_900k, subseasonal*, godaddy, and others)
+filters:
+  min_points: 64
+  drop_constant: true
+  drop_all_nan: true
+  dedupe: value_hash
+  max_series_per_folder: null
+shards:
+  max_series: 20000
+  max_bytes: 268435456
