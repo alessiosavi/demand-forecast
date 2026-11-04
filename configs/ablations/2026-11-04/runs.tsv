@@ -17,3 +17,4 @@ rossmann-pw	rossmann_1W	configs/ablations/2026-11-04/rossmann-pw.yaml	per_window
 rossmann-pw-heads	rossmann_1W	configs/ablations/2026-11-04/rossmann-pw-heads.yaml	per_window	E3
 tuned-seed1	m5_1W,rohlik_sales_1W	configs/ablations/2026-11-04/tuned-seed1.yaml	first_window	E1
 tuned-seed2	m5_1W,rohlik_sales_1W	configs/ablations/2026-11-04/tuned-seed2.yaml	first_window	E1
+refit-weekly	weekly	configs/ablations/2026-11-04/refit-weekly.yaml	first_window	E8
