@@ -4,11 +4,38 @@ from __future__ import annotations
 
 import hashlib
 import json
+from fractions import Fraction
 from pathlib import Path
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 from demand_forecast.config.settings import ForecastConfig, ModelConfig
+
+
+class SourceShards(BaseModel):
+    """Training shards, disjoint hold-outs and a positive mixing weight."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    shards: list[int]
+    holdout: list[int] = Field(default_factory=list)
+    weight: float = Field(gt=0, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def validate_indices(self):
+        for indices in (self.shards, self.holdout):
+            if len(set(indices)) != len(indices) or any(i < 0 for i in indices):
+                raise ValueError("shard indices must be unique and nonnegative")
+        if not self.shards or set(self.shards) & set(self.holdout):
+            raise ValueError("sources require training shards disjoint from holdout")
+        return self
 
 
 class CorpusConfig(BaseModel):
@@ -24,6 +51,65 @@ class CorpusConfig(BaseModel):
     holdout_kernel_synth: list[int] = Field(default_factory=lambda: [19])
     val_pairs_per_kind: int = 4096
     external_validation: str | None = "monash_nn5_weekly"
+    sources: dict[str, SourceShards] | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def reconcile_sources(cls, value):
+        if not isinstance(value, dict) or value.get("sources") is None:
+            return value
+        value = dict(value)
+        if not isinstance(value["sources"], dict):
+            raise ValueError("sources must be a mapping of kind to source settings")
+        sources = {k: SourceShards.model_validate(v) for k, v in value["sources"].items()}
+        known = {"tsmixup", "kernel_synth", "chronos_real", "gifteval_pretrain"}
+        if "tsmixup" not in sources or set(sources) - known:
+            raise ValueError("sources must include tsmixup and contain only registered kinds")
+        for kind in ("tsmixup", "kernel_synth"):
+            source = sources.get(kind)
+            for key, expected in (
+                (f"{kind}_shards", source.shards if source else []),
+                (f"holdout_{kind}", source.holdout if source else []),
+            ):
+                if key in value and value[key] != expected:
+                    raise ValueError(f"{key} conflicts with sources")
+                value[key] = expected
+        if "kernel_synth_every" in value:
+            every = value["kernel_synth_every"]
+            if not isinstance(every, int) or isinstance(every, bool):
+                raise ValueError("kernel_synth_every must be an integer")
+            kernel = sources.get("kernel_synth")
+            # This legacy control can only express a two-kind weight ratio.
+            compatible = (
+                len(sources) == 1
+                and every == 0
+                or len(sources) == 2
+                and kernel is not None
+                and every > 1
+                and Fraction(str(sources["tsmixup"].weight))
+                == Fraction(str(kernel.weight)) * (every - 1)
+            )
+            if not compatible:
+                raise ValueError("kernel_synth_every conflicts with sources weights")
+        return value
+
+    @model_serializer(mode="wrap")
+    def serialize_compatible(self, handler):
+        payload = handler(self)
+        if self.sources is None:
+            payload.pop("sources", None)
+        elif "kernel_synth_every" not in self.model_fields_set:
+            payload.pop("kernel_synth_every", None)
+        return payload
+
+    def selections(self) -> dict[str, tuple[list[int], list[int]]]:
+        """Return training/hold-out indices without changing legacy defaults."""
+        if self.sources is not None:
+            return {kind: (source.shards, source.holdout) for kind, source in self.sources.items()}
+        return {
+            "tsmixup": (self.tsmixup_shards, self.holdout_tsmixup),
+            "kernel_synth": (self.kernel_synth_shards, self.holdout_kernel_synth),
+        }
 
 
 class PretrainTrainingConfig(BaseModel):

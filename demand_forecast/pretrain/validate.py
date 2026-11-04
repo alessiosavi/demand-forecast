@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -155,6 +155,7 @@ class ValidationSet:
     max_context: int
     quantiles: tuple[float, ...]
     batch_size: int = 128
+    diagnostics: dict[str, tuple[Panel, np.ndarray] | None] = field(default_factory=dict)
 
     @classmethod
     def build(
@@ -162,8 +163,8 @@ class ValidationSet:
     ) -> ValidationSet:
         """Select local hold-outs by kind/index and require configured external data."""
         sets = {}
-        for kind in ("tsmixup", "kernel_synth"):
-            wanted = set(getattr(cfg.corpus, f"holdout_{kind}"))
+        for kind, (_, held_out) in cfg.corpus.selections().items():
+            wanted = set(held_out)
             selected = sorted(
                 (ref for ref in refs if ref.kind == kind and ref.index in wanted),
                 key=lambda ref: ref.index,
@@ -193,7 +194,9 @@ class ValidationSet:
                 raise FileNotFoundError(f"external validation directory not found: {directory}")
             external = external_pairs(config_name, cfg.corpus.root, horizon=cfg.forecast.horizon)
         return cls(
-            **sets,
+            tsmixup=sets.pop("tsmixup", None),
+            kernel_synth=sets.pop("kernel_synth", None),
+            diagnostics=sets,
             external=external,
             encoder=encoder,
             horizon=cfg.forecast.horizon,
@@ -216,8 +219,15 @@ class ValidationSet:
                 "n_excluded_external",
             )
         )
-        for kind in ("tsmixup", "kernel_synth", "external"):
-            source = getattr(self, kind)
+        sources = {
+            "tsmixup": self.tsmixup,
+            "kernel_synth": self.kernel_synth,
+            "external": self.external,
+            **self.diagnostics,
+        }
+        for kind, source in sources.items():
+            if kind in self.diagnostics:
+                result[f"val_sql_{kind}"] = result[f"n_excluded_{kind}"] = None
             if source is None:
                 continue
             panel, origins = source
