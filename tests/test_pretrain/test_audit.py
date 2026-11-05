@@ -2,7 +2,10 @@
 
 import hashlib
 import json
+import os
 import re
+import shutil
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -178,6 +181,46 @@ def test_remote_loader_revision(monkeypatch, tmp_path):
     )
 
 
+def test_worker_dataset_caches_multiple_tasks(monkeypatch, tmp_path):
+    loader = Mock(side_effect=lambda *_: object())
+    monkeypatch.setattr(audit, "load_task_dataset", loader)
+    tasks = [json.dumps({"name": name, "dataset_path": name}) for name in ("first", "second")]
+    audit._worker_dataset.cache_clear()
+    try:
+        first, second = [audit._worker_dataset(task, str(tmp_path)) for task in tasks]
+        assert audit._worker_dataset(tasks[0], str(tmp_path)) is first
+        assert audit._worker_dataset(tasks[1], str(tmp_path)) is second
+        assert loader.call_count == 2
+        assert audit._worker_dataset(tasks[0], str(tmp_path / "other")) is not first
+        assert loader.call_count == 3
+    finally:
+        audit._worker_dataset.cache_clear()
+
+
+def _init_worker_with_hf_imported(*args):
+    """Exercise spawn callers that import HF before the pool initializer runs."""
+    from datasets import config
+    from huggingface_hub import constants
+
+    assert not config.HF_DATASETS_OFFLINE
+    assert not constants.HF_HUB_OFFLINE
+    audit._init_worker(*args)
+
+
+def _worker_offline_state():
+    from datasets import config
+    from huggingface_hub import constants
+
+    return (
+        os.getpid(),
+        os.environ.get("HF_HUB_OFFLINE"),
+        os.environ.get("HF_DATASETS_OFFLINE"),
+        config.HF_HUB_OFFLINE,
+        config.HF_DATASETS_OFFLINE,
+        constants.HF_HUB_OFFLINE,
+    )
+
+
 def _parquet(path, rows):
     import pyarrow as pa
     import pyarrow.parquet as pq
@@ -286,6 +329,78 @@ def local_audit(tmp_path):
     task_yaml = tmp_path / "tasks.yaml"
     task_yaml.write_text(yaml.safe_dump({"tasks": definitions}))
     return root, task_yaml
+
+
+@pytest.mark.parametrize("workers", [1, 2])
+@pytest.mark.parametrize("offline_env", [None, "0"])
+def test_audit_workers_offline_without_changing_parent(
+    local_audit, tmp_path, monkeypatch, workers, offline_env
+):
+    root, tasks = local_audit
+    # Warm lazy loader imports (threadpoolctl sets an unrelated OpenMP env var).
+    audit.load_task_dataset(fev_bench_tasks(tasks)[0], tmp_path / "out" / ".cache" / "datasets")
+    for flag in ("HF_HUB_OFFLINE", "HF_DATASETS_OFFLINE"):
+        if offline_env is None:
+            monkeypatch.delenv(flag, raising=False)
+        else:
+            monkeypatch.setenv(flag, offline_env)
+    parent_env = dict(os.environ)
+    parent_state = _worker_offline_state()
+    states = []
+    parallel_scan_jobs = audit._parallel_scan_jobs
+
+    def record_offline_state(pool, *args):
+        states.append(pool.submit(_worker_offline_state).result(timeout=30))
+        yield from parallel_scan_jobs(pool, *args)
+
+    def pool_with_hf_imported(**kwargs):
+        assert kwargs["initializer"] is audit._init_worker
+        return ProcessPoolExecutor(**{**kwargs, "initializer": _init_worker_with_hf_imported})
+
+    monkeypatch.setattr(audit, "ProcessPoolExecutor", pool_with_hf_imported)
+    monkeypatch.setattr(audit, "_parallel_scan_jobs", record_offline_state)
+    report = audit.run_audit(root, tmp_path / "out", tasks=tasks, workers=workers)
+
+    assert report["trained_on_datasets"] == ["copies", "covariate-only"]
+    assert dict(os.environ) == parent_env
+    assert _worker_offline_state() == parent_state
+    assert len(states) == (2 if workers == 2 else 0)  # One pool per kind/frequency class.
+    for pid, *flags in states:
+        assert pid != os.getpid()
+        assert flags == ["1", "1", True, True, True]
+
+
+def test_parallel_resume_caches_datasets_before_starting_workers(
+    local_audit, tmp_path, monkeypatch
+):
+    root, tasks = local_audit
+    out = tmp_path / "out"
+    first = audit.run_audit(root, out, tasks=tasks, workers=1, progress=lambda _: None)
+    cache_dir = out / ".cache" / "datasets"
+    shutil.rmtree(cache_dir)
+    shutil.rmtree(out / "scans")
+    loader = Mock(wraps=audit.load_task_dataset)
+    monkeypatch.setattr(audit, "load_task_dataset", loader)
+    monkeypatch.setattr(
+        audit, "_task_metadata", Mock(side_effect=AssertionError("metadata should be reused"))
+    )
+    definitions = fev_bench_tasks(tasks)
+
+    def pool_after_cache(**kwargs):
+        assert loader.call_count == len(definitions)
+        assert [call.args for call in loader.call_args_list] == [
+            (task, cache_dir) for task in definitions
+        ]
+        assert len(list(cache_dir.rglob("*.arrow"))) == len(definitions)
+        return ProcessPoolExecutor(**kwargs)
+
+    monkeypatch.setattr(audit, "ProcessPoolExecutor", pool_after_cache)
+    messages = []
+    resumed = audit.run_audit(
+        root, out, tasks=tasks, workers=2, resume=True, progress=messages.append
+    )
+    assert resumed["copies"] == first["copies"]
+    assert messages.count("Task datasets cached: 3") == 1
 
 
 def test_end_to_end_parallel_resume_and_declaration(local_audit, tmp_path, monkeypatch):

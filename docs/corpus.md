@@ -312,6 +312,8 @@ float64 values and four posting tables, plus the datasets Arrow cache and scan
 reports. `--workers` defaults to one fewer than the CPU count (minimum one);
 reduce it when worker candidate expansions use too much RAM. Runtime depends
 strongly on series lengths, repeated fingerprints and fallback candidate counts.
+Workers run with Hub access disabled and read task datasets from the cache filled
+by the parent to avoid the anonymous Hub API limit of 500 requests per 300 seconds.
 Small synthetic fixtures complete in seconds, but a full 100-task audit can
 take hours to days; fixture throughput is not a reliable prediction of the
 uncapped post-pass cost. No full corpus audit is performed by the unit tests.

@@ -16,7 +16,7 @@ from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from contextlib import closing
 from dataclasses import asdict
 from datetime import datetime, timezone
-from functools import lru_cache
+from functools import cache
 from itertools import chain
 from pathlib import Path
 
@@ -379,12 +379,23 @@ def _load_index(directory):
 _WORKER_INDEX = None
 
 
-def _init_worker(directory):
+def _init_worker(directory, offline=True):
     global _WORKER_INDEX
+    if offline:
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["HF_DATASETS_OFFLINE"] = "1"
+        # audit's module-level imports are HF-lazy, but spawn may import a caller
+        # that loads HF before this initializer. Update its cached flags as well.
+        import datasets.config
+        import huggingface_hub.constants
+
+        datasets.config.HF_HUB_OFFLINE = True
+        datasets.config.HF_DATASETS_OFFLINE = True
+        huggingface_hub.constants.HF_HUB_OFFLINE = True
     _WORKER_INDEX = _load_index(directory)
 
 
-@lru_cache(maxsize=1)
+@cache
 def _worker_dataset(task_json, cache_dir):
     return load_task_dataset(FevDatasetTask(**json.loads(task_json)), cache_dir)
 
@@ -795,11 +806,16 @@ def run_audit(
         )
         if resume and path.is_file():
             item = json.loads(path.read_text())
+            if workers > 1:
+                # Restored metadata does not guarantee the Arrow cache exists.
+                load_task_dataset(task, out / ".cache" / "datasets")
         else:
             progress(f"Reading task schema and calendars: {task.name}")
             item = _task_metadata(task, out / ".cache" / "datasets")
             _write_json(path, item)
         metadata.append({**item, "metadata_path": str(path)})
+    if workers > 1:
+        progress(f"Task datasets cached: {len(definitions)}")
     jobs = _jobs(metadata, kinds, fingerprint, out)
     classes = {job["frequency_class"] for job in jobs}
     scans, indices, skipped = [], {}, {}
@@ -831,7 +847,7 @@ def run_audit(
             indices[f"{kind}::{cls}"] = coverage
             if pending and workers == 1:
                 try:
-                    _init_worker(store["path"])
+                    _init_worker(store["path"], offline=False)
                     for job in pending:
                         path, elapsed = _timed_scan_job(job)
                         scans.append(json.loads(Path(path).read_text()))
@@ -846,7 +862,7 @@ def run_audit(
                     max_workers=workers,
                     mp_context=multiprocessing.get_context("spawn"),
                     initializer=_init_worker,
-                    initargs=(str(store["path"]),),
+                    initargs=(str(store["path"]), True),
                 ) as pool:
                     with closing(
                         _parallel_scan_jobs(pool, pending, metadata, corpus_rows, workers)
