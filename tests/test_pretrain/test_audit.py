@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import re
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -25,6 +26,7 @@ from demand_forecast.pretrain import audit  # noqa: E402
 from demand_forecast.pretrain import audit_match as match
 from demand_forecast.pretrain.audit_controls import control_cases, run_control  # noqa: E402
 from demand_forecast.pretrain.corpus import corpus_manifest, write_manifest  # noqa: E402
+from tests.helpers.audit_mask_reference import verify as mask_verify  # noqa: E402
 
 CASES, RULES = control_cases()
 
@@ -51,6 +53,64 @@ def test_control_inventory():
     assert sum(spec[2] for spec in CASES.values()) == 26
     assert sum(not spec[2] for spec in CASES.values()) == 14
     assert len(RULES) == 10
+
+
+def test_merge_spans_matches_mask_slices():
+    rng = np.random.default_rng(2718)
+    for _ in range(500):
+        length = int(rng.integers(10, 501))
+        spans = []
+        for _ in range(int(rng.integers(0, 80))):
+            start = int(rng.integers(-2 * length, length + 51))
+            spans.append((start, start + int(rng.integers(1, 51))))
+        # Explicit duplicates, touching, overlap, overrun and out-of-range starts.
+        spans.extend([(2, 6), (6, 9), (2, 6), (3, 8), (length - 3, length + 20)])
+        spans.extend([(length, length + 10), (length + 5, length + 30)])
+        rng.shuffle(spans)
+        mask = np.zeros(length, bool)
+        for start, end in spans:
+            mask[start:end] = True
+        assert match.merge_spans(iter(spans), length) == match.intervals_of(mask)
+    assert match.merge_spans([], 100) == []
+    assert match.merge_spans([(100, 120), (4, 4), (8, 3)], 10) == []
+    assert match.merge_spans([(0, 20)], 0) == []
+
+
+def test_verify_matches_mask_reference_with_multiple_offsets_and_groups():
+    rng = np.random.default_rng(1234)
+    target = rng.normal(size=128)
+    first = np.concatenate((2 * target[:64] + 5, -3 * target[64:] + 9))
+    second = np.concatenate((4 * target[:64] - 7, -2 * target[64:] + 3))
+    source = np.concatenate((first, second))
+    positions = [80, 0, 96, 16, 112, 32, 64, 48, 16, 8, 72]
+    hits = [("affine", pos, pos - offset, 16) for offset in (0, -128) for pos in positions]
+    scale = max(1.0, float(np.abs(source).max()))
+    for offset in (0, -128):
+        assert (
+            len(
+                {
+                    match.affine_key(target, source, tp, sp, span, fam, scale)
+                    for fam, tp, sp, span in hits
+                    if tp - sp == offset
+                }
+            )
+            == 2
+        )
+    expected = mask_verify(target, source, hits)
+    assert expected[0]["is_copy"]
+    assert {rec["offset"] for rec in expected[1]} == {0, -128}
+    assert {rec["fit_mode"] for rec in expected[1]} == {"grouped"}
+    assert match.verify(target, source, hits) == expected
+
+
+def test_verify_matches_mask_reference_with_clipped_spans():
+    target = np.random.default_rng(321).normal(size=128)
+    source = target.copy()
+    hits = [("exact", pos, pos, span) for pos, span in [(100, 50), (128, 8), (140, 8)]]
+    expected = mask_verify(target, source, hits)
+    assert expected[0]["t_start"] == 100
+    assert expected[0]["t_end"] == 128
+    assert match.verify(target, source, hits) == expected
 
 
 @pytest.mark.parametrize(
@@ -231,8 +291,21 @@ def local_audit(tmp_path):
 def test_end_to_end_parallel_resume_and_declaration(local_audit, tmp_path, monkeypatch):
     root, tasks = local_audit
     one, two = tmp_path / "one", tmp_path / "two"
-    first = audit.run_audit(root, one, tasks=tasks, workers=1, progress=lambda _: None)
-    second = audit.run_audit(root, two, tasks=tasks, workers=2, progress=lambda _: None)
+    serial_progress, parallel_progress = [], []
+    first = audit.run_audit(root, one, tasks=tasks, workers=1, progress=serial_progress.append)
+    second = audit.run_audit(root, two, tasks=tasks, workers=2, progress=parallel_progress.append)
+    for report, messages in ((first, serial_progress), (second, parallel_progress)):
+        completed = [line for line in messages if line.startswith("Scanned ")]
+        assert len(completed) == report["summary"]["column_scans"]
+        expected_labels = sorted(
+            f"Scanned {scan['task']} / {scan['column']} / {scan['variant']} / {scan['kind']}"
+            for scan in report["scans"]
+        )
+        assert sorted(line.rsplit(" in ", 1)[0] for line in completed) == expected_labels
+        for line in completed:
+            assert re.search(r" in \d+\.\d+s$", line), line
+        for path in ((one if report is first else two) / "scans").glob("*.json"):
+            assert "elapsed_seconds" not in json.loads(path.read_text())
     for report in (first, second):
         assert report["trained_on_datasets"] == ["copies", "covariate-only"]
         assert report["summary"]["unresolved_rows"] == 0

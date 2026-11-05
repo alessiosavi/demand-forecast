@@ -516,6 +516,13 @@ def _scan_job(job):
     return job["result_path"]
 
 
+def _timed_scan_job(job):
+    """Return worker wall time alongside the path, without changing scan JSON."""
+    started = time.monotonic()
+    path = _scan_job(job)
+    return path, time.monotonic() - started
+
+
 def _jobs(metadata, kinds, fingerprint, out):
     jobs = []
     for item in metadata:
@@ -696,10 +703,11 @@ def run_audit(
             if workers == 1:
                 _init_worker(store["path"])
                 for job in pending:
-                    path = _scan_job(job)
+                    path, elapsed = _timed_scan_job(job)
                     scans.append(json.loads(Path(path).read_text()))
                     progress(
                         f"Scanned {job['task']['name']} / {job['column']} / {job['variant']} / {kind}"
+                        f" in {elapsed:.2f}s"
                     )
             else:
                 with ProcessPoolExecutor(
@@ -708,9 +716,14 @@ def run_audit(
                     initializer=_init_worker,
                     initargs=(str(store["path"]),),
                 ) as pool:
-                    for path in pool.map(_scan_job, pending, chunksize=1):
+                    for job, (path, elapsed) in zip(
+                        pending, pool.map(_timed_scan_job, pending, chunksize=1)
+                    ):
                         scans.append(json.loads(Path(path).read_text()))
-                        progress(f"Completed scan {Path(path).stem[:12]} ({kind} {cls})")
+                        progress(
+                            f"Scanned {job['task']['name']} / {job['column']} / {job['variant']} / {kind}"
+                            f" in {elapsed:.2f}s"
+                        )
         # Release mapped files before removing the temporary index, including on Windows.
         global _WORKER_INDEX
         _WORKER_INDEX = None
