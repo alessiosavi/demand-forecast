@@ -793,6 +793,78 @@ def _scan_row(name, column, i, x, index, c, pairs, records, extra, dim=None, *, 
                 records.append({**r, **ids})
 
 
+def group_rows(series_list, dims=None) -> list[tuple[int, list[int]]]:
+    """Group byte-identical rows and calendar dimensions in first-occurrence order."""
+    groups = {}
+    for i, x in enumerate(series_list):
+        x = np.asarray(x, dtype=np.float64)
+        d = None if dims is None else np.asarray(dims[i], dtype=np.float64)
+        key = _row_key(x) + (b"" if d is None else d.astype("<i2").tobytes())
+        groups.setdefault(key, (i, []))[1].append(i)
+    return list(groups.values())
+
+
+def scan_group(name, column, i, idxs, series_list, index, extra=None, dims=None, *, resolve=True):
+    """Scan one representative, retaining first-pass and final counters separately."""
+    x = np.asarray(series_list[i], dtype=np.float64)
+    d = None if dims is None else np.asarray(dims[i], dtype=np.float64)
+    mult = len(idxs)
+    cr = new_cov()
+    lp, lr = ([], [])
+    _scan_row(name, column, i, x, index, cr, lp, lr, extra, d)
+    result = {
+        "i": i,
+        "idxs": idxs,
+        "mult": mult,
+        "initial_unresolved_rows": cr["unresolved_rows"] * mult,
+        "initial_truncated_rows": cr["truncated_rows"] * mult,
+        "postpass_rows": 0,
+        "postpass_candidates": 0,
+    }
+    if resolve and cr["unresolved_rows"]:
+        cr = new_cov()
+        lp, lr = ([], [])
+        _scan_row(name, column, i, x, index, cr, lp, lr, extra, d, uncapped=True)
+        result["postpass_rows"] = mult
+        result["postpass_candidates"] = cr["candidates"] * mult
+    result.update(counters=cr, pairs=lp, records=lr)
+    return result
+
+
+def finish_scan(c, results, pairs, records, *, all_rejections=False):
+    """Merge group results in group order, applying rejection caps across the scan."""
+    rec_count = defaultdict(int)
+    for result in results:
+        idxs, mult, cr = result["idxs"], result["mult"], result["counters"]
+        for key in (
+            "initial_unresolved_rows",
+            "initial_truncated_rows",
+            "postpass_rows",
+            "postpass_candidates",
+        ):
+            c[key] += result[key]
+        _merge(c, cr, mult)
+        if cr["unresolved_rows"]:
+            c["unresolved_ids"].extend(idxs)
+        for lst in ("uncovered_ids", "unexplained_ids"):
+            if cr[lst]:
+                c[lst].extend(idxs)
+        for p in result["pairs"]:
+            p.update(duplicate_rows=mult, series_indices=idxs)
+            pairs.append(p)
+        for r in result["records"]:
+            key = tuple(r["degenerate_reason"] or [])
+            if all_rejections or (
+                len(records) < MAX_RECORDS and rec_count[key] < MAX_RECORDS_PER_REASON
+            ):
+                rec_count[key] += 1
+                r.update(duplicate_rows=mult, series_indices=idxs)
+                records.append(r)
+            else:
+                c["rejection_records_omitted"] += mult
+    return c
+
+
 def scan(
     name,
     column,
@@ -824,46 +896,15 @@ def scan(
         rejection_records_omitted=0,
     )
     cov[f"{name}::{column}"] = c
-    groups = {}
-    for i, x in enumerate(series_list):
-        x = np.asarray(x, dtype=np.float64)
-        d = None if dims is None else np.asarray(dims[i], dtype=np.float64)
-        key = _row_key(x) + (b"" if d is None else d.astype("<i2").tobytes())
-        groups.setdefault(key, (i, []))[1].append(i)
+    groups = group_rows(series_list, dims)
     c["unique_series"] = len(groups)
-    rec_count = defaultdict(int)
-    for i, idxs in groups.values():
-        x = np.asarray(series_list[i], dtype=np.float64)
-        d = None if dims is None else np.asarray(dims[i], dtype=np.float64)
-        mult = len(idxs)
-        cr = new_cov()
-        lp, lr = ([], [])
-        _scan_row(name, column, i, x, index, cr, lp, lr, extra, d)
-        c["initial_unresolved_rows"] += cr["unresolved_rows"] * mult
-        c["initial_truncated_rows"] += cr["truncated_rows"] * mult
-        if resolve and cr["unresolved_rows"]:
-            cr = new_cov()
-            lp, lr = ([], [])
-            _scan_row(name, column, i, x, index, cr, lp, lr, extra, d, uncapped=True)
-            c["postpass_rows"] += mult
-            c["postpass_candidates"] += cr["candidates"] * mult
-        _merge(c, cr, mult)
-        if cr["unresolved_rows"]:
-            c["unresolved_ids"].extend(idxs)
-        for lst in ("uncovered_ids", "unexplained_ids"):
-            if cr[lst]:
-                c[lst].extend(idxs)
-        for p in lp:
-            p.update(duplicate_rows=mult, series_indices=idxs)
-            pairs.append(p)
-        for r in lr:
-            key = tuple(r["degenerate_reason"] or [])
-            if all_rejections or (
-                len(records) < MAX_RECORDS and rec_count[key] < MAX_RECORDS_PER_REASON
-            ):
-                rec_count[key] += 1
-                r.update(duplicate_rows=mult, series_indices=idxs)
-                records.append(r)
-            else:
-                c["rejection_records_omitted"] += mult
-    return c
+    return finish_scan(
+        c,
+        (
+            scan_group(name, column, i, idxs, series_list, index, extra, dims, resolve=resolve)
+            for i, idxs in groups
+        ),
+        pairs,
+        records,
+        all_rejections=all_rejections,
+    )

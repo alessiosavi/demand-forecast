@@ -4,16 +4,20 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import multiprocessing
 import os
 import re
+import shutil
 import tempfile
 import time
 from collections import Counter
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from contextlib import closing
 from dataclasses import asdict
 from datetime import datetime, timezone
 from functools import lru_cache
+from itertools import chain
 from pathlib import Path
 
 import numpy as np
@@ -31,6 +35,9 @@ from demand_forecast.pretrain.corpus import CORPUS_KINDS, _sha256, read_manifest
 DEFAULT_KINDS = ("chronos_real", "gifteval_pretrain")
 FREQUENCY_CLASSES = ("15T", "30T", "1H", "1D", "1W", "1M", "1Q", "1Y")
 METHOD_VERSION = "run11-corpus-v1"
+SCAN_CHUNK_ROWS = 256
+SCAN_CHUNK_MIN_GROUPS = 32
+SCAN_CHUNKS_PER_WORKER = 4
 METHOD = """All four hash families scan every numeric sequence column, including targets
 and covariates. Within each kind and frequency class, candidate groups have at
 least 3 matched windows or summed window spans of at least 24 points at one
@@ -424,18 +431,22 @@ class VariantDays:
         return self.rows.values_and_days(i)[1]
 
 
-def _scan_job(job):
-    index = _WORKER_INDEX
-    task = FevDatasetTask(**job["task"])
-    dataset = _worker_dataset(json.dumps(job["task"], sort_keys=True), job["cache_dir"])
-    all_meta = json.loads(Path(job["metadata_path"]).read_text())["rows"]
+def _eligible_rows(job, task_rows):
     aggregation = job["variant"] != "native"
-    eligible = [
+    return [
         r
-        for r in all_meta
+        for r in task_rows
         if r["frequency_class"] == ("1D" if aggregation else job["frequency_class"])
         and (not aggregation or r["daily_regular"])
     ]
+
+
+def _job_rows(job, *, kept=None):
+    """Prepare lazy rows; chunks reuse the grouping job's aggregation filter."""
+    task = FevDatasetTask(**job["task"])
+    dataset = _worker_dataset(json.dumps(job["task"], sort_keys=True), job["cache_dir"])
+    all_meta = json.loads(Path(job["metadata_path"]).read_text())["rows"]
+    eligible = _eligible_rows(job, all_meta)
     rows = VariantRows(
         dataset.select_columns([task.timestamp_column, job["column"]]),
         eligible,
@@ -443,10 +454,18 @@ def _scan_job(job):
         job["variant"],
     )
     rows.dataset_timestamp_column = task.timestamp_column
-    if aggregation:
+    if kept is not None:
+        rows.metadata = [eligible[k] for k in kept]
+    elif job["variant"] != "native":
         # Match run 11's exclusion of aggregates without eight full finite bins.
         rows.metadata = [r for i, r in enumerate(eligible) if rows[i] is not None]
     dims = VariantDays(rows) if job["frequency_class"] == "1M" else None
+    return task, rows, dims, all_meta, eligible
+
+
+def _scan_job(job):
+    index = _WORKER_INDEX
+    task, rows, dims, _, _ = _job_rows(job)
     pairs, rejections = [], []
     target = job["column"] in task.targets
     counts = match.scan(
@@ -460,21 +479,30 @@ def _scan_job(job):
         dims=dims,
         all_rejections=target,
     )
+    return _finish_job(job, counts, pairs, rejections, rows.metadata, index.series.rows)
+
+
+def _finish_job(job, counts, pairs, rejections, rows_metadata, corpus_rows):
+    """Enrich and publish a complete scan without accessing index arrays."""
+    task = FevDatasetTask(**job["task"])
+    target = job["column"] in task.targets
+    all_meta = json.loads(Path(job["metadata_path"]).read_text())["rows"]
+    eligible = _eligible_rows(job, all_meta)
     counts["input_rows"] = len(all_meta)
-    counts["aggregation_ineligible_rows"] = len(eligible) - len(rows)
+    counts["aggregation_ineligible_rows"] = len(eligible) - len(rows_metadata)
     counts["irregular_daily_rows_skipped"] = (
         sum(r["frequency_class"] == "1D" and not r["daily_regular"] for r in all_meta)
-        if aggregation
+        if job["variant"] != "native"
         else 0
     )
     for record in pairs + rejections:
-        selected = [rows.metadata[i] for i in record["series_indices"]]
+        selected = [rows_metadata[i] for i in record["series_indices"]]
         record["series_indices"] = [r["row"] for r in selected]
         record["series_index"] = selected[0]["row"]
         record["benchmark_ids"] = [r["id"] for r in selected]
         record["benchmark_id"] = selected[0]["id"]
         # IDs are not assumed unique between folders; the matcher supplies ordinal.
-        corpus = index.series.rows[record.pop("index_series_index")]
+        corpus = corpus_rows[record.pop("index_series_index")]
         record.update(
             task=task.name,
             kind=job["kind"],
@@ -488,11 +516,11 @@ def _scan_job(job):
             corpus_range={"start": corpus["start"], "end": corpus["end"]},
         )
     unresolved = [
-        {"row": rows.metadata[i]["row"], "id": rows.metadata[i]["id"]}
+        {"row": rows_metadata[i]["row"], "id": rows_metadata[i]["id"]}
         for i in counts["unresolved_ids"]
     ]
     for key in ("uncovered_ids", "unexplained_ids", "unresolved_ids"):
-        counts[key] = [rows.metadata[i]["row"] for i in counts[key]]
+        counts[key] = [rows_metadata[i]["row"] for i in counts[key]]
     report = {
         key: job[key]
         for key in ("fingerprint", "scan_id", "kind", "frequency_class", "column", "variant")
@@ -519,11 +547,117 @@ def _scan_job(job):
     return job["result_path"]
 
 
+def _group_job(job):
+    """Deduplicate a whole scan before distributing its representatives."""
+    _, rows, dims, _, eligible = _job_rows(job)
+    positions = {r["row"]: i for i, r in enumerate(eligible)}
+    return {
+        "groups": match.group_rows(rows, dims),
+        "kept": [positions[r["row"]] for r in rows.metadata],
+        "rows_metadata": rows.metadata,
+    }
+
+
+def _chunk_job(payload):
+    job = payload["job"]
+    task, rows, dims, _, _ = _job_rows(job, kept=payload["kept"])
+    return [
+        match.scan_group(task.name, job["column"], i, idxs, rows, _WORKER_INDEX, dims=dims)
+        for i, idxs in payload["groups"]
+    ]
+
+
+def _finish_chunked_job(job, grouped, chunks, corpus_rows):
+    counts = match.new_cov()
+    counts.update(
+        unique_series=len(grouped["groups"]),
+        initial_unresolved_rows=0,
+        initial_truncated_rows=0,
+        postpass_rows=0,
+        postpass_candidates=0,
+        unresolved_ids=[],
+        rejection_records_omitted=0,
+    )
+    pairs, rejections = [], []
+    match.finish_scan(
+        counts,
+        chain.from_iterable(chunks),
+        pairs,
+        rejections,
+        all_rejections=job["column"] in FevDatasetTask(**job["task"]).targets,
+    )
+    return _finish_job(job, counts, pairs, rejections, grouped["rows_metadata"], corpus_rows)
+
+
 def _timed_scan_job(job):
     """Return worker wall time alongside the path, without changing scan JSON."""
     started = time.monotonic()
     path = _scan_job(job)
     return path, time.monotonic() - started
+
+
+def _job_sort_key(job):
+    return (job["kind"], job["frequency_class"], job["task"]["name"], job["column"], job["variant"])
+
+
+def _job_work(job, task_rows):
+    return sum(row["length"] for row in _eligible_rows(job, task_rows))
+
+
+def _order_pending(pending, metadata):
+    task_rows = {item["task"]["name"]: item["rows"] for item in metadata}
+    return sorted(
+        pending,
+        key=lambda job: (-_job_work(job, task_rows[job["task"]["name"]]), _job_sort_key(job)),
+    )
+
+
+def _parallel_scan_jobs(pool, pending, metadata, corpus_rows, workers):
+    """Overlap grouping, whole scans and chunks, merging each scan in row order."""
+    task_rows = {item["task"]["name"]: item["rows"] for item in metadata}
+    futures = {}
+    try:
+        for job in _order_pending(pending, metadata):
+            if len(_eligible_rows(job, task_rows[job["task"]["name"]])) >= SCAN_CHUNK_ROWS:
+                state = {"started": time.monotonic()}
+                futures[pool.submit(_group_job, job)] = ("group", job, state, None)
+            else:
+                futures[pool.submit(_timed_scan_job, job)] = ("scan", job, None, None)
+        while futures:
+            done, _ = wait(futures, return_when=FIRST_COMPLETED)
+            for future in done:
+                stage, job, state, position = futures.pop(future)
+                result = future.result()
+                if stage == "scan":
+                    path, elapsed = result
+                    yield job, path, elapsed
+                    continue
+                if stage == "group":
+                    state["grouped"] = result
+                    groups = result["groups"]
+                    size = max(
+                        SCAN_CHUNK_MIN_GROUPS,
+                        math.ceil(len(groups) / (SCAN_CHUNKS_PER_WORKER * workers)),
+                    )
+                    state["chunks"] = [None] * math.ceil(len(groups) / size)
+                    state["remaining"] = len(state["chunks"])
+                    for position, start in enumerate(range(0, len(groups), size)):
+                        payload = {
+                            "job": job,
+                            "kept": result["kept"],
+                            "groups": groups[start : start + size],
+                        }
+                        futures[pool.submit(_chunk_job, payload)] = ("chunk", job, state, position)
+                else:
+                    state["chunks"][position] = result
+                    state["remaining"] -= 1
+                # Empty aggregate scans finish here without submitting any chunks.
+                if not state["remaining"]:
+                    path = _finish_chunked_job(job, state["grouped"], state["chunks"], corpus_rows)
+                    yield job, path, time.monotonic() - state["started"]
+    finally:
+        for future in futures:
+            future.cancel()
 
 
 def _jobs(metadata, kinds, fingerprint, out):
@@ -556,16 +690,7 @@ def _jobs(metadata, kinds, fingerprint, out):
                             "result_path": str(out / "scans" / f"{scan_id}.json"),
                         }
                     )
-    return sorted(
-        jobs,
-        key=lambda job: (
-            job["kind"],
-            job["frequency_class"],
-            job["task"]["name"],
-            job["column"],
-            job["variant"],
-        ),
-    )
+    return sorted(jobs, key=_job_sort_key)
 
 
 def _resume_result(job):
@@ -611,6 +736,7 @@ def run_audit(
     are reused. Worker count, scheduling and resume do not change audit.json.
     Per-run wall time and generated_at are the only varying report fields.
     """
+    global _WORKER_INDEX
     started = time.monotonic()
     root, out = Path(root).resolve(), Path(out).resolve()
     kinds = tuple(sorted(set(kinds)))
@@ -694,42 +820,47 @@ def run_audit(
                         f"Resume: {job['task']['name']} / {job['column']} / {job['variant']} / {kind}"
                     )
             index_cache = out / ".cache" / f"index-{fingerprint}-{kind}-{cls}.json"
+            # The parent needs only metadata to finish chunks, never mapped arrays.
+            corpus_rows = json.loads((store["path"] / "rows.json").read_text())
             if pending or not index_cache.is_file():
-                progress(f"Indexing {kind} {cls}: {len(ArrayStore(store['path']))} series")
+                progress(f"Indexing {kind} {cls}: {len(corpus_rows)} series")
                 coverage = _save_index(store["path"])
                 _write_json(index_cache, coverage)
             else:
                 coverage = json.loads(index_cache.read_text())
             indices[f"{kind}::{cls}"] = coverage
-            if not pending:
-                continue
-            if workers == 1:
-                _init_worker(store["path"])
-                for job in pending:
-                    path, elapsed = _timed_scan_job(job)
-                    scans.append(json.loads(Path(path).read_text()))
-                    progress(
-                        f"Scanned {job['task']['name']} / {job['column']} / {job['variant']} / {kind}"
-                        f" in {elapsed:.2f}s"
-                    )
-            else:
-                with ProcessPoolExecutor(
-                    max_workers=min(workers, len(pending)),
-                    mp_context=multiprocessing.get_context("spawn"),
-                    initializer=_init_worker,
-                    initargs=(str(store["path"]),),
-                ) as pool:
-                    for job, (path, elapsed) in zip(
-                        pending, pool.map(_timed_scan_job, pending, chunksize=1)
-                    ):
+            if pending and workers == 1:
+                try:
+                    _init_worker(store["path"])
+                    for job in pending:
+                        path, elapsed = _timed_scan_job(job)
                         scans.append(json.loads(Path(path).read_text()))
                         progress(
                             f"Scanned {job['task']['name']} / {job['column']} / {job['variant']} / {kind}"
                             f" in {elapsed:.2f}s"
                         )
-        # Release mapped files before removing the temporary index, including on Windows.
-        global _WORKER_INDEX
-        _WORKER_INDEX = None
+                finally:
+                    _WORKER_INDEX = None
+            elif pending:
+                with ProcessPoolExecutor(
+                    max_workers=workers,
+                    mp_context=multiprocessing.get_context("spawn"),
+                    initializer=_init_worker,
+                    initargs=(str(store["path"]),),
+                ) as pool:
+                    with closing(
+                        _parallel_scan_jobs(pool, pending, metadata, corpus_rows, workers)
+                    ) as results:
+                        for job, path, elapsed in results:
+                            scans.append(json.loads(Path(path).read_text()))
+                            progress(
+                                f"Scanned {job['task']['name']} / {job['column']} / {job['variant']} / {kind}"
+                                f" in {elapsed:.2f}s"
+                            )
+            # Workers have exited and the serial parent has dropped its memory maps.
+            del corpus_rows
+            shutil.rmtree(store["path"])
+            progress(f"Released {kind} {cls} index")
     scans.sort(key=lambda item: item["scan_id"])
     copies = [copy for scan in scans for copy in scan["copies"]]
     near = [pair for scan in scans for pair in scan["near_pairs"]]

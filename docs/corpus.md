@@ -316,6 +316,16 @@ Small synthetic fixtures complete in seconds, but a full 100-task audit can
 take hours to days; fixture throughput is not a reliable prediction of the
 uncapped post-pass cost. No full corpus audit is performed by the unit tests.
 
+Initial grouping and whole-scan submissions are ordered largest-first by eligible
+row lengths. With multiple workers, a column with at least 256 eligible rows is
+split into row-group chunks, which are appended to the queue as groupings complete.
+Chunks run across workers and merge in row order, preserving duplicate rows and
+scan-wide record caps. Chunk boundaries and the scheduling constants
+`SCAN_CHUNK_ROWS`, `SCAN_CHUNK_MIN_GROUPS` and `SCAN_CHUNKS_PER_WORKER` do not affect
+results. Each class's index files are released as soon as its scans finish, so
+posting tables require approximately 128 bytes per window for one class at a
+time, in addition to the temporary float64 values, Arrow cache and reports.
+
 The 26 positive, 14 negative and ten rule controls run offline. Two inputs that
 previously loaded M4 rows use deterministic synthetic surrogates: a varying
 200-point base and a 119-point, three-level/four-run policy-negative shape.
