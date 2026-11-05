@@ -42,6 +42,21 @@ def scheduler_jobs():
     return jobs, metadata
 
 
+def test_dataset_cache_is_scoped_by_revision(scheduler_jobs, tmp_path, monkeypatch):
+    _, metadata = scheduler_jobs
+    first = audit._dataset_cache_dir(tmp_path)
+    assert first == tmp_path / ".cache" / "datasets" / audit.FEV_DATASETS_REVISION
+    jobs = audit._jobs(metadata, ["chronos_real"], "inputs", tmp_path)
+    assert {job["cache_dir"] for job in jobs} == {str(first)}
+
+    monkeypatch.setattr(audit, "FEV_DATASETS_REVISION", "another-revision")
+    second = audit._dataset_cache_dir(tmp_path)
+    assert second == tmp_path / ".cache" / "datasets" / "another-revision"
+    assert second != first
+    jobs = audit._jobs(metadata, ["chronos_real"], "inputs", tmp_path)
+    assert {job["cache_dir"] for job in jobs} == {str(second)}
+
+
 @pytest.mark.parametrize(
     "stage,error_type", [("scan", ValueError), ("group", TypeError), ("chunk", RuntimeError)]
 )
