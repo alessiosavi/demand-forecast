@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -13,12 +14,18 @@ from numpy.typing import DTypeLike
 
 from demand_forecast.data.panel import Panel, Roles, Series
 
+logger = logging.getLogger(__name__)
+
 CORPUS_REPO = "autogluon/chronos_datasets"
 CHRONOS_REVISION = "eeecad0b82a8c237e212ce6f8d1abecb513e2cec"
 TSMIXUP_PREFIX = "training_corpus/tsmixup_10m/"
 KERNEL_SYNTH_PREFIX = "training_corpus/kernel_synth_1m/"
 PRETRAIN_START = pd.Timestamp("2000-01-02")
 PRETRAIN_FREQ = "W-SUN"
+# BatchBuilder._grid materialises history + horizon via grid_range/pd.date_range,
+# even with calendar features disabled. 8,192 weeks (~157 years) from PRETRAIN_START
+# leave ample datetime64[ns] headroom; corpus-v2 windows use at most 512 + 52 = 564 points.
+MAX_SERIES_POINTS = 8192
 CORPUS_ROLES = Roles("target", (), (), (), ())
 
 CORPUS_KINDS = {
@@ -32,15 +39,20 @@ CORPUS_KINDS = {
 def read_shard(path: Path, *, dtype: DTypeLike = np.float32) -> list[Series]:
     """Read targets in file order, ignoring the corpus's dummy timestamps.
 
-    Preserve all target positions, including NaNs. The weekly start and grid
-    are synthetic coordinates for the shared batch builder, not calendar data.
+    Keep the latest MAX_SERIES_POINTS positions, including NaNs. The weekly
+    start and grid are synthetic coordinates for the shared batch builder,
+    not calendar data.
     """
     import pyarrow.parquet as pq
 
     table = pq.read_table(path, columns=["id", "target"])
     series = []
+    truncated = 0
     for series_id, target in zip(table["id"], table["target"], strict=True):
         values = np.asarray(target.as_py(), dtype=dtype)
+        if len(values) > MAX_SERIES_POINTS:
+            values = values[-MAX_SERIES_POINTS:].copy()
+            truncated += 1
         series.append(
             Series(
                 series_id=series_id.as_py(),
@@ -51,6 +63,12 @@ def read_shard(path: Path, *, dtype: DTypeLike = np.float32) -> list[Series]:
                 statics={},
             )
         )
+    logger.info(
+        "Truncated %d series in shard %s to the most recent %d points",
+        truncated,
+        path,
+        MAX_SERIES_POINTS,
+    )
     return series
 
 
