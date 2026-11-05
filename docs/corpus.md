@@ -172,6 +172,11 @@ of local overrides, or fev content isolation.
 
 ## Training with weighted sources
 
+Pretraining and corpus hold-out validation keep only the most recent 8,192 target
+points per series so the synthetic weekly grid stays within pandas' timestamp
+range, with each series still contributing one draw per pass. Each shard load
+logs the number of truncated series; the stored shard files are unchanged.
+
 `configs/corpus-v2.yaml` is a build recipe. A pretraining run uses a separate
 `PretrainConfig`, for example this `corpus` section (choose indices from your
 own build's manifest):
