@@ -1,8 +1,10 @@
 """Row-group chunking preserves scan order, accounting and record limits."""
 
 import pickle
+from concurrent.futures import Future
 from dataclasses import asdict
 from itertools import chain
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -10,6 +12,87 @@ import pytest
 from demand_forecast.bench.specs import FevDatasetTask
 from demand_forecast.pretrain import audit
 from demand_forecast.pretrain import audit_match as match
+
+
+class _FuturePool:
+    """Return hand-controlled futures without starting worker processes."""
+
+    def __init__(self, submissions):
+        self.submissions = submissions
+        self.submitted = []
+
+    def submit(self, fn, payload):
+        expected_fn, future = self.submissions[len(self.submitted)]
+        assert fn is expected_fn
+        self.submitted.append(future)
+        return future
+
+
+@pytest.fixture
+def scheduler_jobs():
+    metadata = [
+        {
+            "task": asdict(FevDatasetTask("t", "local")),
+            "columns": ["a", "b", "c"],
+            "rows": [{"frequency_class": "1H", "length": 32}],
+            "metadata_path": "unused.json",
+        }
+    ]
+    jobs = audit._jobs(metadata, ["chronos_real"], "inputs", Path("unused"))
+    return jobs, metadata
+
+
+@pytest.mark.parametrize(
+    "stage,error_type", [("scan", ValueError), ("group", TypeError), ("chunk", RuntimeError)]
+)
+def test_parallel_scan_jobs_cancel_pending_on_worker_error(
+    scheduler_jobs, monkeypatch, stage, error_type
+):
+    jobs, metadata = scheduler_jobs
+    failed = Future()
+    error = error_type("worker failed")
+    failed.set_exception(error)
+    queued = [Future(), Future()]
+    fn = audit._timed_scan_job if stage == "scan" else audit._group_job
+    if stage != "scan":
+        monkeypatch.setattr(audit, "SCAN_CHUNK_ROWS", 1)
+    first = failed
+    if stage == "chunk":
+        monkeypatch.setattr(audit, "SCAN_CHUNK_MIN_GROUPS", 1)
+        first = Future()
+        first.set_result(
+            {"groups": [(0, [0]), (1, [1]), (2, [2])], "kept": [0, 1, 2], "rows_metadata": []}
+        )
+    submissions = [(fn, first), *((fn, future) for future in queued)]
+    if stage == "chunk":
+        chunks = [Future(), Future()]
+        queued.extend(chunks)
+        submissions.extend((audit._chunk_job, future) for future in [failed, *chunks])
+    pool = _FuturePool(submissions)
+    results = audit._parallel_scan_jobs(pool, jobs, metadata, [], workers=2)
+
+    with pytest.raises(error_type) as exc:
+        next(results)
+
+    assert exc.value is error
+    assert len(pool.submitted) == len(submissions)
+    assert all(future.cancelled() for future in queued)
+
+
+def test_parallel_scan_jobs_cancel_pending_on_close(scheduler_jobs):
+    jobs, metadata = scheduler_jobs
+    completed = Future()
+    completed.set_result(("scan.json", 0.5))
+    queued = [Future(), Future()]
+    pool = _FuturePool([(audit._timed_scan_job, future) for future in [completed, *queued]])
+    results = audit._parallel_scan_jobs(pool, jobs, metadata, [], workers=2)
+
+    assert next(results) == (jobs[0], "scan.json", 0.5)
+    assert all(not future.done() for future in queued)
+    results.close()
+
+    assert len(pool.submitted) == 3
+    assert all(future.cancelled() for future in queued)
 
 
 @pytest.mark.parametrize("all_rejections", [False, True])

@@ -13,6 +13,7 @@ import tempfile
 import time
 from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from contextlib import closing
 from dataclasses import asdict
 from datetime import datetime, timezone
 from functools import lru_cache
@@ -615,44 +616,48 @@ def _parallel_scan_jobs(pool, pending, metadata, corpus_rows, workers):
     """Overlap grouping, whole scans and chunks, merging each scan in row order."""
     task_rows = {item["task"]["name"]: item["rows"] for item in metadata}
     futures = {}
-    for job in _order_pending(pending, metadata):
-        if len(_eligible_rows(job, task_rows[job["task"]["name"]])) >= SCAN_CHUNK_ROWS:
-            state = {"started": time.monotonic()}
-            futures[pool.submit(_group_job, job)] = ("group", job, state, None)
-        else:
-            futures[pool.submit(_timed_scan_job, job)] = ("scan", job, None, None)
-    while futures:
-        done, _ = wait(futures, return_when=FIRST_COMPLETED)
-        for future in done:
-            stage, job, state, position = futures.pop(future)
-            result = future.result()
-            if stage == "scan":
-                path, elapsed = result
-                yield job, path, elapsed
-                continue
-            if stage == "group":
-                state["grouped"] = result
-                groups = result["groups"]
-                size = max(
-                    SCAN_CHUNK_MIN_GROUPS,
-                    math.ceil(len(groups) / (SCAN_CHUNKS_PER_WORKER * workers)),
-                )
-                state["chunks"] = [None] * math.ceil(len(groups) / size)
-                state["remaining"] = len(state["chunks"])
-                for position, start in enumerate(range(0, len(groups), size)):
-                    payload = {
-                        "job": job,
-                        "kept": result["kept"],
-                        "groups": groups[start : start + size],
-                    }
-                    futures[pool.submit(_chunk_job, payload)] = ("chunk", job, state, position)
+    try:
+        for job in _order_pending(pending, metadata):
+            if len(_eligible_rows(job, task_rows[job["task"]["name"]])) >= SCAN_CHUNK_ROWS:
+                state = {"started": time.monotonic()}
+                futures[pool.submit(_group_job, job)] = ("group", job, state, None)
             else:
-                state["chunks"][position] = result
-                state["remaining"] -= 1
-            # Empty aggregate scans finish here without submitting any chunks.
-            if not state["remaining"]:
-                path = _finish_chunked_job(job, state["grouped"], state["chunks"], corpus_rows)
-                yield job, path, time.monotonic() - state["started"]
+                futures[pool.submit(_timed_scan_job, job)] = ("scan", job, None, None)
+        while futures:
+            done, _ = wait(futures, return_when=FIRST_COMPLETED)
+            for future in done:
+                stage, job, state, position = futures.pop(future)
+                result = future.result()
+                if stage == "scan":
+                    path, elapsed = result
+                    yield job, path, elapsed
+                    continue
+                if stage == "group":
+                    state["grouped"] = result
+                    groups = result["groups"]
+                    size = max(
+                        SCAN_CHUNK_MIN_GROUPS,
+                        math.ceil(len(groups) / (SCAN_CHUNKS_PER_WORKER * workers)),
+                    )
+                    state["chunks"] = [None] * math.ceil(len(groups) / size)
+                    state["remaining"] = len(state["chunks"])
+                    for position, start in enumerate(range(0, len(groups), size)):
+                        payload = {
+                            "job": job,
+                            "kept": result["kept"],
+                            "groups": groups[start : start + size],
+                        }
+                        futures[pool.submit(_chunk_job, payload)] = ("chunk", job, state, position)
+                else:
+                    state["chunks"][position] = result
+                    state["remaining"] -= 1
+                # Empty aggregate scans finish here without submitting any chunks.
+                if not state["remaining"]:
+                    path = _finish_chunked_job(job, state["grouped"], state["chunks"], corpus_rows)
+                    yield job, path, time.monotonic() - state["started"]
+    finally:
+        for future in futures:
+            future.cancel()
 
 
 def _jobs(metadata, kinds, fingerprint, out):
@@ -843,14 +848,15 @@ def run_audit(
                     initializer=_init_worker,
                     initargs=(str(store["path"]),),
                 ) as pool:
-                    for job, path, elapsed in _parallel_scan_jobs(
-                        pool, pending, metadata, corpus_rows, workers
-                    ):
-                        scans.append(json.loads(Path(path).read_text()))
-                        progress(
-                            f"Scanned {job['task']['name']} / {job['column']} / {job['variant']} / {kind}"
-                            f" in {elapsed:.2f}s"
-                        )
+                    with closing(
+                        _parallel_scan_jobs(pool, pending, metadata, corpus_rows, workers)
+                    ) as results:
+                        for job, path, elapsed in results:
+                            scans.append(json.loads(Path(path).read_text()))
+                            progress(
+                                f"Scanned {job['task']['name']} / {job['column']} / {job['variant']} / {kind}"
+                                f" in {elapsed:.2f}s"
+                            )
             # Workers have exited and the serial parent has dropped its memory maps.
             del corpus_rows
             shutil.rmtree(store["path"])

@@ -316,9 +316,10 @@ Small synthetic fixtures complete in seconds, but a full 100-task audit can
 take hours to days; fixture throughput is not a reliable prediction of the
 uncapped post-pass cost. No full corpus audit is performed by the unit tests.
 
-Parallel scans are scheduled largest-first by eligible row lengths. With multiple
-workers, a column with at least 256 eligible rows is split into row-group chunks
-that run across workers and merge in row order, preserving duplicate rows and
+Initial grouping and whole-scan submissions are ordered largest-first by eligible
+row lengths. With multiple workers, a column with at least 256 eligible rows is
+split into row-group chunks, which are appended to the queue as groupings complete.
+Chunks run across workers and merge in row order, preserving duplicate rows and
 scan-wide record caps. Chunk boundaries and the scheduling constants
 `SCAN_CHUNK_ROWS`, `SCAN_CHUNK_MIN_GROUPS` and `SCAN_CHUNKS_PER_WORKER` do not affect
 results. Each class's index files are released as soon as its scans finish, so
