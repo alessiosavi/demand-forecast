@@ -502,15 +502,21 @@ before continuing. Keyboard interrupts and `--stop-after` still interrupt the
 run. The exit status is 0 if all selected tasks complete, 3 if selected tasks
 finish with failures. Without this flag, the first exception stops the run.
 Completed tasks keep their rows. `--resume` verifies saved identities/artifacts
-before skipping completed work. The journal also stores the first-window run
-identity (which includes the whole task definition), restartability and retry state.
-Only `--resume --keep-going` restarts a matching runtime failure, including a
-terminal non-finite checkpoint. All saved artifact identities are checked before
-reset. Identity/artifact errors, unclassified validation errors and legacy records
-without identities require removing the task artifacts before retrying. A retry
-is marked started before reset; interrupted retries then resume their new
-checkpoints. The failure record remains until success. Use one output directory
-per experiment; do not change settings while retrying it.
+before skipping completed work. The journal is a pure record: it also stores the
+first-window run identity when known (otherwise null). Each later failure of the
+same task replaces its record; success removes it. `panel_failures.json` follows
+the same rules separately for preflight failures.
+
+A journal entry never changes task execution, deletes artifacts or restarts
+training. Every selected task follows the normal path with the caller's
+`--resume` flag: checkpoints resume and verified completed artifacts are reused.
+Identity or artifact mismatches retain their normal error messages, recorded
+again under `--keep-going` or propagated otherwise. A task whose training ended
+non-finite keeps failing on resume; a task that failed with out-of-memory resumes
+from its last checkpoint. To restart a failed task from scratch, the operator
+must delete its task directory themselves (take care with nested task names:
+a parent directory can also contain another task's artifacts). Use one output
+directory per experiment; do not change settings while retrying it.
 
 `PANEL_OK` reports `negative_share`, the fraction of finite target values below
 zero (NaN if none are finite). This diagnostic never changes target support.

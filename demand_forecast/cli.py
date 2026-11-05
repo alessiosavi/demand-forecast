@@ -366,7 +366,12 @@ def fev_run(
     ),
     resume: bool = typer.Option(False, "--resume", help="Resume matching runs and missing windows"),
     keep_going: bool = typer.Option(
-        False, "--keep-going", help="Record task failures and continue"
+        False,
+        "--keep-going",
+        help=(
+            "Record task failures and continue; resume uses existing checkpoints. "
+            "To restart from scratch, delete the task directory yourself."
+        ),
     ),
     panel_check: bool = typer.Option(
         False, "--panel-check", help="Validate first-window panels without training"
