@@ -314,8 +314,9 @@ reduce it when worker candidate expansions use too much RAM. Runtime depends
 strongly on series lengths, repeated fingerprints and fallback candidate counts.
 Parallel workers (`--workers > 1`) run with Hub access disabled and read task
 datasets from the cache filled by the parent to avoid the anonymous Hub API limit
-of 500 requests per 300 seconds; the serial path stays online. The dataset cache
-under `.cache/datasets` is namespaced by the pinned dataset revision.
+of 500 requests per 300 seconds; the serial path preserves the caller's
+online/offline settings. The dataset cache under `.cache/datasets` is namespaced
+by the pinned dataset revision.
 Small synthetic fixtures complete in seconds, but a full 100-task audit can
 take hours to days; fixture throughput is not a reliable prediction of the
 uncapped post-pass cost. No full corpus audit is performed by the unit tests.

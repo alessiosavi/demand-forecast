@@ -352,7 +352,10 @@ def test_serial_audit_reloads_changed_dataset(local_audit, tmp_path, monkeypatch
         rows = pq.read_table(path).to_pylist()
         for row in rows:
             row["target"] = (np.asarray(row["target"]) + 100).tolist()
+        previous_mtime_ns = path.stat().st_mtime_ns
         _parquet(path, rows)
+        # Invalidate datasets' local-file cache even on coarse-timestamp filesystems.
+        os.utime(path, ns=(path.stat().st_atime_ns, previous_mtime_ns + 2_000_000_000))
         loader.reset_mock()
         second_out = out if reuse_out else tmp_path / "second"
         second = audit.run_audit(root, second_out, tasks=tasks, workers=1, progress=lambda _: None)
