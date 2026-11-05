@@ -4,14 +4,17 @@ import json
 
 import numpy as np
 import pandas as pd
-import pyarrow.parquet as pq
 import pytest
 import yaml
 
-from demand_forecast.pretrain import audit, audit_info
-from demand_forecast.pretrain.corpus import corpus_manifest, write_manifest
-from tests.test_pretrain.test_audit import _parquet
-from tests.test_pretrain.test_audit import local_audit as local_audit
+# The audit needs the corpus extras; the dev-only CI job must skip this module.
+pq = pytest.importorskip("pyarrow.parquet")
+pytest.importorskip("datasets")
+
+from demand_forecast.pretrain import audit, audit_info  # noqa: E402
+from demand_forecast.pretrain.corpus import corpus_manifest, write_manifest  # noqa: E402
+from tests.test_pretrain.test_audit import _parquet  # noqa: E402
+from tests.test_pretrain.test_audit import local_audit as local_audit  # noqa: E402
 
 
 @pytest.fixture
@@ -134,6 +137,10 @@ def test_all_statuses_and_values_byte_identical_across_execution_paths(
             assert scan["info"]["index_windows"] == sum(index["windows"].values())
             assert scan["info"]["target_windows"] == sum(scan["counts"]["windows"].values())
         actual = {p.name: p.read_bytes() for p in (out / "scans").glob("*.json")}
+        for name, content in actual.items():
+            scan = json.loads(content)
+            job = {"result_path": str(out / "scans" / name), "fingerprint": scan["fingerprint"]}
+            assert audit._resume_result(job) == scan
         if expected is None:
             expected = actual
         assert actual == expected
@@ -185,8 +192,33 @@ def test_info_constants_change_fingerprint(monkeypatch, name):
     assert audit._fingerprint({"constants": audit.constants()}) != before
 
 
-@pytest.mark.parametrize("missing", ["info", "identification"])
-def test_incomplete_identification_scan_is_rescanned(local_audit, tmp_path, missing):
+_MISSING = object()
+
+
+@pytest.mark.parametrize(
+    "keys, replacement",
+    [
+        (("info",), _MISSING),
+        (("info",), {}),
+        (("info",), []),
+        (("info",), None),
+        *[
+            (("info", field), _MISSING)
+            for field in ("version", "margin_bits", "target_windows", "index_windows")
+        ],
+        (("copies",), {}),
+        (("copies",), None),
+        *[(("copies", 0), value) for value in (7, None, [], "bad")],
+        *[(("copies", 0, "identification"), value) for value in (_MISSING, "bad", None, [])],
+        *[
+            (("copies", 0, field), value)
+            for field in ("info_bits_target", "info_bits_index")
+            for value in (_MISSING, None, "20", 20.0, True)
+        ],
+        *[(("copies", 0, "info_strict_ramp"), value) for value in (_MISSING, None, "false", 0)],
+    ],
+)
+def test_incomplete_identification_scan_is_rescanned(local_audit, tmp_path, keys, replacement):
     root, tasks = local_audit
     out = tmp_path / "out"
     audit.run_audit(root, out, tasks=tasks, workers=1, progress=lambda _: None)
@@ -197,13 +229,32 @@ def test_incomplete_identification_scan_is_rescanned(local_audit, tmp_path, miss
     scan = json.loads(original)
     job = {"result_path": str(path), "fingerprint": scan["fingerprint"]}
     assert audit._resume_result(job) == scan
-    if missing == "info":
-        del scan["info"]
+    parent = scan
+    for key in keys[:-1]:
+        parent = parent[key]
+    if replacement is _MISSING:
+        del parent[keys[-1]]
     else:
-        del scan["copies"][0]["identification"]
+        parent[keys[-1]] = replacement
     path.write_text(json.dumps(scan))
     assert audit._resume_result(job) is None
     messages = []
     audit.run_audit(root, out, tasks=tasks, workers=1, resume=True, progress=messages.append)
     assert sum(m.startswith("Scanned ") for m in messages) == 1
     assert path.read_bytes() == original
+
+
+def test_resume_checks_structure_without_rederiving_status(local_audit, tmp_path):
+    root, tasks = local_audit
+    out = tmp_path / "out"
+    audit.run_audit(root, out, tasks=tasks, workers=1, progress=lambda _: None)
+    path = next(
+        p for p in sorted((out / "scans").glob("*.json")) if json.loads(p.read_text())["copies"]
+    )
+    scan = json.loads(path.read_text())
+    job = {"result_path": str(path), "fingerprint": scan["fingerprint"]}
+    # Even an inconsistent but known status remains outside structural validation.
+    for status in audit_info.STATUSES:
+        scan["copies"][0]["identification"] = status
+        path.write_text(json.dumps(scan))
+        assert audit._resume_result(job) == scan

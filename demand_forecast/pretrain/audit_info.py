@@ -29,6 +29,7 @@ _CODE_ORDER = (
     "periodic_motif",
     "digital_line",
 )
+_KT_BOUND_FACTORS = 64
 
 
 @dataclass(frozen=True)
@@ -93,6 +94,36 @@ def _kt_bits(transitions: np.ndarray) -> int:
         numerators.append(numerator // common)
         denominators.append(denominator // common)
     return _ratio_bits(math.prod(numerators), math.prod(denominators))
+
+
+def _kt_exceeds_bound(transitions: np.ndarray, limit: int) -> bool:
+    """Prove KT's ceiling exceeds limit, or leave it to the factorial path.
+
+    Row products are exchangeable, so group observations by destination. Each
+    inverse predictive factor (k + 2*t)/(1 + 2*seen) is >= 1 since t >= seen.
+    Every partial product, including the first-symbol k, is thus a lower bound.
+    A STRICT comparison preserves equal-cost codes and their tie order. Cap
+    the work so inconclusive bounds never build long sequential products.
+    """
+    if limit < 0:
+        return True
+    k = len(transitions)
+    numerator, denominator, factors = k, 1, 0
+    if numerator > denominator << limit:
+        return True
+    for row in transitions:
+        t = 0
+        for count in row:
+            for seen in range(min(int(count), _KT_BOUND_FACTORS - factors)):
+                numerator *= k + 2 * t
+                denominator *= 1 + 2 * seen
+                t += 1
+                factors += 1
+                if numerator > denominator << limit:
+                    return True
+            if factors == _KT_BOUND_FACTORS:
+                return False
+    return False
 
 
 def _smallest_period(values: np.ndarray) -> int | None:
@@ -207,11 +238,6 @@ def info_bits(values: ArrayLike, positions: ArrayLike | None = None) -> InfoScor
     piecewise = (
         _size_bits(n - 1) + _choose_bits(n - 2, knots) + (knots + 2) * _size_bits(extent + 1)
     )
-    # KT mixture includes uncertainty in every transition row, including self
-    # transitions. Free fitted transition counts would erase genuine information.
-    transitions = np.zeros((k, k), int)
-    np.add.at(transitions, (inverse[:-1], inverse[1:]), 1)
-    markov = _size_bits(n) + level_bits + _kt_bits(transitions) + 1
     period = _smallest_period(q)
     periodic = (
         _size_bits(n) + _size_bits(n // 2) + level_bits + period * _size_bits(k)
@@ -236,10 +262,20 @@ def info_bits(values: ArrayLike, positions: ArrayLike | None = None) -> InfoScor
         "enumerative": enumerative,
         "run": run,
         "piecewise_linear": piecewise,
-        "kt_markov": markov,
         "periodic_motif": periodic,
         "digital_line": digital_line,
     }
+    # KT mixture includes uncertainty in every transition row, including self
+    # transitions. Avoid its factorials only when an exact bound proves it loses.
+    incumbent = min(codes.values())
+    overhead = _size_bits(n) + level_bits + 1
+    transitions = np.zeros((k, k), int)
+    np.add.at(transitions, (inverse[:-1], inverse[1:]), 1)
+    codes["kt_markov"] = (
+        math.inf
+        if _kt_exceeds_bound(transitions, incumbent - overhead)
+        else overhead + _kt_bits(transitions)
+    )
     code = min(_CODE_ORDER, key=codes.__getitem__)
     return InfoScore(3 + codes[code], code, False, n, k, runs)
 

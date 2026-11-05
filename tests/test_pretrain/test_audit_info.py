@@ -16,6 +16,9 @@ from demand_forecast.pretrain import audit_match as match
 from demand_forecast.pretrain.audit_controls import control_cases
 
 FIXTURE = Path(__file__).parents[1] / "fixtures/audit_info/segments.jsonl"
+# Wall-clock bound for the 100,000-point cost tests. Local two-side times are 0.05-0.55 s; shared CI runners measured
+# about twice that. The bound only has to catch a super-linear regression, which costs minutes at this length.
+COST_BOUND_S = 10.0
 SEGMENTS = [json.loads(line) for line in FIXTURE.read_text().splitlines()]
 LIMITED = {
     "indexed_1100_times_shift+10_fallback": 48,
@@ -27,13 +30,39 @@ LIMITED = {
 
 
 @pytest.mark.parametrize("row", SEGMENTS, ids=lambda row: str(row["record_id"]))
-def test_reference_score_exact(row):
+def test_reference_score_exact(row, monkeypatch):
     score = info.info_bits(row["values"])
+    assert score == _full_score(row["values"], monkeypatch)
     assert type(score.bits) is int
     assert score.bits == row["bits_c"]
     assert score.code == row["code"]
     assert score.strict_ramp == row["ramp"]
     assert (score.n, score.levels, score.runs) == (row["n"], row["k"], row["runs"])
+
+
+def _full_score(values, monkeypatch):
+    # Disabling only the pruning proof evaluates all six codes, as at 71e193d.
+    with monkeypatch.context() as full:
+        full.setattr(info, "_kt_exceeds_bound", lambda transitions, limit: False)
+        return info.info_bits(values)
+
+
+def test_lazy_kt_matches_full_evaluation_random_short_sequences(monkeypatch):
+    rng = np.random.default_rng(20261106)
+    for i in range(2400):
+        n = int(rng.integers(3, 130))
+        k = int(rng.integers(2, 9))
+        values = (
+            rng.normal(size=n),
+            rng.integers(0, k, n),
+            np.sort(rng.integers(0, k, n)),
+            np.resize(rng.integers(0, k, 7), n),
+            np.repeat(rng.integers(0, k, n // 3 + 1), 3)[:n],
+            rng.normal(size=n).cumsum(),
+            np.rint(np.linspace(0, 200, n)) + rng.integers(-1, 2, n),
+            1e6 + rng.normal(size=n),
+        )[i % 8]
+        assert info.info_bits(values) == _full_score(values, monkeypatch), (i, values)
 
 
 def test_fixture_inventory():
@@ -208,13 +237,14 @@ def test_values_bounded_but_score_uses_complete_segment(dtype):
 
 
 @pytest.mark.parametrize("n, expected", [(131074, 62), (65538, 60)])
-def test_long_piecewise_integer_boundaries(n, expected):
+def test_long_piecewise_integer_boundaries(n, expected, monkeypatch):
     # tau=1, q=0,...,0,1,...,200: exactly one nonzero second difference.
     # Piecewise = selector 3 + ceil(log2(n-1)) + ceil(log2 C(n-2,1))
     #             + (1+2)*ceil(log2(201)).
     # n=131074: 3+18+17+24=62; n=65538: 3+17+16+24=60.
     values = np.r_[np.zeros(n - 200), np.arange(1, 201)]
     score = info.info_bits(values)
+    assert score == _full_score(values, monkeypatch)
     assert (score.bits, score.code) == (expected, "piecewise_linear")
     record = _record(score.bits)
     info.finish_identification({"windows": {"exact": 2**17}}, [record], {"exact": 2**24})
@@ -277,8 +307,25 @@ def test_exact_kt_against_independent_fraction_products():
                 power *= 2
                 ceiling += 1
             assert info._kt_bits(transitions) == ceiling
+            for limit in (-1, 0, ceiling - 1, ceiling, ceiling + 1):
+                proved = info._kt_exceeds_bound(transitions, limit)
+                if proved:
+                    assert ceiling > limit
+                if transitions.sum() <= info._KT_BOUND_FACTORS:
+                    assert proved == (ceiling > limit)
     assert info._ratio_bits(8, 2) == 2
     assert info._ratio_bits(9, 2) == 3
+
+
+def test_kt_bound_strict_power_of_two_and_factor_cap(monkeypatch):
+    transitions = np.array([[1, 0], [0, 0]])  # inverse probability = 2 * 2 = 4
+    assert info._kt_exceeds_bound(transitions, 1)
+    assert not info._kt_exceeds_bound(transitions, 2)
+    # The same proof cannot conclude after zero factors: use the exact fallback.
+    monkeypatch.setattr(info, "_KT_BOUND_FACTORS", 0)
+    assert not info._kt_exceeds_bound(transitions, 1)
+    values = [0, 1, 1, 1, 1, 1]
+    assert info.info_bits(values) == _full_score(values, monkeypatch)
 
 
 def _brute_period(q):
@@ -310,7 +357,24 @@ def test_long_aperiodic_both_sides_cost():
     scores = [info.info_bits(v) for v in (values, 2 * values + 1)]
     elapsed = perf_counter() - started
     assert all(s.code == "enumerative" and s.bits > 0 for s in scores)
-    assert elapsed < 1.0, f"two 100,000-point scores took {elapsed:.3f}s"
+    assert elapsed < COST_BOUND_S, f"two 100,000-point scores took {elapsed:.3f}s"
+
+
+@pytest.mark.parametrize("levels, bits", [(200, 108), (201, 61)])
+def test_long_skewed_both_sides_cost(levels, bits, monkeypatch):
+    values = np.r_[np.zeros(100001 - levels), np.arange(1, levels)]
+
+    def forbidden(transitions):
+        pytest.fail("provably losing KT code reached the factorial path")
+
+    monkeypatch.setattr(info, "_kt_bits", forbidden)
+    started = perf_counter()
+    # Both actual sides of the accepted identity copy from the review.
+    scores = [info.info_bits(v) for v in (values, values.copy())]
+    elapsed = perf_counter() - started
+    assert all((s.bits, s.code, s.levels) == (bits, "piecewise_linear", levels) for s in scores)
+    assert elapsed < COST_BOUND_S, f"two {levels}-level 100,000-point scores took {elapsed:.3f}s"
+    assert match.fit_segment(values, values, 0, len(values), 0)["is_copy"]
 
 
 @pytest.mark.parametrize(
@@ -323,6 +387,34 @@ def test_long_aperiodic_both_sides_cost():
 def test_code_tie_order(values, bits, code):
     score = info.info_bits(values)
     assert (score.bits, score.code) == (bits, code)
+
+
+@pytest.mark.parametrize(
+    "values, bits, code, tied_code",
+    [
+        ([0, 1, 1, 1, 1, 1], 11, "kt_markov", None),
+        ([0, 1, 1, 1, 1], 11, "enumerative", "kt_markov"),
+        ([0, 0, 0.02, 0.01, 0.01, 0.02, 0.01, 0.02], 21, "kt_markov", "digital_line"),
+    ],
+)
+def test_lazy_kt_winner_and_ties_use_full_evaluation(values, bits, code, tied_code, monkeypatch):
+    original = info._kt_bits
+    calls = []
+
+    def full_kt(transitions):
+        calls.append(True)
+        return original(transitions)
+
+    monkeypatch.setattr(info, "_kt_bits", full_kt)
+    score = info.info_bits(values)
+    assert calls == [True]  # Neither a KT win nor a tie may be pruned.
+    assert (score.bits, score.code) == (bits, code)
+    assert score == _full_score(values, monkeypatch)
+    if tied_code is not None:
+        # Removing the preferred code exposes its equal-cost competitor.
+        monkeypatch.setattr(info, "_CODE_ORDER", tuple(c for c in info._CODE_ORDER if c != code))
+        tied = info.info_bits(values)
+        assert (tied.bits, tied.code) == (bits, tied_code)
 
 
 def test_documented_six_code_tie_order():

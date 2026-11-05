@@ -818,7 +818,17 @@ def _resume_result(job):
             and all(key in report for key in required)
             and isinstance(report["info"], dict)
             and all(
-                record.get("identification") in audit_info.STATUSES for record in report["copies"]
+                key in report["info"]
+                for key in ("version", "margin_bits", "target_windows", "index_windows")
+            )
+            and isinstance(report["copies"], list)
+            and all(
+                isinstance(record, dict)
+                and record.get("identification") in audit_info.STATUSES
+                and type(record.get("info_bits_target")) is int
+                and type(record.get("info_bits_index")) is int
+                and type(record.get("info_strict_ramp")) is bool
+                for record in report["copies"]
             )
         ):
             return report
