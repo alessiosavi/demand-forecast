@@ -123,3 +123,71 @@ def test_preparation_reuses_builder_across_chunks_matches_reference(validation_c
         )
     expected = reference_evaluate(model, panel, items, origin, horizon, context, encoder, quantiles)
     np.testing.assert_equal(evaluation.evaluate_prepared(model, prepared, quantiles), expected)
+
+
+@pytest.mark.parametrize("error_type", [RuntimeError, torch.cuda.OutOfMemoryError])
+def test_validation_oom_backoff_preserves_outputs_and_limit(
+    validation_case, monkeypatch, caplog, error_type
+):
+    model, quantiles, args = validation_case
+    panel, _, origin, horizon, context, encoder = args
+    items = np.tile([2, 0, 1], 22)  # 66 rows: two full batches and a tail
+    prepared = evaluation.prepare_validation(
+        panel, items, origin, horizon, context, encoder, batch_size=32
+    )
+    calls = []
+    threshold = 100
+
+    def predict(batch):
+        calls.append(batch.size)
+        if batch.size > threshold:
+            raise error_type("out of memory")
+        return batch.series_index[:, None, None].float().expand(-1, horizon, len(quantiles))
+
+    monkeypatch.setattr(model, "predict", predict)
+    expected = evaluation.evaluate_prepared(model, prepared, quantiles)
+    calls.clear()
+    threshold = 8
+    cache_calls = []
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: cache_calls.append(True))
+    actual = evaluation.evaluate_prepared(model, prepared, quantiles)
+    np.testing.assert_equal(actual, expected)
+    assert calls == [32, 16, *([8] * 8), 2]
+    assert len(cache_calls) == 2
+    assert caplog.text.count("Inference OOM: reducing") == 2
+    calls.clear()
+    np.testing.assert_equal(evaluation.evaluate_prepared(model, prepared, quantiles), expected)
+    assert calls == [*([8] * 8), 2]
+    assert model.training
+
+
+def test_validation_oom_floor_propagates(validation_case, monkeypatch):
+    model, quantiles, args = validation_case
+    panel, _, origin, horizon, context, encoder = args
+    prepared = evaluation.prepare_validation(
+        panel, np.zeros(32, dtype=int), origin, horizon, context, encoder
+    )
+    calls = []
+
+    def fail(batch):
+        calls.append(batch.size)
+        raise RuntimeError("CUDA out of memory")
+
+    monkeypatch.setattr(model, "predict", fail)
+    with pytest.raises(RuntimeError, match="out of memory"):
+        evaluation.evaluate_prepared(model, prepared, quantiles)
+    assert calls == [32, 16, 8]
+    assert model.training
+
+
+def test_batch_limits_are_shared_only_within_task():
+    from demand_forecast.core.inference_batching import batch_limit, task_batch_limits
+
+    with task_batch_limits():
+        first = batch_limit("validation")
+        first.size = 8
+        assert batch_limit("validation").size == 8
+        assert batch_limit("prediction").size is None
+    with task_batch_limits():
+        assert batch_limit("validation").size is None
+    assert batch_limit("validation").size is None

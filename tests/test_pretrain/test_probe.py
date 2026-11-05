@@ -398,3 +398,28 @@ def test_task_probe_honours_validation_scale_floor(tmp_path, monkeypatch):
     assert len(expected) == 6
     assert min(expected) > 100  # The unfloored seasonal scale is exactly 1.
     np.testing.assert_allclose(np.concatenate(scales), expected)
+
+
+def test_multitarget_task_probe_reaches_inference(tmp_path, monkeypatch):
+    from demand_forecast.inference.predictor import Predictor
+    from demand_forecast.pretrain.probe import task_probe
+    from tests.helpers.settings import tiny_settings
+    from tests.test_bench.test_fev100 import multivariate_spec
+
+    original = Predictor.forecast_per_item_origins
+    seen = []
+
+    def capture(self, panel, origins, **kwargs):
+        assert set(origins) == {series.series_id for series in panel.series}
+        ids, arrays, diag = original(self, panel, origins, **kwargs)
+        seen.append(arrays)
+        return ids, arrays, diag
+
+    monkeypatch.setattr(Predictor, "forecast_per_item_origins", capture)
+    spec = multivariate_spec(tmp_path)
+    reports = task_probe(
+        [spec], tiny_settings(base_steps=2, d_model=8), steps=2, out=tmp_path / "out", max_series=2
+    )
+    assert len(seen) == 1 and seen[0].shape == (4, spec.horizon, 9)
+    assert np.isfinite(seen[0]).all()
+    assert reports[spec.name]["infer_s"] > 0

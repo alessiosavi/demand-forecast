@@ -114,13 +114,13 @@ solar_1W:
   target_support: nonnegative
   categorical_statics: []
 kdd_cup_2022_10T:
-  target_support: nonnegative
+  target_support: real
   categorical_statics: []
 kdd_cup_2022_30T:
-  target_support: nonnegative
+  target_support: real
   categorical_statics: []
 kdd_cup_2022_1D:
-  target_support: nonnegative
+  target_support: real
   categorical_statics: []
 uci_air_quality_1H:
   target_support: nonnegative
@@ -165,44 +165,16 @@ hospital_admissions_1D:
   target_support: nonnegative
   categorical_statics: []
 ETT_1W:
-  target_support:
-    HUFL: nonnegative
-    HULL: nonnegative
-    MUFL: nonnegative
-    MULL: nonnegative
-    LUFL: nonnegative
-    LULL: nonnegative
-    OT: real
+  target_support: real
   categorical_statics: []
 ETT_1D:
-  target_support:
-    HUFL: nonnegative
-    HULL: nonnegative
-    MUFL: nonnegative
-    MULL: nonnegative
-    LUFL: nonnegative
-    LULL: nonnegative
-    OT: real
+  target_support: real
   categorical_statics: []
 ETT_1H:
-  target_support:
-    HUFL: nonnegative
-    HULL: nonnegative
-    MUFL: nonnegative
-    MULL: nonnegative
-    LUFL: nonnegative
-    LULL: nonnegative
-    OT: real
+  target_support: real
   categorical_statics: []
 ETT_15T:
-  target_support:
-    HUFL: nonnegative
-    HULL: nonnegative
-    MUFL: nonnegative
-    MULL: nonnegative
-    LUFL: nonnegative
-    LULL: nonnegative
-    OT: real
+  target_support: real
   categorical_statics: []
 hospital:
   target_support: nonnegative
@@ -430,13 +402,13 @@ fred_qd_2025/macro:
     VIXCLSx: real
   categorical_statics: []
 us_consumption_1M:
-  target_support: nonnegative
+  target_support: real
   categorical_statics: []
 us_consumption_1Q:
-  target_support: nonnegative
+  target_support: real
   categorical_statics: []
 us_consumption_1Y:
-  target_support: nonnegative
+  target_support: real
   categorical_statics: []
 gvar:
   target_support: real

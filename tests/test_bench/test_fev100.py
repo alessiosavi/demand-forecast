@@ -405,3 +405,259 @@ def test_multitarget_identity_includes_target_selection(tmp_path):
         for spec in [base, changed]
     ]
     assert identities[0] != identities[1]
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "ETT_1W",
+        "ETT_1D",
+        "ETT_1H",
+        "ETT_15T",
+        "kdd_cup_2022_10T",
+        "kdd_cup_2022_30T",
+        "kdd_cup_2022_1D",
+        "us_consumption_1M",
+        "us_consumption_1Q",
+        "us_consumption_1Y",
+    ],
+)
+def test_signed_or_unverified_profiles_are_real(name):
+    assert load_task_specs(name)[0].target_support == "real"
+
+
+@pytest.mark.parametrize("policy", ["first_window", "per_window"])
+@pytest.mark.parametrize("artifact", ["complete", "checkpoint"])
+def test_journal_cannot_bypass_identity(tmp_path, policy, artifact):
+    spec = fixture_spec(write_fev_fixture(tmp_path))
+    settings = tiny_settings(base_steps=3, d_model=8)
+    out = tmp_path / "out"
+    if artifact == "checkpoint":
+        with pytest.raises(InterruptedRun):
+            run_fev([spec], settings, out, policy=policy, stop_after=1)
+    else:
+        run_fev([spec], settings, out, policy=policy)
+    task_dir = out / spec.name
+    before = {p.relative_to(task_dir): p.read_bytes() for p in task_dir.rglob("*") if p.is_file()}
+    settings.seed += 1
+    for _ in range(2):
+        result = run_fev([spec], settings, out, policy=policy, resume=True, keep_going=True)
+        assert result.attrs["failed_tasks"] == [spec.name]
+        failure = json.loads((out / "failures.json").read_text())[spec.name]
+        assert failure["run_identity"] and failure["restartable"] is False
+        assert "remove the task artifacts" in failure["message"]
+        assert before == {
+            p.relative_to(task_dir): p.read_bytes() for p in task_dir.rglob("*") if p.is_file()
+        }
+    for resume in (True, False):
+        with pytest.raises(ValueError, match="remove the task artifacts"):
+            run_fev([spec], settings, out, policy=policy, resume=resume)
+    import shutil
+
+    shutil.rmtree(task_dir)
+    result = run_fev([spec], settings, out, policy=policy, resume=True, keep_going=True)
+    assert not result.attrs["failed_tasks"]
+    assert json.loads((out / "failures.json").read_text()) == {}
+
+
+@pytest.mark.parametrize("policy", ["first_window", "per_window"])
+def test_interrupted_retry_resumes_new_checkpoint(tmp_path, monkeypatch, policy):
+    import torch
+
+    from demand_forecast.core import run
+
+    spec = fixture_spec(write_fev_fixture(tmp_path))
+    settings = tiny_settings(base_steps=4, d_model=8)
+    out = tmp_path / "out"
+    original = run.train_panel
+
+    def fail_after_checkpoint(*args, **kwargs):
+        kwargs["stop_after"] = 1
+        try:
+            original(*args, **kwargs)
+        except InterruptedRun:
+            raise RuntimeError("CUDA out of memory") from None
+
+    monkeypatch.setattr(run, "train_panel", fail_after_checkpoint)
+    run_fev([spec], settings, out, keep_going=True, policy=policy)
+    record = json.loads((out / "failures.json").read_text())[spec.name]
+    assert record["run_identity"] and record["restartable"]
+    monkeypatch.setattr(run, "train_panel", original)
+    with pytest.raises(InterruptedRun):
+        run_fev([spec], settings, out, keep_going=True, resume=True, stop_after=2, policy=policy)
+    record = json.loads((out / "failures.json").read_text())[spec.name]
+    assert record["state"] == "retry_started" and not record["reset_pending"]
+    training_dir = out / spec.name
+    if policy == "per_window":
+        training_dir /= "window_0"
+    assert torch.load(training_dir / "checkpoints/latest.pt", weights_only=False)["step"] == 2
+    seen = []
+
+    def observe(*args, **kwargs):
+        seen.append((kwargs["resume"], (args[3] / "checkpoints/latest.pt").exists()))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(run, "train_panel", observe)
+    result = run_fev([spec], settings, out, keep_going=True, resume=True, policy=policy)
+    assert seen[0] == (True, True)
+    assert not result.attrs["failed_tasks"]
+    report = json.loads((training_dir / "run.json").read_text())
+    assert report["resumed_from_step"] == 2
+    assert json.loads((out / "failures.json").read_text()) == {}
+
+
+def test_panel_negative_share_and_summary(tmp_path, capsys):
+    spec = multivariate_spec(tmp_path)
+    run_fev([spec], tiny_settings(), tmp_path / "out", panel_check=True)
+    output = capsys.readouterr().out
+    assert "negative_share=0.5" in output
+    assert "PANEL_SUMMARY ok=1 failed=0" in output
+
+
+def test_plan_uses_snapshot_without_loading_data(tmp_path, monkeypatch):
+    from demand_forecast.bench.specs import FevTaskSpec
+
+    def forbidden(*args):
+        raise AssertionError("plan must not load data")
+
+    monkeypatch.setattr(FevTaskSpec, "to_task", forbidden)
+    result = CliRunner().invoke(
+        app,
+        [
+            "fev",
+            "plan",
+            "--tasks",
+            "m5_1D,ETT_1H",
+            "--config",
+            str(ROOT / "configs/fev-v2-survey.yaml"),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "m5_1D,30490,1810,12000" in result.output
+    assert "ETT_1H,2,17420,500" in result.output
+
+
+@pytest.mark.parametrize("policy", ["first_window", "per_window"])
+def test_retry_verifies_artifacts_before_reset(tmp_path, policy):
+    spec = fixture_spec(write_fev_fixture(tmp_path))
+    settings = tiny_settings(base_steps=1, d_model=8)
+    out = tmp_path / "out"
+    run_fev([spec], settings, out, policy=policy)
+    task_dir = out / spec.name
+    first = task_dir if policy == "first_window" else task_dir / "window_0"
+    identity = json.loads((first / "run.json").read_text())["run_identity"]
+    # A matching journal cannot authorize discarding an incompatible later artifact.
+    (out / "failures.json").write_text(
+        json.dumps(
+            {
+                spec.name: {
+                    "run_identity": identity,
+                    "restartable": True,
+                    "state": "failed",
+                }
+            }
+        )
+    )
+    later = task_dir if policy == "first_window" else task_dir / "window_1"
+    report_path = later / "run.json"
+    report = json.loads(report_path.read_text())
+    report["run_identity"] = "another-experiment"
+    report_path.write_text(json.dumps(report))
+    before = {p.relative_to(task_dir): p.read_bytes() for p in task_dir.rglob("*") if p.is_file()}
+    result = run_fev([spec], settings, out, resume=True, keep_going=True, policy=policy)
+    assert result.attrs["failed_tasks"] == [spec.name]
+    assert not json.loads((out / "failures.json").read_text())[spec.name]["restartable"]
+    assert before == {
+        p.relative_to(task_dir): p.read_bytes() for p in task_dir.rglob("*") if p.is_file()
+    }
+
+
+def test_journal_restart_requires_keep_going(tmp_path, monkeypatch):
+    from demand_forecast.core import run
+
+    spec = fixture_spec(write_fev_fixture(tmp_path))
+    settings = tiny_settings(base_steps=3, d_model=8)
+    out = tmp_path / "out"
+    with pytest.raises(InterruptedRun):
+        run_fev([spec], settings, out, stop_after=1)
+    import torch
+
+    checkpoint = out / spec.name / "checkpoints/latest.pt"
+    identity = torch.load(checkpoint, weights_only=False)["run_identity"]
+    (out / "failures.json").write_text(
+        json.dumps(
+            {
+                spec.name: {
+                    "run_identity": identity,
+                    "restartable": True,
+                    "state": "failed",
+                }
+            }
+        )
+    )
+    original = run.train_panel
+    seen = []
+
+    def observe(*args, **kwargs):
+        seen.append(kwargs["resume"] and checkpoint.exists())
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(run, "train_panel", observe)
+    run_fev([spec], settings, out, resume=True)
+    assert all(seen)
+    assert json.loads((out / spec.name / "run.json").read_text())["resumed_from_step"] == 1
+
+
+def test_retry_survives_kill_during_reset(tmp_path, monkeypatch):
+    import shutil
+
+    import torch
+
+    spec = fixture_spec(write_fev_fixture(tmp_path))
+    settings = tiny_settings(base_steps=3, d_model=8)
+    out = tmp_path / "out"
+    with pytest.raises(InterruptedRun):
+        run_fev([spec], settings, out, stop_after=1)
+    identity = torch.load(out / spec.name / "checkpoints/latest.pt", weights_only=False)[
+        "run_identity"
+    ]
+    journal = out / "failures.json"
+    journal.write_text(
+        json.dumps(
+            {
+                spec.name: {
+                    "run_identity": identity,
+                    "restartable": True,
+                    "state": "failed",
+                }
+            }
+        )
+    )
+    original = shutil.rmtree
+
+    def kill_after_removal(path, *args, **kwargs):
+        original(path, *args, **kwargs)
+        if Path(path) == out / spec.name:
+            raise KeyboardInterrupt()
+
+    monkeypatch.setattr(shutil, "rmtree", kill_after_removal)
+    with pytest.raises(KeyboardInterrupt):
+        run_fev([spec], settings, out, resume=True, keep_going=True)
+    assert json.loads(journal.read_text())[spec.name]["reset_pending"]
+    monkeypatch.setattr(shutil, "rmtree", original)
+    result = run_fev([spec], settings, out, resume=True, keep_going=True)
+    assert not result.attrs["failed_tasks"]
+    assert json.loads(journal.read_text()) == {}
+
+
+def test_task_logs_resolved_budget(tmp_path, caplog):
+    import logging
+
+    caplog.set_level(logging.INFO)
+    spec = fixture_spec(write_fev_fixture(tmp_path))
+    result = run_fev([spec], tiny_settings(base_steps=2, d_model=8), tmp_path / "out")
+    row = result.iloc[0]
+    assert (
+        f"training budget: task=fixture items={int(row.n_fit_ids)} max_steps={int(row.resolved_max_steps)}"
+        in caplog.text
+    )

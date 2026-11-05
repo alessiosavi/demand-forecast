@@ -574,3 +574,58 @@ def test_predictor_reuses_builder_across_chunks_matches_reference(
         if guarded:
             assert counters[field] > 0
     np.testing.assert_array_equal(actual, np.concatenate(expected))
+
+
+@pytest.mark.parametrize("error_type", [RuntimeError, torch.cuda.OutOfMemoryError])
+def test_prediction_oom_backoff_preserves_outputs_and_diagnostics(
+    bundle_and_panel, monkeypatch, caplog, error_type
+):
+    predictor, panel, origin = bundle_and_panel
+    panel = replace(
+        panel, series=[replace(panel.series[i % 3], series_id=str(i)) for i in range(66)]
+    )
+    cfg = predictor.bundle.forecast_cfg
+    predictor.bundle.forecast_cfg.scale_floor_frac = 0.9
+    calls = []
+    threshold = 100
+
+    def predict(batch):
+        calls.append(batch.size)
+        if batch.size > threshold:
+            raise error_type("out of memory")
+        return batch.loc[:, None, None].expand(-1, cfg.horizon, len(cfg.quantiles))
+
+    monkeypatch.setattr(predictor.bundle.model, "predict", predict)
+    ids, expected, expected_diag = predictor.forecast_with_diagnostics(panel, origin, batch_size=32)
+    calls.clear()
+    threshold = 8
+    cache_calls = []
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: cache_calls.append(True))
+    actual_ids, actual, diag = predictor.forecast_with_diagnostics(panel, origin, batch_size=32)
+    assert actual_ids == ids
+    np.testing.assert_array_equal(actual, expected)
+    assert calls == [32, 16, *([8] * 8), 2]
+    assert len(cache_calls) == 2
+    assert caplog.text.count("Inference OOM: reducing") == 2
+    assert {k: v for k, v in diag.items() if k != "inference_time_s"} == {
+        k: v for k, v in expected_diag.items() if k != "inference_time_s"
+    }
+    calls.clear()
+    _, again, _ = predictor.forecast_per_item_origins(panel, {key: origin for key in ids})
+    np.testing.assert_array_equal(again, expected)
+    assert calls == [*([8] * 8), 2]
+
+
+def test_prediction_oom_floor_propagates(bundle_and_panel, monkeypatch):
+    predictor, panel, origin = bundle_and_panel
+    panel = replace(panel, series=[replace(panel.series[0], series_id=str(i)) for i in range(32)])
+    calls = []
+
+    def fail(batch):
+        calls.append(batch.size)
+        raise RuntimeError("out of memory")
+
+    monkeypatch.setattr(predictor.bundle.model, "predict", fail)
+    with pytest.raises(RuntimeError, match="out of memory"):
+        predictor.forecast_with_diagnostics(panel, origin)
+    assert calls == [32, 16, 8]

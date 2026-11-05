@@ -489,7 +489,7 @@ demand-forecast fev run --tasks fev100 \
 fev evaluation window, builds the model's panel, assembles seasonal-naive
 forecasts through the same item/target alignment function as model predictions,
 and calls fev's prediction validation and window metrics. Output contains
-`PANEL_OK <task> series=<n> max_len=<n> horizon=<h> freq=<f> targets=<k>` or
+`PANEL_OK <task> series=<n> max_len=<n> horizon=<h> freq=<f> targets=<k> negative_share=<fraction>` or
 `PANEL_FAIL <task> <error>`. It does not train. Loading a window still requires
 fev to load its underlying dataset; run the complete preflight on EC2, not the
 Mac. Preflight failures live in `panel_failures.json`, separately from training
@@ -502,10 +502,32 @@ before continuing. Keyboard interrupts and `--stop-after` still interrupt the
 run. The exit status is 0 if all selected tasks complete, 3 if selected tasks
 finish with failures. Without this flag, the first exception stops the run.
 Completed tasks keep their rows. `--resume` verifies saved identities/artifacts
-before skipping completed work. A task recorded as failed restarts from the
-initial seed/bundle, overwriting its partial artifacts; this also retries a
-terminal non-finite checkpoint. Success removes its failure record. Use one
-output directory per experiment; do not change settings while retrying it.
+before skipping completed work. The journal also stores the first-window run
+identity (which includes the whole task definition), restartability and retry state.
+Only `--resume --keep-going` restarts a matching runtime failure, including a
+terminal non-finite checkpoint. All saved artifact identities are checked before
+reset. Identity/artifact errors, unclassified validation errors and legacy records
+without identities require removing the task artifacts before retrying. A retry
+is marked started before reset; interrupted retries then resume their new
+checkpoints. The failure record remains until success. Use one output directory
+per experiment; do not change settings while retrying it.
+
+`PANEL_OK` reports `negative_share`, the fraction of finite target values below
+zero (NaN if none are finite). This diagnostic never changes target support.
+`--panel-check` ends with `PANEL_SUMMARY ok=<n> failed=<n>`.
+Training logs the resolved step budget and fit-item count before fitting.
+`demand-forecast fev plan --tasks fev100 --config configs/fev-v2-survey.yaml`
+lists snapshot item counts, median lengths and selection-budget estimates without
+loading rows. Estimates expand multi-target items; actual budgets use eligible
+fit IDs and can differ. Refit and per-window repetition add work.
+
+Validation and prediction keep their existing batches when they fit. On CUDA OOM
+(or a runtime error containing “out of memory”), they release the cache, halve
+the batch and retry the same rows down to a floor of eight. A failure at that
+floor propagates. Reduced limits persist only within that task, independently
+for validation and prediction. Training batches never back off. Slicing preserves
+input padding and item order; different batched kernels can still differ in the
+last floating-point bits after back-off. No-OOM runs retain their original path.
 
 The survey config copies the tuned refit-weekly recipe unchanged, including
 `training.refit: full`. Task metadata supplies horizon, quantiles, column roles
@@ -608,9 +630,9 @@ For reproducible dataset bytes, use the operator's pinned local/S3 mirror via
 | `solar_with_weather_1H` | nonnegative | Solar generation in physical units. |
 | `solar_1D` | nonnegative | Solar generation in physical units. |
 | `solar_1W` | nonnegative | Solar generation in physical units. |
-| `kdd_cup_2022_10T` | nonnegative | Wind turbine active power generation. |
-| `kdd_cup_2022_30T` | nonnegative | Wind turbine active power generation. |
-| `kdd_cup_2022_1D` | nonnegative | Wind turbine active power generation. |
+| `kdd_cup_2022_10T` | real | Net active power can be negative when the turbine consumes. |
+| `kdd_cup_2022_30T` | real | Net active power can be negative when the turbine consumes. |
+| `kdd_cup_2022_1D` | real | Net active power can be negative when the turbine consumes. |
 | `uci_air_quality_1H` | nonnegative | Pollutant concentrations in physical units. |
 | `uci_air_quality_1D` | nonnegative | Pollutant concentrations in physical units. |
 | `LOOP_SEATTLE_5T` | nonnegative | Traffic volumes. |
@@ -625,10 +647,10 @@ For reproducible dataset bytes, use the operator's pinned local/S3 mirror via
 | `redset_1H` | real | Unspecified workload measurement; conservatively real. |
 | `hospital_admissions_1D` | nonnegative | Admissions or patient counts. |
 | `hospital_admissions_1W` | nonnegative | Admissions or patient counts. |
-| `ETT_1W` | nonnegative: HUFL, HULL, MUFL, MULL, LUFL, LULL; real: OT | OT is temperature (real); other targets are transformer loads in physical units. |
-| `ETT_1D` | nonnegative: HUFL, HULL, MUFL, MULL, LUFL, LULL; real: OT | OT is temperature (real); other targets are transformer loads in physical units. |
-| `ETT_1H` | nonnegative: HUFL, HULL, MUFL, MULL, LUFL, LULL; real: OT | OT is temperature (real); other targets are transformer loads in physical units. |
-| `ETT_15T` | nonnegative: HUFL, HULL, MUFL, MULL, LUFL, LULL; real: OT | OT is temperature (real); other targets are transformer loads in physical units. |
+| `ETT_1W` | real | Temperature and signed useful/useless transformer load components. |
+| `ETT_1D` | real | Temperature and signed useful/useless transformer load components. |
+| `ETT_1H` | real | Temperature and signed useful/useless transformer load components. |
+| `ETT_15T` | real | Temperature and signed useful/useless transformer load components. |
 | `hospital` | nonnegative | Admissions or patient counts. |
 | `jena_weather_10T` | real | Anonymized weather channels include temperatures; conservatively all real. |
 | `jena_weather_1D` | real | Anonymized weather channels include temperatures; conservatively all real. |
@@ -669,7 +691,7 @@ For reproducible dataset bytes, use the operator's pinned local/S3 mirror via
 | `fred_qd_2025/cee` | nonnegative: PAYEMS; real: CPIAUCSL, FEDFUNDS | Employment/housing counts nonnegative; indices, rates and uncertain macro quantities real. |
 | `fred_md_2025/macro` | nonnegative: UEMPLT5, UEMP5TO14, UEMP15T26, UEMP27OV, PAYEMS, USGOOD, USCONS, MANEMP, DMANEMP, NDMANEMP, SRVPRD, USTPU, USTRADE, USFIRE, USGOVT, HOUST, PERMIT; real: INDPRO, IPFINAL, IPCONGD, IPDCONGD, IPNCONGD, IPBUSEQ, IPMAT, IPDMAT, IPNMAT, IPMANSICS, CUMFNS, UNRATE, UEMPMEAN, AWHMAN, BUSINVx, M2REAL, TOTRESNS, NONBORRES, S&P 500, FEDFUNDS, TB3MS, TB6MS, GS1, GS5, GS10, AAA, BAA, EXUSUKx, PPICMM, CPIAUCSL, CPIMEDSL, UMCSENTx, INVEST, VIXCLSx | Employment/housing counts nonnegative; indices, rates and uncertain macro quantities real. |
 | `fred_qd_2025/macro` | nonnegative: UEMPLT5, UEMP5TO14, UEMP15T26, UEMP27OV, PAYEMS, USGOOD, USCONS, MANEMP, DMANEMP, NDMANEMP, SRVPRD, USTPU, USTRADE, USFIRE, USGOVT, HOUST, PERMIT; real: INDPRO, IPFINAL, IPCONGD, IPDCONGD, IPNCONGD, IPBUSEQ, IPMAT, IPDMAT, IPNMAT, IPMANSICS, CUMFNS, UNRATE, UEMPMEAN, AWHMAN, BUSINVx, M2REAL, TOTRESNS, NONBORRES, S&P 500, FEDFUNDS, TB3MS, TB6MS, GS1, GS5, GS10, AAA, BAA, EXUSUKx, PPICMM, CPIAUCSL, CPIMEDSL, UMCSENTx, INVEST, VIXCLSx | Employment/housing counts nonnegative; indices, rates and uncertain macro quantities real. |
-| `us_consumption_1M` | nonnegative | Consumption expenditure levels. |
-| `us_consumption_1Q` | nonnegative | Consumption expenditure levels. |
-| `us_consumption_1Y` | nonnegative | Consumption expenditure levels. |
+| `us_consumption_1M` | real | Level versus growth representation is unverified; real when in doubt. |
+| `us_consumption_1Q` | real | Level versus growth representation is unverified; real when in doubt. |
+| `us_consumption_1Y` | real | Level versus growth representation is unverified; real when in doubt. |
 | `gvar` | real | Macro variables include rates and transformed indices; conservatively all real. |

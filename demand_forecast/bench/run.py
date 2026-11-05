@@ -4,7 +4,7 @@ import hashlib
 import json
 import logging
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Literal
@@ -74,6 +74,20 @@ def window_origins(
             raise ValueError(f"empty future rows for item {key}")
         origins[key] = pd.Timestamp(row[timestamp_column][0])
     return origins
+
+
+def expanded_window_origins(future_data, spec: FevTaskSpec) -> dict[str, pd.Timestamp]:
+    """Use the same item/target identities as the fev panel loader."""
+    from demand_forecast.data.loader_fev import target_series_id
+
+    origins = window_origins(future_data, spec.id_column, spec.timestamp_column)
+    if isinstance(spec.target, str):
+        return origins
+    return {
+        target_series_id(key, target): origin
+        for target in spec.targets
+        for key, origin in origins.items()
+    }
 
 
 def resolved_origin(origins: Mapping[str, pd.Timestamp]) -> pd.Timestamp:
@@ -151,6 +165,7 @@ def _run_fev_tasks(
     resume: bool = False,
     model_name: str | None = None,
     stop_after: int | None = None,
+    before_task: Callable | None = None,
 ) -> pd.DataFrame:
     """Train once per task or once per window, and replace summary rows.
 
@@ -171,7 +186,7 @@ def _run_fev_tasks(
     """
     from demand_forecast import __version__
     from demand_forecast.core.run import resolve_device, run_identity, train_panel
-    from demand_forecast.data.loader_fev import panel_from_window, target_series_id
+    from demand_forecast.data.loader_fev import panel_from_window
     from demand_forecast.inference.predictor import Predictor
 
     if policy not in {"first_window", "per_window"}:
@@ -212,13 +227,7 @@ def _run_fev_tasks(
                 len(panel.series),
                 time.perf_counter() - started,
             )
-            origins = window_origins(future, spec.id_column, spec.timestamp_column)
-            if isinstance(spec.target, list):
-                origins = {
-                    target_series_id(key, target): origin
-                    for target in spec.targets
-                    for key, origin in origins.items()
-                }
+            origins = expanded_window_origins(future, spec)
             origin = resolved_origin(origins)
             earliest = min(origins.values())
             n_origins = len(set(origins.values()))
@@ -245,6 +254,9 @@ def _run_fev_tasks(
                     policy=policy,
                 )
                 logger.info("identity: task=%s %s", spec.name, identity)
+                if index == 0 and before_task is not None:
+                    resume = before_task(spec, task, task_settings, fp, identity)
+                    all_reused = resume
                 if resume:
                     # Check even later windows before doing any training or inference.
                     paths = (
@@ -503,6 +515,11 @@ def check_panel(spec: FevTaskSpec) -> None:
         tail = values[-period:]
         forecast = np.resize(tail, spec.horizon)
         arrays[index] = forecast[:, None]
+    finite = sum(np.isfinite(series.target).sum() for series in panel.series)
+    negative = sum(
+        ((series.target < 0) & np.isfinite(series.target)).sum() for series in panel.series
+    )
+    negative_share = negative / finite if finite else float("nan")
     predictions = assemble_predictions(spec, past, item_ids(panel), arrays)
     cleaned = task.clean_and_validate_predictions(predictions)
     window.compute_metrics(
@@ -514,7 +531,8 @@ def check_panel(spec: FevTaskSpec) -> None:
     print(
         f"PANEL_OK {spec.name} series={len(panel.series)} "
         f"max_len={max(s.history_length for s in panel.series)} "
-        f"horizon={spec.horizon} freq={task.freq} targets={len(spec.targets)}",
+        f"horizon={spec.horizon} freq={task.freq} targets={len(spec.targets)} "
+        f"negative_share={negative_share:.8g}",
         flush=True,
     )
 
@@ -531,6 +549,64 @@ def _save_failures(path: Path, failures: dict) -> None:
             temporary.unlink(missing_ok=True)
 
 
+class ArtifactMismatchError(ValueError):
+    """A failed resume must never turn an incompatible artifact into a restart."""
+
+
+def _verify_retry_artifacts(task_dir, task, spec, settings, fingerprint, policy, first_identity):
+    """Check all windows before a journal-authorized reset can remove anything."""
+    import torch
+
+    from demand_forecast import __version__
+    from demand_forecast.core.run import run_identity
+
+    try:
+        for index in range(spec.num_windows):
+            identity = first_identity
+            past = None
+            if policy == "per_window":
+                past, future = task.get_window(index).get_input_data()
+                identity = run_identity(
+                    settings,
+                    settings.seed,
+                    fingerprint,
+                    __version__,
+                    resolved_origin(expanded_window_origins(future, spec)),
+                    spec.task_definition(),
+                    policy=policy,
+                )
+            training_dir = task_dir if policy == "first_window" else task_dir / f"window_{index}"
+            if index == 0 or policy == "per_window":
+                for name in (
+                    "run.json",
+                    "bundle/manifest.json",
+                    "checkpoints/selection.json",
+                    "checkpoints/progress.json",
+                ):
+                    path = training_dir / name
+                    if (
+                        path.exists()
+                        and json.loads(path.read_text()).get("run_identity") != identity
+                    ):
+                        raise ValueError(f"run identity mismatch: {path}")
+                for path in (training_dir / "checkpoints").rglob("*.pt"):
+                    state = torch.load(path, map_location="cpu", weights_only=False)
+                    if state.get("run_identity") != identity:
+                        raise ValueError(f"run identity mismatch: {path}")
+                    del state
+            path = task_dir / f"window_{index}.npz"
+            if path.exists():
+                with np.load(path, allow_pickle=False) as saved:
+                    _check_prediction_identity(saved, identity)
+                    if past is None:
+                        past, _ = task.get_window(index).get_input_data()
+                    task.clean_and_validate_predictions(
+                        assemble_predictions(spec, past, saved["ids"].tolist(), saved["arrays"])
+                    )
+    except Exception as exc:
+        raise ArtifactMismatchError(f"identity/artifact mismatch: {exc}") from exc
+
+
 def run_fev(
     specs: Iterable[FevTaskSpec],
     settings: Settings,
@@ -545,16 +621,18 @@ def run_fev(
 ) -> pd.DataFrame:
     """Isolate task failures, preserving completed rows and retrying recorded failures.
 
-    Failure records belong to the output directory. Reuse that directory only for
-    the same experiment. A recorded failed task restarts from scratch on resume;
-    successful tasks retain the strict artifact/identity verification path.
+    Only matching, restartable failures can restart under resume + keep-going.
+    A retry intent is journaled before reset; interrupted retries then resume
+    their new checkpoints. Incompatible artifacts require an operator reset.
     """
     import gc
+    import shutil
     import traceback
     from datetime import datetime, timezone
 
     import torch
 
+    from demand_forecast.core.inference_batching import task_batch_limits
     from demand_forecast.core.training import InterruptedRun
 
     if policy not in {"first_window", "per_window"}:
@@ -565,28 +643,82 @@ def run_fev(
     failure_path = out_dir / ("panel_failures.json" if panel_check else "failures.json")
     failures = json.loads(failure_path.read_text()) if failure_path.exists() else {}
     failed = []
+    succeeded = 0
     for spec in specs:
+        current_identity = None
+
+        def before_task(spec, task, task_settings, fingerprint, identity):
+            nonlocal current_identity
+            # The first-window identity identifies the whole invocation: it includes
+            # settings, data fingerprint, full task definition and window policy.
+            current_identity = identity
+            previous = failures.get(spec.name)
+            task_dir = out_dir / spec.name
+            artifacts_exist = task_dir.exists() and any(task_dir.rglob("*"))
+            if previous is None:
+                return resume
+            if artifacts_exist and (
+                previous.get("run_identity") != identity or not previous.get("restartable")
+            ):
+                raise ArtifactMismatchError("journal identity/artifact mismatch")
+            if not resume or not keep_going:
+                return resume
+            if (
+                previous.get("state") == "retry_started"
+                and not previous.get("reset_pending")
+                and previous.get("run_identity") == identity
+            ):
+                return True
+            if artifacts_exist:
+                _verify_retry_artifacts(
+                    task_dir, task, spec, task_settings, fingerprint, policy, identity
+                )
+            # A kill during reset is safe: reset_pending repeats the idempotent reset.
+            # Once cleared, every later resume uses the new checkpoint normally.
+            previous.update(
+                state="retry_started", reset_pending=True, run_identity=identity, restartable=True
+            )
+            _save_failures(failure_path, failures)
+            if task_dir.exists():
+                shutil.rmtree(task_dir)
+            previous["reset_pending"] = False
+            _save_failures(failure_path, failures)
+            return True
+
         try:
             if panel_check:
                 check_panel(spec)
             else:
-                _run_fev_tasks(
-                    [spec],
-                    settings,
-                    out_dir,
-                    policy=policy,
-                    resume=resume and spec.name not in failures,
-                    model_name=model_name,
-                    stop_after=stop_after,
-                )
+                with task_batch_limits():
+                    _run_fev_tasks(
+                        [spec],
+                        settings,
+                        out_dir,
+                        policy=policy,
+                        resume=resume,
+                        model_name=model_name,
+                        stop_after=stop_after,
+                        before_task=before_task,
+                    )
         except InterruptedRun:
             raise
         except Exception as exc:
+            if (
+                isinstance(exc, ValueError)
+                and "mismatch" in str(exc)
+                and (keep_going or isinstance(exc, ArtifactMismatchError))
+            ):
+                exc = ArtifactMismatchError(
+                    f"{exc}; remove the task artifacts at {out_dir / spec.name} "
+                    "before retrying this experiment"
+                )
             if panel_check:
                 message = " ".join(str(exc).splitlines())
                 print(f"PANEL_FAIL {spec.name} {type(exc).__name__}: {message}", flush=True)
             if not keep_going:
-                raise
+                if panel_check:
+                    print(f"PANEL_SUMMARY ok={succeeded} failed=1", flush=True)
+                raise exc
             logger.exception("Task %s failed", spec.name)
             failures[spec.name] = {
                 "task": spec.name,
@@ -594,10 +726,15 @@ def run_fev(
                 "message": str(exc),
                 "traceback": traceback.format_exc().splitlines()[-20:],
                 "utc_time": datetime.now(timezone.utc).isoformat(),
+                "run_identity": current_identity,
+                # Fail closed for data/artifact/validation errors and legacy journals.
+                "restartable": current_identity is not None and isinstance(exc, RuntimeError),
+                "state": "failed",
             }
             _save_failures(failure_path, failures)
             failed.append(spec.name)
         else:
+            succeeded += 1
             if spec.name in failures:
                 del failures[spec.name]
                 _save_failures(failure_path, failures)
@@ -605,6 +742,8 @@ def run_fev(
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+    if panel_check:
+        print(f"PANEL_SUMMARY ok={succeeded} failed={len(failed)}", flush=True)
     path = out_dir / "summaries.csv"
     result = (
         pd.read_csv(path, float_precision="round_trip")
