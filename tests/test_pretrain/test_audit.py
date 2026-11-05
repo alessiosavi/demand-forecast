@@ -292,9 +292,38 @@ def test_end_to_end_parallel_resume_and_declaration(local_audit, tmp_path, monke
     root, tasks = local_audit
     one, two = tmp_path / "one", tmp_path / "two"
     serial_progress, parallel_progress = [], []
-    first = audit.run_audit(root, one, tasks=tasks, workers=1, progress=serial_progress.append)
-    second = audit.run_audit(root, two, tasks=tasks, workers=2, progress=parallel_progress.append)
+
+    def track_release(out, messages):
+        released = []
+
+        def progress(line):
+            if line.startswith("Indexing "):
+                assert all(not path.exists() for path in released)
+            if line.startswith("Released "):
+                _, kind, cls, _ = line.split()
+                work = next(out.glob(".audit-work-*"))
+                path = work / kind / cls
+                assert not path.exists()
+                if out == one:
+                    assert audit._WORKER_INDEX is None
+                released.append(path)
+            messages.append(line)
+
+        return progress
+
+    first = audit.run_audit(
+        root, one, tasks=tasks, workers=1, progress=track_release(one, serial_progress)
+    )
+    monkeypatch.setattr(audit, "SCAN_CHUNK_ROWS", 1)
+    monkeypatch.setattr(audit, "SCAN_CHUNK_MIN_GROUPS", 1)
+    second = audit.run_audit(
+        root, two, tasks=tasks, workers=2, progress=track_release(two, parallel_progress)
+    )
+    assert {p.name: p.read_bytes() for p in (one / "scans").glob("*.json")} == {
+        p.name: p.read_bytes() for p in (two / "scans").glob("*.json")
+    }
     for report, messages in ((first, serial_progress), (second, parallel_progress)):
+        assert "Released chronos_real 1D index" in messages
         completed = [line for line in messages if line.startswith("Scanned ")]
         assert len(completed) == report["summary"]["column_scans"]
         expected_labels = sorted(
@@ -358,9 +387,16 @@ def test_end_to_end_parallel_resume_and_declaration(local_audit, tmp_path, monke
     monkeypatch.setattr(
         audit, "load_task_dataset", Mock(side_effect=AssertionError("resume reloaded a dataset"))
     )
+    resume_progress = []
     resumed = audit.run_audit(
-        root, one, tasks=tasks, workers=1, resume=True, progress=lambda _: None
+        root,
+        one,
+        tasks=tasks,
+        workers=1,
+        resume=True,
+        progress=track_release(one, resume_progress),
     )
+    assert "Released chronos_real 1D index" in resume_progress
     assert resumed["copies"] == first["copies"]
     assert mtimes == {p: p.stat().st_mtime_ns for p in mtimes}
 
@@ -382,6 +418,68 @@ def test_uncapped_postpass_and_oversize_guard(monkeypatch):
     c = match.scan("test", "target", [x], index, {}, [], [])
     assert c["unresolved_rows"] == c["fallback_oversize_rows"] == 1
     assert c["unresolved_ids"] == [0]
+
+
+def test_parallel_multiple_chunks_and_whole_jobs_match_serial(local_audit, tmp_path, monkeypatch):
+    import pyarrow.parquet as pq
+
+    root, tasks = local_audit
+    definitions = yaml.safe_load(tasks.read_text())
+    definitions["tasks"] = [t for t in definitions["tasks"] if t["task_name"] == "copies"]
+    tasks.write_text(yaml.safe_dump(definitions))
+    path = tmp_path / "copies.parquet"
+    rows = pq.read_table(path).to_pylist()
+    for shift in (10, 20, 30):
+        rows.append(
+            {
+                **rows[0],
+                "id": f"shift-{shift}",
+                "target": (np.asarray(rows[0]["target"]) + shift).tolist(),
+                "other_target": (np.asarray(rows[0]["other_target"]) + shift).tolist(),
+            }
+        )
+    _parquet(path, rows)
+    expected = None
+    submitted = []
+    executor = audit.ProcessPoolExecutor
+
+    def observed_pool(**kwargs):
+        assert kwargs["max_workers"] == 2
+        pool = executor(**kwargs)
+        submit = pool.submit
+
+        def observed_submit(fn, payload):
+            submitted.append((fn.__name__, len(payload.get("groups", []))))
+            return submit(fn, payload)
+
+        pool.submit = observed_submit
+        return pool
+
+    monkeypatch.setattr(audit, "ProcessPoolExecutor", observed_pool)
+    for label, workers, threshold, size in (
+        ("serial", 1, 1, 1),
+        ("whole", 2, 256, 32),
+        ("chunk1", 2, 1, 1),
+        ("chunk2", 2, 1, 2),
+        ("chunk_all", 2, 1, 32),
+    ):
+        monkeypatch.setattr(audit, "SCAN_CHUNK_ROWS", threshold)
+        monkeypatch.setattr(audit, "SCAN_CHUNK_MIN_GROUPS", size)
+        submitted.clear()
+        out = tmp_path / label
+        audit.run_audit(
+            root, out, tasks=tasks, kinds=["chronos_real"], workers=workers, progress=lambda _: None
+        )
+        scans = {p.name: p.read_bytes() for p in (out / "scans").glob("*.json")}
+        if expected is None:
+            expected = scans
+        assert scans == expected
+        if label.startswith("chunk"):
+            assert ("_chunk_job", min(size, 4)) in submitted
+        elif label == "whole":
+            assert all(name == "_timed_scan_job" for name, _ in submitted)
+        else:
+            assert not submitted
 
 
 def test_dedup_preserves_missingness_and_calendar():
@@ -463,7 +561,7 @@ def test_rejection_records_are_scan_local_and_target_records_uncapped(monkeypatc
     assert records == [] and c["rejection_records_omitted"] > 0
 
 
-def test_monthly_variants_preserve_calendar_and_original_row_ids(tmp_path):
+def test_monthly_variants_preserve_calendar_and_original_row_ids(tmp_path, monkeypatch):
     root = tmp_path / "corpus"
     rng = np.random.default_rng(0)
     daily = np.abs(rng.standard_normal(1400)).cumsum() + rng.standard_normal(1400) * 3
@@ -538,6 +636,19 @@ def test_monthly_variants_preserve_calendar_and_original_row_ids(tmp_path):
             p["benchmark_ids"] == ["long"] and p["series_indices"] == [1] for p in scan["copies"]
         )
     assert any(p["task"] == "monthly" and p["variant"] == "native" for p in report["copies"])
+    monkeypatch.setattr(audit, "SCAN_CHUNK_ROWS", 1)
+    monkeypatch.setattr(audit, "SCAN_CHUNK_MIN_GROUPS", 1)
+    audit.run_audit(
+        root,
+        tmp_path / "chunked",
+        tasks=tasks,
+        kinds=["chronos_real"],
+        workers=2,
+        progress=lambda _: None,
+    )
+    assert {p.name: p.read_bytes() for p in (tmp_path / "out/scans").glob("*.json")} == {
+        p.name: p.read_bytes() for p in (tmp_path / "chunked/scans").glob("*.json")
+    }
 
 
 def test_near_segments_are_retained_alongside_copied_prefixes():
