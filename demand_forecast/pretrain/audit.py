@@ -29,12 +29,13 @@ from demand_forecast.bench.specs import (
     fev_bench_tasks,
     fev_bench_tasks_path,
 )
+from demand_forecast.pretrain import audit_info
 from demand_forecast.pretrain import audit_match as match
 from demand_forecast.pretrain.corpus import CORPUS_KINDS, _sha256, read_manifest
 
 DEFAULT_KINDS = ("chronos_real", "gifteval_pretrain")
 FREQUENCY_CLASSES = ("15T", "30T", "1H", "1D", "1W", "1M", "1Q", "1Y")
-METHOD_VERSION = "run11-corpus-v1"
+METHOD_VERSION = "run12-corpus-v1"
 SCAN_CHUNK_ROWS = 256
 SCAN_CHUNK_MIN_GROUPS = 32
 SCAN_CHUNKS_PER_WORKER = 4
@@ -61,7 +62,8 @@ are scanned natively, as weekly sums at seven anchors, and as full calendar-mont
 sums and means. Byte-identical float64 rows (with canonical NaNs and matching
 calendar dimensions) are scanned once, with counters multiplied by group size.
 Copies and near pairs retain all notable segments and all duplicate row IDs;
-counters count pairs, while rejection counters count fits and reasons per side.
+existing copy counters count pairs, while rejection counters count fits and reasons
+per side. Identification counters count segment records without duplicate expansion.
 Target policy exclusions are retained in full; covariate rejection records use
 the run-11 per-reason and total record caps within each scan."""
 LIMITS = """Known limits of the matcher (specification §3b, accepted and not fixed further).
@@ -84,12 +86,88 @@ non-overlap. The information thresholds are policies chosen after inspecting
 chance matches, not independent evidence of provenance."""
 
 
+def identification_method():
+    """Machine-readable policy and measured sensitivity limits (memo §6)."""
+    return {
+        "method_version": METHOD_VERSION,
+        "info_version": audit_info.INFO_VERSION,
+        "margin_bits": audit_info.INFO_MARGIN_BITS,
+        "ramp_ulp_factor": audit_info.RAMP_ULP_FACTOR,
+        "meaning_and_limits": (
+            "An identifying match has min(target bits, corpus bits) >= "
+            "log2(max(1, target windows)) + log2(max(1, index windows)) + margin bits; "
+            "a strict numerical ramp on either side has status interpolation_ramp and score zero. "
+            "A low-information match is not identifiable as a copy, not proven unrelated, "
+            "and remains visible in audit.json. "
+            "This conditional description-length diagnostic is neither a probability nor a "
+            "provenance test, and an empty declaration does not prove absence of shared training data."
+        ),
+        "detection_limits": {
+            "local_positive_controls_identifying": 26,
+            "positive_controls": 26,
+            "production_search_bits": 56.84675,
+            "production_threshold_bits": 76.84675,
+            "production_positive_controls_identifying": 21,
+            "minimal_controls_low_information": {
+                "indexed_1100_times_shift+10_fallback": 48,
+                "three_levels_seven_runs_dof7_2x+1": 48,
+                "four_levels_eight_runs_1.1x+0.5": 64,
+                "five_level_staircase_five_runs_x2": 61,
+                "intermittent_4_nonzero_of_26_2x+1": 55,
+            },
+            "measured_prefixes": [
+                {
+                    "case": "sparse m5_1D row 16, start 0",
+                    "points": 80,
+                    "bits": 77,
+                    "threshold": 76.84675,
+                },
+                {
+                    "case": "smooth boomlet_1975 target_27, start 31",
+                    "points": 24,
+                    "bits": 62,
+                    "threshold": 60.75416,
+                },
+                {
+                    "case": "smooth boomlet_1975 target_27, start 31",
+                    "points": 40,
+                    "bits": 77,
+                    "threshold": 76.84675,
+                },
+            ],
+            "statement": (
+                "At margin 20, all 26 positive controls are identifying at their small local "
+                "search budgets; at search_bits=56.84675, five minimal controls become "
+                "low_information and 21 remain identifying. The measured sparse copy first "
+                "passes at 80 points (77 bits, threshold 76.84675); the smooth copy passes "
+                "at 24 points (62 bits, threshold 60.75416), or first at 40 points "
+                "(77 bits) at threshold 76.84675. These are row/start/map-specific "
+                "measurements, not universal detection lengths; longer prefixes need not "
+                "pass monotonically. There is no finite universal minimum for sparse or "
+                "smooth copies. These measurements use margin 20, regardless of the "
+                "configured margin of this scan."
+            ),
+        },
+    }
+
+
+def _identification_summary(task_names, copies):
+    summary = {
+        name: {role: dict.fromkeys(audit_info.STATUSES, 0) for role in ("target", "covariate")}
+        for name in sorted(task_names)
+    }
+    for record in copies:
+        summary[record["task"]][record["role"]][record["identification"]] += 1
+    return summary
+
+
 def constants() -> dict:
     """Record every named matcher parameter, including arithmetic thresholds."""
     return {
         name: value.item() if isinstance(value, np.generic) else value
-        for name, value in vars(match).items()
+        for name, value in {**vars(match), **vars(audit_info)}.items()
         if name.isupper()
+        and not name.startswith("_")
         and isinstance(value, (int, float, dict, np.generic))
         and name != "FAMILIES"
     }
@@ -484,6 +562,7 @@ def _scan_job(job):
     task, rows, dims, _, _ = _job_rows(job)
     pairs, rejections = [], []
     target = job["column"] in task.targets
+    info = {}
     counts = match.scan(
         task.name,
         job["column"],
@@ -494,11 +573,12 @@ def _scan_job(job):
         rejections,
         dims=dims,
         all_rejections=target,
+        scan_info=info,
     )
-    return _finish_job(job, counts, pairs, rejections, rows.metadata, index.series.rows)
+    return _finish_job(job, counts, pairs, rejections, rows.metadata, index.series.rows, info)
 
 
-def _finish_job(job, counts, pairs, rejections, rows_metadata, corpus_rows):
+def _finish_job(job, counts, pairs, rejections, rows_metadata, corpus_rows, info):
     """Enrich and publish a complete scan without accessing index arrays."""
     task = FevDatasetTask(**job["task"])
     target = job["column"] in task.targets
@@ -545,6 +625,7 @@ def _finish_job(job, counts, pairs, rejections, rows_metadata, corpus_rows):
         task=task.name,
         role="target" if target else "covariate",
         counts=counts,
+        info=info,
         copies=[p for p in pairs if p["is_copy"]],
         near_pairs=[p for p in pairs if not p["is_copy"]],
         rejections=rejections,
@@ -583,7 +664,7 @@ def _chunk_job(payload):
     ]
 
 
-def _finish_chunked_job(job, grouped, chunks, corpus_rows):
+def _finish_chunked_job(job, grouped, chunks, corpus_rows, index_windows):
     counts = match.new_cov()
     counts.update(
         unique_series=len(grouped["groups"]),
@@ -595,14 +676,17 @@ def _finish_chunked_job(job, grouped, chunks, corpus_rows):
         rejection_records_omitted=0,
     )
     pairs, rejections = [], []
+    info = {}
     match.finish_scan(
         counts,
         chain.from_iterable(chunks),
         pairs,
         rejections,
+        index_windows=index_windows,
+        scan_info=info,
         all_rejections=job["column"] in FevDatasetTask(**job["task"]).targets,
     )
-    return _finish_job(job, counts, pairs, rejections, grouped["rows_metadata"], corpus_rows)
+    return _finish_job(job, counts, pairs, rejections, grouped["rows_metadata"], corpus_rows, info)
 
 
 def _timed_scan_job(job):
@@ -628,7 +712,7 @@ def _order_pending(pending, metadata):
     )
 
 
-def _parallel_scan_jobs(pool, pending, metadata, corpus_rows, workers):
+def _parallel_scan_jobs(pool, pending, metadata, corpus_rows, workers, *, index_windows):
     """Overlap grouping, whole scans and chunks, merging each scan in row order."""
     task_rows = {item["task"]["name"]: item["rows"] for item in metadata}
     futures = {}
@@ -669,7 +753,9 @@ def _parallel_scan_jobs(pool, pending, metadata, corpus_rows, workers):
                     state["remaining"] -= 1
                 # Empty aggregate scans finish here without submitting any chunks.
                 if not state["remaining"]:
-                    path = _finish_chunked_job(job, state["grouped"], state["chunks"], corpus_rows)
+                    path = _finish_chunked_job(
+                        job, state["grouped"], state["chunks"], corpus_rows, index_windows
+                    )
                     yield job, path, time.monotonic() - state["started"]
     finally:
         for future in futures:
@@ -724,11 +810,26 @@ def _resume_result(job):
             "rejections",
             "policy_excluded_targets",
             "unresolved",
+            "info",
         )
         if (
             report["fingerprint"] == job["fingerprint"]
             and report["counts"]["unresolved_rows"] == 0
             and all(key in report for key in required)
+            and isinstance(report["info"], dict)
+            and all(
+                key in report["info"]
+                for key in ("version", "margin_bits", "target_windows", "index_windows")
+            )
+            and isinstance(report["copies"], list)
+            and all(
+                isinstance(record, dict)
+                and record.get("identification") in audit_info.STATUSES
+                and type(record.get("info_bits_target")) is int
+                and type(record.get("info_bits_index")) is int
+                and type(record.get("info_strict_ramp")) is bool
+                for record in report["copies"]
+            )
         ):
             return report
     except (OSError, ValueError, KeyError, TypeError):
@@ -807,7 +908,10 @@ def _run_audit(
     manifest_sha = _sha256(root / "manifest.json")
     tasks_sha = hashlib.sha256(fev_bench_tasks_path(tasks).read_bytes()).hexdigest()
     method_sha = _fingerprint(
-        {name: _sha256(Path(__file__).with_name(name)) for name in ("audit.py", "audit_match.py")}
+        {
+            name: _sha256(Path(__file__).with_name(name))
+            for name in ("audit.py", "audit_match.py", "audit_info.py")
+        }
     )
     from importlib.metadata import version
 
@@ -895,7 +999,14 @@ def _run_audit(
                     initargs=(str(store["path"]), True),
                 ) as pool:
                     with closing(
-                        _parallel_scan_jobs(pool, pending, metadata, corpus_rows, workers)
+                        _parallel_scan_jobs(
+                            pool,
+                            pending,
+                            metadata,
+                            corpus_rows,
+                            workers,
+                            index_windows=coverage["windows"],
+                        )
                     ) as results:
                         for job, path, elapsed in results:
                             scans.append(json.loads(Path(path).read_text()))
@@ -910,7 +1021,12 @@ def _run_audit(
     scans.sort(key=lambda item: item["scan_id"])
     copies = [copy for scan in scans for copy in scan["copies"]]
     near = [pair for scan in scans for pair in scan["near_pairs"]]
-    declaration = sorted({copy["task"] for copy in copies})
+    identifying = [copy for copy in copies if copy["identification"] == "identifying"]
+    declaration = sorted({copy["task"] for copy in identifying})
+    low_only = sorted({copy["task"] for copy in copies} - set(declaration))
+    identification_summary = _identification_summary(
+        (item["task"]["name"] for item in metadata), copies
+    )
     summary = match.new_cov()
     for scan in scans:
         # The driver adds counters absent from run 11's base table.
@@ -974,13 +1090,19 @@ def _run_audit(
         "near_pairs": near,
         "policy_excluded_targets": [r for scan in scans for r in scan["policy_excluded_targets"]],
         "trained_on_datasets": declaration,
+        "identification_summary": identification_summary,
+        "tasks_with_only_low_information_matches": low_only,
+        "identification_method": identification_method(),
     }
     _write_json(out / "audit.json", report)
     _write_json(
         out / "declaration.json",
         {
             "trained_on_datasets": declaration,
-            "copies": copies,
+            "copies": identifying,
+            "identification_summary": identification_summary,
+            "tasks_with_only_low_information_matches": low_only,
+            "method": identification_method(),
             "generated_at": report["generated_at"],
             "corpus_manifest_sha256": manifest_sha,
             "tasks_yaml_sha256": tasks_sha,
@@ -1018,11 +1140,51 @@ def _markdown(report):
             + cell(", ".join(row["folders"]))
             + " |"
         )
+    method = report["identification_method"]
+    lines += [
+        "",
+        "## Identification",
+        "",
+        method["meaning_and_limits"],
+        "",
+        "Counts below are segment records, split by role; the existing copy-pair counters "
+        "still expand duplicate rows. Search budgets use final target windows and all "
+        "index windows across the four families, before any posting caps.",
+        "",
+        "| Task | Role | Identifying | Low information | Interpolation ramp |",
+        "|---|---|---:|---:|---:|",
+    ]
+    for task, roles in report["identification_summary"].items():
+        for role, counts in roles.items():
+            lines.append(
+                "| "
+                + " | ".join(
+                    cell(v) for v in (task, role, *(counts[s] for s in audit_info.STATUSES))
+                )
+                + " |"
+            )
+    lines += [
+        "",
+        "Tasks with only low-information or interpolation-ramp matches:",
+        "",
+        "```json",
+        json.dumps(report["tasks_with_only_low_information_matches"], indent=2),
+        "```",
+        "",
+        method["detection_limits"]["statement"],
+        "",
+        "Minimal controls below the production threshold (best two-sided bits):",
+        "",
+    ]
+    lines.extend(
+        f"- `{name}`: {bits} bits"
+        for name, bits in method["detection_limits"]["minimal_controls_low_information"].items()
+    )
     lines += [
         "",
         "## Declaration",
         "",
-        "Use these exact task names in `trained_on_datasets`. A copy in any numeric",
+        "Use these exact task names in `trained_on_datasets`. An identifying copy in any numeric",
         "target or covariate column declares that task. This list is an empirical",
         "minimum; provenance may require additional declarations.",
         "",
@@ -1030,9 +1192,11 @@ def _markdown(report):
         json.dumps({"trained_on_datasets": report["trained_on_datasets"]}, indent=2),
         "```",
         "",
-        "`declaration.json` contains the complete copy records. `audit.json` contains",
+        "`declaration.json` contains the identifying copy records in full. `audit.json` contains",
         "every scan's coverage counters, copies, near pairs, policy exclusions,",
-        "unresolved row IDs, and input fingerprints. Duplicate rows retain every ID.",
+        "unresolved row IDs, and input fingerprints. Duplicate rows retain every ID. All identifying"
+        " records and the twenty highest-scoring low-information records per scan retain aligned"
+        " finite values (the first 512 points per side); scores use the complete segment.",
         "",
         "## Temporal facts",
         "",

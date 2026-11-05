@@ -104,7 +104,7 @@ def test_verify_matches_mask_reference_with_multiple_offsets_and_groups():
     assert expected[0]["is_copy"]
     assert {rec["offset"] for rec in expected[1]} == {0, -128}
     assert {rec["fit_mode"] for rec in expected[1]} == {"grouped"}
-    assert match.verify(target, source, hits) == expected
+    np.testing.assert_equal(match.verify(target, source, hits), expected)
 
 
 def test_verify_matches_mask_reference_with_clipped_spans():
@@ -114,7 +114,7 @@ def test_verify_matches_mask_reference_with_clipped_spans():
     expected = mask_verify(target, source, hits)
     assert expected[0]["t_start"] == 100
     assert expected[0]["t_end"] == 128
-    assert match.verify(target, source, hits) == expected
+    np.testing.assert_equal(match.verify(target, source, hits), expected)
 
 
 @pytest.mark.parametrize(
@@ -419,9 +419,9 @@ def test_audit_workers_offline_without_changing_parent(
     states = []
     parallel_scan_jobs = audit._parallel_scan_jobs
 
-    def record_offline_state(pool, *args):
+    def record_offline_state(pool, *args, **kwargs):
         states.append(pool.submit(_worker_offline_state).result(timeout=30))
-        yield from parallel_scan_jobs(pool, *args)
+        yield from parallel_scan_jobs(pool, *args, **kwargs)
 
     def pool_with_hf_imported(**kwargs):
         assert kwargs["initializer"] is audit._init_worker
