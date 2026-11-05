@@ -258,6 +258,13 @@ and piecewise refinement with twice the copy tolerance. Rows with only
 above-cap hits expand all four families; a 512-group first-pass limit is
 removed in the automatic post-pass. An expansion exceeding 50 million postings
 remains explicitly unresolved rather than exhausting memory silently.
+All passes retain at most 2,048 `(corpus series, offset)` groups per target row
+and fit at most 128 offsets per candidate series, ranked by hit count with
+ascending series/offset ties; true copies typically concentrate many hits at
+one offset and therefore rank ahead of weak smooth-column coincidences.
+The `groups_capped_rows`, `groups_dropped`, `offsets_capped_candidates` and
+`offsets_dropped` counters record every cap application and discarded count,
+while rows and candidates below the caps retain the same matching behavior.
 
 Frequency classes are `15T`, `30T`, `1H`, `1D`, `1W`, `1M`, `1Q`, `1Y`.
 Weekly anchors share a class, month-start/end aliases share a class, and business

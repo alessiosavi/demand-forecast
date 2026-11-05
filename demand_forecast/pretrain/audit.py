@@ -37,8 +37,11 @@ least 3 matched windows or summed window spans of at least 24 points at one
 offset. Masked rows expand all four families without multiplicity caps; the
 first pass keeps at most 512 candidate groups and the post-pass removes that
 candidate limit. The expansion memory guard remains explicit: unresolved rows
-are reported and cause exit 2. Every candidate pair is fitted at every qualifying
-offset, using merged intervals, window-map regrouping and piecewise refinement.
+are reported and cause exit 2. All passes keep at most 2,048 (series, offset)
+groups per row and 128 offsets per candidate series, ranked by descending hit
+count with ascending series/offset ties; coverage counters record the drops.
+Every retained candidate pair is fitted at each retained qualifying offset,
+using merged intervals, window-map regrouping and piecewise refinement.
 A copy has at least 24 overlapping finite observations, non-degenerate segments
 on both sides, and exact fraction >= 0.99 (isclose atol=0.005, rtol=1e-6, as in
 run 11) or maximum affine residual <= max(0.01, 0.005 * index segment range).

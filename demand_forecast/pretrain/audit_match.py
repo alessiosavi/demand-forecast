@@ -18,6 +18,8 @@ import pandas as pd
 WIN, RWIN, RWIN8, MIN_HITS, SEG_MIN = (8, 4, 8, 3, 24)
 CAP = {"exact": 1024, "affine": 1024, "runs": 64, "runs8": 8192}
 FALLBACK_TOPK, FALLBACK_CAP, MAX_RECORDS, MAX_RECORDS_PER_REASON = (512, 1 << 40, 60000, 3000)
+ROW_GROUP_CAP = 2048
+VERIFY_OFFSET_CAP = 128
 ULP32, ULP_FACTOR = (2.0 ** (-23), 64.0)
 MOD = np.uint64(1 << 61) - np.uint64(1)
 COPY_ATOL = 0.01
@@ -465,11 +467,20 @@ def refine_pieces(t, s, a0, a1, off, slack):
     return pieces
 
 
-def verify(t, s, hits, dim=None):
+def verify(t, s, hits, dim=None, stats=None):
     """hits: list of (fam, t_pos, s_pos, span). Returns (best record, notable records)."""
     offsets = defaultdict(list)
     for fam, tp, sp, span_length in hits:
         offsets[int(tp - sp)].append((int(tp), int(span_length), fam, int(sp)))
+    if len(offsets) > VERIFY_OFFSET_CAP:
+        if stats is not None:
+            stats["offsets_capped_candidates"] = stats.get("offsets_capped_candidates", 0) + 1
+            stats["offsets_dropped"] = (
+                stats.get("offsets_dropped", 0) + len(offsets) - VERIFY_OFFSET_CAP
+            )
+        offsets = dict(
+            sorted(offsets.items(), key=lambda item: (-len(item[1]), item[0]))[:VERIFY_OFFSET_CAP]
+        )
     best, notable = (None, [])
     fin_s = s[np.isfinite(s)]
     scale = max(1.0, float(np.abs(fin_s).max())) if len(fin_s) else 1.0
@@ -558,6 +569,10 @@ def new_cov():
         "truncated_rows": 0,
         "fallback_no_candidate_rows": 0,
         "fallback_oversize_rows": 0,
+        "groups_capped_rows": 0,
+        "groups_dropped": 0,
+        "offsets_capped_candidates": 0,
+        "offsets_dropped": 0,
         "candidates": 0,
         "verified": 0,
         "copies": 0,
@@ -631,7 +646,7 @@ def _merge(dst, src, mult):
 
 
 def _scan_row(name, column, i, x, index, c, pairs, records, extra, dim=None, *, uncapped=False):
-    """The unchanged run-5 per-row procedure for one row `x` (float64), counting into the fresh cov `c`."""
+    """Scan one row `x` (float64), counting into `c`; uncapped lifts only FALLBACK_TOPK."""
     c["n_series"] += 1
     fin = np.isfinite(x)
     if len(x) < WIN:
@@ -729,13 +744,19 @@ def _scan_row(name, column, i, x, index, c, pairs, records, extra, dim=None, *, 
         if n_distinct >= AFFINE_MIN_LEVELS and runs8:
             c["no_window_unexplained"] += 1
             c["unexplained_ids"].append(i)
+    if len(groups) > ROW_GROUP_CAP:
+        c["groups_capped_rows"] += 1
+        c["groups_dropped"] += len(groups) - ROW_GROUP_CAP
+        groups = dict(
+            sorted(groups.items(), key=lambda item: (-len(item[1]), item[0]))[:ROW_GROUP_CAP]
+        )
     by_index = defaultdict(list)
     for (m, off), hits in groups.items():
         if len(hits) >= MIN_HITS or sum((span_length for _, _, _, span_length in hits)) >= SEG_MIN:
             by_index[m].extend(hits)
     for m, hits in by_index.items():
         c["candidates"] += 1
-        rec, notable = verify(x, index.series[m], hits, dim)
+        rec, notable = verify(x, index.series[m], hits, dim, stats=c)
         if rec is None:
             continue
         c["verified"] += 1
