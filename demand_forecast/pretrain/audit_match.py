@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 from collections import defaultdict
+from collections.abc import Iterable
 
 import numpy as np
 import pandas as pd
@@ -337,6 +338,26 @@ def intervals_of(mask):
     return list(zip(edges[::2].tolist(), edges[1::2].tolist()))
 
 
+def merge_spans(spans: Iterable[tuple[int, int]], length: int) -> list[tuple[int, int]]:
+    """Union half-open spans in start order, with the same bounds as mask slices.
+
+    Overlapping and touching spans form one interval. Slice normalization also
+    clips overruns and discards empty spans without allocating a length-sized mask.
+    """
+    clipped = []
+    for start, end in spans:
+        start, end, _ = slice(start, end).indices(length)
+        if start < end:
+            clipped.append((start, end))
+    merged = []
+    for start, end in sorted(clipped):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
 def fit_segment(t, s, a0, a1, off, dim=None):
     b0, b1 = (a0 - off, a1 - off)
     if b0 < 0:
@@ -455,11 +476,13 @@ def verify(t, s, hits, dim=None):
     for off, lst in offsets.items():
         if len(lst) < MIN_HITS and sum((span_length for _, span_length, _, _ in lst)) < SEG_MIN:
             continue
-        covered = np.zeros(len(t), bool)
-        for tp, span_length, _, _ in lst:
-            covered[tp : tp + span_length] = True
         fams = sorted({f for _, _, f, _ in lst})
-        todo = [("merged", a0, a1) for a0, a1 in intervals_of(covered)]
+        todo = [
+            ("merged", a0, a1)
+            for a0, a1 in merge_spans(
+                ((tp, tp + span_length) for tp, span_length, _, _ in lst), len(t)
+            )
+        ]
         groups = defaultdict(list)
         for tp, span_length, fam, sp in lst:
             k = affine_key(t, s, tp, sp, span_length, fam, scale)
@@ -467,10 +490,12 @@ def verify(t, s, hits, dim=None):
                 groups[k].append((tp, span_length))
         if len(groups) > 1:
             for items in groups.values():
-                cg = np.zeros(len(t), bool)
-                for tp, span_length in items:
-                    cg[tp : tp + span_length] = True
-                todo.extend((("grouped", a0, a1) for a0, a1 in intervals_of(cg)))
+                todo.extend(
+                    ("grouped", a0, a1)
+                    for a0, a1 in merge_spans(
+                        ((tp, tp + span_length) for tp, span_length in items), len(t)
+                    )
+                )
         seen = set()
         queue = list(todo)
         while queue:
