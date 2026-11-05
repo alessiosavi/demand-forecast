@@ -493,7 +493,7 @@ and calls fev's prediction validation and window metrics. Output contains
 `PANEL_FAIL <task> <error>`. It does not train. Loading a window still requires
 fev to load its underlying dataset; run the complete preflight on EC2, not the
 Mac. Preflight failures live in `panel_failures.json`, separately from training
-failures, so preflight cannot erase a pending training retry.
+failures, so preflight cannot erase a training failure record.
 
 `--keep-going` catches task exceptions, logs their tracebacks and atomically
 updates `failures.json`, keyed by task, with exception type, message, last 20

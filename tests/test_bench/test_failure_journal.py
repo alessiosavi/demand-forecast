@@ -2,7 +2,6 @@
 
 import ast
 import json
-import subprocess
 from dataclasses import replace
 from pathlib import Path
 
@@ -281,43 +280,30 @@ def test_journal_replaces_failure_atomically_and_clears_on_success(
     assert other_journal.read_bytes() == other_before
 
 
-def test_runner_has_only_main_artifact_cleanup_paths():
-    root = Path(__file__).resolve().parents[2]
-    path = "demand_forecast/bench/run.py"
-    main_source = subprocess.run(
-        ["git", "show", f"e6a05b9:{path}"],
-        cwd=root,
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout
-    source = (root / path).read_text()
-    assert "rmtree" not in source
-    assert "before_task" not in source
-    assert "_verify_retry_artifacts" not in source
-    assert "ArtifactMismatchError" not in source
+def test_runner_has_only_temporary_file_cleanup():
+    """The runner deletes nothing but the temporary files of its three atomic writers.
 
-    def cleanup_functions(text):
-        tree = ast.parse(text)
-        return {
-            node.name: [
-                ast.dump(call)
-                for call in ast.walk(node)
-                if isinstance(call, ast.Call)
-                and isinstance(call.func, ast.Attribute)
-                and call.func.attr == "unlink"
-            ]
-            for node in tree.body
-            if isinstance(node, ast.FunctionDef)
-            and any(
-                isinstance(call, ast.Attribute) and call.attr == "unlink" for call in ast.walk(node)
-            )
-        }
-
-    actual = cleanup_functions(source)
-    journal_cleanup = actual.pop("_save_failures")
-    # The sole added unlink cleans the journal's temporary file, never task artifacts.
-    assert journal_cleanup == [
-        ast.dump(ast.parse("temporary.unlink(missing_ok=True)").body[0].value)
-    ]
-    assert actual == cleanup_functions(main_source)
+    Pinned as literals rather than compared with an earlier revision: CI checks
+    out a single commit, so no history is available to read main's source from.
+    """
+    source = (Path(__file__).resolve().parents[2] / "demand_forecast/bench/run.py").read_text()
+    for removed in ("rmtree", "before_task", "_verify_retry_artifacts", "ArtifactMismatchError"):
+        assert removed not in source
+    destructive = {"unlink", "rmtree", "rmdir", "remove", "removedirs"}
+    calls = {
+        node.name: [
+            ast.unparse(call)
+            for call in ast.walk(node)
+            if isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr in destructive
+        ]
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.FunctionDef)
+    }
+    assert {name: found for name, found in calls.items() if found} == {
+        "_save_predictions": ["temporary_path.unlink(missing_ok=True)"],
+        "_save_summaries": ["temporary_path.unlink(missing_ok=True)"],
+        "_save_failures": ["temporary.unlink(missing_ok=True)"],
+    }
+    assert "shutil" not in source
