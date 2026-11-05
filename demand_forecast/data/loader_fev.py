@@ -1,5 +1,8 @@
 """Adapt fev list-column windows to the shared data core."""
 
+import json
+from dataclasses import replace
+
 import pandas as pd
 
 from demand_forecast.bench.specs import FevTaskSpec
@@ -20,7 +23,52 @@ def panel_from_window(past_data, future_data, spec: FevTaskSpec, freq: str) -> P
     No optional bench imports are needed to consume these datasets.
     """
     if not isinstance(spec.target, str):
-        raise ValueError("Panel requires a single target column")
+        if {"__fev_target__", "__fev_nonnegative__"}.intersection(spec.static_columns):
+            raise ValueError("__fev_target__ and __fev_nonnegative__ are reserved")
+        # Keep item order within each target; fev sorts target names itself.
+        panels = []
+        for target in spec.targets:
+            support = (
+                spec.target_support[target]
+                if isinstance(spec.target_support, dict)
+                else spec.target_support
+            )
+            single = replace(spec, target=target, target_support=support)
+            columns = list(
+                dict.fromkeys(
+                    [
+                        spec.id_column,
+                        spec.timestamp_column,
+                        target,
+                        *spec.known_dynamic,
+                        *spec.past_dynamic,
+                        *spec.static_columns,
+                    ]
+                )
+            )
+            # Avoid decoding every other target for each univariate series.
+            selected = (
+                past_data.select_columns(columns)
+                if hasattr(past_data, "select_columns")
+                else [{column: row[column] for column in columns} for row in past_data]
+            )
+            panel = panel_from_window(selected, future_data, single, freq)
+            for series in panel.series:
+                series.series_id = target_series_id(series.series_id, target)
+                series.statics["__fev_target__"] = target
+            panels.append(panel)
+        roles = replace(
+            panels[0].roles,
+            target="__fev_value__",
+            static_categorical=(*panels[0].roles.static_categorical, "__fev_target__"),
+        )
+        return Panel(
+            [series for panel in panels for series in panel.series],
+            roles,
+            panels[0].freq,
+            panels[0].seasonal_period,
+            spec.target_support,
+        )
     roles = Roles(
         target=spec.target,
         known_dynamic=tuple(spec.known_dynamic),
@@ -75,9 +123,19 @@ def panel_from_window(past_data, future_data, spec: FevTaskSpec, freq: str) -> P
         )
     if future_by_id:
         raise ValueError(f"Future rows without past series: {list(future_by_id)}")
-    return Panel(series, roles, offset, seasonal_period(offset), spec.target_support)
+    support = (
+        spec.target_support[spec.target]
+        if isinstance(spec.target_support, dict)
+        else spec.target_support
+    )
+    return Panel(series, roles, offset, seasonal_period(offset), support)
 
 
 def item_ids(panel: Panel) -> list[str]:
     """Return fev item ids in the panel's prediction order."""
     return [series.series_id for series in panel.series]
+
+
+def target_series_id(item: str, target: str) -> str:
+    """Collision-free item/target identity, independent of separator characters."""
+    return json.dumps([str(item), target], ensure_ascii=True, separators=(",", ":"))

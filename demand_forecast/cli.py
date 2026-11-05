@@ -319,10 +319,12 @@ def forecast(
 @fev_app.command("run")
 def fev_run(
     tasks: str = typer.Option(
-        "weekly", "--tasks", help="weekly, heldout, comma-separated weekly names, or task YAML"
+        "weekly",
+        "--tasks",
+        help="weekly, heldout, fev100, comma-separated task names, or task YAML",
     ),
-    config: Path = typer.Option(
-        ..., "--config", exists=True, dir_okay=False, help="Model and training settings YAML"
+    config: Path | None = typer.Option(
+        None, "--config", exists=True, dir_okay=False, help="Model and training settings YAML"
     ),
     policy: str = typer.Option("first_window", "--policy", help="first_window or per_window"),
     out_dir: Path = typer.Option(..., "--out-dir", help="Directory for bundles and summaries.csv"),
@@ -330,6 +332,12 @@ def fev_run(
         None, "--profiles", exists=True, dir_okay=False, help="Override task role profiles YAML"
     ),
     resume: bool = typer.Option(False, "--resume", help="Resume matching runs and missing windows"),
+    keep_going: bool = typer.Option(
+        False, "--keep-going", help="Record task failures and continue"
+    ),
+    panel_check: bool = typer.Option(
+        False, "--panel-check", help="Validate first-window panels without training"
+    ),
     model_name: str | None = typer.Option(None, "--model-name", help="Model label in summaries"),
     stop_after: int | None = typer.Option(
         None, "--stop-after", min=1, help="Interrupt training at this step, saving a checkpoint"
@@ -346,9 +354,26 @@ def fev_run(
     from demand_forecast.core.training import InterruptedRun, NonFiniteTraining
 
     try:
-        settings = _training_settings(config, init_from)
+        if config is None and not panel_check:
+            raise typer.BadParameter("--config is required unless --panel-check is set")
+        if panel_check:
+            from demand_forecast.config import Settings
+
+            settings = Settings.model_validate(
+                {
+                    "data": {
+                        "source": "fev",
+                        "id_columns": ["id"],
+                        "target": "target",
+                        "target_support": "real",
+                    },
+                    "forecast": {"horizon": 1},
+                }
+            )
+        else:
+            settings = _training_settings(config, init_from)
         configure_logging(settings.log_level)
-        run_fev(
+        result = run_fev(
             load_task_specs(tasks, profiles),
             settings,
             out_dir,
@@ -356,12 +381,18 @@ def fev_run(
             resume=resume,
             model_name=model_name,
             stop_after=stop_after,
+            keep_going=keep_going,
+            panel_check=panel_check,
         )
     except (ValueError, OSError, ImportError, NotImplementedError, yaml.YAMLError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     except (InterruptedRun, NonFiniteTraining) as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=1) from exc
+    if result.attrs.get("failed_tasks"):
+        raise typer.Exit(code=3)
+    if panel_check:
+        return
     typer.echo(f"Summaries saved to {out_dir / 'summaries.csv'}")
 
 

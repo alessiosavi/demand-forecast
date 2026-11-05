@@ -27,7 +27,7 @@ class ModelSpec:
     vocab_sizes: dict[str, int]
     n_numeric: int
     cat_emb_dim: int
-    target_support: str
+    target_support: str | dict[str, str]
     width_factor: float = 2.0
     use_vsn: bool = True
 
@@ -165,6 +165,11 @@ class ForecastModel(nn.Module):
             observed = batch.target[row, batch.observed[row]]
             values = observed * batch.scale[row] + batch.loc[row]
             quantiles[row] = torch.quantile(values, values.new_tensor(self.spec.quantiles))
+        if isinstance(self.spec.target_support, dict):
+            nonnegative = batch.cat["__fev_nonnegative__"][:, None, None]
+            empty = torch.where(nonnegative, 0.0, self.fallback_level)
+            quantiles = torch.where(flags["no_context"][:, None, None], empty, quantiles)
+            return torch.where(nonnegative, quantiles.clamp_min(0), quantiles)
         empty_level = 0.0 if self.spec.target_support == "nonnegative" else self.fallback_level
         quantiles = torch.where(flags["no_context"][:, None, None], empty_level, quantiles)
         return quantiles.clamp_min(0) if self.spec.target_support == "nonnegative" else quantiles

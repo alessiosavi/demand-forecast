@@ -14,7 +14,7 @@ class DatasetConfig(BaseModel):
     id_columns: list[str]
     timestamp_column: str = "timestamp"
     target: str
-    target_support: Literal["nonnegative", "real"]
+    target_support: Literal["nonnegative", "real"] | dict[str, Literal["nonnegative", "real"]]
     known_dynamic: list[str] = Field(default_factory=list)
     past_dynamic: list[str] = Field(default_factory=list)
     static_path: Path | None = None

@@ -44,10 +44,15 @@ class Panel:
     roles: Roles
     freq: str | pd.offsets.BaseOffset
     seasonal_period: int
-    target_support: str
+    target_support: str | dict[str, str]
 
     def __post_init__(self) -> None:
-        if self.target_support not in ("nonnegative", "real"):
+        supports = (
+            list(self.target_support.values())
+            if isinstance(self.target_support, dict)
+            else [self.target_support]
+        )
+        if not supports or any(value not in ("nonnegative", "real") for value in supports):
             raise ValueError("target_support must be 'nonnegative' or 'real'")
 
     def index_of(self, series_id: str) -> int:

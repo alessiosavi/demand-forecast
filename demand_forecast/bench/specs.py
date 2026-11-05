@@ -98,7 +98,7 @@ class FevTaskSpec:
     past_dynamic: list[str] = field(default_factory=list)
     static_columns: list[str] = field(default_factory=list)
     categorical_statics: list[str] = field(default_factory=list)
-    target_support: Literal["nonnegative", "real"] = field(kw_only=True)
+    target_support: Literal["nonnegative", "real"] | dict[str, str] = field(kw_only=True)
     initial_cutoff: int | str | None = None
     min_context_length: int = 1
     eval_metric: str | dict[str, Any] = "MASE"
@@ -108,10 +108,26 @@ class FevTaskSpec:
     timestamp_column: str = "timestamp"
 
     def __post_init__(self):
-        if self.target_support not in ("nonnegative", "real"):
+        if isinstance(self.target, list) and (
+            not self.target or len(set(self.target)) != len(self.target)
+        ):
+            raise ValueError("target list must be nonempty and unique")
+        supports = self.target_support
+        if isinstance(supports, dict):
+            targets = [self.target] if isinstance(self.target, str) else self.target
+            if set(supports) != set(targets):
+                raise ValueError("target_support mapping must cover exactly the target columns")
+            supports = list(supports.values())
+        else:
+            supports = [supports]
+        if not supports or any(value not in ("nonnegative", "real") for value in supports):
             raise ValueError("target_support must be 'nonnegative' or 'real'")
         if not set(self.categorical_statics) <= set(self.static_columns):
             raise ValueError("categorical_statics must be a subset of static_columns")
+
+    @property
+    def targets(self) -> list[str]:
+        return [self.target] if isinstance(self.target, str) else self.target
 
     def task_definition(self) -> dict:
         """Return the evaluation boundaries included in a model run's identity."""
@@ -124,6 +140,7 @@ class FevTaskSpec:
             "min_context_length": self.min_context_length,
             "seasonality": self.seasonality,
             "quantile_levels": list(self.quantile_levels),
+            **({"targets": list(self.target)} if isinstance(self.target, list) else {}),
         }
 
     def to_task(self) -> fev.Task:  # noqa: F821 -- optional import stays local.
@@ -166,7 +183,7 @@ def _local_path(dataset_path: str | Path) -> Path | None:
 
 
 def load_task_specs(selector: str | Path, profiles: Path | None = None) -> list[FevTaskSpec]:
-    """Read ``weekly``, ``heldout``, comma-separated weekly names, or task YAML.
+    """Read ``weekly``, ``heldout``, ``fev100``, comma-separated task names, or task YAML.
 
     Profiles map task names to ``target_support`` and ``categorical_statics``.
     Custom YAML may supply ``name`` (or fev's ``task_name``); otherwise the
@@ -179,15 +196,24 @@ def load_task_specs(selector: str | Path, profiles: Path | None = None) -> list[
     if custom_yaml:
         definitions = yaml.safe_load(path.read_text(encoding="utf-8"))
     else:
-        filename = (
-            "fev_bench_weekly_heldout.yaml" if selector == "heldout" else "fev_bench_weekly.yaml"
-        )
+        filename = {
+            "weekly": "fev_bench_weekly.yaml",
+            "heldout": "fev_bench_weekly_heldout.yaml",
+        }.get(str(selector), "fev_bench_100_193e4fc.yaml")
         definitions = yaml.safe_load(resources.joinpath(filename).read_text())
+        if selector not in ("weekly", "heldout", "fev100"):
+            # Historical aliases (notably uk_covid_utla_1W) remain selectable.
+            existing = {d.get("task_name", d["dataset_config"]) for d in definitions["tasks"]}
+            for legacy in ("fev_bench_weekly.yaml", "fev_bench_weekly_heldout.yaml"):
+                for definition in yaml.safe_load(resources.joinpath(legacy).read_text())["tasks"]:
+                    if definition.get("task_name", definition["dataset_config"]) not in existing:
+                        definitions["tasks"].append(definition)
     if not isinstance(definitions, dict) or not isinstance(definitions.get("tasks"), list):
         raise ValueError("task YAML must contain a tasks list")
 
     if profiles is None:
         profile_data = yaml.safe_load(resources.joinpath("profiles.yaml").read_text())
+        profile_data.update(yaml.safe_load(resources.joinpath("profiles_fev100.yaml").read_text()))
     else:
         profile_data = yaml.safe_load(Path(profiles).read_text(encoding="utf-8"))
     if profile_data is None:
@@ -207,7 +233,7 @@ def load_task_specs(selector: str | Path, profiles: Path | None = None) -> list[
 
     names = (
         list(named_tasks)
-        if custom_yaml or selector in ("weekly", "heldout")
+        if custom_yaml or selector in ("weekly", "heldout", "fev100")
         else [name.strip() for name in str(selector).split(",")]
     )
     specs = []

@@ -462,3 +462,214 @@ unchanged. The experiment labels are `demand-forecast-v2`,
 configuration decision follows from this experiment's fev scores. Held-out
 `target_support` is preregistered from semantics, without full-history statistics;
 the [pretraining EC2 runbook](pretrain-ec2.md) specifies the operational gates.
+
+## 100-task survey (separate from the frozen weekly protocol)
+
+`--tasks fev100` selects all 100 tasks, in the order of the pinned upstream
+`fev_bench_100_193e4fc.yaml` snapshot. A comma-separated selector can mix any of
+those names and legacy weekly/held-out names. Explicit upstream task names,
+such as `fred_md_2025/cee`, select their own target groups. The legacy
+`uk_covid_utla_1W` alias remains available; the snapshot calls that task
+`uk_covid_utla_1W/cumulative`. The twelve legacy task specs, definitions and run
+identities remain unchanged. The survey is exploratory and does not change
+membership or claims of the frozen protocol above.
+
+Run the preflight on EC2 before spending GPU time:
+
+```bash
+demand-forecast fev run --tasks fev100 --panel-check --keep-going \
+  --out-dir runs/fev100-preflight
+
+demand-forecast fev run --tasks fev100 \
+  --config configs/fev-v2-survey.yaml --init-from /path/to/pretrained/bundle \
+  --keep-going --resume --out-dir runs/fev100-survey
+```
+
+`--panel-check` needs neither a config nor a bundle. It loads only the first
+fev evaluation window, builds the model's panel, assembles seasonal-naive
+forecasts through the same item/target alignment function as model predictions,
+and calls fev's prediction validation and window metrics. Output contains
+`PANEL_OK <task> series=<n> max_len=<n> horizon=<h> freq=<f> targets=<k>` or
+`PANEL_FAIL <task> <error>`. It does not train. Loading a window still requires
+fev to load its underlying dataset; run the complete preflight on EC2, not the
+Mac. Preflight failures live in `panel_failures.json`, separately from training
+failures, so preflight cannot erase a pending training retry.
+
+`--keep-going` catches task exceptions, logs their tracebacks and atomically
+updates `failures.json`, keyed by task, with exception type, message, last 20
+traceback lines and UTC time. It releases task references and cached CUDA memory
+before continuing. Keyboard interrupts and `--stop-after` still interrupt the
+run. The exit status is 0 if all selected tasks complete, 3 if selected tasks
+finish with failures. Without this flag, the first exception stops the run.
+Completed tasks keep their rows. `--resume` verifies saved identities/artifacts
+before skipping completed work. A task recorded as failed restarts from the
+initial seed/bundle, overwriting its partial artifacts; this also retries a
+terminal non-finite checkpoint. Success removes its failure record. Use one
+output directory per experiment; do not change settings while retrying it.
+
+The survey config copies the tuned refit-weekly recipe unchanged, including
+`training.refit: full`. Task metadata supplies horizon, quantiles, column roles
+and frequency. The encoder context remains at most `forecast.max_context=512`
+per sample. Full history is still retained for sampling, scale estimation and
+fev metrics: this is not a bound on dataset/panel RAM. The pinned metadata's
+largest items × median-length product is `m5_1D` (30,490 × 1,810, about 55.2
+million target observations); `LOOP_SEATTLE_5T` is 323 × 105,120 (about 34.0
+million). The card does not give maximum lengths. The metadata snapshot records
+these as median lengths and includes the serialized dataset byte counts.
+
+V2 uses variable-length decoder queries and RoPE positions, so a changed horizon
+does not reinitialize its backbone or quantile head. `--init-from` copies the
+entire backbone and head, the target/observation encoder projection columns and
+projection biases. Extra temporal input columns, decoder projection weights
+and static projection weights start at zero; the source static contribution is
+folded into the static bias. Task categorical embeddings and gates are fresh.
+A different quantile grid or incompatible backbone configuration raises a
+`TransferError` naming the difference before transfer; no silent backbone
+reinitialization occurs. The survey uses the pretrained nine-quantile grid.
+Patching remains disabled. Calendar features support subdaily through yearly
+offsets; subhourly calendars currently have hour/day features, without a minute
+feature. Local scaling retains the existing seasonal rule (daily 7, hourly 24,
+monthly 12, otherwise 1), while fev metrics and preflight use the task's explicit
+seasonality. These conventions intentionally preserve the frozen weekly recipe.
+
+### Multi-target treatment and profile rules
+
+Each target becomes an independent univariate series identified by the JSON
+pair `[item_id, target_name]`. The target name is an extra categorical static
+`__fev_target__`. Other targets are **not covariates**. Known and past covariates
+and item statics are shared by role. Predictions are reassembled as
+`{target_name: [{"predictions": [...], "0.1": [...], ...}, ...]}`, one row per
+original item in fev input order. Thus the multivariate task and its scoring
+remain intact, but the model does not directly learn cross-target dynamics.
+Per-target nonnegative masks are applied during both validation and inference,
+including fallback forecasts, independently of learned categorical vocabularies.
+
+Target support is preregistered from semantics, never from observed minima or
+negative shares. A string applies to all targets; a mapping must cover exactly
+the target names. Counts, physical amounts and sales are nonnegative; uncertain,
+signed or anonymized measurements are real. Wholesale electricity prices are
+real because their market permits negative prices. The per-task table below
+states each choice.
+
+`profiles_fev100.yaml` adds the new profiles, including the explicit upstream
+COVID name; `profiles.yaml` preserves the twelve legacy profiles. New static
+roles follow the pinned schema: string/categorical features are categorical,
+numeric features numeric. Five frozen profiles intentionally retain historical
+numeric categorical identifiers: `rohlik_sales_1W` (`product_unique_id`),
+`rossmann_1W` (`Store`, `Promo2`), `walmart` (`Store`, `Dept`),
+`favorita_stores_1W` and `favorita_transactions_1W` (`store_nbr`, `cluster`).
+Changing these would change the frozen identities. The offline consistency test
+asserts these exact exceptions and schema agreement for every other static.
+
+The schema and size evidence is
+`demand_forecast/bench/tasks/schema_fev100.yaml`, from the dataset card at
+revision `d3e7e720f4158eab03ebcb021f1cce779cd92acc`. Regenerate with
+`python scripts/fev_schema_snapshot.py`; it fetches one pinned README, never
+rows, and backs off on HTTP 429. Frequencies come from that card's metadata
+table. Runtime loading retains fev 0.10.0's existing loader: the task YAML pins
+the benchmark definition, but does **not** make fev pass a Hub revision.
+For reproducible dataset bytes, use the operator's pinned local/S3 mirror via
+`FEV_DATASETS_PREFIX`; do not assume the default Hub loader is revision-pinned.
+
+| Task | Support | Semantic justification |
+| --- | --- | --- |
+| `proenfo_gfc12` | nonnegative | Electricity load in physical units. |
+| `proenfo_gfc14` | nonnegative | Electricity load in physical units. |
+| `proenfo_gfc17` | nonnegative | Electricity load in physical units. |
+| `rohlik_sales_1D` | nonnegative | Sales quantities. |
+| `rohlik_orders_1D` | nonnegative | Order counts. |
+| `rohlik_sales_1W` | nonnegative | Sales quantities. |
+| `rohlik_orders_1W` | nonnegative | Order counts. |
+| `entsoe_15T` | nonnegative | Electricity consumption in physical units. |
+| `entsoe_30T` | nonnegative | Electricity consumption in physical units. |
+| `entsoe_1H` | nonnegative | Electricity consumption in physical units. |
+| `epf_be` | real | Wholesale electricity prices can be negative; price is not a nonnegative physical quantity. |
+| `epf_de` | real | Wholesale electricity prices can be negative; price is not a nonnegative physical quantity. |
+| `epf_fr` | real | Wholesale electricity prices can be negative; price is not a nonnegative physical quantity. |
+| `epf_np` | real | Wholesale electricity prices can be negative; price is not a nonnegative physical quantity. |
+| `epf_pjm` | real | Wholesale electricity prices can be negative; price is not a nonnegative physical quantity. |
+| `rossmann_1D` | nonnegative | Retail sales. |
+| `rossmann_1W` | nonnegative | Retail sales. |
+| `restaurant` | nonnegative | Visitor counts. |
+| `hermes` | nonnegative | Sales quantities. |
+| `walmart` | nonnegative | Retail sales. |
+| `m5_1D` | nonnegative | Unit sales. |
+| `m5_1W` | nonnegative | Unit sales. |
+| `m5_1M` | nonnegative | Unit sales. |
+| `hierarchical_sales_1D` | nonnegative | Sales quantities. |
+| `hierarchical_sales_1W` | nonnegative | Sales quantities. |
+| `favorita_stores_1D` | nonnegative | Sales quantities. |
+| `favorita_stores_1W` | nonnegative | Sales quantities. |
+| `favorita_stores_1M` | nonnegative | Sales quantities. |
+| `favorita_transactions_1D` | nonnegative | Transaction counts. |
+| `favorita_transactions_1W` | nonnegative | Transaction counts. |
+| `favorita_transactions_1M` | nonnegative | Transaction counts. |
+| `solar_with_weather_15T` | nonnegative | Solar generation in physical units. |
+| `solar_with_weather_1H` | nonnegative | Solar generation in physical units. |
+| `solar_1D` | nonnegative | Solar generation in physical units. |
+| `solar_1W` | nonnegative | Solar generation in physical units. |
+| `kdd_cup_2022_10T` | nonnegative | Wind turbine active power generation. |
+| `kdd_cup_2022_30T` | nonnegative | Wind turbine active power generation. |
+| `kdd_cup_2022_1D` | nonnegative | Wind turbine active power generation. |
+| `uci_air_quality_1H` | nonnegative | Pollutant concentrations in physical units. |
+| `uci_air_quality_1D` | nonnegative | Pollutant concentrations in physical units. |
+| `LOOP_SEATTLE_5T` | nonnegative | Traffic volumes. |
+| `LOOP_SEATTLE_1D` | nonnegative | Traffic volumes. |
+| `LOOP_SEATTLE_1H` | nonnegative | Traffic volumes. |
+| `M_DENSE_1D` | nonnegative | Traffic measurements; counts or speed are nonnegative. |
+| `M_DENSE_1H` | nonnegative | Traffic measurements; counts or speed are nonnegative. |
+| `SZ_TAXI_15T` | nonnegative | Traffic speed magnitude. |
+| `SZ_TAXI_1H` | nonnegative | Traffic speed magnitude. |
+| `redset_5T` | real | Unspecified workload measurement; conservatively real. |
+| `redset_15T` | real | Unspecified workload measurement; conservatively real. |
+| `redset_1H` | real | Unspecified workload measurement; conservatively real. |
+| `hospital_admissions_1D` | nonnegative | Admissions or patient counts. |
+| `hospital_admissions_1W` | nonnegative | Admissions or patient counts. |
+| `ETT_1W` | nonnegative: HUFL, HULL, MUFL, MULL, LUFL, LULL; real: OT | OT is temperature (real); other targets are transformer loads in physical units. |
+| `ETT_1D` | nonnegative: HUFL, HULL, MUFL, MULL, LUFL, LULL; real: OT | OT is temperature (real); other targets are transformer loads in physical units. |
+| `ETT_1H` | nonnegative: HUFL, HULL, MUFL, MULL, LUFL, LULL; real: OT | OT is temperature (real); other targets are transformer loads in physical units. |
+| `ETT_15T` | nonnegative: HUFL, HULL, MUFL, MULL, LUFL, LULL; real: OT | OT is temperature (real); other targets are transformer loads in physical units. |
+| `hospital` | nonnegative | Admissions or patient counts. |
+| `jena_weather_10T` | real | Anonymized weather channels include temperatures; conservatively all real. |
+| `jena_weather_1D` | real | Anonymized weather channels include temperatures; conservatively all real. |
+| `jena_weather_1H` | real | Anonymized weather channels include temperatures; conservatively all real. |
+| `bizitobs_l2c_1H` | real | Anonymized system measurements; sign semantics uncertain, all real. |
+| `bizitobs_l2c_5T` | real | Anonymized system measurements; sign semantics uncertain, all real. |
+| `australian_tourism` | nonnegative | Tourism visit counts. |
+| `world_tourism` | nonnegative | Tourism arrival counts. |
+| `world_co2_emissions` | nonnegative | CO2 emissions in physical units. |
+| `world_life_expectancy` | nonnegative | Life expectancy in years. |
+| `ercot_1H` | nonnegative | Electricity load in MW. |
+| `ercot_1D` | nonnegative | Electricity load in MW. |
+| `ercot_1W` | nonnegative | Electricity load in MW. |
+| `ercot_1M` | nonnegative | Electricity load in MW. |
+| `uk_covid_utla_1D/new` | nonnegative | Case, death and admission counts. |
+| `uk_covid_utla_1W/cumulative` | nonnegative | Case, death and admission counts. |
+| `uk_covid_nation_1D/new` | nonnegative | Case, death and admission counts. |
+| `uk_covid_nation_1D/cumulative` | nonnegative | Case, death and admission counts. |
+| `uk_covid_nation_1W/new` | nonnegative | Case, death and admission counts. |
+| `uk_covid_nation_1W/cumulative` | nonnegative | Case, death and admission counts. |
+| `ecdc_ili` | nonnegative | Influenza-like illness counts or rates. |
+| `boomlet_1062` | real | Anonymized multivariate channels; sign semantics unspecified, all real. |
+| `boomlet_1209` | real | Anonymized multivariate channels; sign semantics unspecified, all real. |
+| `boomlet_1225` | real | Anonymized multivariate channels; sign semantics unspecified, all real. |
+| `boomlet_1230` | real | Anonymized multivariate channels; sign semantics unspecified, all real. |
+| `boomlet_1282` | real | Anonymized multivariate channels; sign semantics unspecified, all real. |
+| `boomlet_1487` | real | Anonymized multivariate channels; sign semantics unspecified, all real. |
+| `boomlet_1631` | real | Anonymized multivariate channels; sign semantics unspecified, all real. |
+| `boomlet_1676` | real | Anonymized multivariate channels; sign semantics unspecified, all real. |
+| `boomlet_1855` | real | Anonymized multivariate channels; sign semantics unspecified, all real. |
+| `boomlet_1975` | real | Anonymized multivariate channels; sign semantics unspecified, all real. |
+| `boomlet_2187` | real | Anonymized multivariate channels; sign semantics unspecified, all real. |
+| `boomlet_285` | real | Anonymized multivariate channels; sign semantics unspecified, all real. |
+| `boomlet_619` | real | Anonymized multivariate channels; sign semantics unspecified, all real. |
+| `boomlet_772` | real | Anonymized multivariate channels; sign semantics unspecified, all real. |
+| `boomlet_963` | real | Anonymized multivariate channels; sign semantics unspecified, all real. |
+| `fred_md_2025/cee` | nonnegative: PAYEMS; real: CPIAUCSL, FEDFUNDS | Employment/housing counts nonnegative; indices, rates and uncertain macro quantities real. |
+| `fred_qd_2025/cee` | nonnegative: PAYEMS; real: CPIAUCSL, FEDFUNDS | Employment/housing counts nonnegative; indices, rates and uncertain macro quantities real. |
+| `fred_md_2025/macro` | nonnegative: UEMPLT5, UEMP5TO14, UEMP15T26, UEMP27OV, PAYEMS, USGOOD, USCONS, MANEMP, DMANEMP, NDMANEMP, SRVPRD, USTPU, USTRADE, USFIRE, USGOVT, HOUST, PERMIT; real: INDPRO, IPFINAL, IPCONGD, IPDCONGD, IPNCONGD, IPBUSEQ, IPMAT, IPDMAT, IPNMAT, IPMANSICS, CUMFNS, UNRATE, UEMPMEAN, AWHMAN, BUSINVx, M2REAL, TOTRESNS, NONBORRES, S&P 500, FEDFUNDS, TB3MS, TB6MS, GS1, GS5, GS10, AAA, BAA, EXUSUKx, PPICMM, CPIAUCSL, CPIMEDSL, UMCSENTx, INVEST, VIXCLSx | Employment/housing counts nonnegative; indices, rates and uncertain macro quantities real. |
+| `fred_qd_2025/macro` | nonnegative: UEMPLT5, UEMP5TO14, UEMP15T26, UEMP27OV, PAYEMS, USGOOD, USCONS, MANEMP, DMANEMP, NDMANEMP, SRVPRD, USTPU, USTRADE, USFIRE, USGOVT, HOUST, PERMIT; real: INDPRO, IPFINAL, IPCONGD, IPDCONGD, IPNCONGD, IPBUSEQ, IPMAT, IPDMAT, IPNMAT, IPMANSICS, CUMFNS, UNRATE, UEMPMEAN, AWHMAN, BUSINVx, M2REAL, TOTRESNS, NONBORRES, S&P 500, FEDFUNDS, TB3MS, TB6MS, GS1, GS5, GS10, AAA, BAA, EXUSUKx, PPICMM, CPIAUCSL, CPIMEDSL, UMCSENTx, INVEST, VIXCLSx | Employment/housing counts nonnegative; indices, rates and uncertain macro quantities real. |
+| `us_consumption_1M` | nonnegative | Consumption expenditure levels. |
+| `us_consumption_1Q` | nonnegative | Consumption expenditure levels. |
+| `us_consumption_1Y` | nonnegative | Consumption expenditure levels. |
+| `gvar` | real | Macro variables include rates and transformed indices; conservatively all real. |

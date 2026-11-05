@@ -1,0 +1,443 @@
+# Preregistered from target semantics, never observed statistics.
+# Frozen legacy profiles remain in profiles.yaml.
+proenfo_gfc12:
+  target_support: nonnegative
+  categorical_statics: []
+proenfo_gfc14:
+  target_support: nonnegative
+  categorical_statics: []
+proenfo_gfc17:
+  target_support: nonnegative
+  categorical_statics: []
+rohlik_sales_1D:
+  target_support: nonnegative
+  categorical_statics:
+  - name
+  - L1_category_name_en
+  - L2_category_name_en
+  - L3_category_name_en
+  - L4_category_name_en
+  - warehouse
+rohlik_orders_1D:
+  target_support: nonnegative
+  categorical_statics: []
+entsoe_15T:
+  target_support: nonnegative
+  categorical_statics: []
+entsoe_30T:
+  target_support: nonnegative
+  categorical_statics: []
+entsoe_1H:
+  target_support: nonnegative
+  categorical_statics: []
+epf_be:
+  target_support: real
+  categorical_statics: []
+epf_de:
+  target_support: real
+  categorical_statics: []
+epf_fr:
+  target_support: real
+  categorical_statics: []
+epf_np:
+  target_support: real
+  categorical_statics: []
+epf_pjm:
+  target_support: real
+  categorical_statics: []
+rossmann_1D:
+  target_support: nonnegative
+  categorical_statics:
+  - StoreType
+  - Assortment
+  - PromoInterval
+restaurant:
+  target_support: nonnegative
+  categorical_statics:
+  - air_genre_name
+  - air_area_name
+m5_1D:
+  target_support: nonnegative
+  categorical_statics:
+  - item_id
+  - dept_id
+  - cat_id
+  - store_id
+  - state_id
+m5_1M:
+  target_support: nonnegative
+  categorical_statics:
+  - item_id
+  - dept_id
+  - cat_id
+  - store_id
+  - state_id
+hierarchical_sales_1D:
+  target_support: nonnegative
+  categorical_statics: []
+favorita_stores_1D:
+  target_support: nonnegative
+  categorical_statics:
+  - family
+  - city
+  - state
+  - type
+favorita_stores_1M:
+  target_support: nonnegative
+  categorical_statics:
+  - family
+  - city
+  - state
+  - type
+favorita_transactions_1D:
+  target_support: nonnegative
+  categorical_statics:
+  - city
+  - state
+  - type
+favorita_transactions_1M:
+  target_support: nonnegative
+  categorical_statics:
+  - city
+  - state
+  - type
+solar_with_weather_15T:
+  target_support: nonnegative
+  categorical_statics: []
+solar_with_weather_1H:
+  target_support: nonnegative
+  categorical_statics: []
+solar_1D:
+  target_support: nonnegative
+  categorical_statics: []
+solar_1W:
+  target_support: nonnegative
+  categorical_statics: []
+kdd_cup_2022_10T:
+  target_support: nonnegative
+  categorical_statics: []
+kdd_cup_2022_30T:
+  target_support: nonnegative
+  categorical_statics: []
+kdd_cup_2022_1D:
+  target_support: nonnegative
+  categorical_statics: []
+uci_air_quality_1H:
+  target_support: nonnegative
+  categorical_statics: []
+uci_air_quality_1D:
+  target_support: nonnegative
+  categorical_statics: []
+LOOP_SEATTLE_5T:
+  target_support: nonnegative
+  categorical_statics: []
+LOOP_SEATTLE_1D:
+  target_support: nonnegative
+  categorical_statics: []
+LOOP_SEATTLE_1H:
+  target_support: nonnegative
+  categorical_statics: []
+M_DENSE_1D:
+  target_support: nonnegative
+  categorical_statics: []
+M_DENSE_1H:
+  target_support: nonnegative
+  categorical_statics: []
+SZ_TAXI_15T:
+  target_support: nonnegative
+  categorical_statics: []
+SZ_TAXI_1H:
+  target_support: nonnegative
+  categorical_statics: []
+redset_5T:
+  target_support: real
+  categorical_statics:
+  - subset
+redset_15T:
+  target_support: real
+  categorical_statics:
+  - subset
+redset_1H:
+  target_support: real
+  categorical_statics:
+  - subset
+hospital_admissions_1D:
+  target_support: nonnegative
+  categorical_statics: []
+ETT_1W:
+  target_support:
+    HUFL: nonnegative
+    HULL: nonnegative
+    MUFL: nonnegative
+    MULL: nonnegative
+    LUFL: nonnegative
+    LULL: nonnegative
+    OT: real
+  categorical_statics: []
+ETT_1D:
+  target_support:
+    HUFL: nonnegative
+    HULL: nonnegative
+    MUFL: nonnegative
+    MULL: nonnegative
+    LUFL: nonnegative
+    LULL: nonnegative
+    OT: real
+  categorical_statics: []
+ETT_1H:
+  target_support:
+    HUFL: nonnegative
+    HULL: nonnegative
+    MUFL: nonnegative
+    MULL: nonnegative
+    LUFL: nonnegative
+    LULL: nonnegative
+    OT: real
+  categorical_statics: []
+ETT_15T:
+  target_support:
+    HUFL: nonnegative
+    HULL: nonnegative
+    MUFL: nonnegative
+    MULL: nonnegative
+    LUFL: nonnegative
+    LULL: nonnegative
+    OT: real
+  categorical_statics: []
+hospital:
+  target_support: nonnegative
+  categorical_statics: []
+jena_weather_10T:
+  target_support: real
+  categorical_statics: []
+jena_weather_1D:
+  target_support: real
+  categorical_statics: []
+jena_weather_1H:
+  target_support: real
+  categorical_statics: []
+bizitobs_l2c_1H:
+  target_support: real
+  categorical_statics: []
+bizitobs_l2c_5T:
+  target_support: real
+  categorical_statics: []
+australian_tourism:
+  target_support: nonnegative
+  categorical_statics: []
+world_tourism:
+  target_support: nonnegative
+  categorical_statics: []
+world_co2_emissions:
+  target_support: nonnegative
+  categorical_statics: []
+world_life_expectancy:
+  target_support: nonnegative
+  categorical_statics: []
+ercot_1H:
+  target_support: nonnegative
+  categorical_statics: []
+ercot_1D:
+  target_support: nonnegative
+  categorical_statics: []
+ercot_1M:
+  target_support: nonnegative
+  categorical_statics: []
+uk_covid_utla_1D/new:
+  target_support: nonnegative
+  categorical_statics: []
+uk_covid_utla_1W/cumulative:
+  target_support: nonnegative
+  categorical_statics: []
+uk_covid_nation_1D/new:
+  target_support: nonnegative
+  categorical_statics: []
+uk_covid_nation_1D/cumulative:
+  target_support: nonnegative
+  categorical_statics: []
+uk_covid_nation_1W/new:
+  target_support: nonnegative
+  categorical_statics: []
+uk_covid_nation_1W/cumulative:
+  target_support: nonnegative
+  categorical_statics: []
+ecdc_ili:
+  target_support: nonnegative
+  categorical_statics: []
+boomlet_1062:
+  target_support: real
+  categorical_statics: []
+boomlet_1209:
+  target_support: real
+  categorical_statics: []
+boomlet_1225:
+  target_support: real
+  categorical_statics: []
+boomlet_1230:
+  target_support: real
+  categorical_statics: []
+boomlet_1282:
+  target_support: real
+  categorical_statics: []
+boomlet_1487:
+  target_support: real
+  categorical_statics: []
+boomlet_1631:
+  target_support: real
+  categorical_statics: []
+boomlet_1676:
+  target_support: real
+  categorical_statics: []
+boomlet_1855:
+  target_support: real
+  categorical_statics: []
+boomlet_1975:
+  target_support: real
+  categorical_statics: []
+boomlet_2187:
+  target_support: real
+  categorical_statics: []
+boomlet_285:
+  target_support: real
+  categorical_statics: []
+boomlet_619:
+  target_support: real
+  categorical_statics: []
+boomlet_772:
+  target_support: real
+  categorical_statics: []
+boomlet_963:
+  target_support: real
+  categorical_statics: []
+fred_md_2025/cee:
+  target_support:
+    PAYEMS: nonnegative
+    CPIAUCSL: real
+    FEDFUNDS: real
+  categorical_statics: []
+fred_qd_2025/cee:
+  target_support:
+    PAYEMS: nonnegative
+    CPIAUCSL: real
+    FEDFUNDS: real
+  categorical_statics: []
+fred_md_2025/macro:
+  target_support:
+    INDPRO: real
+    IPFINAL: real
+    IPCONGD: real
+    IPDCONGD: real
+    IPNCONGD: real
+    IPBUSEQ: real
+    IPMAT: real
+    IPDMAT: real
+    IPNMAT: real
+    IPMANSICS: real
+    CUMFNS: real
+    UNRATE: real
+    UEMPMEAN: real
+    UEMPLT5: nonnegative
+    UEMP5TO14: nonnegative
+    UEMP15T26: nonnegative
+    UEMP27OV: nonnegative
+    PAYEMS: nonnegative
+    USGOOD: nonnegative
+    USCONS: nonnegative
+    MANEMP: nonnegative
+    DMANEMP: nonnegative
+    NDMANEMP: nonnegative
+    SRVPRD: nonnegative
+    USTPU: nonnegative
+    USTRADE: nonnegative
+    USFIRE: nonnegative
+    USGOVT: nonnegative
+    AWHMAN: real
+    HOUST: nonnegative
+    PERMIT: nonnegative
+    BUSINVx: real
+    M2REAL: real
+    TOTRESNS: real
+    NONBORRES: real
+    S&P 500: real
+    FEDFUNDS: real
+    TB3MS: real
+    TB6MS: real
+    GS1: real
+    GS5: real
+    GS10: real
+    AAA: real
+    BAA: real
+    EXUSUKx: real
+    PPICMM: real
+    CPIAUCSL: real
+    CPIMEDSL: real
+    UMCSENTx: real
+    INVEST: real
+    VIXCLSx: real
+  categorical_statics: []
+fred_qd_2025/macro:
+  target_support:
+    INDPRO: real
+    IPFINAL: real
+    IPCONGD: real
+    IPDCONGD: real
+    IPNCONGD: real
+    IPBUSEQ: real
+    IPMAT: real
+    IPDMAT: real
+    IPNMAT: real
+    IPMANSICS: real
+    CUMFNS: real
+    UNRATE: real
+    UEMPMEAN: real
+    UEMPLT5: nonnegative
+    UEMP5TO14: nonnegative
+    UEMP15T26: nonnegative
+    UEMP27OV: nonnegative
+    PAYEMS: nonnegative
+    USGOOD: nonnegative
+    USCONS: nonnegative
+    MANEMP: nonnegative
+    DMANEMP: nonnegative
+    NDMANEMP: nonnegative
+    SRVPRD: nonnegative
+    USTPU: nonnegative
+    USTRADE: nonnegative
+    USFIRE: nonnegative
+    USGOVT: nonnegative
+    AWHMAN: real
+    HOUST: nonnegative
+    PERMIT: nonnegative
+    BUSINVx: real
+    M2REAL: real
+    TOTRESNS: real
+    NONBORRES: real
+    S&P 500: real
+    FEDFUNDS: real
+    TB3MS: real
+    TB6MS: real
+    GS1: real
+    GS5: real
+    GS10: real
+    AAA: real
+    BAA: real
+    EXUSUKx: real
+    PPICMM: real
+    CPIAUCSL: real
+    CPIMEDSL: real
+    UMCSENTx: real
+    INVEST: real
+    VIXCLSx: real
+  categorical_statics: []
+us_consumption_1M:
+  target_support: nonnegative
+  categorical_statics: []
+us_consumption_1Q:
+  target_support: nonnegative
+  categorical_statics: []
+us_consumption_1Y:
+  target_support: nonnegative
+  categorical_statics: []
+gvar:
+  target_support: real
+  categorical_statics: []

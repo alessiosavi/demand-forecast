@@ -333,6 +333,15 @@ class BatchBuilder:
             floored_covariates=arrays["floored_covariates"],
         )
         cat = {name: np.zeros(size, dtype=np.int64) for name in encoder.vocab_sizes}
+        if isinstance(panel.target_support, dict):
+            cat["__fev_nonnegative__"] = np.array(
+                [
+                    panel.target_support[panel.series[int(i)].statics["__fev_target__"]]
+                    == "nonnegative"
+                    for i in items[:, 0]
+                ],
+                dtype=bool,
+            )
         # Keep torch's per-scalar float32 overflow checks, not NumPy's inf cast.
         loc = torch.zeros(size, dtype=torch.float32)
         scale = torch.ones(size, dtype=torch.float32)

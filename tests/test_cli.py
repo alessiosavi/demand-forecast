@@ -645,7 +645,7 @@ def test_cli_init_from_merge_rejects_empty_and_list_roots_and_handles_missing_tr
 
     def capture(*args, **kwargs):
         captured.append(args[0] if command == "train" else args[1])
-        return tmp_path / "out/bundle"
+        return tmp_path / "out/bundle" if command == "train" else pd.DataFrame()
 
     monkeypatch.setattr(target, capture)
     for raw, message in [
@@ -687,6 +687,7 @@ def test_cli_shipped_zero_shot_yaml_resolves(tmp_path, monkeypatch):
 
     def capture(specs, settings, *args, **kwargs):
         captured.append(settings)
+        return pd.DataFrame()
 
     monkeypatch.setattr("demand_forecast.bench.run.run_fev", capture)
     result = runner.invoke(
