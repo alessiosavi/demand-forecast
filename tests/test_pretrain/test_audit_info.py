@@ -3,7 +3,10 @@
 import copy
 import json
 import math
+from fractions import Fraction
+from itertools import product
 from pathlib import Path
+from time import perf_counter
 
 import numpy as np
 import pytest
@@ -26,7 +29,9 @@ LIMITED = {
 @pytest.mark.parametrize("row", SEGMENTS, ids=lambda row: str(row["record_id"]))
 def test_reference_score_exact(row):
     score = info.info_bits(row["values"])
+    assert type(score.bits) is int
     assert score.bits == row["bits_c"]
+    assert score.code == row["code"]
     assert score.strict_ramp == row["ramp"]
     assert (score.n, score.levels, score.runs) == (row["n"], row["k"], row["runs"])
 
@@ -80,8 +85,8 @@ def test_control_identification_and_detection_limit(name):
         if name in LIMITED:
             assert bits == LIMITED[name]
         # Exercise the actual labeller with exactly the specified production B.
-        # Fractional counts here are a test input solely to fix log2(T) exactly.
-        info.finish_identification({"windows": {"exact": 2**56.84675}}, copies, {})
+        # Integer comparison opportunities nearest the specified display budget.
+        info.finish_identification({"windows": {"exact": round(2**56.84675)}}, copies, {})
         expected_status = "low_information" if name in LIMITED else "identifying"
         assert any(p["identification"] == expected_status for p in copies)
         if name in LIMITED:
@@ -94,7 +99,7 @@ def _record(bits, *, ramp=False, index_bits=None):
         "info_bits_target": bits,
         "info_bits_index": bits if index_bits is None else index_bits,
         "info_strict_ramp": ramp,
-        "_info_values": ([1.0], [2.0]),
+        "_info_values": (np.array([1.0]), np.array([2.0])),
     }
 
 
@@ -153,7 +158,7 @@ def test_strict_ramp_uses_original_joint_positions():
     assert record["is_copy"] and record["info_strict_ramp"]
     assert record["info_bits_target"] == record["info_bits_index"] == 0
     both = np.isfinite(target) & np.isfinite(corpus)
-    assert record["_info_values"] == (target[both].tolist(), corpus[both].tolist())
+    assert "_info_values" not in record
     assert not info.info_bits(target[both]).strict_ramp
     # Conversely, a ramp only after compression is not an original-position ramp.
     compressed = target.copy()
@@ -161,6 +166,9 @@ def test_strict_ramp_uses_original_joint_positions():
     compressed[~both] = np.nan
     rec = match.fit_segment(compressed, compressed.copy(), 0, 48, 0)
     assert rec["is_copy"] and not rec["info_strict_ramp"]
+    for values in rec["_info_values"]:
+        np.testing.assert_array_equal(values, compressed[both])
+        assert values.flags.owndata and values.dtype == np.float64
     assert info.info_bits(compressed[both]).strict_ramp
 
 
@@ -181,11 +189,15 @@ def test_quantisation_uses_matcher_constants(monkeypatch):
     assert info.info_bits(v).bits == 0
 
 
-def test_values_bounded_but_score_uses_complete_segment():
-    v = np.random.default_rng(42).normal(size=700)
+@pytest.mark.parametrize("dtype", [np.float64, np.float32])
+def test_values_bounded_but_score_uses_complete_segment(dtype):
+    v = np.random.default_rng(42).normal(size=700).astype(dtype)
     record = match.fit_segment(v, 2 * v + 1, 0, len(v), 0)
     assert record["segment"] == record["info_n"] == 700
     assert record["info_bits_target"] == info.info_bits(v).bits
+    for values in record["_info_values"]:
+        assert values.dtype == np.float64 and values.shape == (512,)
+        assert values.flags.owndata and values.base is None
     original = copy.deepcopy(record)
     info.finish_identification({"windows": {}}, [record], {})
     assert record["identification"] == "identifying"
@@ -193,3 +205,140 @@ def test_values_bounded_but_score_uses_complete_segment():
     assert record["values_index"] == (2 * v[:512] + 1).tolist()
     assert record["is_copy"] == original["is_copy"]
     assert len(record["values_target"]) == 512
+
+
+@pytest.mark.parametrize("n, expected", [(131074, 62), (65538, 60)])
+def test_long_piecewise_integer_boundaries(n, expected):
+    # tau=1, q=0,...,0,1,...,200: exactly one nonzero second difference.
+    # Piecewise = selector 3 + ceil(log2(n-1)) + ceil(log2 C(n-2,1))
+    #             + (1+2)*ceil(log2(201)).
+    # n=131074: 3+18+17+24=62; n=65538: 3+17+16+24=60.
+    values = np.r_[np.zeros(n - 200), np.arange(1, 201)]
+    score = info.info_bits(values)
+    assert (score.bits, score.code) == (expected, "piecewise_linear")
+    record = _record(score.bits)
+    info.finish_identification({"windows": {"exact": 2**17}}, [record], {"exact": 2**24})
+    assert record["identification"] == ("identifying" if expected >= 61 else "low_information")
+
+
+def test_scoring_never_calls_floating_logs(monkeypatch):
+    def forbidden(*args):
+        pytest.fail("floating log on the code-length path")
+
+    with monkeypatch.context() as no_logs:
+        no_logs.setattr(math, "lgamma", forbidden)
+        no_logs.setattr(math, "log2", forbidden)
+        no_logs.setattr(math, "log", forbidden)
+        for row in SEGMENTS:
+            assert info.info_bits(row["values"]).bits == row["bits_c"]
+    # Only the two human-readable search logarithms may use math.log2.
+    original = math.log2
+    calls = []
+
+    def display_log(n):
+        calls.append(n)
+        return original(n)
+
+    monkeypatch.setattr(math, "log2", display_log)
+    info.finish_identification({"windows": {"exact": 3}}, [_record(22)], {"exact": 5})
+    assert calls == [3, 5]
+
+
+def test_exact_status_beyond_float_precision():
+    # All three products round to 2**60 as floats, but only the first two pass.
+    for windows, expected in (
+        (2**60 - 1, "identifying"),
+        (2**60, "identifying"),
+        (2**60 + 1, "low_information"),
+    ):
+        record = _record(80)
+        info.finish_identification({"windows": {"exact": windows}}, [record], {"exact": 1})
+        assert record["identification"] == expected
+    record = _record(19)
+    info.finish_identification({"windows": {}}, [record], {})
+    assert record["identification"] == "low_information"
+
+
+def test_exact_kt_against_independent_fraction_products():
+    rng = np.random.default_rng(30)
+    for k in (2, 3, 4, 5):
+        for _ in range(10):
+            transitions = rng.integers(0, 8, (k, k))
+            ratio = Fraction(k)
+            for row in transitions:
+                for i in range(int(row.sum())):
+                    ratio *= Fraction(k, 2) + i
+                for count in row:
+                    for i in range(int(count)):
+                        ratio /= Fraction(1, 2) + i
+            # Independent oracle: walk successive powers, with no logarithms.
+            ceiling, power = 0, 1
+            while power < ratio:
+                power *= 2
+                ceiling += 1
+            assert info._kt_bits(transitions) == ceiling
+    assert info._ratio_bits(8, 2) == 2
+    assert info._ratio_bits(9, 2) == 3
+
+
+def _brute_period(q):
+    return next((p for p in range(1, len(q) // 2 + 1) if np.array_equal(q[p:], q[:-p])), None)
+
+
+def test_period_exhaustive_binary():
+    for n in range(1, 13):
+        for values in product((0, 1), repeat=n):
+            q = np.asarray(values)
+            assert info._smallest_period(q) == _brute_period(q)
+
+
+def test_period_random_long_and_partial_motifs():
+    rng = np.random.default_rng(72)
+    for n in (1001, 10000, 100000):
+        random = rng.integers(0, 200, n)
+        partial = np.resize([0, 3, 1, 8, 2, 7, 4], n)
+        almost = partial.copy()
+        almost[-1] = 199
+        for q in (random, partial, almost):
+            assert info._smallest_period(q) == _brute_period(q)
+        assert info._smallest_period(partial) == 7  # no n % p requirement
+
+
+def test_long_aperiodic_both_sides_cost():
+    values = np.random.default_rng(0).normal(size=100000)
+    started = perf_counter()
+    scores = [info.info_bits(v) for v in (values, 2 * values + 1)]
+    elapsed = perf_counter() - started
+    assert all(s.code == "enumerative" and s.bits > 0 for s in scores)
+    assert elapsed < 1.0, f"two 100,000-point scores took {elapsed:.3f}s"
+
+
+@pytest.mark.parametrize(
+    "values, bits, code",
+    [
+        ([0, 1, 0], 8, "enumerative"),  # enumerative ties run
+        ([0, 1, 0, 1], 8, "run"),  # run ties periodic_motif
+    ],
+)
+def test_code_tie_order(values, bits, code):
+    score = info.info_bits(values)
+    assert (score.bits, score.code) == (bits, code)
+
+
+def test_documented_six_code_tie_order():
+    assert info._CODE_ORDER == (
+        "enumerative",
+        "run",
+        "piecewise_linear",
+        "kt_markov",
+        "periodic_motif",
+        "digital_line",
+    )
+
+
+def test_exact_digital_rounding():
+    for denominator in range(1, 30):
+        for numerator in range(-100, 101):
+            assert info._round_ratio(numerator, denominator) == round(
+                Fraction(numerator, denominator)
+            )

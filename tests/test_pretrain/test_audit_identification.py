@@ -65,7 +65,16 @@ def _assert_report(out, report):
         p for p in report["copies"] if p["identification"] == "identifying"
     ]
     assert all(p["values_target"] and p["values_index"] for p in declaration["copies"])
+    assert all(
+        type(p[field]) is int
+        for p in declaration["copies"]
+        for field in ("info_bits_target", "info_bits_index")
+    )
     assert declaration["identification_summary"] == report["identification_summary"]
+    assert not any(p["task"] == "negative" for p in report["copies"])
+    assert report["identification_summary"]["negative"] == {
+        role: dict.fromkeys(audit_info.STATUSES, 0) for role in ("target", "covariate")
+    }
     assert (
         declaration["tasks_with_only_low_information_matches"]
         == report["tasks_with_only_low_information_matches"]
@@ -167,3 +176,34 @@ def test_previous_method_scans_are_not_resumed(local_audit, tmp_path, monkeypatc
     assert previous["input_fingerprint"] != current["input_fingerprint"]
     assert not any(m.startswith("Resume:") for m in messages)
     assert sum(m.startswith("Scanned ") for m in messages) == len(current["scans"])
+
+
+@pytest.mark.parametrize("name", ["INFO_VERSION", "INFO_MARGIN_BITS"])
+def test_info_constants_change_fingerprint(monkeypatch, name):
+    before = audit._fingerprint({"constants": audit.constants()})
+    monkeypatch.setattr(audit_info, name, getattr(audit_info, name) + 1)
+    assert audit._fingerprint({"constants": audit.constants()}) != before
+
+
+@pytest.mark.parametrize("missing", ["info", "identification"])
+def test_incomplete_identification_scan_is_rescanned(local_audit, tmp_path, missing):
+    root, tasks = local_audit
+    out = tmp_path / "out"
+    audit.run_audit(root, out, tasks=tasks, workers=1, progress=lambda _: None)
+    path = next(
+        p for p in sorted((out / "scans").glob("*.json")) if json.loads(p.read_text())["copies"]
+    )
+    original = path.read_bytes()
+    scan = json.loads(original)
+    job = {"result_path": str(path), "fingerprint": scan["fingerprint"]}
+    assert audit._resume_result(job) == scan
+    if missing == "info":
+        del scan["info"]
+    else:
+        del scan["copies"][0]["identification"]
+    path.write_text(json.dumps(scan))
+    assert audit._resume_result(job) is None
+    messages = []
+    audit.run_audit(root, out, tasks=tasks, workers=1, resume=True, progress=messages.append)
+    assert sum(m.startswith("Scanned ") for m in messages) == 1
+    assert path.read_bytes() == original

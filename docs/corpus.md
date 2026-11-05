@@ -315,13 +315,22 @@ multiplication; index windows include postings above the matching caps. Fallback
 passes do not count windows twice. A zero-window scan reports zero for the
 corresponding logarithm; it has no matching opportunity.
 
+Code lengths and the status decision use exact integer arithmetic and are
+platform independent for a given quantised sequence and ramp result. Bits are
+stored as JSON integers. The equivalent status comparison is
+`2**(bits - INFO_MARGIN_BITS) >= max(1, T) * max(1, I)` (a negative exponent
+cannot pass). Displayed `info_search_bits` / `info_threshold` and scan
+`search_bits` are floats for reading only; they never decide the status.
+Quantisation and the numerical ramp test still operate on float64 input.
+
 `INFO_VERSION = 1`, `INFO_MARGIN_BITS = 20`, and `RAMP_ULP_FACTOR = 8`.
 The score uses `tau = max(COPY_ATOL, COPY_RTOL * range)` with the existing
 `COPY_ATOL = 0.01` and `COPY_RTOL = 0.005`, rounds `values / tau` to integers,
 and subtracts their minimum. It takes three selector bits plus the shortest
 of six exact conditional codes: enumerative, run, piecewise-linear, first-order
-KT Markov, exact periodic motif, and digital line plus signed residuals. Occupied
-levels are encoded either directly or by an exactly reconstructible digital
+KT Markov, exact periodic motif, and digital line plus signed residuals, in that
+order for ties. Occupied levels are encoded either directly or by an exactly
+reconstructible digital
 lattice with a charged denominator and rounding phase. The strict ramp rule
 requires endpoint-line residuals at most
 `min(tau, 8 * 2**(-23) * max(abs(values)))`; with missing points it evaluates the

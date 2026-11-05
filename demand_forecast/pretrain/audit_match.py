@@ -430,9 +430,14 @@ def fit_segment(t, s, a0, a1, off, dim=None):
             info_levels_index=index_info.levels,
             info_runs_target=target_info.runs,
             info_runs_index=index_info.runs,
-            # Only inspection values are bounded; scoring always uses every point.
-            _info_values=(a[:512].tolist(), b[:512].tolist()),
         )
+        if not result["info_strict_ramp"]:
+            # Own bounded buffers: views would retain the complete aligned arrays.
+            # Lists are materialised only for records selected after the scan.
+            result["_info_values"] = (
+                a[:512].astype(np.float64, copy=True),
+                b[:512].astype(np.float64, copy=True),
+            )
     return result
 
 

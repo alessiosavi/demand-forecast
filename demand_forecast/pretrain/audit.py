@@ -810,11 +810,16 @@ def _resume_result(job):
             "rejections",
             "policy_excluded_targets",
             "unresolved",
+            "info",
         )
         if (
             report["fingerprint"] == job["fingerprint"]
             and report["counts"]["unresolved_rows"] == 0
             and all(key in report for key in required)
+            and isinstance(report["info"], dict)
+            and all(
+                record.get("identification") in audit_info.STATUSES for record in report["copies"]
+            )
         ):
             return report
     except (OSError, ValueError, KeyError, TypeError):

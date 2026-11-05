@@ -115,11 +115,11 @@ def test_verify_caps_offsets_before_fitting_and_keeps_strong_copy(monkeypatch, r
         return fit_segment(t, s, a0, a1, off, dim)
 
     monkeypatch.setattr(match, "fit_segment", track_fit)
-    assert match.verify(target, source, hits) == expected
+    np.testing.assert_equal(match.verify(target, source, hits), expected)
     assert fitted == kept
     stats = {"unrelated": 17}
     for _ in range(2):
-        assert match.verify(target, source, hits, stats=stats) == expected
+        np.testing.assert_equal(match.verify(target, source, hits, stats=stats), expected)
     assert stats == {"unrelated": 17, "offsets_capped_candidates": 2, "offsets_dropped": 8}
     assert all(type(value) is int for value in stats.values())
 
@@ -130,9 +130,9 @@ def test_verify_at_or_below_cap_matches_frozen_reference(monkeypatch, cap):
     monkeypatch.setattr(match, "VERIFY_OFFSET_CAP", cap)
     expected = mask_verify(target, source, hits)
     stats = {"offsets_capped_candidates": 5, "offsets_dropped": 11}
-    assert match.verify(target, source, hits, stats=stats) == expected
+    np.testing.assert_equal(match.verify(target, source, hits, stats=stats), expected)
     assert stats == {"offsets_capped_candidates": 5, "offsets_dropped": 11}
-    assert match.verify(target, source, hits) == expected
+    np.testing.assert_equal(match.verify(target, source, hits), expected)
 
 
 @pytest.mark.parametrize("row_cap,offset_cap", [(2, 1), (3, 2)])

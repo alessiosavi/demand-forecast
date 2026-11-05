@@ -21,14 +21,21 @@ INFO_VERSION = 1
 INFO_MARGIN_BITS = 20
 RAMP_ULP_FACTOR = 8
 STATUSES = ("identifying", "low_information", "interpolation_ramp")
-_LOG2 = math.log(2)
+_CODE_ORDER = (
+    "enumerative",
+    "run",
+    "piecewise_linear",
+    "kt_markov",
+    "periodic_motif",
+    "digital_line",
+)
 
 
 @dataclass(frozen=True)
 class InfoScore:
     """Winning conditional code (ties use the documented six-code order)."""
 
-    bits: float
+    bits: int
     code: str
     strict_ramp: bool
     n: int
@@ -36,56 +43,111 @@ class InfoScore:
     runs: int
 
 
-def _log_choose(n: int, k: int) -> float:
-    if k < 0 or k > n:
-        return math.inf
-    if k == 0 or k == n:
-        return 0.0
-    return max(0.0, (math.lgamma(n + 1) - math.lgamma(k + 1) - math.lgamma(n - k + 1)) / _LOG2)
-
-
-def _log_size(n: int) -> float:
-    return math.log2(max(1, int(n)))
-
-
-def _ceil_bits(bits: float) -> int:
-    # Only a floating-roundoff guard, not a relaxed coding threshold.
-    return math.ceil(max(0.0, bits) - 1e-10)
-
-
 def _size_bits(n: int) -> int:
-    return _ceil_bits(_log_size(n))
+    """Exact ceil(log2(n)), with zero cost for empty/singleton choices."""
+    return (max(1, n) - 1).bit_length()
 
 
-@lru_cache(maxsize=50000)
-def _level_cost(levels: tuple[int, ...]) -> float:
+def _choose_bits(n: int, k: int) -> int:
+    return _size_bits(math.comb(n, k))
+
+
+def _ratio_bits(numerator: int, denominator: int) -> int:
+    """Exact nonnegative ceil(log2(numerator / denominator))."""
+    shift = max(0, numerator.bit_length() - denominator.bit_length())
+    return shift + (numerator > denominator << shift)
+
+
+def _multinomial(counts: list[int]) -> int:
+    # Balanced products avoid dividing two enormous, almost equal factorials.
+    if len(counts) <= 1:
+        return 1
+    mid = len(counts) // 2
+    left, right = counts[:mid], counts[mid:]
+    return math.comb(sum(counts), sum(left)) * _multinomial(left) * _multinomial(right)
+
+
+def _odd_factorial(n: int) -> int:
+    """1 * 3 * ... * (2n-1), including the empty product."""
+    return math.factorial(2 * n) // (math.factorial(n) << n)
+
+
+def _kt_bits(transitions: np.ndarray) -> int:
+    # Cancel the powers of two in (k/2)_N / product((1/2)_c).
+    # Fold the first-symbol k into the ratio BEFORE taking the single ceiling.
+    k = len(transitions)
+    numerators, denominators = [k], []
+    for row in transitions:
+        counts = [int(c) for c in row if c]
+        total = sum(counts)
+        if not total:
+            continue
+        if k % 2:
+            offset = (k - 1) // 2
+            numerator = _odd_factorial(total + offset) // _odd_factorial(offset)
+        else:
+            offset = k // 2 - 1
+            numerator = (math.factorial(total + offset) // math.factorial(offset)) << total
+        denominator = math.prod(_odd_factorial(c) for c in counts)
+        common = math.gcd(numerator, denominator)
+        numerators.append(numerator // common)
+        denominators.append(denominator // common)
+    return _ratio_bits(math.prod(numerators), math.prod(denominators))
+
+
+def _smallest_period(values: np.ndarray) -> int | None:
+    """Linear prefix function; a final partial motif is allowed."""
+    q = values.tolist()
+    n = len(q)
+    borders = [0] * n
+    border = 0
+    for i in range(1, n):
+        while border and q[i] != q[border]:
+            border = borders[border - 1]
+        if q[i] == q[border]:
+            border += 1
+        borders[i] = border
+    period = n - border
+    return period if 0 < period <= n // 2 else None
+
+
+def _round_ratio(numerator: int, denominator: int) -> int:
+    quotient, remainder = divmod(numerator, denominator)
+    return quotient + (
+        2 * remainder > denominator or (2 * remainder == denominator and quotient % 2)
+    )
+
+
+@lru_cache(maxsize=256)
+def _level_cost(levels: tuple[int, ...]) -> int:
     """Encode interior levels, or an exactly reconstructible digital lattice.
 
     Extrema are supplied. The lattice charges denominator, rounding phase and
     occupied positions; integer-valued input never gets free level spacing.
+    The 256-entry cache bounds diverse 150-level keys to about 0.4 MB (measured),
+    while retaining the 24-key working set of the reference fixture.
     """
     k, extent = len(levels), levels[-1]
     if k <= 2:
-        return 0.0
-    best = _ceil_bits(_log_choose(extent - 1, k - 2))
-    values = np.asarray(levels)
+        return 0
+    best = _choose_bits(extent - 1, k - 2)
     for denominator in range(k - 1, extent + 1):
         cost = (
-            _size_bits(extent)
-            + _size_bits(denominator + 2)
-            + _ceil_bits(_log_choose(denominator - 1, k - 2))
+            _size_bits(extent) + _size_bits(denominator + 2) + _choose_bits(denominator - 1, k - 2)
         )
         if cost >= best:
             continue
-        positions = np.rint(values * denominator / extent).astype(int)
+        positions = [_round_ratio(v * denominator, extent) for v in levels]
         if len(set(positions)) != k:
             continue
-        raw = positions * extent / denominator
-        lo = max(-0.5, max(values - raw - 0.5))
-        hi = min(0.5, min(values - raw + 0.5))
-        if lo < hi and np.array_equal(np.rint(raw + (lo + hi) / 2).astype(int), values):
+        # Phase bounds in units of 1/(2*denominator). A nonempty open
+        # interval reconstructs every level without any rounding-boundary ties.
+        errors = [2 * (v * denominator - j * extent) for v, j in zip(levels, positions)]
+        lo = max(-denominator, max(errors) - denominator)
+        hi = min(denominator, min(errors) + denominator)
+        if lo < hi:
             best = cost
-    return 1.0 + best
+    return 1 + best
 
 
 def info_bits(values: ArrayLike, positions: ArrayLike | None = None) -> InfoScore:
@@ -107,7 +169,7 @@ def info_bits(values: ArrayLike, positions: ArrayLike | None = None) -> InfoScor
     v, pos = v[finite], pos[finite]
     n = len(v)
     if not n:
-        return InfoScore(0.0, "empty", False, 0, 0, 0)
+        return InfoScore(0, "empty", False, 0, 0, 0)
     if not np.isfinite(pos).all() or np.any(np.diff(pos) <= 0):
         raise ValueError("positions must be finite and strictly increasing")
     tolerance = max(COPY_ATOL, COPY_RTOL * float(np.ptp(v)))
@@ -117,7 +179,7 @@ def info_bits(values: ArrayLike, positions: ArrayLike | None = None) -> InfoScor
     k, extent = len(levels), int(q.max())
     runs = 1 + int(np.count_nonzero(np.diff(q)))
     if k < 2:
-        return InfoScore(0.0, "constant", True, n, k, runs)
+        return InfoScore(0, "constant", True, n, k, runs)
 
     # Use linspace for contiguous data to reproduce the numerical reference
     # exactly, and original positions for a mask with internal holes.
@@ -129,59 +191,46 @@ def info_bits(values: ArrayLike, positions: ArrayLike | None = None) -> InfoScor
         tolerance, RAMP_ULP_FACTOR * ULP32 * max(float(np.max(np.abs(v))), PRECISION_SCALE_FLOOR)
     )
     if float(np.max(np.abs(v - line))) <= ramp_tolerance:
-        return InfoScore(0.0, "strict_ramp", True, n, k, runs)
+        return InfoScore(0, "strict_ramp", True, n, k, runs)
 
     level_bits = _level_cost(tuple(levels.tolist()))
-    arrangement = max(
-        0.0,
-        (math.lgamma(sum(counts) + 1) - sum(math.lgamma(int(c) + 1) for c in counts)) / _LOG2,
-    )
-    enumerative = (
-        _size_bits(n) + level_bits + _ceil_bits(_log_choose(n - 1, k - 1)) + _ceil_bits(arrangement)
-    )
+    arrangement = _multinomial([int(c) for c in counts])
+    enumerative = _size_bits(n) + level_bits + _choose_bits(n - 1, k - 1) + _size_bits(arrangement)
     run = (
         2 * _size_bits(n)
         + level_bits
-        + _ceil_bits(_log_choose(n - 1, runs - 1))
+        + _choose_bits(n - 1, runs - 1)
         + _size_bits(k)
         + (runs - 1) * _size_bits(k - 1)
     )
     knots = int(np.count_nonzero(np.diff(q, n=2)))
     piecewise = (
-        _size_bits(n - 1)
-        + _ceil_bits(_log_choose(n - 2, knots))
-        + (knots + 2) * _size_bits(extent + 1)
+        _size_bits(n - 1) + _choose_bits(n - 2, knots) + (knots + 2) * _size_bits(extent + 1)
     )
     # KT mixture includes uncertainty in every transition row, including self
     # transitions. Free fitted transition counts would erase genuine information.
     transitions = np.zeros((k, k), int)
     np.add.at(transitions, (inverse[:-1], inverse[1:]), 1)
-    kt = _log_size(k) + sum(
-        (
-            math.lgamma(int(row.sum()) + k / 2)
-            - math.lgamma(k / 2)
-            - sum(math.lgamma(int(c) + 0.5) - math.lgamma(0.5) for c in row)
-        )
-        / _LOG2
-        for row in transitions
-    )
-    markov = _size_bits(n) + level_bits + _ceil_bits(kt) + 1
-    period = next((p for p in range(1, n // 2 + 1) if np.array_equal(q[p:], q[:-p])), None)
+    markov = _size_bits(n) + level_bits + _kt_bits(transitions) + 1
+    period = _smallest_period(q)
     periodic = (
         _size_bits(n) + _size_bits(n // 2) + level_bits + period * _size_bits(k)
         if period is not None
         else math.inf
     )
     # Signed Elias-gamma residuals preserve every deviation from the digital line.
-    prediction = np.rint(np.linspace(q[0], q[-1], n)).astype(int)
+    start, step, span = int(q[0]) * (n - 1), int(q[-1] - q[0]), n - 1
+    prediction = np.fromiter(
+        (_round_ratio(start + step * i, span) for i in range(n)), dtype=np.int64, count=n
+    )
     residuals = q - prediction
     nonzero = int(np.count_nonzero(residuals))
     endpoints = 2 if {int(q[0]), int(q[-1])} == {0, extent} else 1 + 2 * _size_bits(extent + 1)
     digital_line = (
         endpoints
         + _size_bits(n + 1)
-        + _ceil_bits(_log_choose(n, nonzero))
-        + sum(2 + 2 * int(math.floor(_log_size(abs(e)))) for e in residuals if e)
+        + _choose_bits(n, nonzero)
+        + sum(2 * abs(int(e)).bit_length() for e in residuals if e)
     )
     codes = {
         "enumerative": enumerative,
@@ -191,8 +240,8 @@ def info_bits(values: ArrayLike, positions: ArrayLike | None = None) -> InfoScor
         "periodic_motif": periodic,
         "digital_line": digital_line,
     }
-    code = min(codes, key=codes.__getitem__)
-    return InfoScore(float(3 + codes[code]), code, False, n, k, runs)
+    code = min(_CODE_ORDER, key=codes.__getitem__)
+    return InfoScore(3 + codes[code], code, False, n, k, runs)
 
 
 def finish_identification(
@@ -202,10 +251,13 @@ def finish_identification(
 
     New counters count segment records, not duplicate-expanded copy pairs.
     The top twenty low-information records use stable record-order ties.
+    Status uses integer arithmetic; info_search_bits and info_threshold are
+    floating-point display fields only and never decide a declaration.
     """
     target_total, index_total = sum(counts["windows"].values()), sum(index_windows.values())
     search_bits = math.log2(max(1, target_total)) + math.log2(max(1, index_total))
     threshold = search_bits + INFO_MARGIN_BITS
+    opportunities = max(1, target_total) * max(1, index_total)
     low = []
     for status in STATUSES:
         counts[f"{status}_copies"] = 0
@@ -217,7 +269,7 @@ def finish_identification(
             "interpolation_ramp"
             if record["info_strict_ramp"]
             else "identifying"
-            if bits >= threshold
+            if bits >= INFO_MARGIN_BITS and (1 << (bits - INFO_MARGIN_BITS)) >= opportunities
             else "low_information"
         )
         record.update(identification=status, info_search_bits=search_bits, info_threshold=threshold)
@@ -228,7 +280,7 @@ def finish_identification(
     for i, record in enumerate(records):
         values = record.pop("_info_values", None)
         if values is not None and (record["identification"] == "identifying" or i in keep_low):
-            record["values_target"], record["values_index"] = values
+            record["values_target"], record["values_index"] = (v.tolist() for v in values)
     return {
         "version": INFO_VERSION,
         "margin_bits": INFO_MARGIN_BITS,
