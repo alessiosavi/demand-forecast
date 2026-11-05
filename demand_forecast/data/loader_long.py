@@ -82,6 +82,8 @@ def load_long(cfg: DatasetConfig) -> Panel:
     Only target or past-covariate observations extend the historical span;
     known covariates may continue beyond it.
     """
+    if isinstance(cfg.target_support, dict):
+        raise ValueError("target_support mapping requires the fev expanded-target representation")
     if cfg.path is None:
         raise ValueError("data.path is required for long-format input")
     roles = Roles(

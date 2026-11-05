@@ -1,0 +1,934 @@
+{
+  "m5_1W": {
+    "spec": {
+      "name": "m5_1W",
+      "dataset_path": "autogluon/fev_datasets",
+      "dataset_config": "m5_1W",
+      "horizon": 13,
+      "num_windows": 1,
+      "seasonality": 1,
+      "quantile_levels": [
+        0.1,
+        0.2,
+        0.3,
+        0.4,
+        0.5,
+        0.6,
+        0.7,
+        0.8,
+        0.9
+      ],
+      "target": "target",
+      "known_dynamic": [
+        "sell_price",
+        "event_National",
+        "event_Religious",
+        "event_Cultural",
+        "snap_CA",
+        "event_Sporting",
+        "snap_WI",
+        "snap_TX"
+      ],
+      "past_dynamic": [],
+      "static_columns": [
+        "item_id",
+        "dept_id",
+        "cat_id",
+        "store_id",
+        "state_id"
+      ],
+      "categorical_statics": [
+        "item_id",
+        "dept_id",
+        "cat_id",
+        "store_id",
+        "state_id"
+      ],
+      "target_support": "nonnegative",
+      "initial_cutoff": null,
+      "min_context_length": 1,
+      "eval_metric": "SQL",
+      "extra_metrics": [
+        "MASE",
+        {
+          "name": "WAPE",
+          "epsilon": 1.0
+        },
+        {
+          "name": "WQL",
+          "epsilon": 1.0
+        }
+      ],
+      "window_step_size": null,
+      "id_column": "id",
+      "timestamp_column": "timestamp"
+    },
+    "definition": {
+      "name": "m5_1W",
+      "horizon": 13,
+      "num_windows": 1,
+      "initial_cutoff": null,
+      "window_step_size": null,
+      "min_context_length": 1,
+      "seasonality": 1,
+      "quantile_levels": [
+        0.1,
+        0.2,
+        0.3,
+        0.4,
+        0.5,
+        0.6,
+        0.7,
+        0.8,
+        0.9
+      ]
+    },
+    "identity": "e9ead87e09d33515028a5e3596dcfb6c39081ec5edefbc538511ef4ae1b64560"
+  },
+  "favorita_stores_1W": {
+    "spec": {
+      "name": "favorita_stores_1W",
+      "dataset_path": "autogluon/fev_datasets",
+      "dataset_config": "favorita_stores_1W",
+      "horizon": 13,
+      "num_windows": 10,
+      "seasonality": 1,
+      "quantile_levels": [
+        0.1,
+        0.2,
+        0.3,
+        0.4,
+        0.5,
+        0.6,
+        0.7,
+        0.8,
+        0.9
+      ],
+      "target": "sales",
+      "known_dynamic": [
+        "onpromotion"
+      ],
+      "past_dynamic": [
+        "oil_price"
+      ],
+      "static_columns": [
+        "store_nbr",
+        "family",
+        "city",
+        "state",
+        "type",
+        "cluster"
+      ],
+      "categorical_statics": [
+        "store_nbr",
+        "family",
+        "city",
+        "state",
+        "type",
+        "cluster"
+      ],
+      "target_support": "nonnegative",
+      "initial_cutoff": null,
+      "min_context_length": 1,
+      "eval_metric": "SQL",
+      "extra_metrics": [
+        "MASE",
+        {
+          "name": "WAPE",
+          "epsilon": 1.0
+        },
+        {
+          "name": "WQL",
+          "epsilon": 1.0
+        }
+      ],
+      "window_step_size": null,
+      "id_column": "id",
+      "timestamp_column": "timestamp"
+    },
+    "definition": {
+      "name": "favorita_stores_1W",
+      "horizon": 13,
+      "num_windows": 10,
+      "initial_cutoff": null,
+      "window_step_size": null,
+      "min_context_length": 1,
+      "seasonality": 1,
+      "quantile_levels": [
+        0.1,
+        0.2,
+        0.3,
+        0.4,
+        0.5,
+        0.6,
+        0.7,
+        0.8,
+        0.9
+      ]
+    },
+    "identity": "99106cf520203d0c36be003df9fc01880e82994e0f391d5550e85558a05123c1"
+  },
+  "rossmann_1W": {
+    "spec": {
+      "name": "rossmann_1W",
+      "dataset_path": "autogluon/fev_datasets",
+      "dataset_config": "rossmann_1W",
+      "horizon": 13,
+      "num_windows": 8,
+      "seasonality": 1,
+      "quantile_levels": [
+        0.1,
+        0.2,
+        0.3,
+        0.4,
+        0.5,
+        0.6,
+        0.7,
+        0.8,
+        0.9
+      ],
+      "target": "Sales",
+      "known_dynamic": [
+        "Open",
+        "SchoolHoliday",
+        "StateHoliday",
+        "Promo"
+      ],
+      "past_dynamic": [
+        "Customers"
+      ],
+      "static_columns": [
+        "Store",
+        "StoreType",
+        "Assortment",
+        "CompetitionDistance",
+        "CompetitionOpenSinceMonth",
+        "CompetitionOpenSinceYear",
+        "Promo2",
+        "Promo2SinceWeek",
+        "Promo2SinceYear",
+        "PromoInterval"
+      ],
+      "categorical_statics": [
+        "Store",
+        "StoreType",
+        "Assortment",
+        "Promo2",
+        "PromoInterval"
+      ],
+      "target_support": "nonnegative",
+      "initial_cutoff": null,
+      "min_context_length": 1,
+      "eval_metric": "SQL",
+      "extra_metrics": [
+        "MASE",
+        {
+          "name": "WAPE",
+          "epsilon": 1.0
+        },
+        {
+          "name": "WQL",
+          "epsilon": 1.0
+        }
+      ],
+      "window_step_size": null,
+      "id_column": "id",
+      "timestamp_column": "timestamp"
+    },
+    "definition": {
+      "name": "rossmann_1W",
+      "horizon": 13,
+      "num_windows": 8,
+      "initial_cutoff": null,
+      "window_step_size": null,
+      "min_context_length": 1,
+      "seasonality": 1,
+      "quantile_levels": [
+        0.1,
+        0.2,
+        0.3,
+        0.4,
+        0.5,
+        0.6,
+        0.7,
+        0.8,
+        0.9
+      ]
+    },
+    "identity": "013a8c45bfaf4bd07336baaae13e5a370613d0bacf4725cb0b8a8f7abd72ba5c"
+  },
+  "rohlik_sales_1W": {
+    "spec": {
+      "name": "rohlik_sales_1W",
+      "dataset_path": "autogluon/fev_datasets",
+      "dataset_config": "rohlik_sales_1W",
+      "horizon": 8,
+      "num_windows": 1,
+      "seasonality": 1,
+      "quantile_levels": [
+        0.1,
+        0.2,
+        0.3,
+        0.4,
+        0.5,
+        0.6,
+        0.7,
+        0.8,
+        0.9
+      ],
+      "target": "sales",
+      "known_dynamic": [
+        "total_orders",
+        "sell_price_main",
+        "type_0_discount",
+        "type_1_discount",
+        "type_2_discount",
+        "type_3_discount",
+        "type_4_discount",
+        "type_5_discount",
+        "type_6_discount",
+        "holiday",
+        "shops_closed",
+        "winter_school_holidays",
+        "school_holidays"
+      ],
+      "past_dynamic": [
+        "availability"
+      ],
+      "static_columns": [
+        "product_unique_id",
+        "name",
+        "L1_category_name_en",
+        "L2_category_name_en",
+        "L3_category_name_en",
+        "L4_category_name_en",
+        "warehouse"
+      ],
+      "categorical_statics": [
+        "product_unique_id",
+        "name",
+        "L1_category_name_en",
+        "L2_category_name_en",
+        "L3_category_name_en",
+        "L4_category_name_en",
+        "warehouse"
+      ],
+      "target_support": "nonnegative",
+      "initial_cutoff": "2023-12-15",
+      "min_context_length": 8,
+      "eval_metric": "SQL",
+      "extra_metrics": [
+        "MASE",
+        {
+          "name": "WAPE",
+          "epsilon": 1.0
+        },
+        {
+          "name": "WQL",
+          "epsilon": 1.0
+        }
+      ],
+      "window_step_size": null,
+      "id_column": "id",
+      "timestamp_column": "timestamp"
+    },
+    "definition": {
+      "name": "rohlik_sales_1W",
+      "horizon": 8,
+      "num_windows": 1,
+      "initial_cutoff": "2023-12-15",
+      "window_step_size": null,
+      "min_context_length": 8,
+      "seasonality": 1,
+      "quantile_levels": [
+        0.1,
+        0.2,
+        0.3,
+        0.4,
+        0.5,
+        0.6,
+        0.7,
+        0.8,
+        0.9
+      ]
+    },
+    "identity": "64807a1edf5ba39c5cc9022ace8c4215cd21879110235f1450259ac86772f23d"
+  },
+  "walmart": {
+    "spec": {
+      "name": "walmart",
+      "dataset_path": "autogluon/fev_datasets",
+      "dataset_config": "walmart",
+      "horizon": 39,
+      "num_windows": 1,
+      "seasonality": 1,
+      "quantile_levels": [
+        0.1,
+        0.2,
+        0.3,
+        0.4,
+        0.5,
+        0.6,
+        0.7,
+        0.8,
+        0.9
+      ],
+      "target": "target",
+      "known_dynamic": [
+        "MarkDown2",
+        "Unemployment",
+        "MarkDown4",
+        "Fuel_Price",
+        "MarkDown1",
+        "Temperature",
+        "MarkDown5",
+        "MarkDown3",
+        "CPI",
+        "IsHoliday"
+      ],
+      "past_dynamic": [],
+      "static_columns": [
+        "Store",
+        "Dept",
+        "Type",
+        "Size"
+      ],
+      "categorical_statics": [
+        "Store",
+        "Dept",
+        "Type"
+      ],
+      "target_support": "nonnegative",
+      "initial_cutoff": null,
+      "min_context_length": 1,
+      "eval_metric": "SQL",
+      "extra_metrics": [
+        "MASE",
+        {
+          "name": "WAPE",
+          "epsilon": 1.0
+        },
+        {
+          "name": "WQL",
+          "epsilon": 1.0
+        }
+      ],
+      "window_step_size": null,
+      "id_column": "id",
+      "timestamp_column": "timestamp"
+    },
+    "definition": {
+      "name": "walmart",
+      "horizon": 39,
+      "num_windows": 1,
+      "initial_cutoff": null,
+      "window_step_size": null,
+      "min_context_length": 1,
+      "seasonality": 1,
+      "quantile_levels": [
+        0.1,
+        0.2,
+        0.3,
+        0.4,
+        0.5,
+        0.6,
+        0.7,
+        0.8,
+        0.9
+      ]
+    },
+    "identity": "24fe869dd3707dd61233be7e3867ba5b9bc85088fbe582ef05c27e2bf3294638"
+  },
+  "hermes": {
+    "spec": {
+      "name": "hermes",
+      "dataset_path": "autogluon/fev_datasets",
+      "dataset_config": "hermes",
+      "horizon": 52,
+      "num_windows": 1,
+      "seasonality": 1,
+      "quantile_levels": [
+        0.1,
+        0.2,
+        0.3,
+        0.4,
+        0.5,
+        0.6,
+        0.7,
+        0.8,
+        0.9
+      ],
+      "target": "target",
+      "known_dynamic": [
+        "external"
+      ],
+      "past_dynamic": [],
+      "static_columns": [
+        "country",
+        "category"
+      ],
+      "categorical_statics": [
+        "country",
+        "category"
+      ],
+      "target_support": "nonnegative",
+      "initial_cutoff": null,
+      "min_context_length": 1,
+      "eval_metric": "SQL",
+      "extra_metrics": [
+        "MASE",
+        {
+          "name": "WAPE",
+          "epsilon": 1.0
+        },
+        {
+          "name": "WQL",
+          "epsilon": 1.0
+        }
+      ],
+      "window_step_size": null,
+      "id_column": "id",
+      "timestamp_column": "timestamp"
+    },
+    "definition": {
+      "name": "hermes",
+      "horizon": 52,
+      "num_windows": 1,
+      "initial_cutoff": null,
+      "window_step_size": null,
+      "min_context_length": 1,
+      "seasonality": 1,
+      "quantile_levels": [
+        0.1,
+        0.2,
+        0.3,
+        0.4,
+        0.5,
+        0.6,
+        0.7,
+        0.8,
+        0.9
+      ]
+    },
+    "identity": "64e4b234b1e36cd9ad524d8742aa718deb2a98a4097f431bdde0fb116031a921"
+  },
+  "hierarchical_sales_1W": {
+    "spec": {
+      "name": "hierarchical_sales_1W",
+      "dataset_path": "autogluon/fev_datasets",
+      "dataset_config": "hierarchical_sales_1W",
+      "horizon": 13,
+      "num_windows": 10,
+      "seasonality": 1,
+      "quantile_levels": [
+        0.1,
+        0.2,
+        0.3,
+        0.4,
+        0.5,
+        0.6,
+        0.7,
+        0.8,
+        0.9
+      ],
+      "target": "target",
+      "known_dynamic": [],
+      "past_dynamic": [],
+      "static_columns": [],
+      "categorical_statics": [],
+      "target_support": "nonnegative",
+      "initial_cutoff": null,
+      "min_context_length": 1,
+      "eval_metric": "SQL",
+      "extra_metrics": [
+        "MASE",
+        {
+          "name": "WAPE",
+          "epsilon": 1.0
+        },
+        {
+          "name": "WQL",
+          "epsilon": 1.0
+        }
+      ],
+      "window_step_size": null,
+      "id_column": "id",
+      "timestamp_column": "timestamp"
+    },
+    "definition": {
+      "name": "hierarchical_sales_1W",
+      "horizon": 13,
+      "num_windows": 10,
+      "initial_cutoff": null,
+      "window_step_size": null,
+      "min_context_length": 1,
+      "seasonality": 1,
+      "quantile_levels": [
+        0.1,
+        0.2,
+        0.3,
+        0.4,
+        0.5,
+        0.6,
+        0.7,
+        0.8,
+        0.9
+      ]
+    },
+    "identity": "d9c1506a827dd183a5a38aa336262c669ecd8f51d2a2dc332fc7692e84a6687b"
+  },
+  "favorita_transactions_1W": {
+    "spec": {
+      "name": "favorita_transactions_1W",
+      "dataset_path": "autogluon/fev_datasets",
+      "dataset_config": "favorita_transactions_1W",
+      "horizon": 13,
+      "num_windows": 10,
+      "seasonality": 1,
+      "quantile_levels": [
+        0.1,
+        0.2,
+        0.3,
+        0.4,
+        0.5,
+        0.6,
+        0.7,
+        0.8,
+        0.9
+      ],
+      "target": "transactions",
+      "known_dynamic": [],
+      "past_dynamic": [
+        "oil_price"
+      ],
+      "static_columns": [
+        "store_nbr",
+        "city",
+        "state",
+        "type",
+        "cluster"
+      ],
+      "categorical_statics": [
+        "store_nbr",
+        "city",
+        "state",
+        "type",
+        "cluster"
+      ],
+      "target_support": "nonnegative",
+      "initial_cutoff": null,
+      "min_context_length": 1,
+      "eval_metric": "SQL",
+      "extra_metrics": [
+        "MASE",
+        {
+          "name": "WAPE",
+          "epsilon": 1.0
+        },
+        {
+          "name": "WQL",
+          "epsilon": 1.0
+        }
+      ],
+      "window_step_size": null,
+      "id_column": "id",
+      "timestamp_column": "timestamp"
+    },
+    "definition": {
+      "name": "favorita_transactions_1W",
+      "horizon": 13,
+      "num_windows": 10,
+      "initial_cutoff": null,
+      "window_step_size": null,
+      "min_context_length": 1,
+      "seasonality": 1,
+      "quantile_levels": [
+        0.1,
+        0.2,
+        0.3,
+        0.4,
+        0.5,
+        0.6,
+        0.7,
+        0.8,
+        0.9
+      ]
+    },
+    "identity": "4fbcb974cdd847512bcdd2cf8a1a929c510ad35a1d94c14841880644f2bc625b"
+  },
+  "rohlik_orders_1W": {
+    "spec": {
+      "name": "rohlik_orders_1W",
+      "dataset_path": "autogluon/fev_datasets",
+      "dataset_config": "rohlik_orders_1W",
+      "horizon": 8,
+      "num_windows": 5,
+      "seasonality": 1,
+      "quantile_levels": [
+        0.1,
+        0.2,
+        0.3,
+        0.4,
+        0.5,
+        0.6,
+        0.7,
+        0.8,
+        0.9
+      ],
+      "target": "orders",
+      "known_dynamic": [
+        "holiday",
+        "shops_closed",
+        "winter_school_holidays",
+        "school_holidays"
+      ],
+      "past_dynamic": [
+        "shutdown",
+        "mini_shutdown",
+        "blackout",
+        "mov_change",
+        "frankfurt_shutdown",
+        "precipitation",
+        "snow",
+        "user_activity_1",
+        "user_activity_2"
+      ],
+      "static_columns": [],
+      "categorical_statics": [],
+      "target_support": "nonnegative",
+      "initial_cutoff": "2023-05-01",
+      "min_context_length": 1,
+      "eval_metric": "SQL",
+      "extra_metrics": [
+        "MASE",
+        {
+          "name": "WAPE",
+          "epsilon": 1.0
+        },
+        {
+          "name": "WQL",
+          "epsilon": 1.0
+        }
+      ],
+      "window_step_size": null,
+      "id_column": "id",
+      "timestamp_column": "timestamp"
+    },
+    "definition": {
+      "name": "rohlik_orders_1W",
+      "horizon": 8,
+      "num_windows": 5,
+      "initial_cutoff": "2023-05-01",
+      "window_step_size": null,
+      "min_context_length": 1,
+      "seasonality": 1,
+      "quantile_levels": [
+        0.1,
+        0.2,
+        0.3,
+        0.4,
+        0.5,
+        0.6,
+        0.7,
+        0.8,
+        0.9
+      ]
+    },
+    "identity": "39c91590932c6e06d52ca56b20f474f01e37c59a46955c7cf9adc06e1b10c66e"
+  },
+  "hospital_admissions_1W": {
+    "spec": {
+      "name": "hospital_admissions_1W",
+      "dataset_path": "autogluon/fev_datasets",
+      "dataset_config": "hospital_admissions_1W",
+      "horizon": 13,
+      "num_windows": 16,
+      "seasonality": 1,
+      "quantile_levels": [
+        0.1,
+        0.2,
+        0.3,
+        0.4,
+        0.5,
+        0.6,
+        0.7,
+        0.8,
+        0.9
+      ],
+      "target": "target",
+      "known_dynamic": [],
+      "past_dynamic": [],
+      "static_columns": [],
+      "categorical_statics": [],
+      "target_support": "nonnegative",
+      "initial_cutoff": null,
+      "min_context_length": 1,
+      "eval_metric": "SQL",
+      "extra_metrics": [
+        "MASE",
+        {
+          "name": "WAPE",
+          "epsilon": 1.0
+        },
+        {
+          "name": "WQL",
+          "epsilon": 1.0
+        }
+      ],
+      "window_step_size": null,
+      "id_column": "id",
+      "timestamp_column": "timestamp"
+    },
+    "definition": {
+      "name": "hospital_admissions_1W",
+      "horizon": 13,
+      "num_windows": 16,
+      "initial_cutoff": null,
+      "window_step_size": null,
+      "min_context_length": 1,
+      "seasonality": 1,
+      "quantile_levels": [
+        0.1,
+        0.2,
+        0.3,
+        0.4,
+        0.5,
+        0.6,
+        0.7,
+        0.8,
+        0.9
+      ]
+    },
+    "identity": "87445370e3706ecc538e80bc34437e23360bb50b6184ed29a0c58e6d890b6318"
+  },
+  "ercot_1W": {
+    "spec": {
+      "name": "ercot_1W",
+      "dataset_path": "autogluon/fev_datasets",
+      "dataset_config": "ercot_1W",
+      "horizon": 13,
+      "num_windows": 20,
+      "seasonality": 1,
+      "quantile_levels": [
+        0.1,
+        0.2,
+        0.3,
+        0.4,
+        0.5,
+        0.6,
+        0.7,
+        0.8,
+        0.9
+      ],
+      "target": "target",
+      "known_dynamic": [],
+      "past_dynamic": [],
+      "static_columns": [],
+      "categorical_statics": [],
+      "target_support": "nonnegative",
+      "initial_cutoff": null,
+      "min_context_length": 1,
+      "eval_metric": "SQL",
+      "extra_metrics": [
+        "MASE",
+        {
+          "name": "WAPE",
+          "epsilon": 1.0
+        },
+        {
+          "name": "WQL",
+          "epsilon": 1.0
+        }
+      ],
+      "window_step_size": null,
+      "id_column": "id",
+      "timestamp_column": "timestamp"
+    },
+    "definition": {
+      "name": "ercot_1W",
+      "horizon": 13,
+      "num_windows": 20,
+      "initial_cutoff": null,
+      "window_step_size": null,
+      "min_context_length": 1,
+      "seasonality": 1,
+      "quantile_levels": [
+        0.1,
+        0.2,
+        0.3,
+        0.4,
+        0.5,
+        0.6,
+        0.7,
+        0.8,
+        0.9
+      ]
+    },
+    "identity": "28e7af5a8fdc45bced36590f24e63b5cf88e2156abf8b5ecd5054ab626c66afd"
+  },
+  "uk_covid_utla_1W": {
+    "spec": {
+      "name": "uk_covid_utla_1W",
+      "dataset_path": "autogluon/fev_datasets",
+      "dataset_config": "uk_covid_utla_1W",
+      "horizon": 13,
+      "num_windows": 5,
+      "seasonality": 1,
+      "quantile_levels": [
+        0.1,
+        0.2,
+        0.3,
+        0.4,
+        0.5,
+        0.6,
+        0.7,
+        0.8,
+        0.9
+      ],
+      "target": "cumulative_cases",
+      "known_dynamic": [],
+      "past_dynamic": [],
+      "static_columns": [],
+      "categorical_statics": [],
+      "target_support": "nonnegative",
+      "initial_cutoff": null,
+      "min_context_length": 1,
+      "eval_metric": "SQL",
+      "extra_metrics": [
+        "MASE",
+        {
+          "name": "WAPE",
+          "epsilon": 1.0
+        },
+        {
+          "name": "WQL",
+          "epsilon": 1.0
+        }
+      ],
+      "window_step_size": null,
+      "id_column": "id",
+      "timestamp_column": "timestamp"
+    },
+    "definition": {
+      "name": "uk_covid_utla_1W",
+      "horizon": 13,
+      "num_windows": 5,
+      "initial_cutoff": null,
+      "window_step_size": null,
+      "min_context_length": 1,
+      "seasonality": 1,
+      "quantile_levels": [
+        0.1,
+        0.2,
+        0.3,
+        0.4,
+        0.5,
+        0.6,
+        0.7,
+        0.8,
+        0.9
+      ]
+    },
+    "identity": "1c4f752f6bde56784fe15ba55b8a2d46c7dce498930455b4f993c11eeb2bf80d"
+  }
+}

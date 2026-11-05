@@ -1,12 +1,13 @@
 """Evaluate quantile forecasts in original units against complete past histories."""
 
 from collections.abc import Sequence
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 
 import numpy as np
 import pandas as pd
 import torch
 
+from demand_forecast.core.inference_batching import BatchLimit, batch_limit, predict_batches
 from demand_forecast.data.encoders import StaticEncoder
 from demand_forecast.data.frequency import steps_between
 from demand_forecast.data.panel import Panel
@@ -23,14 +24,15 @@ class PreparedValidation:
     y_true: np.ndarray
     y_past: tuple[np.ndarray, ...]
     seasonal_period: int
+    batch_limit: BatchLimit = field(default_factory=lambda: batch_limit("validation"))
 
     @property
     def nbytes(self) -> int:
         """Payload bytes of the retained arrays and tensors, excluding metadata."""
         total = self.y_true.nbytes + sum(values.nbytes for values in self.y_past)
         for batch in self.batches:
-            for field in fields(Batch):
-                value = getattr(batch, field.name)
+            for batch_field in fields(Batch):
+                value = getattr(batch, batch_field.name)
                 tensors = value.values() if isinstance(value, dict) else [value]
                 total += sum(tensor.numel() * tensor.element_size() for tensor in tensors)
         return total
@@ -81,16 +83,16 @@ def evaluate_prepared(
     """Score reusable CPU batches in original units, then resume training mode."""
     q_pred = np.empty((*prepared.y_true.shape, len(quantiles)), dtype=np.float64)
 
-    device = model.fallback_level.device
     model.eval()
     try:
         with torch.no_grad():
             start = 0
             for cpu_batch in prepared.batches:
-                batch = cpu_batch.to(device)
-                # predict already denormalises and applies support/fallbacks.
-                q_pred[start : start + batch.size] = model.predict(batch).cpu().numpy()
-                start += batch.size
+                for offset, chunk, predictions in predict_batches(
+                    model, cpu_batch, prepared.batch_limit
+                ):
+                    q_pred[start + offset : start + offset + chunk.size] = predictions
+                start += cpu_batch.size
             return summarize(
                 prepared.y_true, q_pred, prepared.y_past, prepared.seasonal_period, quantiles
             )

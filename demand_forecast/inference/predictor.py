@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -12,6 +12,7 @@ import pandas as pd
 import torch
 
 from demand_forecast.core.bundle import Bundle, load_bundle
+from demand_forecast.core.inference_batching import BatchLimit, batch_limit, predict_batches
 from demand_forecast.data.frequency import grid_range, steps_between, to_offset, validate_on_grid
 from demand_forecast.data.panel import Panel, Roles
 from demand_forecast.data.sampler import BatchBuilder, align_to_origin
@@ -22,6 +23,7 @@ class Predictor:
     """Serve every input series, including unseen ids and fallback-only histories."""
 
     bundle: Bundle
+    batch_limit: BatchLimit = field(default_factory=lambda: batch_limit("prediction"))
 
     @classmethod
     def from_bundle(cls, directory: Path | str, device: torch.device | str = "cpu") -> Predictor:
@@ -160,14 +162,19 @@ class Predictor:
             "device": str(model.fallback_level.device),
         }
         for start in range(0, len(items), batch_size):
-            batch = builder.build(items[start : start + batch_size]).to(model.fallback_level.device)
-            for name, flag in model.fallback_flags(batch).items():
-                diagnostics[f"fallback_{name}"] += int(flag.sum().item())
-            diagnostics["cold_covariate_columns"] += int(batch.cold_covariates.sum().item())
-            diagnostics["clipped_covariate_values"] += int(batch.clipped_covariates.sum().item())
-            diagnostics["floored_covariate_columns"] += int(batch.floored_covariates.sum().item())
-            # predict performs the single denormalisation and the model's fallbacks.
-            predictions[start : start + batch.size] = model.predict(batch).cpu().numpy()
+            cpu_batch = builder.build(items[start : start + batch_size])
+            for offset, batch, values in predict_batches(model, cpu_batch, self.batch_limit):
+                # Count only successful rows; retries never duplicate diagnostics.
+                for name, flag in model.fallback_flags(batch).items():
+                    diagnostics[f"fallback_{name}"] += int(flag.sum().item())
+                diagnostics["cold_covariate_columns"] += int(batch.cold_covariates.sum().item())
+                diagnostics["clipped_covariate_values"] += int(
+                    batch.clipped_covariates.sum().item()
+                )
+                diagnostics["floored_covariate_columns"] += int(
+                    batch.floored_covariates.sum().item()
+                )
+                predictions[start + offset : start + offset + batch.size] = values
         # Each .cpu().numpy() above waits for its CUDA output, so this includes
         # device work and host transfer rather than only asynchronous launches.
         diagnostics["inference_time_s"] = time.perf_counter() - started

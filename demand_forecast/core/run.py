@@ -27,6 +27,7 @@ from demand_forecast.core.training import (
     Trainer,
     _empty_timings,
     _set_fallback_level,
+    resolve_budget,
 )
 from demand_forecast.core.transfer import init_from_pretrained
 from demand_forecast.core.validation import plan_inner_validation, subsample_validation
@@ -288,6 +289,18 @@ def train_panel(
     random.seed(settings.seed)
     plan = plan_inner_validation(
         panel, origin, settings.forecast.horizon, settings.training.min_train_history
+    )
+    steps, _ = resolve_budget(
+        settings.training.base_steps,
+        len(plan.fit_ids),
+        settings.training.eval_every,
+        settings.training.max_steps_cap,
+    )
+    logger.info(
+        "training budget: task=%s items=%d max_steps=%d",
+        (task_definition or {}).get("name", "long"),
+        len(plan.fit_ids),
+        0 if settings.training.zero_shot else steps,
     )
     eligible = plan
     plan = subsample_validation(plan, settings.training.val_items_max, settings.seed)

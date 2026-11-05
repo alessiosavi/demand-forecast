@@ -1,0 +1,4660 @@
+revision: d3e7e720f4158eab03ebcb021f1cce779cd92acc
+source: https://huggingface.co/datasets/autogluon/fev_datasets/raw/d3e7e720f4158eab03ebcb021f1cce779cd92acc/README.md
+source_sha256: b0b86c1c1dfd87d704c21cb158de0da06dd46122debd3a083c7c5c5d08d03834
+configs:
+  ETT_15T:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      HUFL:
+        sequence: float32
+      HULL:
+        sequence: float32
+      MUFL:
+        sequence: float32
+      MULL:
+        sequence: float32
+      LUFL:
+        sequence: float32
+      LULL:
+        sequence: float32
+      OT:
+        sequence: float32
+    frequency: 15min
+    items: 2
+    median_length: 69680
+    observations_all_dynamic_columns: 975520
+    dataset_bytes: 5017042
+  ETT_1D:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      HUFL:
+        sequence: float32
+      HULL:
+        sequence: float32
+      MUFL:
+        sequence: float32
+      MULL:
+        sequence: float32
+      LUFL:
+        sequence: float32
+      LULL:
+        sequence: float32
+      OT:
+        sequence: float32
+    frequency: D
+    items: 2
+    median_length: 724
+    observations_all_dynamic_columns: 10136
+    dataset_bytes: 52210
+  ETT_1H:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      HUFL:
+        sequence: float32
+      HULL:
+        sequence: float32
+      MUFL:
+        sequence: float32
+      MULL:
+        sequence: float32
+      LUFL:
+        sequence: float32
+      LULL:
+        sequence: float32
+      OT:
+        sequence: float32
+    frequency: h
+    items: 2
+    median_length: 17420
+    observations_all_dynamic_columns: 243880
+    dataset_bytes: 1254322
+  ETT_1W:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      HUFL:
+        sequence: float32
+      HULL:
+        sequence: float32
+      MUFL:
+        sequence: float32
+      MULL:
+        sequence: float32
+      LUFL:
+        sequence: float32
+      LULL:
+        sequence: float32
+      OT:
+        sequence: float32
+    frequency: W-SUN
+    items: 2
+    median_length: 103
+    observations_all_dynamic_columns: 1442
+    dataset_bytes: 7498
+  LOOP_SEATTLE_1D:
+    features:
+      target:
+        sequence: float32
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+    frequency: D
+    items: 323
+    median_length: 365
+    observations_all_dynamic_columns: 117895
+    dataset_bytes: 1419475
+  LOOP_SEATTLE_1H:
+    features:
+      target:
+        sequence: float32
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+    frequency: h
+    items: 323
+    median_length: 8760
+    observations_all_dynamic_columns: 2829480
+    dataset_bytes: 33958495
+  LOOP_SEATTLE_5T:
+    features:
+      target:
+        sequence: float32
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+    frequency: 5min
+    items: 323
+    median_length: 105120
+    observations_all_dynamic_columns: 33953760
+    dataset_bytes: 407449855
+  M_DENSE_1D:
+    features:
+      target:
+        sequence: float32
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+    frequency: D
+    items: 30
+    median_length: 730
+    observations_all_dynamic_columns: 21900
+    dataset_bytes: 263210
+  M_DENSE_1H:
+    features:
+      target:
+        sequence: float32
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+    frequency: h
+    items: 30
+    median_length: 17520
+    observations_all_dynamic_columns: 525600
+    dataset_bytes: 6307610
+  SZ_TAXI_15T:
+    features:
+      target:
+        sequence: float32
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+    frequency: 15min
+    items: 156
+    median_length: 2976
+    observations_all_dynamic_columns: 464256
+    dataset_bytes: 5573777
+  SZ_TAXI_1H:
+    features:
+      target:
+        sequence: float32
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+    frequency: h
+    items: 156
+    median_length: 744
+    observations_all_dynamic_columns: 116064
+    dataset_bytes: 1395473
+  australian_tourism:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      target:
+        sequence: float32
+    frequency: QE-DEC
+    items: 89
+    median_length: 36
+    observations_all_dynamic_columns: 3204
+    dataset_bytes: 40729
+  bizitobs_l2c_1H:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      target_0:
+        sequence: float32
+      target_1:
+        sequence: float32
+      target_2:
+        sequence: float32
+      target_3:
+        sequence: float32
+      target_4:
+        sequence: float32
+      target_5:
+        sequence: float32
+      target_6:
+        sequence: float32
+    frequency: h
+    items: 1
+    median_length: 2664
+    observations_all_dynamic_columns: 18648
+    dataset_bytes: 95943
+  bizitobs_l2c_5T:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      target_0:
+        sequence: float32
+      target_1:
+        sequence: float32
+      target_2:
+        sequence: float32
+      target_3:
+        sequence: float32
+      target_4:
+        sequence: float32
+      target_5:
+        sequence: float32
+      target_6:
+        sequence: float32
+    frequency: 5min
+    items: 1
+    median_length: 31968
+    observations_all_dynamic_columns: 223776
+    dataset_bytes: 1150887
+  boomlet_1062:
+    features:
+      id:
+        dtype: string
+      type:
+        dtype: string
+      Application Usage:
+        dtype: float32
+      Infrastructure:
+        dtype: float32
+      Database:
+        dtype: float32
+      Networking:
+        dtype: float32
+      Security:
+        dtype: float32
+      timestamp:
+        sequence: timestamp[ms]
+      target_0:
+        sequence: float32
+      target_1:
+        sequence: float32
+      target_2:
+        sequence: float32
+      target_3:
+        sequence: float32
+      target_4:
+        sequence: float32
+      target_5:
+        sequence: float32
+      target_6:
+        sequence: float32
+      target_7:
+        sequence: float32
+      target_8:
+        sequence: float32
+      target_9:
+        sequence: float32
+      target_10:
+        sequence: float32
+      target_11:
+        sequence: float32
+      target_12:
+        sequence: float32
+      target_13:
+        sequence: float32
+      target_14:
+        sequence: float32
+      target_15:
+        sequence: float32
+      target_16:
+        sequence: float32
+      target_17:
+        sequence: float32
+      target_18:
+        sequence: float32
+      target_19:
+        sequence: float32
+      target_20:
+        sequence: float32
+    frequency: 5min
+    items: 1
+    median_length: 16384
+    observations_all_dynamic_columns: 344064
+    dataset_bytes: 1507449
+  boomlet_1209:
+    features:
+      id:
+        dtype: string
+      type:
+        dtype: string
+      Application Usage:
+        dtype: float32
+      Infrastructure:
+        dtype: float32
+      Database:
+        dtype: float32
+      Networking:
+        dtype: float32
+      Security:
+        dtype: float32
+      timestamp:
+        sequence: timestamp[ms]
+      target_0:
+        sequence: float32
+      target_1:
+        sequence: float32
+      target_2:
+        sequence: float32
+      target_3:
+        sequence: float32
+      target_4:
+        sequence: float32
+      target_5:
+        sequence: float32
+      target_6:
+        sequence: float32
+      target_7:
+        sequence: float32
+      target_8:
+        sequence: float32
+      target_9:
+        sequence: float32
+      target_10:
+        sequence: float32
+      target_11:
+        sequence: float32
+      target_12:
+        sequence: float32
+      target_13:
+        sequence: float32
+      target_14:
+        sequence: float32
+      target_15:
+        sequence: float32
+      target_16:
+        sequence: float32
+      target_17:
+        sequence: float32
+      target_18:
+        sequence: float32
+      target_19:
+        sequence: float32
+      target_20:
+        sequence: float32
+      target_21:
+        sequence: float32
+      target_22:
+        sequence: float32
+      target_23:
+        sequence: float32
+      target_24:
+        sequence: float32
+      target_25:
+        sequence: float32
+      target_26:
+        sequence: float32
+      target_27:
+        sequence: float32
+      target_28:
+        sequence: float32
+      target_29:
+        sequence: float32
+      target_30:
+        sequence: float32
+      target_31:
+        sequence: float32
+      target_32:
+        sequence: float32
+      target_33:
+        sequence: float32
+      target_34:
+        sequence: float32
+      target_35:
+        sequence: float32
+      target_36:
+        sequence: float32
+      target_37:
+        sequence: float32
+      target_38:
+        sequence: float32
+      target_39:
+        sequence: float32
+      target_40:
+        sequence: float32
+      target_41:
+        sequence: float32
+      target_42:
+        sequence: float32
+      target_43:
+        sequence: float32
+      target_44:
+        sequence: float32
+      target_45:
+        sequence: float32
+      target_46:
+        sequence: float32
+      target_47:
+        sequence: float32
+      target_48:
+        sequence: float32
+      target_49:
+        sequence: float32
+      target_50:
+        sequence: float32
+      target_51:
+        sequence: float32
+      target_52:
+        sequence: float32
+    frequency: 5min
+    items: 1
+    median_length: 16384
+    observations_all_dynamic_columns: 868352
+    dataset_bytes: 3604729
+  boomlet_1225:
+    features:
+      id:
+        dtype: string
+      type:
+        dtype: string
+      Application Usage:
+        dtype: float32
+      Infrastructure:
+        dtype: float32
+      Database:
+        dtype: float32
+      Networking:
+        dtype: float32
+      Security:
+        dtype: float32
+      timestamp:
+        sequence: timestamp[ms]
+      target_0:
+        sequence: float32
+      target_1:
+        sequence: float32
+      target_2:
+        sequence: float32
+      target_3:
+        sequence: float32
+      target_4:
+        sequence: float32
+      target_5:
+        sequence: float32
+      target_6:
+        sequence: float32
+      target_7:
+        sequence: float32
+      target_8:
+        sequence: float32
+      target_9:
+        sequence: float32
+      target_10:
+        sequence: float32
+      target_11:
+        sequence: float32
+      target_12:
+        sequence: float32
+      target_13:
+        sequence: float32
+      target_14:
+        sequence: float32
+      target_15:
+        sequence: float32
+      target_16:
+        sequence: float32
+      target_17:
+        sequence: float32
+      target_18:
+        sequence: float32
+      target_19:
+        sequence: float32
+      target_20:
+        sequence: float32
+      target_21:
+        sequence: float32
+      target_22:
+        sequence: float32
+      target_23:
+        sequence: float32
+      target_24:
+        sequence: float32
+      target_25:
+        sequence: float32
+      target_26:
+        sequence: float32
+      target_27:
+        sequence: float32
+      target_28:
+        sequence: float32
+      target_29:
+        sequence: float32
+      target_30:
+        sequence: float32
+      target_31:
+        sequence: float32
+      target_32:
+        sequence: float32
+      target_33:
+        sequence: float32
+      target_34:
+        sequence: float32
+      target_35:
+        sequence: float32
+      target_36:
+        sequence: float32
+      target_37:
+        sequence: float32
+      target_38:
+        sequence: float32
+      target_39:
+        sequence: float32
+      target_40:
+        sequence: float32
+      target_41:
+        sequence: float32
+      target_42:
+        sequence: float32
+      target_43:
+        sequence: float32
+      target_44:
+        sequence: float32
+      target_45:
+        sequence: float32
+      target_46:
+        sequence: float32
+      target_47:
+        sequence: float32
+      target_48:
+        sequence: float32
+    frequency: min
+    items: 1
+    median_length: 16384
+    observations_all_dynamic_columns: 802816
+    dataset_bytes: 3342569
+  boomlet_1230:
+    features:
+      id:
+        dtype: string
+      type:
+        dtype: string
+      Application Usage:
+        dtype: float32
+      Infrastructure:
+        dtype: float32
+      Database:
+        dtype: float32
+      Networking:
+        dtype: float32
+      Security:
+        dtype: float32
+      timestamp:
+        sequence: timestamp[ms]
+      target_0:
+        sequence: float32
+      target_1:
+        sequence: float32
+      target_2:
+        sequence: float32
+      target_3:
+        sequence: float32
+      target_4:
+        sequence: float32
+      target_5:
+        sequence: float32
+      target_6:
+        sequence: float32
+      target_7:
+        sequence: float32
+      target_8:
+        sequence: float32
+      target_9:
+        sequence: float32
+      target_10:
+        sequence: float32
+      target_11:
+        sequence: float32
+      target_12:
+        sequence: float32
+      target_13:
+        sequence: float32
+      target_14:
+        sequence: float32
+      target_15:
+        sequence: float32
+      target_16:
+        sequence: float32
+      target_17:
+        sequence: float32
+      target_18:
+        sequence: float32
+      target_19:
+        sequence: float32
+      target_20:
+        sequence: float32
+      target_21:
+        sequence: float32
+      target_22:
+        sequence: float32
+    frequency: 5min
+    items: 1
+    median_length: 16384
+    observations_all_dynamic_columns: 376832
+    dataset_bytes: 1638529
+  boomlet_1282:
+    features:
+      id:
+        dtype: string
+      type:
+        dtype: string
+      Application Usage:
+        dtype: float32
+      Infrastructure:
+        dtype: float32
+      Database:
+        dtype: float32
+      Networking:
+        dtype: float32
+      Security:
+        dtype: float32
+      timestamp:
+        sequence: timestamp[ms]
+      target_0:
+        sequence: float32
+      target_1:
+        sequence: float32
+      target_2:
+        sequence: float32
+      target_3:
+        sequence: float32
+      target_4:
+        sequence: float32
+      target_5:
+        sequence: float32
+      target_6:
+        sequence: float32
+      target_7:
+        sequence: float32
+      target_8:
+        sequence: float32
+      target_9:
+        sequence: float32
+      target_10:
+        sequence: float32
+      target_11:
+        sequence: float32
+      target_12:
+        sequence: float32
+      target_13:
+        sequence: float32
+      target_14:
+        sequence: float32
+      target_15:
+        sequence: float32
+      target_16:
+        sequence: float32
+      target_17:
+        sequence: float32
+      target_18:
+        sequence: float32
+      target_19:
+        sequence: float32
+      target_20:
+        sequence: float32
+      target_21:
+        sequence: float32
+      target_22:
+        sequence: float32
+      target_23:
+        sequence: float32
+      target_24:
+        sequence: float32
+      target_25:
+        sequence: float32
+      target_26:
+        sequence: float32
+      target_27:
+        sequence: float32
+      target_28:
+        sequence: float32
+      target_29:
+        sequence: float32
+      target_30:
+        sequence: float32
+      target_31:
+        sequence: float32
+      target_32:
+        sequence: float32
+      target_33:
+        sequence: float32
+      target_34:
+        sequence: float32
+    frequency: min
+    items: 1
+    median_length: 16384
+    observations_all_dynamic_columns: 573440
+    dataset_bytes: 2425009
+  boomlet_1487:
+    features:
+      id:
+        dtype: string
+      type:
+        dtype: string
+      Application Usage:
+        dtype: float32
+      Infrastructure:
+        dtype: float32
+      Database:
+        dtype: float32
+      Networking:
+        dtype: float32
+      Security:
+        dtype: float32
+      timestamp:
+        sequence: timestamp[ms]
+      target_0:
+        sequence: float32
+      target_1:
+        sequence: float32
+      target_2:
+        sequence: float32
+      target_3:
+        sequence: float32
+      target_4:
+        sequence: float32
+      target_5:
+        sequence: float32
+      target_6:
+        sequence: float32
+      target_7:
+        sequence: float32
+      target_8:
+        sequence: float32
+      target_9:
+        sequence: float32
+      target_10:
+        sequence: float32
+      target_11:
+        sequence: float32
+      target_12:
+        sequence: float32
+      target_13:
+        sequence: float32
+      target_14:
+        sequence: float32
+      target_15:
+        sequence: float32
+      target_16:
+        sequence: float32
+      target_17:
+        sequence: float32
+      target_18:
+        sequence: float32
+      target_19:
+        sequence: float32
+      target_20:
+        sequence: float32
+      target_21:
+        sequence: float32
+      target_22:
+        sequence: float32
+      target_23:
+        sequence: float32
+      target_24:
+        sequence: float32
+      target_25:
+        sequence: float32
+      target_26:
+        sequence: float32
+      target_27:
+        sequence: float32
+      target_28:
+        sequence: float32
+      target_29:
+        sequence: float32
+      target_30:
+        sequence: float32
+      target_31:
+        sequence: float32
+      target_32:
+        sequence: float32
+      target_33:
+        sequence: float32
+      target_34:
+        sequence: float32
+      target_35:
+        sequence: float32
+      target_36:
+        sequence: float32
+      target_37:
+        sequence: float32
+      target_38:
+        sequence: float32
+      target_39:
+        sequence: float32
+      target_40:
+        sequence: float32
+      target_41:
+        sequence: float32
+      target_42:
+        sequence: float32
+      target_43:
+        sequence: float32
+      target_44:
+        sequence: float32
+      target_45:
+        sequence: float32
+      target_46:
+        sequence: float32
+      target_47:
+        sequence: float32
+      target_48:
+        sequence: float32
+      target_49:
+        sequence: float32
+      target_50:
+        sequence: float32
+      target_51:
+        sequence: float32
+      target_52:
+        sequence: float32
+      target_53:
+        sequence: float32
+    frequency: 5min
+    items: 1
+    median_length: 16384
+    observations_all_dynamic_columns: 884736
+    dataset_bytes: 3670269
+  boomlet_1631:
+    features:
+      id:
+        dtype: string
+      type:
+        dtype: string
+      Application Usage:
+        dtype: float32
+      Infrastructure:
+        dtype: float32
+      Database:
+        dtype: float32
+      Networking:
+        dtype: float32
+      Security:
+        dtype: float32
+      timestamp:
+        sequence: timestamp[ms]
+      target_0:
+        sequence: float32
+      target_1:
+        sequence: float32
+      target_2:
+        sequence: float32
+      target_3:
+        sequence: float32
+      target_4:
+        sequence: float32
+      target_5:
+        sequence: float32
+      target_6:
+        sequence: float32
+      target_7:
+        sequence: float32
+      target_8:
+        sequence: float32
+      target_9:
+        sequence: float32
+      target_10:
+        sequence: float32
+      target_11:
+        sequence: float32
+      target_12:
+        sequence: float32
+      target_13:
+        sequence: float32
+      target_14:
+        sequence: float32
+      target_15:
+        sequence: float32
+      target_16:
+        sequence: float32
+      target_17:
+        sequence: float32
+      target_18:
+        sequence: float32
+      target_19:
+        sequence: float32
+      target_20:
+        sequence: float32
+      target_21:
+        sequence: float32
+      target_22:
+        sequence: float32
+      target_23:
+        sequence: float32
+      target_24:
+        sequence: float32
+      target_25:
+        sequence: float32
+      target_26:
+        sequence: float32
+      target_27:
+        sequence: float32
+      target_28:
+        sequence: float32
+      target_29:
+        sequence: float32
+      target_30:
+        sequence: float32
+      target_31:
+        sequence: float32
+      target_32:
+        sequence: float32
+      target_33:
+        sequence: float32
+      target_34:
+        sequence: float32
+      target_35:
+        sequence: float32
+      target_36:
+        sequence: float32
+      target_37:
+        sequence: float32
+      target_38:
+        sequence: float32
+      target_39:
+        sequence: float32
+    frequency: 30min
+    items: 1
+    median_length: 10463
+    observations_all_dynamic_columns: 418520
+    dataset_bytes: 1757981
+  boomlet_1676:
+    features:
+      id:
+        dtype: string
+      type:
+        dtype: string
+      Application Usage:
+        dtype: float32
+      Infrastructure:
+        dtype: float32
+      Database:
+        dtype: float32
+      Networking:
+        dtype: float32
+      Security:
+        dtype: float32
+      timestamp:
+        sequence: timestamp[ms]
+      target_0:
+        sequence: float32
+      target_1:
+        sequence: float32
+      target_2:
+        sequence: float32
+      target_3:
+        sequence: float32
+      target_4:
+        sequence: float32
+      target_5:
+        sequence: float32
+      target_6:
+        sequence: float32
+      target_7:
+        sequence: float32
+      target_8:
+        sequence: float32
+      target_9:
+        sequence: float32
+      target_10:
+        sequence: float32
+      target_11:
+        sequence: float32
+      target_12:
+        sequence: float32
+      target_13:
+        sequence: float32
+      target_14:
+        sequence: float32
+      target_15:
+        sequence: float32
+      target_16:
+        sequence: float32
+      target_17:
+        sequence: float32
+      target_18:
+        sequence: float32
+      target_19:
+        sequence: float32
+      target_20:
+        sequence: float32
+      target_21:
+        sequence: float32
+      target_22:
+        sequence: float32
+      target_23:
+        sequence: float32
+      target_24:
+        sequence: float32
+      target_25:
+        sequence: float32
+      target_26:
+        sequence: float32
+      target_27:
+        sequence: float32
+      target_28:
+        sequence: float32
+      target_29:
+        sequence: float32
+      target_30:
+        sequence: float32
+      target_31:
+        sequence: float32
+      target_32:
+        sequence: float32
+      target_33:
+        sequence: float32
+      target_34:
+        sequence: float32
+      target_35:
+        sequence: float32
+      target_36:
+        sequence: float32
+      target_37:
+        sequence: float32
+      target_38:
+        sequence: float32
+      target_39:
+        sequence: float32
+      target_40:
+        sequence: float32
+      target_41:
+        sequence: float32
+      target_42:
+        sequence: float32
+      target_43:
+        sequence: float32
+      target_44:
+        sequence: float32
+      target_45:
+        sequence: float32
+      target_46:
+        sequence: float32
+      target_47:
+        sequence: float32
+      target_48:
+        sequence: float32
+      target_49:
+        sequence: float32
+      target_50:
+        sequence: float32
+      target_51:
+        sequence: float32
+      target_52:
+        sequence: float32
+      target_53:
+        sequence: float32
+      target_54:
+        sequence: float32
+      target_55:
+        sequence: float32
+      target_56:
+        sequence: float32
+      target_57:
+        sequence: float32
+      target_58:
+        sequence: float32
+      target_59:
+        sequence: float32
+      target_60:
+        sequence: float32
+      target_61:
+        sequence: float32
+      target_62:
+        sequence: float32
+      target_63:
+        sequence: float32
+      target_64:
+        sequence: float32
+      target_65:
+        sequence: float32
+      target_66:
+        sequence: float32
+      target_67:
+        sequence: float32
+      target_68:
+        sequence: float32
+      target_69:
+        sequence: float32
+      target_70:
+        sequence: float32
+      target_71:
+        sequence: float32
+      target_72:
+        sequence: float32
+      target_73:
+        sequence: float32
+      target_74:
+        sequence: float32
+      target_75:
+        sequence: float32
+      target_76:
+        sequence: float32
+      target_77:
+        sequence: float32
+      target_78:
+        sequence: float32
+      target_79:
+        sequence: float32
+      target_80:
+        sequence: float32
+      target_81:
+        sequence: float32
+      target_82:
+        sequence: float32
+      target_83:
+        sequence: float32
+      target_84:
+        sequence: float32
+      target_85:
+        sequence: float32
+      target_86:
+        sequence: float32
+      target_87:
+        sequence: float32
+      target_88:
+        sequence: float32
+      target_89:
+        sequence: float32
+      target_90:
+        sequence: float32
+      target_91:
+        sequence: float32
+      target_92:
+        sequence: float32
+      target_93:
+        sequence: float32
+      target_94:
+        sequence: float32
+      target_95:
+        sequence: float32
+      target_96:
+        sequence: float32
+      target_97:
+        sequence: float32
+      target_98:
+        sequence: float32
+      target_99:
+        sequence: float32
+    frequency: 30min
+    items: 1
+    median_length: 10463
+    observations_all_dynamic_columns: 1046300
+    dataset_bytes: 4269341
+  boomlet_1855:
+    features:
+      id:
+        dtype: string
+      type:
+        dtype: string
+      Application Usage:
+        dtype: float32
+      Infrastructure:
+        dtype: float32
+      Database:
+        dtype: float32
+      Networking:
+        dtype: float32
+      Security:
+        dtype: float32
+      timestamp:
+        sequence: timestamp[ms]
+      target_0:
+        sequence: float32
+      target_1:
+        sequence: float32
+      target_2:
+        sequence: float32
+      target_3:
+        sequence: float32
+      target_4:
+        sequence: float32
+      target_5:
+        sequence: float32
+      target_6:
+        sequence: float32
+      target_7:
+        sequence: float32
+      target_8:
+        sequence: float32
+      target_9:
+        sequence: float32
+      target_10:
+        sequence: float32
+      target_11:
+        sequence: float32
+      target_12:
+        sequence: float32
+      target_13:
+        sequence: float32
+      target_14:
+        sequence: float32
+      target_15:
+        sequence: float32
+      target_16:
+        sequence: float32
+      target_17:
+        sequence: float32
+      target_18:
+        sequence: float32
+      target_19:
+        sequence: float32
+      target_20:
+        sequence: float32
+      target_21:
+        sequence: float32
+      target_22:
+        sequence: float32
+      target_23:
+        sequence: float32
+      target_24:
+        sequence: float32
+      target_25:
+        sequence: float32
+      target_26:
+        sequence: float32
+      target_27:
+        sequence: float32
+      target_28:
+        sequence: float32
+      target_29:
+        sequence: float32
+      target_30:
+        sequence: float32
+      target_31:
+        sequence: float32
+      target_32:
+        sequence: float32
+      target_33:
+        sequence: float32
+      target_34:
+        sequence: float32
+      target_35:
+        sequence: float32
+      target_36:
+        sequence: float32
+      target_37:
+        sequence: float32
+      target_38:
+        sequence: float32
+      target_39:
+        sequence: float32
+      target_40:
+        sequence: float32
+      target_41:
+        sequence: float32
+      target_42:
+        sequence: float32
+      target_43:
+        sequence: float32
+      target_44:
+        sequence: float32
+      target_45:
+        sequence: float32
+      target_46:
+        sequence: float32
+      target_47:
+        sequence: float32
+      target_48:
+        sequence: float32
+      target_49:
+        sequence: float32
+      target_50:
+        sequence: float32
+      target_51:
+        sequence: float32
+    frequency: h
+    items: 1
+    median_length: 5231
+    observations_all_dynamic_columns: 272012
+    dataset_bytes: 1130141
+  boomlet_1975:
+    features:
+      id:
+        dtype: string
+      type:
+        dtype: string
+      Application Usage:
+        dtype: float32
+      Infrastructure:
+        dtype: float32
+      Database:
+        dtype: float32
+      Networking:
+        dtype: float32
+      Security:
+        dtype: float32
+      timestamp:
+        sequence: timestamp[ms]
+      target_0:
+        sequence: float32
+      target_1:
+        sequence: float32
+      target_2:
+        sequence: float32
+      target_3:
+        sequence: float32
+      target_4:
+        sequence: float32
+      target_5:
+        sequence: float32
+      target_6:
+        sequence: float32
+      target_7:
+        sequence: float32
+      target_8:
+        sequence: float32
+      target_9:
+        sequence: float32
+      target_10:
+        sequence: float32
+      target_11:
+        sequence: float32
+      target_12:
+        sequence: float32
+      target_13:
+        sequence: float32
+      target_14:
+        sequence: float32
+      target_15:
+        sequence: float32
+      target_16:
+        sequence: float32
+      target_17:
+        sequence: float32
+      target_18:
+        sequence: float32
+      target_19:
+        sequence: float32
+      target_20:
+        sequence: float32
+      target_21:
+        sequence: float32
+      target_22:
+        sequence: float32
+      target_23:
+        sequence: float32
+      target_24:
+        sequence: float32
+      target_25:
+        sequence: float32
+      target_26:
+        sequence: float32
+      target_27:
+        sequence: float32
+      target_28:
+        sequence: float32
+      target_29:
+        sequence: float32
+      target_30:
+        sequence: float32
+      target_31:
+        sequence: float32
+      target_32:
+        sequence: float32
+      target_33:
+        sequence: float32
+      target_34:
+        sequence: float32
+      target_35:
+        sequence: float32
+      target_36:
+        sequence: float32
+      target_37:
+        sequence: float32
+      target_38:
+        sequence: float32
+      target_39:
+        sequence: float32
+      target_40:
+        sequence: float32
+      target_41:
+        sequence: float32
+      target_42:
+        sequence: float32
+      target_43:
+        sequence: float32
+      target_44:
+        sequence: float32
+      target_45:
+        sequence: float32
+      target_46:
+        sequence: float32
+      target_47:
+        sequence: float32
+      target_48:
+        sequence: float32
+      target_49:
+        sequence: float32
+      target_50:
+        sequence: float32
+      target_51:
+        sequence: float32
+      target_52:
+        sequence: float32
+      target_53:
+        sequence: float32
+      target_54:
+        sequence: float32
+      target_55:
+        sequence: float32
+      target_56:
+        sequence: float32
+      target_57:
+        sequence: float32
+      target_58:
+        sequence: float32
+      target_59:
+        sequence: float32
+      target_60:
+        sequence: float32
+      target_61:
+        sequence: float32
+      target_62:
+        sequence: float32
+      target_63:
+        sequence: float32
+      target_64:
+        sequence: float32
+      target_65:
+        sequence: float32
+      target_66:
+        sequence: float32
+      target_67:
+        sequence: float32
+      target_68:
+        sequence: float32
+      target_69:
+        sequence: float32
+      target_70:
+        sequence: float32
+      target_71:
+        sequence: float32
+      target_72:
+        sequence: float32
+      target_73:
+        sequence: float32
+      target_74:
+        sequence: float32
+    frequency: h
+    items: 1
+    median_length: 5231
+    observations_all_dynamic_columns: 392325
+    dataset_bytes: 1611485
+  boomlet_2187:
+    features:
+      id:
+        dtype: string
+      type:
+        dtype: string
+      Application Usage:
+        dtype: float32
+      Infrastructure:
+        dtype: float32
+      Database:
+        dtype: float32
+      Networking:
+        dtype: float32
+      Security:
+        dtype: float32
+      timestamp:
+        sequence: timestamp[ms]
+      target_0:
+        sequence: float32
+      target_1:
+        sequence: float32
+      target_2:
+        sequence: float32
+      target_3:
+        sequence: float32
+      target_4:
+        sequence: float32
+      target_5:
+        sequence: float32
+      target_6:
+        sequence: float32
+      target_7:
+        sequence: float32
+      target_8:
+        sequence: float32
+      target_9:
+        sequence: float32
+      target_10:
+        sequence: float32
+      target_11:
+        sequence: float32
+      target_12:
+        sequence: float32
+      target_13:
+        sequence: float32
+      target_14:
+        sequence: float32
+      target_15:
+        sequence: float32
+      target_16:
+        sequence: float32
+      target_17:
+        sequence: float32
+      target_18:
+        sequence: float32
+      target_19:
+        sequence: float32
+      target_20:
+        sequence: float32
+      target_21:
+        sequence: float32
+      target_22:
+        sequence: float32
+      target_23:
+        sequence: float32
+      target_24:
+        sequence: float32
+      target_25:
+        sequence: float32
+      target_26:
+        sequence: float32
+      target_27:
+        sequence: float32
+      target_28:
+        sequence: float32
+      target_29:
+        sequence: float32
+      target_30:
+        sequence: float32
+      target_31:
+        sequence: float32
+      target_32:
+        sequence: float32
+      target_33:
+        sequence: float32
+      target_34:
+        sequence: float32
+      target_35:
+        sequence: float32
+      target_36:
+        sequence: float32
+      target_37:
+        sequence: float32
+      target_38:
+        sequence: float32
+      target_39:
+        sequence: float32
+      target_40:
+        sequence: float32
+      target_41:
+        sequence: float32
+      target_42:
+        sequence: float32
+      target_43:
+        sequence: float32
+      target_44:
+        sequence: float32
+      target_45:
+        sequence: float32
+      target_46:
+        sequence: float32
+      target_47:
+        sequence: float32
+      target_48:
+        sequence: float32
+      target_49:
+        sequence: float32
+      target_50:
+        sequence: float32
+      target_51:
+        sequence: float32
+      target_52:
+        sequence: float32
+      target_53:
+        sequence: float32
+      target_54:
+        sequence: float32
+      target_55:
+        sequence: float32
+      target_56:
+        sequence: float32
+      target_57:
+        sequence: float32
+      target_58:
+        sequence: float32
+      target_59:
+        sequence: float32
+      target_60:
+        sequence: float32
+      target_61:
+        sequence: float32
+      target_62:
+        sequence: float32
+      target_63:
+        sequence: float32
+      target_64:
+        sequence: float32
+      target_65:
+        sequence: float32
+      target_66:
+        sequence: float32
+      target_67:
+        sequence: float32
+      target_68:
+        sequence: float32
+      target_69:
+        sequence: float32
+      target_70:
+        sequence: float32
+      target_71:
+        sequence: float32
+      target_72:
+        sequence: float32
+      target_73:
+        sequence: float32
+      target_74:
+        sequence: float32
+      target_75:
+        sequence: float32
+      target_76:
+        sequence: float32
+      target_77:
+        sequence: float32
+      target_78:
+        sequence: float32
+      target_79:
+        sequence: float32
+      target_80:
+        sequence: float32
+      target_81:
+        sequence: float32
+      target_82:
+        sequence: float32
+      target_83:
+        sequence: float32
+      target_84:
+        sequence: float32
+      target_85:
+        sequence: float32
+      target_86:
+        sequence: float32
+      target_87:
+        sequence: float32
+      target_88:
+        sequence: float32
+      target_89:
+        sequence: float32
+      target_90:
+        sequence: float32
+      target_91:
+        sequence: float32
+      target_92:
+        sequence: float32
+      target_93:
+        sequence: float32
+      target_94:
+        sequence: float32
+      target_95:
+        sequence: float32
+      target_96:
+        sequence: float32
+      target_97:
+        sequence: float32
+      target_98:
+        sequence: float32
+      target_99:
+        sequence: float32
+    frequency: h
+    items: 1
+    median_length: 5231
+    observations_all_dynamic_columns: 523100
+    dataset_bytes: 2134685
+  boomlet_285:
+    features:
+      id:
+        dtype: string
+      type:
+        dtype: string
+      Application Usage:
+        dtype: float32
+      Infrastructure:
+        dtype: float32
+      Database:
+        dtype: float32
+      Networking:
+        dtype: float32
+      Security:
+        dtype: float32
+      timestamp:
+        sequence: timestamp[ms]
+      target_0:
+        sequence: float32
+      target_1:
+        sequence: float32
+      target_2:
+        sequence: float32
+      target_3:
+        sequence: float32
+      target_4:
+        sequence: float32
+      target_5:
+        sequence: float32
+      target_6:
+        sequence: float32
+      target_7:
+        sequence: float32
+      target_8:
+        sequence: float32
+      target_9:
+        sequence: float32
+      target_10:
+        sequence: float32
+      target_11:
+        sequence: float32
+      target_12:
+        sequence: float32
+      target_13:
+        sequence: float32
+      target_14:
+        sequence: float32
+      target_15:
+        sequence: float32
+      target_16:
+        sequence: float32
+      target_17:
+        sequence: float32
+      target_18:
+        sequence: float32
+      target_19:
+        sequence: float32
+      target_20:
+        sequence: float32
+      target_21:
+        sequence: float32
+      target_22:
+        sequence: float32
+      target_23:
+        sequence: float32
+      target_24:
+        sequence: float32
+      target_25:
+        sequence: float32
+      target_26:
+        sequence: float32
+      target_27:
+        sequence: float32
+      target_28:
+        sequence: float32
+      target_29:
+        sequence: float32
+      target_30:
+        sequence: float32
+      target_31:
+        sequence: float32
+      target_32:
+        sequence: float32
+      target_33:
+        sequence: float32
+      target_34:
+        sequence: float32
+      target_35:
+        sequence: float32
+      target_36:
+        sequence: float32
+      target_37:
+        sequence: float32
+      target_38:
+        sequence: float32
+      target_39:
+        sequence: float32
+      target_40:
+        sequence: float32
+      target_41:
+        sequence: float32
+      target_42:
+        sequence: float32
+      target_43:
+        sequence: float32
+      target_44:
+        sequence: float32
+      target_45:
+        sequence: float32
+      target_46:
+        sequence: float32
+      target_47:
+        sequence: float32
+      target_48:
+        sequence: float32
+      target_49:
+        sequence: float32
+      target_50:
+        sequence: float32
+      target_51:
+        sequence: float32
+      target_52:
+        sequence: float32
+      target_53:
+        sequence: float32
+      target_54:
+        sequence: float32
+      target_55:
+        sequence: float32
+      target_56:
+        sequence: float32
+      target_57:
+        sequence: float32
+      target_58:
+        sequence: float32
+      target_59:
+        sequence: float32
+      target_60:
+        sequence: float32
+      target_61:
+        sequence: float32
+      target_62:
+        sequence: float32
+      target_63:
+        sequence: float32
+      target_64:
+        sequence: float32
+      target_65:
+        sequence: float32
+      target_66:
+        sequence: float32
+      target_67:
+        sequence: float32
+      target_68:
+        sequence: float32
+      target_69:
+        sequence: float32
+      target_70:
+        sequence: float32
+      target_71:
+        sequence: float32
+      target_72:
+        sequence: float32
+      target_73:
+        sequence: float32
+      target_74:
+        sequence: float32
+    frequency: min
+    items: 1
+    median_length: 16384
+    observations_all_dynamic_columns: 1228800
+    dataset_bytes: 5046608
+  boomlet_619:
+    features:
+      id:
+        dtype: string
+      type:
+        dtype: string
+      Application Usage:
+        dtype: float32
+      Infrastructure:
+        dtype: float32
+      Database:
+        dtype: float32
+      Networking:
+        dtype: float32
+      Security:
+        dtype: float32
+      timestamp:
+        sequence: timestamp[ms]
+      target_0:
+        sequence: float32
+      target_1:
+        sequence: float32
+      target_2:
+        sequence: float32
+      target_3:
+        sequence: float32
+      target_4:
+        sequence: float32
+      target_5:
+        sequence: float32
+      target_6:
+        sequence: float32
+      target_7:
+        sequence: float32
+      target_8:
+        sequence: float32
+      target_9:
+        sequence: float32
+      target_10:
+        sequence: float32
+      target_11:
+        sequence: float32
+      target_12:
+        sequence: float32
+      target_13:
+        sequence: float32
+      target_14:
+        sequence: float32
+      target_15:
+        sequence: float32
+      target_16:
+        sequence: float32
+      target_17:
+        sequence: float32
+      target_18:
+        sequence: float32
+      target_19:
+        sequence: float32
+      target_20:
+        sequence: float32
+      target_21:
+        sequence: float32
+      target_22:
+        sequence: float32
+      target_23:
+        sequence: float32
+      target_24:
+        sequence: float32
+      target_25:
+        sequence: float32
+      target_26:
+        sequence: float32
+      target_27:
+        sequence: float32
+      target_28:
+        sequence: float32
+      target_29:
+        sequence: float32
+      target_30:
+        sequence: float32
+      target_31:
+        sequence: float32
+      target_32:
+        sequence: float32
+      target_33:
+        sequence: float32
+      target_34:
+        sequence: float32
+      target_35:
+        sequence: float32
+      target_36:
+        sequence: float32
+      target_37:
+        sequence: float32
+      target_38:
+        sequence: float32
+      target_39:
+        sequence: float32
+      target_40:
+        sequence: float32
+      target_41:
+        sequence: float32
+      target_42:
+        sequence: float32
+      target_43:
+        sequence: float32
+      target_44:
+        sequence: float32
+      target_45:
+        sequence: float32
+      target_46:
+        sequence: float32
+      target_47:
+        sequence: float32
+      target_48:
+        sequence: float32
+      target_49:
+        sequence: float32
+      target_50:
+        sequence: float32
+      target_51:
+        sequence: float32
+    frequency: min
+    items: 1
+    median_length: 16384
+    observations_all_dynamic_columns: 851968
+    dataset_bytes: 3539188
+  boomlet_772:
+    features:
+      id:
+        dtype: string
+      type:
+        dtype: string
+      Application Usage:
+        dtype: float32
+      Infrastructure:
+        dtype: float32
+      Database:
+        dtype: float32
+      Networking:
+        dtype: float32
+      Security:
+        dtype: float32
+      timestamp:
+        sequence: timestamp[ms]
+      target_0:
+        sequence: float32
+      target_1:
+        sequence: float32
+      target_2:
+        sequence: float32
+      target_3:
+        sequence: float32
+      target_4:
+        sequence: float32
+      target_5:
+        sequence: float32
+      target_6:
+        sequence: float32
+      target_7:
+        sequence: float32
+      target_8:
+        sequence: float32
+      target_9:
+        sequence: float32
+      target_10:
+        sequence: float32
+      target_11:
+        sequence: float32
+      target_12:
+        sequence: float32
+      target_13:
+        sequence: float32
+      target_14:
+        sequence: float32
+      target_15:
+        sequence: float32
+      target_16:
+        sequence: float32
+      target_17:
+        sequence: float32
+      target_18:
+        sequence: float32
+      target_19:
+        sequence: float32
+      target_20:
+        sequence: float32
+      target_21:
+        sequence: float32
+      target_22:
+        sequence: float32
+      target_23:
+        sequence: float32
+      target_24:
+        sequence: float32
+      target_25:
+        sequence: float32
+      target_26:
+        sequence: float32
+      target_27:
+        sequence: float32
+      target_28:
+        sequence: float32
+      target_29:
+        sequence: float32
+      target_30:
+        sequence: float32
+      target_31:
+        sequence: float32
+      target_32:
+        sequence: float32
+      target_33:
+        sequence: float32
+      target_34:
+        sequence: float32
+      target_35:
+        sequence: float32
+      target_36:
+        sequence: float32
+      target_37:
+        sequence: float32
+      target_38:
+        sequence: float32
+      target_39:
+        sequence: float32
+      target_40:
+        sequence: float32
+      target_41:
+        sequence: float32
+      target_42:
+        sequence: float32
+      target_43:
+        sequence: float32
+      target_44:
+        sequence: float32
+      target_45:
+        sequence: float32
+      target_46:
+        sequence: float32
+      target_47:
+        sequence: float32
+      target_48:
+        sequence: float32
+      target_49:
+        sequence: float32
+      target_50:
+        sequence: float32
+      target_51:
+        sequence: float32
+      target_52:
+        sequence: float32
+      target_53:
+        sequence: float32
+      target_54:
+        sequence: float32
+      target_55:
+        sequence: float32
+      target_56:
+        sequence: float32
+      target_57:
+        sequence: float32
+      target_58:
+        sequence: float32
+      target_59:
+        sequence: float32
+      target_60:
+        sequence: float32
+      target_61:
+        sequence: float32
+      target_62:
+        sequence: float32
+      target_63:
+        sequence: float32
+      target_64:
+        sequence: float32
+      target_65:
+        sequence: float32
+      target_66:
+        sequence: float32
+    frequency: min
+    items: 1
+    median_length: 16384
+    observations_all_dynamic_columns: 1097728
+    dataset_bytes: 4522288
+  boomlet_963:
+    features:
+      id:
+        dtype: string
+      type:
+        dtype: string
+      Application Usage:
+        dtype: float32
+      Infrastructure:
+        dtype: float32
+      Database:
+        dtype: float32
+      Networking:
+        dtype: float32
+      Security:
+        dtype: float32
+      timestamp:
+        sequence: timestamp[ms]
+      target_0:
+        sequence: float32
+      target_1:
+        sequence: float32
+      target_2:
+        sequence: float32
+      target_3:
+        sequence: float32
+      target_4:
+        sequence: float32
+      target_5:
+        sequence: float32
+      target_6:
+        sequence: float32
+      target_7:
+        sequence: float32
+      target_8:
+        sequence: float32
+      target_9:
+        sequence: float32
+      target_10:
+        sequence: float32
+      target_11:
+        sequence: float32
+      target_12:
+        sequence: float32
+      target_13:
+        sequence: float32
+      target_14:
+        sequence: float32
+      target_15:
+        sequence: float32
+      target_16:
+        sequence: float32
+      target_17:
+        sequence: float32
+      target_18:
+        sequence: float32
+      target_19:
+        sequence: float32
+      target_20:
+        sequence: float32
+      target_21:
+        sequence: float32
+      target_22:
+        sequence: float32
+      target_23:
+        sequence: float32
+      target_24:
+        sequence: float32
+      target_25:
+        sequence: float32
+      target_26:
+        sequence: float32
+      target_27:
+        sequence: float32
+    frequency: min
+    items: 1
+    median_length: 16384
+    observations_all_dynamic_columns: 458752
+    dataset_bytes: 1966228
+  ecdc_ili:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      target:
+        sequence: float32
+    frequency: W-SUN
+    items: 25
+    median_length: 201
+    observations_all_dynamic_columns: 4797
+    dataset_bytes: 58040
+  entsoe_15T:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      target:
+        sequence: float32
+      solar_generation_actual:
+        sequence: float32
+      wind_onshore_generation_actual:
+        sequence: float32
+      temperature:
+        sequence: float32
+      radiation_direct_horizontal:
+        sequence: float32
+      radiation_diffuse_horizontal:
+        sequence: float32
+    frequency: 15min
+    items: 6
+    median_length: 175292
+    observations_all_dynamic_columns: 6310512
+    dataset_bytes: 33656268
+  entsoe_1H:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      target:
+        sequence: float32
+      solar_generation_actual:
+        sequence: float32
+      wind_onshore_generation_actual:
+        sequence: float32
+      temperature:
+        sequence: float32
+      radiation_direct_horizontal:
+        sequence: float32
+      radiation_diffuse_horizontal:
+        sequence: float32
+    frequency: h
+    items: 6
+    median_length: 43822
+    observations_all_dynamic_columns: 1577592
+    dataset_bytes: 8414028
+  entsoe_30T:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      target:
+        sequence: float32
+      solar_generation_actual:
+        sequence: float32
+      wind_onshore_generation_actual:
+        sequence: float32
+      temperature:
+        sequence: float32
+      radiation_direct_horizontal:
+        sequence: float32
+      radiation_diffuse_horizontal:
+        sequence: float32
+    frequency: 30min
+    items: 6
+    median_length: 87645
+    observations_all_dynamic_columns: 3155220
+    dataset_bytes: 16828044
+  epf_be:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      target:
+        sequence: float32
+      Generation forecast:
+        sequence: float32
+      System load forecast:
+        sequence: float32
+    frequency: h
+    items: 1
+    median_length: 52416
+    observations_all_dynamic_columns: 157248
+    dataset_bytes: 1048342
+  epf_de:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      target:
+        sequence: float32
+      Ampirion Load Forecast:
+        sequence: float32
+      PV+Wind Forecast:
+        sequence: float32
+    frequency: h
+    items: 1
+    median_length: 52416
+    observations_all_dynamic_columns: 157248
+    dataset_bytes: 1048342
+  epf_fr:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      target:
+        sequence: float32
+      Generation forecast:
+        sequence: float32
+      System load forecast:
+        sequence: float32
+    frequency: h
+    items: 1
+    median_length: 52416
+    observations_all_dynamic_columns: 157248
+    dataset_bytes: 1048342
+  epf_np:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      target:
+        sequence: float32
+      Grid load forecast:
+        sequence: float32
+      Wind power forecast:
+        sequence: float32
+    frequency: h
+    items: 1
+    median_length: 52416
+    observations_all_dynamic_columns: 157248
+    dataset_bytes: 1048342
+  epf_pjm:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      target:
+        sequence: float32
+      System load forecast:
+        sequence: float32
+      Zonal COMED load foecast:
+        sequence: float32
+    frequency: h
+    items: 1
+    median_length: 52416
+    observations_all_dynamic_columns: 157248
+    dataset_bytes: 1048343
+  ercot_1D:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      target:
+        sequence: float32
+    frequency: D
+    items: 8
+    median_length: 6452
+    observations_all_dynamic_columns: 51616
+    dataset_bytes: 619536
+  ercot_1H:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      target:
+        sequence: float32
+    frequency: h
+    items: 8
+    median_length: 154872
+    observations_all_dynamic_columns: 1238976
+    dataset_bytes: 14867856
+  ercot_1M:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      target:
+        sequence: float32
+    frequency: ME
+    items: 8
+    median_length: 211
+    observations_all_dynamic_columns: 1688
+    dataset_bytes: 20400
+  ercot_1W:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      target:
+        sequence: float32
+    frequency: W-SUN
+    items: 8
+    median_length: 921
+    observations_all_dynamic_columns: 7368
+    dataset_bytes: 88560
+  favorita_stores_1D:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      sales:
+        sequence: float32
+      onpromotion:
+        sequence: float32
+      oil_price:
+        sequence: float32
+      holiday:
+        sequence: string
+      store_nbr:
+        dtype: float32
+      family:
+        dtype: string
+      city:
+        dtype: string
+      state:
+        dtype: string
+      type:
+        dtype: string
+      cluster:
+        dtype: float32
+    frequency: D
+    items: 1579
+    median_length: 1688
+    observations_all_dynamic_columns: 10661408
+    dataset_bytes: 68671823
+  favorita_stores_1M:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      sales:
+        sequence: float32
+      onpromotion:
+        sequence: float32
+      oil_price:
+        sequence: float32
+      store_nbr:
+        dtype: float32
+      family:
+        dtype: string
+      city:
+        dtype: string
+      state:
+        dtype: string
+      type:
+        dtype: string
+      cluster:
+        dtype: float32
+    frequency: ME
+    items: 1579
+    median_length: 54
+    observations_all_dynamic_columns: 255798
+    dataset_bytes: 1840648
+  favorita_stores_1W:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      sales:
+        sequence: float32
+      onpromotion:
+        sequence: float32
+      oil_price:
+        sequence: float32
+      store_nbr:
+        dtype: float32
+      family:
+        dtype: string
+      city:
+        dtype: string
+      state:
+        dtype: string
+      type:
+        dtype: string
+      cluster:
+        dtype: float32
+    frequency: W-SUN
+    items: 1579
+    median_length: 240
+    observations_all_dynamic_columns: 1136880
+    dataset_bytes: 7714528
+  favorita_transactions_1D:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      transactions:
+        sequence: float32
+      oil_price:
+        sequence: float32
+      holiday:
+        sequence: string
+      store_nbr:
+        dtype: float32
+      city:
+        dtype: string
+      state:
+        dtype: string
+      type:
+        dtype: string
+      cluster:
+        dtype: float32
+    frequency: D
+    items: 51
+    median_length: 1688
+    observations_all_dynamic_columns: 258264
+    dataset_bytes: 1872095
+  favorita_transactions_1M:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      transactions:
+        sequence: float32
+      oil_price:
+        sequence: float32
+      store_nbr:
+        dtype: float32
+      city:
+        dtype: string
+      state:
+        dtype: string
+      type:
+        dtype: string
+      cluster:
+        dtype: float32
+    frequency: ME
+    items: 51
+    median_length: 54
+    observations_all_dynamic_columns: 5508
+    dataset_bytes: 46856
+  favorita_transactions_1W:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      transactions:
+        sequence: float32
+      oil_price:
+        sequence: float32
+      store_nbr:
+        dtype: float32
+      city:
+        dtype: string
+      state:
+        dtype: string
+      type:
+        dtype: string
+      cluster:
+        dtype: float32
+    frequency: W-SUN
+    items: 51
+    median_length: 240
+    observations_all_dynamic_columns: 24480
+    dataset_bytes: 198632
+  fred_md_2025:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      RPI:
+        sequence: float32
+      W875RX1:
+        sequence: float32
+      DPCERA3M086SBEA:
+        sequence: float32
+      CMRMTSPLx:
+        sequence: float32
+      RETAILx:
+        sequence: float32
+      INDPRO:
+        sequence: float32
+      IPFPNSS:
+        sequence: float32
+      IPFINAL:
+        sequence: float32
+      IPCONGD:
+        sequence: float32
+      IPDCONGD:
+        sequence: float32
+      IPNCONGD:
+        sequence: float32
+      IPBUSEQ:
+        sequence: float32
+      IPMAT:
+        sequence: float32
+      IPDMAT:
+        sequence: float32
+      IPNMAT:
+        sequence: float32
+      IPMANSICS:
+        sequence: float32
+      IPB51222S:
+        sequence: float32
+      IPFUELS:
+        sequence: float32
+      CUMFNS:
+        sequence: float32
+      HWI:
+        sequence: float32
+      HWIURATIO:
+        sequence: float32
+      CLF16OV:
+        sequence: float32
+      CE16OV:
+        sequence: float32
+      UNRATE:
+        sequence: float32
+      UEMPMEAN:
+        sequence: float32
+      UEMPLT5:
+        sequence: float32
+      UEMP5TO14:
+        sequence: float32
+      UEMP15OV:
+        sequence: float32
+      UEMP15T26:
+        sequence: float32
+      UEMP27OV:
+        sequence: float32
+      CLAIMSx:
+        sequence: float32
+      PAYEMS:
+        sequence: float32
+      USGOOD:
+        sequence: float32
+      CES1021000001:
+        sequence: float32
+      USCONS:
+        sequence: float32
+      MANEMP:
+        sequence: float32
+      DMANEMP:
+        sequence: float32
+      NDMANEMP:
+        sequence: float32
+      SRVPRD:
+        sequence: float32
+      USTPU:
+        sequence: float32
+      USWTRADE:
+        sequence: float32
+      USTRADE:
+        sequence: float32
+      USFIRE:
+        sequence: float32
+      USGOVT:
+        sequence: float32
+      CES0600000007:
+        sequence: float32
+      AWOTMAN:
+        sequence: float32
+      AWHMAN:
+        sequence: float32
+      HOUST:
+        sequence: float32
+      HOUSTNE:
+        sequence: float32
+      HOUSTMW:
+        sequence: float32
+      HOUSTS:
+        sequence: float32
+      HOUSTW:
+        sequence: float32
+      PERMIT:
+        sequence: float32
+      PERMITNE:
+        sequence: float32
+      PERMITMW:
+        sequence: float32
+      PERMITS:
+        sequence: float32
+      PERMITW:
+        sequence: float32
+      ACOGNO:
+        sequence: float32
+      AMDMNOx:
+        sequence: float32
+      ANDENOx:
+        sequence: float32
+      AMDMUOx:
+        sequence: float32
+      BUSINVx:
+        sequence: float32
+      ISRATIOx:
+        sequence: float32
+      M1SL:
+        sequence: float32
+      M2SL:
+        sequence: float32
+      M2REAL:
+        sequence: float32
+      BOGMBASE:
+        sequence: float32
+      TOTRESNS:
+        sequence: float32
+      NONBORRES:
+        sequence: float32
+      BUSLOANS:
+        sequence: float32
+      REALLN:
+        sequence: float32
+      NONREVSL:
+        sequence: float32
+      CONSPI:
+        sequence: float32
+      S&P 500:
+        sequence: float32
+      S&P div yield:
+        sequence: float32
+      S&P PE ratio:
+        sequence: float32
+      FEDFUNDS:
+        sequence: float32
+      CP3Mx:
+        sequence: float32
+      TB3MS:
+        sequence: float32
+      TB6MS:
+        sequence: float32
+      GS1:
+        sequence: float32
+      GS5:
+        sequence: float32
+      GS10:
+        sequence: float32
+      AAA:
+        sequence: float32
+      BAA:
+        sequence: float32
+      COMPAPFFx:
+        sequence: float32
+      TB3SMFFM:
+        sequence: float32
+      TB6SMFFM:
+        sequence: float32
+      T1YFFM:
+        sequence: float32
+      T5YFFM:
+        sequence: float32
+      T10YFFM:
+        sequence: float32
+      AAAFFM:
+        sequence: float32
+      BAAFFM:
+        sequence: float32
+      TWEXAFEGSMTHx:
+        sequence: float32
+      EXSZUSx:
+        sequence: float32
+      EXJPUSx:
+        sequence: float32
+      EXUSUKx:
+        sequence: float32
+      EXCAUSx:
+        sequence: float32
+      WPSFD49207:
+        sequence: float32
+      WPSFD49502:
+        sequence: float32
+      WPSID61:
+        sequence: float32
+      WPSID62:
+        sequence: float32
+      OILPRICEx:
+        sequence: float32
+      PPICMM:
+        sequence: float32
+      CPIAUCSL:
+        sequence: float32
+      CPIAPPSL:
+        sequence: float32
+      CPITRNSL:
+        sequence: float32
+      CPIMEDSL:
+        sequence: float32
+      CUSR0000SAC:
+        sequence: float32
+      CUSR0000SAD:
+        sequence: float32
+      CUSR0000SAS:
+        sequence: float32
+      CPIULFSL:
+        sequence: float32
+      CUSR0000SA0L2:
+        sequence: float32
+      CUSR0000SA0L5:
+        sequence: float32
+      PCEPI:
+        sequence: float32
+      DDURRG3M086SBEA:
+        sequence: float32
+      DNDGRG3M086SBEA:
+        sequence: float32
+      DSERRG3M086SBEA:
+        sequence: float32
+      CES0600000008:
+        sequence: float32
+      CES2000000008:
+        sequence: float32
+      CES3000000008:
+        sequence: float32
+      UMCSENTx:
+        sequence: float32
+      DTCOLNVHFNM:
+        sequence: float32
+      DTCTHFNM:
+        sequence: float32
+      INVEST:
+        sequence: float32
+      VIXCLSx:
+        sequence: float32
+    frequency: MS
+    items: 1
+    median_length: 798
+    observations_all_dynamic_columns: 100548
+    dataset_bytes: 409103
+  fred_qd_2025:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      GDPC1:
+        sequence: float32
+      PCECC96:
+        sequence: float32
+      PCDGx:
+        sequence: float32
+      PCESVx:
+        sequence: float32
+      PCNDx:
+        sequence: float32
+      GPDIC1:
+        sequence: float32
+      FPIx:
+        sequence: float32
+      Y033RC1Q027SBEAx:
+        sequence: float32
+      PNFIx:
+        sequence: float32
+      PRFIx:
+        sequence: float32
+      A014RE1Q156NBEA:
+        sequence: float32
+      GCEC1:
+        sequence: float32
+      A823RL1Q225SBEA:
+        sequence: float32
+      FGRECPTx:
+        sequence: float32
+      SLCEx:
+        sequence: float32
+      EXPGSC1:
+        sequence: float32
+      IMPGSC1:
+        sequence: float32
+      DPIC96:
+        sequence: float32
+      OUTNFB:
+        sequence: float32
+      OUTBS:
+        sequence: float32
+      OUTMS:
+        sequence: float32
+      INDPRO:
+        sequence: float32
+      IPFINAL:
+        sequence: float32
+      IPCONGD:
+        sequence: float32
+      IPMAT:
+        sequence: float32
+      IPDMAT:
+        sequence: float32
+      IPNMAT:
+        sequence: float32
+      IPDCONGD:
+        sequence: float32
+      IPB51110SQ:
+        sequence: float32
+      IPNCONGD:
+        sequence: float32
+      IPBUSEQ:
+        sequence: float32
+      IPB51220SQ:
+        sequence: float32
+      TCU:
+        sequence: float32
+      CUMFNS:
+        sequence: float32
+      PAYEMS:
+        sequence: float32
+      USPRIV:
+        sequence: float32
+      MANEMP:
+        sequence: float32
+      SRVPRD:
+        sequence: float32
+      USGOOD:
+        sequence: float32
+      DMANEMP:
+        sequence: float32
+      NDMANEMP:
+        sequence: float32
+      USCONS:
+        sequence: float32
+      USEHS:
+        sequence: float32
+      USFIRE:
+        sequence: float32
+      USINFO:
+        sequence: float32
+      USPBS:
+        sequence: float32
+      USLAH:
+        sequence: float32
+      USSERV:
+        sequence: float32
+      USMINE:
+        sequence: float32
+      USTPU:
+        sequence: float32
+      USGOVT:
+        sequence: float32
+      USTRADE:
+        sequence: float32
+      USWTRADE:
+        sequence: float32
+      CES9091000001:
+        sequence: float32
+      CES9092000001:
+        sequence: float32
+      CES9093000001:
+        sequence: float32
+      CE16OV:
+        sequence: float32
+      CIVPART:
+        sequence: float32
+      UNRATE:
+        sequence: float32
+      UNRATESTx:
+        sequence: float32
+      UNRATELTx:
+        sequence: float32
+      LNS14000012:
+        sequence: float32
+      LNS14000025:
+        sequence: float32
+      LNS14000026:
+        sequence: float32
+      UEMPLT5:
+        sequence: float32
+      UEMP5TO14:
+        sequence: float32
+      UEMP15T26:
+        sequence: float32
+      UEMP27OV:
+        sequence: float32
+      LNS13023621:
+        sequence: float32
+      LNS13023557:
+        sequence: float32
+      LNS13023705:
+        sequence: float32
+      LNS13023569:
+        sequence: float32
+      LNS12032194:
+        sequence: float32
+      HOABS:
+        sequence: float32
+      HOAMS:
+        sequence: float32
+      HOANBS:
+        sequence: float32
+      AWHMAN:
+        sequence: float32
+      AWHNONAG:
+        sequence: float32
+      AWOTMAN:
+        sequence: float32
+      HWIx:
+        sequence: float32
+      HOUST:
+        sequence: float32
+      HOUST5F:
+        sequence: float32
+      PERMIT:
+        sequence: float32
+      HOUSTMW:
+        sequence: float32
+      HOUSTNE:
+        sequence: float32
+      HOUSTS:
+        sequence: float32
+      HOUSTW:
+        sequence: float32
+      CMRMTSPLx:
+        sequence: float32
+      RSAFSx:
+        sequence: float32
+      AMDMNOx:
+        sequence: float32
+      ACOGNOx:
+        sequence: float32
+      AMDMUOx:
+        sequence: float32
+      ANDENOx:
+        sequence: float32
+      INVCQRMTSPL:
+        sequence: float32
+      PCECTPI:
+        sequence: float32
+      PCEPILFE:
+        sequence: float32
+      GDPCTPI:
+        sequence: float32
+      GPDICTPI:
+        sequence: float32
+      IPDBS:
+        sequence: float32
+      DGDSRG3Q086SBEA:
+        sequence: float32
+      DDURRG3Q086SBEA:
+        sequence: float32
+      DSERRG3Q086SBEA:
+        sequence: float32
+      DNDGRG3Q086SBEA:
+        sequence: float32
+      DHCERG3Q086SBEA:
+        sequence: float32
+      DMOTRG3Q086SBEA:
+        sequence: float32
+      DFDHRG3Q086SBEA:
+        sequence: float32
+      DREQRG3Q086SBEA:
+        sequence: float32
+      DODGRG3Q086SBEA:
+        sequence: float32
+      DFXARG3Q086SBEA:
+        sequence: float32
+      DCLORG3Q086SBEA:
+        sequence: float32
+      DGOERG3Q086SBEA:
+        sequence: float32
+      DONGRG3Q086SBEA:
+        sequence: float32
+      DHUTRG3Q086SBEA:
+        sequence: float32
+      DHLCRG3Q086SBEA:
+        sequence: float32
+      DTRSRG3Q086SBEA:
+        sequence: float32
+      DRCARG3Q086SBEA:
+        sequence: float32
+      DFSARG3Q086SBEA:
+        sequence: float32
+      DIFSRG3Q086SBEA:
+        sequence: float32
+      DOTSRG3Q086SBEA:
+        sequence: float32
+      CPIAUCSL:
+        sequence: float32
+      CPILFESL:
+        sequence: float32
+      WPSFD49207:
+        sequence: float32
+      PPIACO:
+        sequence: float32
+      WPSFD49502:
+        sequence: float32
+      WPSFD4111:
+        sequence: float32
+      PPIIDC:
+        sequence: float32
+      WPSID61:
+        sequence: float32
+      WPU0531:
+        sequence: float32
+      WPU0561:
+        sequence: float32
+      OILPRICEx:
+        sequence: float32
+      AHETPIx:
+        sequence: float32
+      CES2000000008x:
+        sequence: float32
+      CES3000000008x:
+        sequence: float32
+      COMPRMS:
+        sequence: float32
+      COMPRNFB:
+        sequence: float32
+      RCPHBS:
+        sequence: float32
+      OPHMFG:
+        sequence: float32
+      OPHNFB:
+        sequence: float32
+      OPHPBS:
+        sequence: float32
+      ULCBS:
+        sequence: float32
+      ULCMFG:
+        sequence: float32
+      ULCNFB:
+        sequence: float32
+      UNLPNBS:
+        sequence: float32
+      FEDFUNDS:
+        sequence: float32
+      TB3MS:
+        sequence: float32
+      TB6MS:
+        sequence: float32
+      GS1:
+        sequence: float32
+      GS10:
+        sequence: float32
+      MORTGAGE30US:
+        sequence: float32
+      AAA:
+        sequence: float32
+      BAA:
+        sequence: float32
+      BAA10YM:
+        sequence: float32
+      MORTG10YRx:
+        sequence: float32
+      TB6M3Mx:
+        sequence: float32
+      GS1TB3Mx:
+        sequence: float32
+      GS10TB3Mx:
+        sequence: float32
+      CPF3MTB3Mx:
+        sequence: float32
+      BOGMBASEREALx:
+        sequence: float32
+      M1REAL:
+        sequence: float32
+      M2REAL:
+        sequence: float32
+      BUSLOANSx:
+        sequence: float32
+      CONSUMERx:
+        sequence: float32
+      NONREVSLx:
+        sequence: float32
+      REALLNx:
+        sequence: float32
+      REVOLSLx:
+        sequence: float32
+      TOTALSLx:
+        sequence: float32
+      DRIWCIL:
+        sequence: float32
+      TABSHNOx:
+        sequence: float32
+      TLBSHNOx:
+        sequence: float32
+      LIABPIx:
+        sequence: float32
+      TNWBSHNOx:
+        sequence: float32
+      NWPIx:
+        sequence: float32
+      TARESAx:
+        sequence: float32
+      HNOREMQ027Sx:
+        sequence: float32
+      TFAABSHNOx:
+        sequence: float32
+      VIXCLSx:
+        sequence: float32
+      USSTHPI:
+        sequence: float32
+      SPCS10RSA:
+        sequence: float32
+      SPCS20RSA:
+        sequence: float32
+      TWEXAFEGSMTHx:
+        sequence: float32
+      EXUSEU:
+        sequence: float32
+      EXSZUSx:
+        sequence: float32
+      EXJPUSx:
+        sequence: float32
+      EXUSUKx:
+        sequence: float32
+      EXCAUSx:
+        sequence: float32
+      UMCSENTx:
+        sequence: float32
+      USEPUINDXM:
+        sequence: float32
+      B020RE1Q156NBEA:
+        sequence: float32
+      B021RE1Q156NBEA:
+        sequence: float32
+      GFDEGDQ188S:
+        sequence: float32
+      GFDEBTNx:
+        sequence: float32
+      IPMANSICS:
+        sequence: float32
+      IPB51222S:
+        sequence: float32
+      IPFUELS:
+        sequence: float32
+      UEMPMEAN:
+        sequence: float32
+      CES0600000007:
+        sequence: float32
+      TOTRESNS:
+        sequence: float32
+      NONBORRES:
+        sequence: float32
+      GS5:
+        sequence: float32
+      TB3SMFFM:
+        sequence: float32
+      T5YFFM:
+        sequence: float32
+      AAAFFM:
+        sequence: float32
+      WPSID62:
+        sequence: float32
+      PPICMM:
+        sequence: float32
+      CPIAPPSL:
+        sequence: float32
+      CPITRNSL:
+        sequence: float32
+      CPIMEDSL:
+        sequence: float32
+      CUSR0000SAC:
+        sequence: float32
+      CUSR0000SAD:
+        sequence: float32
+      CUSR0000SAS:
+        sequence: float32
+      CPIULFSL:
+        sequence: float32
+      CUSR0000SA0L2:
+        sequence: float32
+      CUSR0000SA0L5:
+        sequence: float32
+      CES0600000008:
+        sequence: float32
+      DTCOLNVHFNM:
+        sequence: float32
+      DTCTHFNM:
+        sequence: float32
+      INVEST:
+        sequence: float32
+      HWIURATIOx:
+        sequence: float32
+      CLAIMSx:
+        sequence: float32
+      BUSINVx:
+        sequence: float32
+      ISRATIOx:
+        sequence: float32
+      CONSPIx:
+        sequence: float32
+      CP3M:
+        sequence: float32
+      COMPAPFF:
+        sequence: float32
+      PERMITNE:
+        sequence: float32
+      PERMITMW:
+        sequence: float32
+      PERMITS:
+        sequence: float32
+      PERMITW:
+        sequence: float32
+      NIKKEI225:
+        sequence: float32
+      NASDAQCOM:
+        sequence: float32
+      CUSR0000SEHC:
+        sequence: float32
+      TLBSNNCBx:
+        sequence: float32
+      TLBSNNCBBDIx:
+        sequence: float32
+      TTAABSNNCBx:
+        sequence: float32
+      TNWMVBSNNCBx:
+        sequence: float32
+      TNWMVBSNNCBBDIx:
+        sequence: float32
+      TLBSNNBx:
+        sequence: float32
+      TLBSNNBBDIx:
+        sequence: float32
+      TABSNNBx:
+        sequence: float32
+      TNWBSNNBx:
+        sequence: float32
+      TNWBSNNBBDIx:
+        sequence: float32
+      CNCFx:
+        sequence: float32
+      S&P 500:
+        sequence: float32
+      S&P div yield:
+        sequence: float32
+      S&P PE ratio:
+        sequence: float32
+    frequency: QS-DEC
+    items: 1
+    median_length: 266
+    observations_all_dynamic_columns: 65170
+    dataset_bytes: 263811
+  gvar:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      y:
+        sequence: float32
+      Dp:
+        sequence: float32
+      eq:
+        sequence: float32
+      ep:
+        sequence: float32
+      r:
+        sequence: float32
+      lr:
+        sequence: float32
+      poil:
+        sequence: float32
+      pmat:
+        sequence: float32
+      pmetal:
+        sequence: float32
+    frequency: QS-OCT
+    items: 33
+    median_length: 178
+    observations_all_dynamic_columns: 52866
+    dataset_bytes: 260043
+  hermes:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      target:
+        sequence: float32
+      external:
+        sequence: float32
+      country:
+        dtype: string
+      category:
+        dtype: string
+    frequency: W-MON
+    items: 10000
+    median_length: 261
+    observations_all_dynamic_columns: 5220000
+    dataset_bytes: 42319094
+  hierarchical_sales_1D:
+    features:
+      target:
+        sequence: float32
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+    frequency: D
+    items: 118
+    median_length: 1825
+    observations_all_dynamic_columns: 215350
+    dataset_bytes: 2586642
+  hierarchical_sales_1W:
+    features:
+      target:
+        sequence: float32
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+    frequency: W-WED
+    items: 118
+    median_length: 260
+    observations_all_dynamic_columns: 30680
+    dataset_bytes: 370602
+  hospital:
+    features:
+      target:
+        sequence: float32
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+    frequency: ME
+    items: 767
+    median_length: 84
+    observations_all_dynamic_columns: 64428
+    dataset_bytes: 785300
+  hospital_admissions_1D:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      target:
+        sequence: float32
+    frequency: D
+    items: 8
+    median_length: 1731
+    observations_all_dynamic_columns: 13846
+    dataset_bytes: 166428
+  hospital_admissions_1W:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      target:
+        sequence: float32
+    frequency: W-SUN
+    items: 8
+    median_length: 246
+    observations_all_dynamic_columns: 1968
+    dataset_bytes: 23892
+  jena_weather_10T:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      target_0:
+        sequence: float32
+      target_1:
+        sequence: float32
+      target_2:
+        sequence: float32
+      target_3:
+        sequence: float32
+      target_4:
+        sequence: float32
+      target_5:
+        sequence: float32
+      target_6:
+        sequence: float32
+      target_7:
+        sequence: float32
+      target_8:
+        sequence: float32
+      target_9:
+        sequence: float32
+      target_10:
+        sequence: float32
+      target_11:
+        sequence: float32
+      target_12:
+        sequence: float32
+      target_13:
+        sequence: float32
+      target_14:
+        sequence: float32
+      target_15:
+        sequence: float32
+      target_16:
+        sequence: float32
+      target_17:
+        sequence: float32
+      target_18:
+        sequence: float32
+      target_19:
+        sequence: float32
+      target_20:
+        sequence: float32
+    frequency: 10min
+    items: 1
+    median_length: 52704
+    observations_all_dynamic_columns: 1106784
+    dataset_bytes: 4848866
+  jena_weather_1D:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      target_0:
+        sequence: float32
+      target_1:
+        sequence: float32
+      target_2:
+        sequence: float32
+      target_3:
+        sequence: float32
+      target_4:
+        sequence: float32
+      target_5:
+        sequence: float32
+      target_6:
+        sequence: float32
+      target_7:
+        sequence: float32
+      target_8:
+        sequence: float32
+      target_9:
+        sequence: float32
+      target_10:
+        sequence: float32
+      target_11:
+        sequence: float32
+      target_12:
+        sequence: float32
+      target_13:
+        sequence: float32
+      target_14:
+        sequence: float32
+      target_15:
+        sequence: float32
+      target_16:
+        sequence: float32
+      target_17:
+        sequence: float32
+      target_18:
+        sequence: float32
+      target_19:
+        sequence: float32
+      target_20:
+        sequence: float32
+    frequency: D
+    items: 1
+    median_length: 366
+    observations_all_dynamic_columns: 7686
+    dataset_bytes: 33770
+  jena_weather_1H:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      target_0:
+        sequence: float32
+      target_1:
+        sequence: float32
+      target_2:
+        sequence: float32
+      target_3:
+        sequence: float32
+      target_4:
+        sequence: float32
+      target_5:
+        sequence: float32
+      target_6:
+        sequence: float32
+      target_7:
+        sequence: float32
+      target_8:
+        sequence: float32
+      target_9:
+        sequence: float32
+      target_10:
+        sequence: float32
+      target_11:
+        sequence: float32
+      target_12:
+        sequence: float32
+      target_13:
+        sequence: float32
+      target_14:
+        sequence: float32
+      target_15:
+        sequence: float32
+      target_16:
+        sequence: float32
+      target_17:
+        sequence: float32
+      target_18:
+        sequence: float32
+      target_19:
+        sequence: float32
+      target_20:
+        sequence: float32
+    frequency: h
+    items: 1
+    median_length: 8784
+    observations_all_dynamic_columns: 184464
+    dataset_bytes: 808226
+  kdd_cup_2022_10T:
+    features:
+      id:
+        dtype: string
+      Wspd:
+        sequence: float32
+      Wdir:
+        sequence: float32
+      Etmp:
+        sequence: float32
+      Itmp:
+        sequence: float32
+      Ndir:
+        sequence: float32
+      Pab1:
+        sequence: float32
+      Pab2:
+        sequence: float32
+      Pab3:
+        sequence: float32
+      Prtv:
+        sequence: float32
+      Patv:
+        sequence: float32
+      timestamp:
+        sequence: timestamp[ms]
+    frequency: 10min
+    items: 134
+    median_length: 35279
+    observations_all_dynamic_columns: 47273860
+    dataset_bytes: 226921254
+  kdd_cup_2022_1D:
+    features:
+      id:
+        dtype: string
+      Wspd:
+        sequence: float32
+      Wdir:
+        sequence: float32
+      Etmp:
+        sequence: float32
+      Itmp:
+        sequence: float32
+      Ndir:
+        sequence: float32
+      Pab1:
+        sequence: float32
+      Pab2:
+        sequence: float32
+      Pab3:
+        sequence: float32
+      Prtv:
+        sequence: float32
+      Patv:
+        sequence: float32
+      timestamp:
+        sequence: timestamp[ms]
+    frequency: D
+    items: 134
+    median_length: 243
+    observations_all_dynamic_columns: 325620
+    dataset_bytes: 1569702
+  kdd_cup_2022_30T:
+    features:
+      id:
+        dtype: string
+      Wspd:
+        sequence: float32
+      Wdir:
+        sequence: float32
+      Etmp:
+        sequence: float32
+      Itmp:
+        sequence: float32
+      Ndir:
+        sequence: float32
+      Pab1:
+        sequence: float32
+      Pab2:
+        sequence: float32
+      Pab3:
+        sequence: float32
+      Prtv:
+        sequence: float32
+      Patv:
+        sequence: float32
+      timestamp:
+        sequence: timestamp[ms]
+    frequency: 30min
+    items: 134
+    median_length: 11758
+    observations_all_dynamic_columns: 15755720
+    dataset_bytes: 75634182
+  m5_1D:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      target:
+        sequence: float32
+      snap_CA:
+        sequence: bool
+      snap_TX:
+        sequence: bool
+      snap_WI:
+        sequence: bool
+      sell_price:
+        sequence: float32
+      event_Cultural:
+        sequence: bool
+      event_National:
+        sequence: bool
+      event_Religious:
+        sequence: bool
+      event_Sporting:
+        sequence: bool
+      item_id:
+        dtype: string
+      dept_id:
+        dtype: string
+      cat_id:
+        dtype: string
+      store_id:
+        dtype: string
+      state_id:
+        dtype: string
+    frequency: D
+    items: 30490
+    median_length: 1810
+    observations_all_dynamic_columns: 428849460
+    dataset_bytes: 2100133490
+  m5_1M:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      target:
+        sequence: float32
+      snap_CA:
+        sequence: float32
+      snap_TX:
+        sequence: float32
+      snap_WI:
+        sequence: float32
+      sell_price:
+        sequence: float32
+      event_Cultural:
+        sequence: float32
+      event_National:
+        sequence: float32
+      event_Religious:
+        sequence: float32
+      event_Sporting:
+        sequence: float32
+      item_id:
+        dtype: string
+      dept_id:
+        dtype: string
+      cat_id:
+        dtype: string
+      store_id:
+        dtype: string
+      state_id:
+        dtype: string
+    frequency: ME
+    items: 30490
+    median_length: 58
+    observations_all_dynamic_columns: 13805685
+    dataset_bytes: 71030590
+  m5_1W:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      target:
+        sequence: float32
+      snap_CA:
+        sequence: float32
+      snap_TX:
+        sequence: float32
+      snap_WI:
+        sequence: float32
+      sell_price:
+        sequence: float32
+      event_Cultural:
+        sequence: float32
+      event_National:
+        sequence: float32
+      event_Religious:
+        sequence: float32
+      event_Sporting:
+        sequence: float32
+      item_id:
+        dtype: string
+      dept_id:
+        dtype: string
+      cat_id:
+        dtype: string
+      store_id:
+        dtype: string
+      state_id:
+        dtype: string
+    frequency: W-SUN
+    items: 30490
+    median_length: 257
+    observations_all_dynamic_columns: 60857703
+    dataset_bytes: 301062678
+  proenfo_gfc12:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      target:
+        sequence: float32
+      airtemperature:
+        sequence: float32
+    frequency: h
+    items: 11
+    median_length: 39414
+    observations_all_dynamic_columns: 867108
+    dataset_bytes: 6937062
+  proenfo_gfc14:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      target:
+        sequence: float32
+      airtemperature:
+        sequence: float32
+    frequency: h
+    items: 1
+    median_length: 17520
+    observations_all_dynamic_columns: 35040
+    dataset_bytes: 280340
+  proenfo_gfc17:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      target:
+        sequence: float32
+      airtemperature:
+        sequence: float32
+    frequency: h
+    items: 8
+    median_length: 17544
+    observations_all_dynamic_columns: 280704
+    dataset_bytes: 2245792
+  redset_15T:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      target:
+        sequence: float32
+      subset:
+        dtype: string
+    frequency: 15min
+    items: 126
+    median_length: 8640
+    observations_all_dynamic_columns: 1052371
+    dataset_bytes: 12633616
+  redset_1H:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      target:
+        sequence: float32
+      subset:
+        dtype: string
+    frequency: h
+    items: 138
+    median_length: 2160
+    observations_all_dynamic_columns: 283070
+    dataset_bytes: 3402487
+  redset_5T:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      target:
+        sequence: float32
+      subset:
+        dtype: string
+    frequency: 5min
+    items: 118
+    median_length: 25920
+    observations_all_dynamic_columns: 2960408
+    dataset_bytes: 35529745
+  restaurant:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      target:
+        sequence: float32
+      air_genre_name:
+        dtype: string
+      air_area_name:
+        dtype: string
+      latitude:
+        dtype: float32
+      longitude:
+        dtype: float32
+    frequency: D
+    items: 817
+    median_length: 296
+    observations_all_dynamic_columns: 294568
+    dataset_bytes: 3609839
+  rohlik_orders_1D:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      orders:
+        sequence: float32
+      holiday_name:
+        sequence: string
+      holiday:
+        sequence: float32
+      shutdown:
+        sequence: float32
+      mini_shutdown:
+        sequence: float32
+      shops_closed:
+        sequence: float32
+      winter_school_holidays:
+        sequence: float32
+      school_holidays:
+        sequence: float32
+      blackout:
+        sequence: float32
+      mov_change:
+        sequence: float32
+      frankfurt_shutdown:
+        sequence: float32
+      precipitation:
+        sequence: float32
+      snow:
+        sequence: float32
+      user_activity_1:
+        sequence: float32
+      user_activity_2:
+        sequence: float32
+    frequency: D
+    items: 7
+    median_length: 1197
+    observations_all_dynamic_columns: 115650
+    dataset_bytes: 530130
+  rohlik_orders_1W:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      orders:
+        sequence: float32
+      holiday:
+        sequence: float32
+      shutdown:
+        sequence: float32
+      mini_shutdown:
+        sequence: float32
+      shops_closed:
+        sequence: float32
+      winter_school_holidays:
+        sequence: float32
+      school_holidays:
+        sequence: float32
+      blackout:
+        sequence: float32
+      mov_change:
+        sequence: float32
+      frankfurt_shutdown:
+        sequence: float32
+      precipitation:
+        sequence: float32
+      snow:
+        sequence: float32
+      user_activity_1:
+        sequence: float32
+      user_activity_2:
+        sequence: float32
+    frequency: W-SUN
+    items: 7
+    median_length: 170
+    observations_all_dynamic_columns: 15316
+    dataset_bytes: 70523
+  rohlik_sales_1D:
+    features:
+      id:
+        dtype: string
+      product_unique_id:
+        dtype: float32
+      name:
+        dtype: string
+      L1_category_name_en:
+        dtype: string
+      L2_category_name_en:
+        dtype: string
+      L3_category_name_en:
+        dtype: string
+      L4_category_name_en:
+        dtype: string
+      warehouse:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      total_orders:
+        sequence: float32
+      sales:
+        sequence: float32
+      sell_price_main:
+        sequence: float32
+      availability:
+        sequence: float32
+      type_0_discount:
+        sequence: float32
+      type_1_discount:
+        sequence: float32
+      type_2_discount:
+        sequence: float32
+      type_3_discount:
+        sequence: float32
+      type_4_discount:
+        sequence: float32
+      type_5_discount:
+        sequence: float32
+      type_6_discount:
+        sequence: float32
+      holiday:
+        sequence: float32
+      shops_closed:
+        sequence: float32
+      winter_school_holidays:
+        sequence: float32
+      school_holidays:
+        sequence: float32
+    frequency: D
+    items: 5390
+    median_length: 1046
+    observations_all_dynamic_columns: 74413935
+    dataset_bytes: 338376839
+  rohlik_sales_1W:
+    features:
+      id:
+        dtype: string
+      product_unique_id:
+        dtype: float32
+      name:
+        dtype: string
+      L1_category_name_en:
+        dtype: string
+      L2_category_name_en:
+        dtype: string
+      L3_category_name_en:
+        dtype: string
+      L4_category_name_en:
+        dtype: string
+      warehouse:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      total_orders:
+        sequence: float32
+      sales:
+        sequence: float32
+      sell_price_main:
+        sequence: float32
+      availability:
+        sequence: float32
+      type_0_discount:
+        sequence: float32
+      type_1_discount:
+        sequence: float32
+      type_2_discount:
+        sequence: float32
+      type_3_discount:
+        sequence: float32
+      type_4_discount:
+        sequence: float32
+      type_5_discount:
+        sequence: float32
+      type_6_discount:
+        sequence: float32
+      holiday:
+        sequence: float32
+      shops_closed:
+        sequence: float32
+      winter_school_holidays:
+        sequence: float32
+      school_holidays:
+        sequence: float32
+    frequency: W-SUN
+    items: 5243
+    median_length: 150
+    observations_all_dynamic_columns: 10516770
+    dataset_bytes: 48679611
+  rossmann_1D:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      DayOfWeek:
+        sequence: float32
+      Sales:
+        sequence: float32
+      Customers:
+        sequence: float32
+      Open:
+        sequence: float32
+      Promo:
+        sequence: float32
+      StateHoliday:
+        sequence: string
+      SchoolHoliday:
+        sequence: float32
+      Store:
+        dtype: float32
+      StoreType:
+        dtype: string
+      Assortment:
+        dtype: string
+      CompetitionDistance:
+        dtype: float32
+      CompetitionOpenSinceMonth:
+        dtype: float32
+      CompetitionOpenSinceYear:
+        dtype: float32
+      Promo2:
+        dtype: float32
+      Promo2SinceWeek:
+        dtype: float32
+      Promo2SinceYear:
+        dtype: float32
+      PromoInterval:
+        dtype: string
+    frequency: D
+    items: 1115
+    median_length: 942
+    observations_all_dynamic_columns: 7352310
+    dataset_bytes: 39224613
+  rossmann_1W:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      Sales:
+        sequence: float32
+      Customers:
+        sequence: float32
+      Open:
+        sequence: float32
+      Promo:
+        sequence: float32
+      StateHoliday:
+        sequence: float32
+      SchoolHoliday:
+        sequence: float32
+      Store:
+        dtype: float32
+      StoreType:
+        dtype: string
+      Assortment:
+        dtype: string
+      CompetitionDistance:
+        dtype: float32
+      CompetitionOpenSinceMonth:
+        dtype: float32
+      CompetitionOpenSinceYear:
+        dtype: float32
+      Promo2:
+        dtype: float32
+      Promo2SinceWeek:
+        dtype: float32
+      Promo2SinceYear:
+        dtype: float32
+      PromoInterval:
+        dtype: string
+    frequency: W-SUN
+    items: 1115
+    median_length: 133
+    observations_all_dynamic_columns: 889770
+    dataset_bytes: 4840114
+  solar_1D:
+    features:
+      target:
+        sequence: float32
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+    frequency: D
+    items: 137
+    median_length: 365
+    observations_all_dynamic_columns: 50005
+    dataset_bytes: 602690
+  solar_1W:
+    features:
+      target:
+        sequence: float32
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+    frequency: W-FRI
+    items: 137
+    median_length: 52
+    observations_all_dynamic_columns: 7124
+    dataset_bytes: 88118
+  solar_with_weather_15T:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      target:
+        sequence: float32
+      global_horizontal_irradiance:
+        sequence: float32
+      temp:
+        sequence: float32
+      pressure:
+        sequence: float32
+      humidity:
+        sequence: float32
+      wind_speed:
+        sequence: float32
+      rain_1h:
+        sequence: float32
+      snow_1h:
+        sequence: float32
+      clouds_all:
+        sequence: float32
+      day_length:
+        sequence: float32
+    frequency: 15min
+    items: 1
+    median_length: 198600
+    observations_all_dynamic_columns: 1986000
+    dataset_bytes: 9532849
+  solar_with_weather_1H:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      target:
+        sequence: float32
+      global_horizontal_irradiance:
+        sequence: float32
+      temp:
+        sequence: float32
+      pressure:
+        sequence: float32
+      humidity:
+        sequence: float32
+      wind_speed:
+        sequence: float32
+      rain_1h:
+        sequence: float32
+      snow_1h:
+        sequence: float32
+      clouds_all:
+        sequence: float32
+      day_length:
+        sequence: float32
+    frequency: h
+    items: 1
+    median_length: 49648
+    observations_all_dynamic_columns: 496480
+    dataset_bytes: 2383153
+  uci_air_quality_1D:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      CO(GT):
+        sequence: float32
+      PT08.S1(CO):
+        sequence: float32
+      NMHC(GT):
+        sequence: float32
+      C6H6(GT):
+        sequence: float32
+      PT08.S2(NMHC):
+        sequence: float32
+      NOx(GT):
+        sequence: float32
+      PT08.S3(NOx):
+        sequence: float32
+      NO2(GT):
+        sequence: float32
+      PT08.S4(NO2):
+        sequence: float32
+      PT08.S5(O3):
+        sequence: float32
+      T:
+        sequence: float32
+      RH:
+        sequence: float32
+      AH:
+        sequence: float32
+    frequency: D
+    items: 1
+    median_length: 389
+    observations_all_dynamic_columns: 5057
+    dataset_bytes: 23401
+  uci_air_quality_1H:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      CO(GT):
+        sequence: float32
+      PT08.S1(CO):
+        sequence: float32
+      NMHC(GT):
+        sequence: float32
+      C6H6(GT):
+        sequence: float32
+      PT08.S2(NMHC):
+        sequence: float32
+      NOx(GT):
+        sequence: float32
+      PT08.S3(NOx):
+        sequence: float32
+      NO2(GT):
+        sequence: float32
+      PT08.S4(NO2):
+        sequence: float32
+      PT08.S5(O3):
+        sequence: float32
+      T:
+        sequence: float32
+      RH:
+        sequence: float32
+      AH:
+        sequence: float32
+    frequency: h
+    items: 1
+    median_length: 9357
+    observations_all_dynamic_columns: 121641
+    dataset_bytes: 561481
+  uk_covid_nation_1D:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      new_cases:
+        sequence: float32
+      cumulative_cases:
+        sequence: float32
+      new_deaths:
+        sequence: float32
+      cumulative_deaths:
+        sequence: float32
+      new_admissions:
+        sequence: float32
+      cumulative_admissions:
+        sequence: float32
+      hospital_cases:
+        sequence: float32
+      icu_ventilator_occupancy:
+        sequence: float32
+      new_vaccinated_1:
+        sequence: float32
+      new_vaccinated_2:
+        sequence: float32
+      new_vaccinated_3:
+        sequence: float32
+      cumulative_vaccinated_1:
+        sequence: float32
+      cumulative_vaccinated_2:
+        sequence: float32
+      cumulative_vaccinated_3:
+        sequence: float32
+    frequency: D
+    items: 4
+    median_length: 729
+    observations_all_dynamic_columns: 41216
+    dataset_bytes: 188708
+  uk_covid_nation_1W:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      new_cases:
+        sequence: float32
+      cumulative_cases:
+        sequence: float32
+      new_deaths:
+        sequence: float32
+      cumulative_deaths:
+        sequence: float32
+      new_admissions:
+        sequence: float32
+      cumulative_admissions:
+        sequence: float32
+      hospital_cases:
+        sequence: float32
+      icu_ventilator_occupancy:
+        sequence: float32
+      new_vaccinated_1:
+        sequence: float32
+      new_vaccinated_2:
+        sequence: float32
+      new_vaccinated_3:
+        sequence: float32
+      cumulative_vaccinated_1:
+        sequence: float32
+      cumulative_vaccinated_2:
+        sequence: float32
+      cumulative_vaccinated_3:
+        sequence: float32
+    frequency: W-SUN
+    items: 4
+    median_length: 105
+    observations_all_dynamic_columns: 5936
+    dataset_bytes: 27428
+  uk_covid_utla_1D:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      new_cases:
+        sequence: float32
+      cumulative_cases:
+        sequence: float32
+    frequency: D
+    items: 214
+    median_length: 721
+    observations_all_dynamic_columns: 308786
+    dataset_bytes: 2476285
+  uk_covid_utla_1W:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      new_cases:
+        sequence: float32
+      cumulative_cases:
+        sequence: float32
+    frequency: W-SUN
+    items: 214
+    median_length: 104
+    observations_all_dynamic_columns: 44448
+    dataset_bytes: 361581
+  us_consumption_1M:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      target:
+        sequence: float32
+    frequency: MS
+    items: 31
+    median_length: 792
+    observations_all_dynamic_columns: 24552
+    dataset_bytes: 295903
+  us_consumption_1Q:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      target:
+        sequence: float32
+    frequency: QE-DEC
+    items: 31
+    median_length: 262
+    observations_all_dynamic_columns: 8122
+    dataset_bytes: 98743
+  us_consumption_1Y:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      target:
+        sequence: float32
+    frequency: YE-DEC
+    items: 31
+    median_length: 64
+    observations_all_dynamic_columns: 1984
+    dataset_bytes: 25087
+  walmart:
+    features:
+      id:
+        dtype: string
+      Store:
+        dtype: float32
+      Dept:
+        dtype: float32
+      Type:
+        dtype: string
+      Size:
+        dtype: float32
+      timestamp:
+        sequence: timestamp[ms]
+      target:
+        sequence: float32
+      IsHoliday:
+        sequence: float32
+      Temperature:
+        sequence: float32
+      Fuel_Price:
+        sequence: float32
+      MarkDown1:
+        sequence: float32
+      MarkDown2:
+        sequence: float32
+      MarkDown3:
+        sequence: float32
+      MarkDown4:
+        sequence: float32
+      MarkDown5:
+        sequence: float32
+      CPI:
+        sequence: float32
+      Unemployment:
+        sequence: float32
+    frequency: W-FRI
+    items: 2936
+    median_length: 143
+    observations_all_dynamic_columns: 4609143
+    dataset_bytes: 22004931
+  world_co2_emissions:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      target:
+        sequence: float32
+    frequency: YE-DEC
+    items: 191
+    median_length: 60
+    observations_all_dynamic_columns: 11460
+    dataset_bytes: 142293
+  world_life_expectancy:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      target:
+        sequence: float32
+    frequency: YE-DEC
+    items: 237
+    median_length: 74
+    observations_all_dynamic_columns: 17538
+    dataset_bytes: 215512
+  world_tourism:
+    features:
+      id:
+        dtype: string
+      timestamp:
+        sequence: timestamp[ms]
+      target:
+        sequence: float32
+    frequency: YE-DEC
+    items: 178
+    median_length: 21
+    observations_all_dynamic_columns: 3738
+    dataset_bytes: 49291

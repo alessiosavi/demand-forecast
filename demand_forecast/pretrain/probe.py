@@ -156,7 +156,7 @@ def pretrain_probe(cfg: PretrainConfig, *, steps: int = 50, out: Path) -> dict:
 
 
 def _window_panel(task, index: int, spec: FevTaskSpec, max_series: int | None):
-    from demand_forecast.bench.run import window_origins
+    from demand_forecast.bench.run import expanded_window_origins
     from demand_forecast.data.loader_fev import panel_from_window
 
     past, future = task.get_window(index).get_input_data()
@@ -167,7 +167,7 @@ def _window_panel(task, index: int, spec: FevTaskSpec, max_series: int | None):
             [i for i, row in enumerate(future) if str(row[spec.id_column]) in ids]
         )
     panel = panel_from_window(past, future, spec, task.freq)
-    return panel, window_origins(future, spec.id_column, spec.timestamp_column)
+    return panel, expanded_window_origins(future, spec)
 
 
 def task_probe(

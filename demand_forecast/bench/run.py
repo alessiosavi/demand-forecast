@@ -41,11 +41,12 @@ def settings_for_task(spec: FevTaskSpec, base: Settings, freq: str) -> Settings:
         source="fev",
         id_columns=[spec.id_column],
         timestamp_column=spec.timestamp_column,
-        target=spec.target,
+        target=spec.target if isinstance(spec.target, str) else "__fev_value__",
         target_support=spec.target_support,
         known_dynamic=spec.known_dynamic,
         past_dynamic=spec.past_dynamic,
-        static_categorical=spec.categorical_statics,
+        static_categorical=spec.categorical_statics
+        + (["__fev_target__"] if isinstance(spec.target, list) else []),
         static_numeric=[s for s in spec.static_columns if s not in spec.categorical_statics],
         freq=freq,
         missing_target="nan",
@@ -73,6 +74,20 @@ def window_origins(
             raise ValueError(f"empty future rows for item {key}")
         origins[key] = pd.Timestamp(row[timestamp_column][0])
     return origins
+
+
+def expanded_window_origins(future_data, spec: FevTaskSpec) -> dict[str, pd.Timestamp]:
+    """Use the same item/target identities as the fev panel loader."""
+    from demand_forecast.data.loader_fev import target_series_id
+
+    origins = window_origins(future_data, spec.id_column, spec.timestamp_column)
+    if isinstance(spec.target, str):
+        return origins
+    return {
+        target_series_id(key, target): origin
+        for target in spec.targets
+        for key, origin in origins.items()
+    }
 
 
 def resolved_origin(origins: Mapping[str, pd.Timestamp]) -> pd.Timestamp:
@@ -142,7 +157,7 @@ def _save_predictions(
             temporary_path.unlink(missing_ok=True)
 
 
-def run_fev(
+def _run_fev_tasks(
     specs: Iterable[FevTaskSpec],
     settings: Settings,
     out_dir: Path,
@@ -150,6 +165,7 @@ def run_fev(
     resume: bool = False,
     model_name: str | None = None,
     stop_after: int | None = None,
+    run_identities: dict[str, str] | None = None,
 ) -> pd.DataFrame:
     """Train once per task or once per window, and replace summary rows.
 
@@ -170,7 +186,7 @@ def run_fev(
     """
     from demand_forecast import __version__
     from demand_forecast.core.run import resolve_device, run_identity, train_panel
-    from demand_forecast.data.loader_fev import item_ids, panel_from_window
+    from demand_forecast.data.loader_fev import panel_from_window
     from demand_forecast.inference.predictor import Predictor
 
     if policy not in {"first_window", "per_window"}:
@@ -211,7 +227,7 @@ def run_fev(
                 len(panel.series),
                 time.perf_counter() - started,
             )
-            origins = window_origins(future, spec.id_column, spec.timestamp_column)
+            origins = expanded_window_origins(future, spec)
             origin = resolved_origin(origins)
             earliest = min(origins.values())
             n_origins = len(set(origins.values()))
@@ -238,6 +254,9 @@ def run_fev(
                     policy=policy,
                 )
                 logger.info("identity: task=%s %s", spec.name, identity)
+                if index == 0 and run_identities is not None:
+                    # Reporting only: never changes artifact validation or resume.
+                    run_identities[spec.name] = identity
                 if resume:
                     # Check even later windows before doing any training or inference.
                     paths = (
@@ -294,6 +313,12 @@ def run_fev(
                             break
                         with np.load(saved_path, allow_pickle=False) as saved:
                             _check_prediction_identity(saved, identity)
+                            saved_past, _ = task.get_window(i).get_input_data()
+                            task.clean_and_validate_predictions(
+                                assemble_predictions(
+                                    spec, saved_past, saved["ids"].tolist(), saved["arrays"]
+                                )
+                            )
                             if prediction_diagnostics(saved) is None:
                                 complete = False
                     if complete:
@@ -306,16 +331,18 @@ def run_fev(
                     _check_prediction_identity(saved, identity)
                     ids, arrays = saved["ids"].tolist(), saved["arrays"]
                     diagnostics = prediction_diagnostics(saved)
+                    task.clean_and_validate_predictions(
+                        assemble_predictions(spec, past, ids, arrays)
+                    )
             else:
                 predictor = Predictor.from_bundle(
                     training_dir / "bundle", device=resolve_device(settings)
                 )
                 ids, arrays, diagnostics = predictor.forecast_per_item_origins(panel, origins)
                 _save_predictions(prediction_path, ids, arrays, identity, diagnostics)
+                del predictor
             diagnostics_per_window.append(diagnostics)
-            predictions.append(
-                predictions_for_fev(ids, arrays, item_ids(panel), task.quantile_levels)
-            )
+            predictions.append(assemble_predictions(spec, past, ids, arrays))
         if skipped:
             continue
         if policy == "per_window":
@@ -453,3 +480,165 @@ def leaderboard(summaries_csv: Path, baseline: str = "seasonal_naive") -> pd.Dat
 
     summaries = pd.read_csv(summaries_csv, float_precision="round_trip")
     return fev.leaderboard(summaries, baseline_model=baseline, n_resamples=1000)
+
+
+def assemble_predictions(spec: FevTaskSpec, past, ids: list[str], arrays: np.ndarray):
+    """Reassemble independent target series in fev's original positional item order."""
+    from demand_forecast.data.loader_fev import target_series_id
+
+    id_rows = past.select_columns([spec.id_column]) if hasattr(past, "select_columns") else past
+    items = [str(row[spec.id_column]) for row in id_rows]
+    if isinstance(spec.target, str):
+        return predictions_for_fev(ids, arrays, items, spec.quantile_levels)
+    expected = [target_series_id(item, target) for target in spec.targets for item in items]
+    rows = predictions_for_fev(ids, arrays, expected, spec.quantile_levels)
+    return {
+        target: rows[index * len(items) : (index + 1) * len(items)]
+        for index, target in enumerate(spec.targets)
+    }
+
+
+def check_panel(spec: FevTaskSpec) -> None:
+    """Validate the first window with seasonal-naive predictions, without training."""
+    from fev.metrics import get_metric
+
+    from demand_forecast.data.loader_fev import item_ids, panel_from_window
+
+    task = spec.to_task()
+    window = task.get_window(0)
+    past, future = window.get_input_data()
+    panel = panel_from_window(past, future, spec, task.freq)
+    arrays = np.empty((len(panel.series), spec.horizon, len(spec.quantile_levels)))
+    period = max(spec.seasonality, panel.seasonal_period)
+    for index, series in enumerate(panel.series):
+        values = pd.Series(series.target).ffill().fillna(0).to_numpy()
+        tail = values[-period:]
+        forecast = np.resize(tail, spec.horizon)
+        arrays[index] = forecast[:, None]
+    finite = sum(np.isfinite(series.target).sum() for series in panel.series)
+    negative = sum(
+        ((series.target < 0) & np.isfinite(series.target)).sum() for series in panel.series
+    )
+    negative_share = negative / finite if finite else float("nan")
+    predictions = assemble_predictions(spec, past, item_ids(panel), arrays)
+    cleaned = task.clean_and_validate_predictions(predictions)
+    window.compute_metrics(
+        cleaned,
+        metrics=[get_metric(metric) for metric in [spec.eval_metric, *spec.extra_metrics]],
+        seasonality=spec.seasonality,
+        quantile_levels=spec.quantile_levels,
+    )
+    print(
+        f"PANEL_OK {spec.name} series={len(panel.series)} "
+        f"max_len={max(s.history_length for s in panel.series)} "
+        f"horizon={spec.horizon} freq={task.freq} targets={len(spec.targets)} "
+        f"negative_share={negative_share:.8g}",
+        flush=True,
+    )
+
+
+def _save_failures(path: Path, failures: dict) -> None:
+    with NamedTemporaryFile(mode="w", dir=path.parent, suffix=".json", delete=False) as stream:
+        temporary = Path(stream.name)
+        try:
+            json.dump(failures, stream, indent=2)
+            stream.write("\n")
+            stream.close()
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+def run_fev(
+    specs: Iterable[FevTaskSpec],
+    settings: Settings,
+    out_dir: Path,
+    policy: Literal["first_window", "per_window"] = "first_window",
+    resume: bool = False,
+    model_name: str | None = None,
+    stop_after: int | None = None,
+    *,
+    keep_going: bool = False,
+    panel_check: bool = False,
+) -> pd.DataFrame:
+    """Record task failures without changing normal artifact reuse or resume.
+
+    Journals are reporting only. Restarting from scratch requires the operator
+    to remove the task directory; resume retains even terminal checkpoints.
+    """
+    import gc
+    import traceback
+    from datetime import datetime, timezone
+
+    import torch
+
+    from demand_forecast.core.inference_batching import task_batch_limits
+    from demand_forecast.core.training import InterruptedRun
+
+    if policy not in {"first_window", "per_window"}:
+        raise ValueError(f"unknown fev policy: {policy}")
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    # A preflight must not clear training failures, or prevent their retries.
+    failure_path = out_dir / ("panel_failures.json" if panel_check else "failures.json")
+    failures = json.loads(failure_path.read_text()) if failure_path.exists() else {}
+    failed = []
+    succeeded = 0
+    for spec in specs:
+        run_identities: dict[str, str] = {}
+
+        try:
+            if panel_check:
+                check_panel(spec)
+            else:
+                with task_batch_limits():
+                    _run_fev_tasks(
+                        [spec],
+                        settings,
+                        out_dir,
+                        policy=policy,
+                        resume=resume,
+                        model_name=model_name,
+                        stop_after=stop_after,
+                        run_identities=run_identities,
+                    )
+        except InterruptedRun:
+            raise
+        except Exception as exc:
+            if panel_check:
+                message = " ".join(str(exc).splitlines())
+                print(f"PANEL_FAIL {spec.name} {type(exc).__name__}: {message}", flush=True)
+            if not keep_going:
+                if panel_check:
+                    print(f"PANEL_SUMMARY ok={succeeded} failed=1", flush=True)
+                raise
+            logger.exception("Task %s failed", spec.name)
+            failures[spec.name] = {
+                "task": spec.name,
+                "exception_type": type(exc).__name__,
+                "message": str(exc),
+                "traceback": traceback.format_exc().splitlines()[-20:],
+                "utc_time": datetime.now(timezone.utc).isoformat(),
+                "run_identity": run_identities.get(spec.name),
+            }
+            _save_failures(failure_path, failures)
+            failed.append(spec.name)
+        else:
+            succeeded += 1
+            if spec.name in failures:
+                del failures[spec.name]
+                _save_failures(failure_path, failures)
+        # Execute after the exception scope: its traceback can retain the model.
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    if panel_check:
+        print(f"PANEL_SUMMARY ok={succeeded} failed={len(failed)}", flush=True)
+    path = out_dir / "summaries.csv"
+    result = (
+        pd.read_csv(path, float_precision="round_trip")
+        if path.exists()
+        else pd.DataFrame(columns=["task", "model_name"])
+    )
+    result.attrs["failed_tasks"] = failed
+    return result

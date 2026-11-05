@@ -411,3 +411,17 @@ def test_parquet_long_and_statics_match_csv(tmp_path):
         )
         np.testing.assert_equal(s.target, e.target)
         np.testing.assert_equal(s.dynamic["promo"], e.dynamic["promo"])
+
+
+def test_support_mapping_requires_expanded_target_representation(tmp_path):
+    from demand_forecast.config.settings import DatasetConfig
+    from demand_forecast.data.loader_long import load_long
+
+    cfg = DatasetConfig(
+        path=tmp_path / "not-read.csv",
+        id_columns=["id"],
+        target="target",
+        target_support={"target": "real"},
+    )
+    with pytest.raises(ValueError, match="target_support mapping requires.*expanded-target"):
+        load_long(cfg)
