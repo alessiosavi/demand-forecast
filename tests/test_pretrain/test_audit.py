@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 from concurrent.futures import ProcessPoolExecutor
+from dataclasses import asdict
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -331,6 +332,75 @@ def local_audit(tmp_path):
     return root, task_yaml
 
 
+@pytest.mark.parametrize("reuse_out", [False, True], ids=["new_out", "same_out"])
+def test_serial_audit_reloads_changed_dataset(local_audit, tmp_path, monkeypatch, reuse_out):
+    import pyarrow.parquet as pq
+
+    root, tasks = local_audit
+    out = tmp_path / "out"
+    loader = Mock(wraps=audit.load_task_dataset)
+    monkeypatch.setattr(audit, "load_task_dataset", loader)
+    audit._worker_dataset.cache_clear()
+    try:
+        first = audit.run_audit(root, out, tasks=tasks, workers=1, progress=lambda _: None)
+        first_cache_size = audit._worker_dataset.cache_info().currsize
+        definitions = fev_bench_tasks(tasks)
+        # Each task is loaded for metadata and once more for all serial scans.
+        assert loader.call_count == 2 * len(definitions)
+
+        path = tmp_path / "copies.parquet"
+        rows = pq.read_table(path).to_pylist()
+        for row in rows:
+            row["target"] = (np.asarray(row["target"]) + 100).tolist()
+        previous_mtime_ns = path.stat().st_mtime_ns
+        _parquet(path, rows)
+        # Invalidate datasets' local-file cache even on coarse-timestamp filesystems.
+        os.utime(path, ns=(path.stat().st_atime_ns, previous_mtime_ns + 2_000_000_000))
+        loader.reset_mock()
+        second_out = out if reuse_out else tmp_path / "second"
+        second = audit.run_audit(root, second_out, tasks=tasks, workers=1, progress=lambda _: None)
+
+        for report, coef in ((first, [1, 0]), (second, [1, -100])):
+            literal = [
+                copy
+                for copy in report["copies"]
+                if copy["corpus_id"] == "literal" and copy["column"] == "target"
+            ]
+            assert literal
+            assert all(copy["coef"] == pytest.approx(coef, abs=1e-10) for copy in literal)
+        assert second["local_dataset_sha256"]["copies"] != first["local_dataset_sha256"]["copies"]
+        assert loader.call_count == 2 * len(definitions)
+        assert {Path(call.args[1]) for call in loader.call_args_list} == {
+            second_out / ".cache" / "datasets" / FEV_DATASETS_REVISION
+        }
+        assert first_cache_size == 0
+        assert audit._worker_dataset.cache_info().currsize == 0
+    finally:
+        audit._worker_dataset.cache_clear()
+
+
+def test_serial_audit_clears_datasets_on_entry_and_error(local_audit, tmp_path):
+    root, tasks = local_audit
+    task = fev_bench_tasks(tasks)[0]
+    audit._worker_dataset.cache_clear()
+    try:
+        audit._worker_dataset(json.dumps(asdict(task)), str(tmp_path / "prewarmed"))
+        assert audit._worker_dataset.cache_info().currsize == 1
+
+        def interrupt_scan(message):
+            if message.startswith("Reading task schema"):
+                assert audit._worker_dataset.cache_info().currsize == 0
+            if message.startswith("Scanned "):
+                assert audit._worker_dataset.cache_info().currsize > 0
+                raise RuntimeError("interrupted after loading dataset")
+
+        with pytest.raises(RuntimeError, match="interrupted after loading dataset"):
+            audit.run_audit(root, tmp_path / "out", tasks=tasks, workers=1, progress=interrupt_scan)
+        assert audit._worker_dataset.cache_info().currsize == 0
+    finally:
+        audit._worker_dataset.cache_clear()
+
+
 @pytest.mark.parametrize("workers", [1, 2])
 @pytest.mark.parametrize("offline_env", [None, "0"])
 def test_audit_workers_offline_without_changing_parent(
@@ -338,7 +408,7 @@ def test_audit_workers_offline_without_changing_parent(
 ):
     root, tasks = local_audit
     # Warm lazy loader imports (threadpoolctl sets an unrelated OpenMP env var).
-    audit.load_task_dataset(fev_bench_tasks(tasks)[0], tmp_path / "out" / ".cache" / "datasets")
+    audit.load_task_dataset(fev_bench_tasks(tasks)[0], audit._dataset_cache_dir(tmp_path / "out"))
     for flag in ("HF_HUB_OFFLINE", "HF_DATASETS_OFFLINE"):
         if offline_env is None:
             monkeypatch.delenv(flag, raising=False)
@@ -376,7 +446,7 @@ def test_parallel_resume_caches_datasets_before_starting_workers(
     root, tasks = local_audit
     out = tmp_path / "out"
     first = audit.run_audit(root, out, tasks=tasks, workers=1, progress=lambda _: None)
-    cache_dir = out / ".cache" / "datasets"
+    cache_dir = audit._dataset_cache_dir(out)
     shutil.rmtree(cache_dir)
     shutil.rmtree(out / "scans")
     loader = Mock(wraps=audit.load_task_dataset)

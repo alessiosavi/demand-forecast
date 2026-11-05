@@ -168,6 +168,11 @@ def _timestamp_frequency(timestamps, explicit=None):
     return alias, stamps
 
 
+def _dataset_cache_dir(out: Path) -> Path:
+    # Offline datasets loading selects the newest cached config, ignoring revision.
+    return out / ".cache" / "datasets" / FEV_DATASETS_REVISION
+
+
 def load_task_dataset(task: FevDatasetTask, cache_dir: str | Path):
     """Use the same HF train-split loader for pinned remote and local parquet."""
     from datasets import load_dataset
@@ -697,7 +702,7 @@ def _jobs(metadata, kinds, fingerprint, out):
                             "scan_id": scan_id,
                             "fingerprint": _fingerprint({"inputs": fingerprint, "scan": identity}),
                             "metadata_path": item["metadata_path"],
-                            "cache_dir": str(out / ".cache" / "datasets"),
+                            "cache_dir": str(_dataset_cache_dir(out)),
                             "result_path": str(out / "scans" / f"{scan_id}.json"),
                         }
                     )
@@ -747,6 +752,31 @@ def run_audit(
     are reused. Worker count, scheduling and resume do not change audit.json.
     Per-run wall time and generated_at are the only varying report fields.
     """
+    _worker_dataset.cache_clear()
+    try:
+        return _run_audit(
+            root,
+            out,
+            tasks=tasks,
+            kinds=kinds,
+            workers=workers,
+            resume=resume,
+            progress=progress,
+        )
+    finally:
+        _worker_dataset.cache_clear()
+
+
+def _run_audit(
+    root: Path,
+    out: Path,
+    *,
+    tasks="fev100",
+    kinds=DEFAULT_KINDS,
+    workers=None,
+    resume=False,
+    progress=print,
+):
     global _WORKER_INDEX
     started = time.monotonic()
     root, out = Path(root).resolve(), Path(out).resolve()
@@ -808,10 +838,10 @@ def run_audit(
             item = json.loads(path.read_text())
             if workers > 1:
                 # Restored metadata does not guarantee the Arrow cache exists.
-                load_task_dataset(task, out / ".cache" / "datasets")
+                load_task_dataset(task, _dataset_cache_dir(out))
         else:
             progress(f"Reading task schema and calendars: {task.name}")
-            item = _task_metadata(task, out / ".cache" / "datasets")
+            item = _task_metadata(task, _dataset_cache_dir(out))
             _write_json(path, item)
         metadata.append({**item, "metadata_path": str(path)})
     if workers > 1:
