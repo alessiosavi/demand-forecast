@@ -419,9 +419,9 @@ def test_audit_workers_offline_without_changing_parent(
     states = []
     parallel_scan_jobs = audit._parallel_scan_jobs
 
-    def record_offline_state(pool, *args):
+    def record_offline_state(pool, *args, **kwargs):
         states.append(pool.submit(_worker_offline_state).result(timeout=30))
-        yield from parallel_scan_jobs(pool, *args)
+        yield from parallel_scan_jobs(pool, *args, **kwargs)
 
     def pool_with_hf_imported(**kwargs):
         assert kwargs["initializer"] is audit._init_worker

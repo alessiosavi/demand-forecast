@@ -15,6 +15,8 @@ from collections.abc import Iterable
 import numpy as np
 import pandas as pd
 
+from . import audit_info
+
 WIN, RWIN, RWIN8, MIN_HITS, SEG_MIN = (8, 4, 8, 3, 24)
 CAP = {"exact": 1024, "affine": 1024, "runs": 64, "runs8": 8192}
 FALLBACK_TOPK, FALLBACK_CAP, MAX_RECORDS, MAX_RECORDS_PER_REASON = (512, 1 << 40, 60000, 3000)
@@ -220,6 +222,7 @@ class Index:
                 float((mult > CAP[fam]).mean()) if len(mult) else 0.0
             )
             self.cov[f"max_multiplicity_{fam}"] = int(mult.max()) if len(mult) else 0
+        self.cov["windows"] = {fam: len(arrays[0]) for fam, arrays in self.by.items()}
         self.cov["no_window_any_family"] = [ids[i] for i in np.flatnonzero(~anyw)]
         self.cov["degenerate"] = int(
             sum(1 for s in series_list if len(np.unique(s[np.isfinite(s)])) < 3)
@@ -393,7 +396,7 @@ def fit_segment(t, s, a0, a1, off, dim=None):
     fits = n >= SEG_MIN and (
         exact_frac >= EXACT_FRACTION or maxres <= max(COPY_ATOL, COPY_RTOL * rng)
     )
-    return {
+    result = {
         "segment": n,
         "r2": r2,
         "max_resid": maxres,
@@ -411,6 +414,26 @@ def fit_segment(t, s, a0, a1, off, dim=None):
         "index_start": int(b0),
         "index_end": int(b1),
     }
+
+    if result["is_copy"]:
+        positions = np.flatnonzero(both)
+        target_info = audit_info.info_bits(a, positions)
+        index_info = audit_info.info_bits(b, positions)
+        result.update(
+            info_bits_target=target_info.bits,
+            info_bits_index=index_info.bits,
+            info_code_target=target_info.code,
+            info_code_index=index_info.code,
+            info_strict_ramp=target_info.strict_ramp or index_info.strict_ramp,
+            info_n=target_info.n,
+            info_levels_target=target_info.levels,
+            info_levels_index=index_info.levels,
+            info_runs_target=target_info.runs,
+            info_runs_index=index_info.runs,
+            # Only inspection values are bounded; scoring always uses every point.
+            _info_values=(a[:512].tolist(), b[:512].tolist()),
+        )
+    return result
 
 
 def refine_pieces(t, s, a0, a1, off, slack):
@@ -831,7 +854,7 @@ def scan_group(name, column, i, idxs, series_list, index, extra=None, dims=None,
     return result
 
 
-def finish_scan(c, results, pairs, records, *, all_rejections=False):
+def finish_scan(c, results, pairs, records, *, index_windows, scan_info=None, all_rejections=False):
     """Merge group results in group order, applying rejection caps across the scan."""
     rec_count = defaultdict(int)
     for result in results:
@@ -862,6 +885,9 @@ def finish_scan(c, results, pairs, records, *, all_rejections=False):
                 records.append(r)
             else:
                 c["rejection_records_omitted"] += mult
+    info = audit_info.finish_identification(c, pairs, index_windows)
+    if scan_info is not None:
+        scan_info.update(info)
     return c
 
 
@@ -878,6 +904,7 @@ def scan(
     *,
     resolve=True,
     all_rejections=False,
+    scan_info=None,
 ):
     """Scan byte-identical rows once, then re-scan truncated rows without top-K.
 
@@ -907,4 +934,6 @@ def scan(
         pairs,
         records,
         all_rejections=all_rejections,
+        index_windows=index.cov["windows"],
+        scan_info=scan_info,
     )

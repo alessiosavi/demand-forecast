@@ -84,7 +84,7 @@ def test_parallel_scan_jobs_cancel_pending_on_worker_error(
         queued.extend(chunks)
         submissions.extend((audit._chunk_job, future) for future in [failed, *chunks])
     pool = _FuturePool(submissions)
-    results = audit._parallel_scan_jobs(pool, jobs, metadata, [], workers=2)
+    results = audit._parallel_scan_jobs(pool, jobs, metadata, [], workers=2, index_windows={})
 
     with pytest.raises(error_type) as exc:
         next(results)
@@ -100,7 +100,7 @@ def test_parallel_scan_jobs_cancel_pending_on_close(scheduler_jobs):
     completed.set_result(("scan.json", 0.5))
     queued = [Future(), Future()]
     pool = _FuturePool([(audit._timed_scan_job, future) for future in [completed, *queued]])
-    results = audit._parallel_scan_jobs(pool, jobs, metadata, [], workers=2)
+    results = audit._parallel_scan_jobs(pool, jobs, metadata, [], workers=2, index_windows={})
 
     assert next(results) == (jobs[0], "scan.json", 0.5)
     assert all(not future.done() for future in queued)
@@ -140,6 +140,7 @@ def test_chunk_record_caps_match_serial(monkeypatch, all_rejections, caps):
             actual_pairs,
             actual_records,
             all_rejections=all_rejections,
+            index_windows=index.cov["windows"],
         )
         assert actual == expected
         assert audit._json_bytes((actual_pairs, actual_records)) == audit._json_bytes(
@@ -250,9 +251,47 @@ def test_chunk_postpass_accounting_and_unresolved_ids(monkeypatch, resolve, guar
         (match.scan_group("t", "c", i, idxs, rows, index, resolve=resolve) for i, idxs in groups),
         actual_pairs,
         actual_records,
+        index_windows=index.cov["windows"],
     )
     assert actual == expected
     assert (actual_pairs, actual_records) == (pairs, records)
     assert expected["initial_unresolved_rows"] == len(rows)
     assert expected["postpass_rows"] == (len(rows) if resolve else 0)
     assert expected["unresolved_rows"] == (0 if resolve and guard > 1 else len(rows))
+
+
+def test_chunk_top20_values_selection_after_complete_merge():
+    motif = np.tile([0.0, 1.0], 16)
+    random = np.random.default_rng(17).normal(size=80)
+    ramp = np.arange(32, dtype=float)
+    rows = [motif + i for i in range(24)] + [random, ramp, motif.copy()]
+    index = match.Index([motif, random, ramp], ["motif", "random", "ramp"])
+    pairs, records = [], []
+    expected = match.scan("t", "c", rows, index, {}, pairs, records)
+    low = [p for p in pairs if p.get("identification") == "low_information"]
+    assert len(low) >= 24
+    assert sum("values_target" in p for p in low) == 20
+    ranked = sorted(low, key=lambda p: -min(p["info_bits_target"], p["info_bits_index"]))
+    assert all("values_target" in p for p in ranked[:20])
+    assert all("values_target" not in p for p in ranked[20:])
+    groups = match.group_rows(rows)
+    for size in (1, 5, len(groups)):
+        chunks = [
+            [match.scan_group("t", "c", i, idxs, rows, index) for i, idxs in groups[j : j + size]]
+            for j in range(0, len(groups), size)
+        ]
+        chunks = pickle.loads(pickle.dumps(chunks))
+        counts = match.scan("t", "c", [], index, {}, [], [])
+        counts["unique_series"] = len(groups)
+        actual_pairs, actual_records = [], []
+        actual = match.finish_scan(
+            counts,
+            chain.from_iterable(chunks),
+            actual_pairs,
+            actual_records,
+            index_windows=index.cov["windows"],
+        )
+        assert actual == expected
+        assert audit._json_bytes((actual_pairs, actual_records)) == audit._json_bytes(
+            (pairs, records)
+        )

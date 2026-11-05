@@ -241,7 +241,7 @@ columns default to `id` and `timestamp`. Optional `freq` resolves short local
 series whose timestamps alone cannot establish frequency. The audit scans every
 numeric sequence feature, even when it has no explicit role annotation.
 
-A **copy** is an identifying segment of at least 24 overlapping finite points
+A **copy** (`is_copy`) is a matching segment of at least 24 overlapping finite points
 under `corpus = slope * benchmark + intercept`, with either an exact fraction
 of at least 0.99 or maximum absolute residual at most
 `max(0.01, 0.005 * corpus segment range)`. Run 11 measures the exact fraction
@@ -291,18 +291,95 @@ original IDs. Pair counters can be smaller than the number of segment records.
 Nonfinite residuals in rejected fits are represented as JSON `null`.
 
 `declaration.json` supplies `trained_on_datasets`: **a task is included if any
-of its target or covariate columns has a qualifying copy**. Preserve explicit
+of its target or covariate columns has an `identifying` copy**. Preserve explicit
 names such as `uk_covid_utla_1W/cumulative`. Feed this list into the model's fev
 training-data declaration; provenance may require additional entries, so an
 empty list does not establish source isolation. The command exits 0 on a
 completed audit, including one that finds copies, and exits 2 if the post-pass
 leaves unresolved rows. An incomplete declaration is marked `complete: false`.
 
+### Identification status (run 12)
+
+Copy detection, rejection rules and caps are unchanged. Each accepted copy has
+an additional status, computed once after the scan's final counters are merged:
+
+- `identifying`: `min(info_bits_target, info_bits_index) >= search_bits + INFO_MARGIN_BITS`.
+- `low_information`: below that threshold.
+- `interpolation_ramp`: either aligned side is a strict numerical ramp, whose score is zero.
+
+The scan budget is
+`search_bits = log2(max(1, T)) + log2(max(1, I))`, where `T` is the sum of target
+`counts.windows` over all four families and `I` is the sum of index windows for
+that scan's kind and frequency class. Target counts retain duplicate-row
+multiplication; index windows include postings above the matching caps. Fallback
+passes do not count windows twice. A zero-window scan reports zero for the
+corresponding logarithm; it has no matching opportunity.
+
+`INFO_VERSION = 1`, `INFO_MARGIN_BITS = 20`, and `RAMP_ULP_FACTOR = 8`.
+The score uses `tau = max(COPY_ATOL, COPY_RTOL * range)` with the existing
+`COPY_ATOL = 0.01` and `COPY_RTOL = 0.005`, rounds `values / tau` to integers,
+and subtracts their minimum. It takes three selector bits plus the shortest
+of six exact conditional codes: enumerative, run, piecewise-linear, first-order
+KT Markov, exact periodic motif, and digital line plus signed residuals. Occupied
+levels are encoded either directly or by an exactly reconstructible digital
+lattice with a charged denominator and rounding phase. The strict ramp rule
+requires endpoint-line residuals at most
+`min(tau, 8 * 2**(-23) * max(abs(values)))`; with missing points it evaluates the
+line at original aligned positions. Other codes operate on the jointly finite
+sequence conditional on its mask. Both actual sides are scored because the
+quantiser's absolute floor and bin origin are not affine invariant.
+
+This is a reproducible description-length diagnostic conditional on the affine
+map, length, range and mask, **not a probability or a provenance test**. The
+search budget is a conservative potential comparison count, not the number of
+literal pair verifications. The margin is an empirical policy, not a calibrated
+false-positive rate or an audit-wide guarantee. A low-information match is
+**not identifiable as a copy**, not **proven unrelated**. A deliberately copied
+short sparse pattern or ramp can have exactly the same values as a coincidence.
+
+`audit.json` retains every copy and its status. Both JSON reports contain
+`identification_summary` per task, split into target/covariate segment counts,
+and the sorted `tasks_with_only_low_information_matches` (including tasks whose
+only matches are ramps). `audit.md` displays both task lists and an Identification
+table. New `identifying_copies`, `low_information_copies` and
+`interpolation_ramp_copies` counters count segment records; the existing `copies`
+counter still counts duplicate-expanded pairs. `declaration.json` includes only
+identifying copy records in full, plus a method block with versions and measured
+limits. Every identifying record and the twenty low-information records with
+highest minimum two-sided bits in each scan retain `values_target` and
+`values_index`; ties use record order. Values contain the first at most 512
+aligned finite points per side as JSON numbers; scoring uses the full segment.
+Ramp records retain scores and locators but no inspection values.
+
+The measured sensitivity limit is explicit: all 26 existing positive controls
+are identifying at their small fixture budgets. At
+`search_bits = 56.84675` and margin 20, these five minimal fixtures become
+`low_information`, while the other 21 stay identifying:
+
+| Fixture | Best two-sided bits |
+|---|---:|
+| `indexed_1100_times_shift+10_fallback` | 48 |
+| `three_levels_seven_runs_dof7_2x+1` | 48 |
+| `four_levels_eight_runs_1.1x+0.5` | 64 |
+| `five_level_staircase_five_runs_x2` | 61 |
+| `intermittent_4_nonzero_of_26_2x+1` | 55 |
+
+For the measured m5 sparse control (row 16, start 0), the first identifying prefix
+is 80 points / 77 bits at threshold 76.84675. The smooth boomlet_1975 target_27
+control starting at 31 is identifying at 24 points / 62 bits at threshold
+60.75416; at threshold 76.84675 its first identifying prefix is 40 points /
+77 bits. These are row/start/map-specific measurements. There is no finite
+universal minimum for sparse or smooth copies, and passing is not necessarily
+monotonic in prefix length. An empty declaration cannot establish clean training
+or absence of shared-source data.
+
 Each column/variant/kind scan is atomically saved under `<out>/scans/`.
 `--resume` reuses only complete scans with matching shard-manifest, task-YAML,
 dataset-revision, local-input, constants, library-version and implementation
 fingerprints. Actual shard bytes are verified against the manifest first.
-Corrupted, incomplete or mismatched scans are recomputed. Run one audit at a
+The `run12-corpus-v1` fingerprint includes the information implementation and
+constants; run-11 scans cannot be resumed. Corrupted, incomplete or mismatched
+scans are recomputed. Run one audit at a
 time per output directory, and keep the corpus unchanged while it runs.
 
 Shards stream into temporary disk-backed float64 arrays; one index per kind and
