@@ -9,6 +9,7 @@ from contextlib import nullcontext
 import numpy as np
 import pytest
 import torch
+import yaml
 from typer.testing import CliRunner
 
 from demand_forecast.cli import app
@@ -145,14 +146,27 @@ def test_pretrain_probe_rejects_nonfinite_validation(tmp_path, tiny_pretrain_cfg
     assert not out.exists()
 
 
+@pytest.mark.parametrize("text_dynamic", [(), ("promo", "oil")])
 def test_cli_probe_task_on_fixture_task(
-    tmp_path, fixture_tasks_yaml, fixture_profiles_yaml, tiny_experiment_yaml, monkeypatch
+    tmp_path,
+    fixture_tasks_yaml,
+    fixture_profiles_yaml,
+    tiny_experiment_yaml,
+    monkeypatch,
+    text_dynamic,
 ):
     from demand_forecast.core import evaluation, training
     from demand_forecast.data import loader_fev
     from demand_forecast.inference.predictor import Predictor
     from demand_forecast.models.base import ForecastModel
     from demand_forecast.pretrain import probe
+    from tests.helpers.fev_fixture import write_fev_fixture
+
+    if text_dynamic:
+        write_fev_fixture(tmp_path / "fev", n_series=8, text_dynamic=text_dynamic)
+        profiles = yaml.safe_load(fixture_profiles_yaml.read_text())
+        profiles["fixture"]["event_dynamics"] = {name: ["0"] for name in text_dynamic}
+        fixture_profiles_yaml.write_text(yaml.safe_dump(profiles))
 
     # Observe real work: each update must finish before its per-step timer ends.
     events, contexts, prepared_batches, training_batches = [], [], [], []
@@ -184,6 +198,9 @@ def test_cli_probe_task_on_fixture_task(
 
     def observe_panel(*args, **kwargs):
         panel = panel_from_window(*args, **kwargs)
+        for series in panel.series:
+            for name in text_dynamic:
+                assert set(series.dynamic[name]) <= {0.0, 1.0}
         contexts.append([series.history_length for series in panel.series])
         return panel
 

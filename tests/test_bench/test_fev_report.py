@@ -30,7 +30,11 @@ def report_template(tmp_path_factory):
     import pyarrow.parquet as pq
 
     directory = tmp_path_factory.mktemp("report-source")
-    first = fixture_spec(write_fev_fixture(directory / "first"), name="first")
+    first = fixture_spec(
+        write_fev_fixture(directory / "first", text_dynamic=("promo",)),
+        name="first",
+        event_dynamics={"promo": ["0"]},
+    )
     parquet = write_fev_fixture(directory / "second")
     rows = pq.read_table(parquet).to_pylist()
     rows[0]["target"] = [6.0] * 40
@@ -49,6 +53,8 @@ def report_template(tmp_path_factory):
         profiles[spec.name] = {
             key: definition.pop(key) for key in ("target_support", "categorical_statics")
         }
+        if spec.event_dynamics:
+            profiles[spec.name]["event_dynamics"] = spec.event_dynamics
         definitions.append(definition)
     tasks = directory / "tasks.yaml"
     tasks.write_text(yaml.safe_dump({"tasks": definitions}))

@@ -166,6 +166,7 @@ def cli_files(tmp_path, specs, settings):
         profiles[spec.name] = {
             "target_support": definition.pop("target_support"),
             "categorical_statics": definition.pop("categorical_statics"),
+            **({"event_dynamics": spec.event_dynamics} if spec.event_dynamics else {}),
         }
         tasks.append(definition)
     task_file, profile_file, config = [
@@ -222,8 +223,13 @@ def test_keep_going_cli_retry_and_completed_skip(tmp_path, monkeypatch):
     assert set(pd.read_csv(tmp_path / "out/summaries.csv").task) == {"bad", "later"}
 
 
-def test_panel_check_cli_pass_and_fail_without_config(tmp_path):
-    spec = fixture_spec(write_fev_fixture(tmp_path))
+@pytest.mark.bench
+@pytest.mark.parametrize("text_dynamic", [(), ("promo",)])
+def test_panel_check_cli_pass_and_fail_without_config(tmp_path, text_dynamic):
+    spec = fixture_spec(
+        write_fev_fixture(tmp_path, text_dynamic=text_dynamic),
+        event_dynamics={name: ["0"] for name in text_dynamic},
+    )
     bad = replace(spec, name="missing", dataset_path=str(tmp_path / "absent.parquet"))
     args, _ = cli_files(tmp_path, [bad, spec], tiny_settings())
     result = CliRunner().invoke(app, [*args, "--panel-check", "--keep-going"])

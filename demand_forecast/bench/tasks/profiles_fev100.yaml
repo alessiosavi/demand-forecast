@@ -47,6 +47,8 @@ epf_pjm:
   categorical_statics: []
 rossmann_1D:
   target_support: nonnegative
+  event_dynamics:
+    StateHoliday: ["0"]
   categorical_statics:
   - StoreType
   - Assortment
@@ -77,6 +79,8 @@ hierarchical_sales_1D:
   categorical_statics: []
 favorita_stores_1D:
   target_support: nonnegative
+  event_dynamics:
+    holiday: []
   categorical_statics:
   - family
   - city
@@ -91,6 +95,8 @@ favorita_stores_1M:
   - type
 favorita_transactions_1D:
   target_support: nonnegative
+  event_dynamics:
+    holiday: []
   categorical_statics:
   - city
   - state
