@@ -60,7 +60,6 @@ import os
 import platform
 import shutil
 import sys
-from dataclasses import asdict
 from pathlib import Path
 import demand_forecast
 from demand_forecast.bench.specs import load_task_specs
@@ -77,7 +76,7 @@ settings = Settings.from_yaml(config)
 quick = settings.training.max_steps_cap is not None or settings.training.val_items_max is not None
 (out / "model-name.txt").write_text("demand-forecast-v2-quick" if quick else "")
 (out / "tasks.txt").write_text("\n".join(names) + "\n")
-(out / "task-definitions.json").write_text(json.dumps([asdict(s) for s in specs], indent=2, default=str))
+(out / "task-definitions.json").write_text(json.dumps([s.to_dict() for s in specs], indent=2, default=str))
 (out / "execution.json").write_text(json.dumps({
     "sha": os.environ["FEV_EXECUTING_SHA"], "interpreter": sys.executable,
     "package": demand_forecast.__file__, "python": platform.python_version(),

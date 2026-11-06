@@ -10,6 +10,34 @@ from demand_forecast.data.frequency import seasonal_period, to_offset
 from demand_forecast.data.panel import Panel, Roles, build_series
 
 
+def _dynamic_values(row, name: str, spec: FevTaskSpec):
+    """Encode declared events without learning a vocabulary from any window."""
+    values = row[name]
+    if name in spec.event_dynamics:
+        no_event = set(spec.event_dynamics[name])
+        return [0.0 if pd.isna(value) or str(value) in no_event else 1.0 for value in values]
+    return values
+
+
+def _float_frame(values, index, row, spec: FevTaskSpec):
+    """Keep the normal float cast fast; diagnose dynamic columns only on failure."""
+    try:
+        return pd.DataFrame(values, index=index, dtype=float)
+    except (ValueError, TypeError) as exc:
+        for name in (*spec.known_dynamic, *spec.past_dynamic):
+            if name not in values or name in spec.event_dynamics:
+                continue
+            try:
+                pd.Series(values[name], dtype=float)
+            except (ValueError, TypeError):
+                raise ValueError(
+                    f"Task {spec.name!r}, series {row[spec.id_column]!r}: dynamic column "
+                    f"{name!r} cannot be cast to float; "
+                    "declare it under event_dynamics in the task profile"
+                ) from exc
+        raise
+
+
 def panel_from_window(past_data, future_data, spec: FevTaskSpec, freq: str) -> Panel:
     """Build a Panel from the datasets returned by ``window.get_input_data()``.
 
@@ -22,6 +50,13 @@ def panel_from_window(past_data, future_data, spec: FevTaskSpec, freq: str) -> P
     with NaN; the trainer applies the configured missing-target policy later.
     No optional bench imports are needed to consume these datasets.
     """
+    if spec.event_dynamics:
+        # Read nullable strings as Python cells rather than formatter-dependent
+        # numpy strings, which can turn a null into literal text.
+        if hasattr(past_data, "with_format"):
+            past_data = past_data.with_format(None)
+        if hasattr(future_data, "with_format"):
+            future_data = future_data.with_format(None)
     if not isinstance(spec.target, str):
         if {"__fev_target__", "__fev_nonnegative__"}.intersection(spec.static_columns):
             raise ValueError("__fev_target__ and __fev_nonnegative__ are reserved")
@@ -91,17 +126,25 @@ def panel_from_window(past_data, future_data, spec: FevTaskSpec, freq: str) -> P
         if key not in future_by_id:
             raise ValueError(f"Series {key!r}: missing future row or duplicate past id")
         future = future_by_id.pop(key)
-        past_frame = pd.DataFrame(
-            {name: row[name] for name in [roles.target, *roles.known_dynamic, *roles.past_dynamic]},
+        past_frame = _float_frame(
+            {
+                roles.target: row[roles.target],
+                **{
+                    name: _dynamic_values(row, name, spec)
+                    for name in (*roles.known_dynamic, *roles.past_dynamic)
+                },
+            },
             index=pd.DatetimeIndex(row[spec.timestamp_column]),
-            dtype=float,
+            row=row,
+            spec=spec,
         )
         if past_frame.empty:
             raise ValueError(f"Series {key!r}: cannot build from an empty history")
-        future_frame = pd.DataFrame(
-            {name: future[name] for name in roles.known_dynamic},
+        future_frame = _float_frame(
+            {name: _dynamic_values(future, name, spec) for name in roles.known_dynamic},
             index=pd.DatetimeIndex(future[spec.timestamp_column]),
-            dtype=float,
+            row=future,
+            spec=spec,
         )
         statics = {}
         for name in roles.static_categorical:

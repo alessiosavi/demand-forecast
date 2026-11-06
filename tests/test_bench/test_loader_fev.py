@@ -175,3 +175,31 @@ def test_off_grid_timestamps_are_rejected_per_series(tmp_path, part, shift):
         panel_from_window(past, future, spec, task.freq)
     assert exc.value.series_id == "1"
     assert exc.value.timestamp == (past if part == "past" else future)[1]["timestamp"][-1]
+
+
+@pytest.mark.parametrize("multi_target", [False, True])
+def test_text_events_from_real_fev_windows(tmp_path, multi_target):
+    from datasets import Dataset
+
+    path = write_fev_fixture(tmp_path, n_series=2, text_dynamic=("promo", "oil"))
+    if multi_target:
+        data = Dataset.from_parquet(str(path))
+        data.add_column("second", data["target"]).to_parquet(path)
+    spec = fixture_spec(
+        path,
+        target=["target", "second"] if multi_target else "target",
+        event_dynamics={"promo": ["0"], "oil": []},
+    )
+    task = spec.to_task()
+    for window in task.iter_windows():
+        past, future = window.get_input_data()
+        panel = panel_from_window(past, future, spec, task.freq)
+        assert len(panel.series) == (4 if multi_target else 2)
+        for series in panel.series:
+            np.testing.assert_array_equal(
+                series.dynamic["promo"],
+                ([0, 1, 0, 1] * 10)[: series.length + spec.horizon],
+            )
+            np.testing.assert_array_equal(
+                series.dynamic["oil"], ([1, 1, 0, 1] * 10)[: series.length]
+            )

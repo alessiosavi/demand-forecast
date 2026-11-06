@@ -589,6 +589,16 @@ numeric categorical identifiers: `rohlik_sales_1W` (`product_unique_id`),
 Changing these would change the frozen identities. The offline consistency test
 asserts these exact exceptions and schema agreement for every other static.
 
+Text-valued dynamic columns require an `event_dynamics` entry in the task
+profile: each column maps to a list of string tokens meaning no event. Nulls
+and declared tokens map to `0.0`; all other cells map to `1.0`, comparing tokens
+against `str(value)`. Rossmann's daily `StateHoliday` uses `["0"]`; the daily
+Favorita stores and transactions `holiday` columns use `[]` (null means no
+holiday). Names and column counts stay unchanged, and the same mapping applies
+to past and known future values in every window. Undeclared text columns fail
+with a profile hint. Declarations enter run identities; tasks without them keep
+their existing identities.
+
 The schema and size evidence is
 `demand_forecast/bench/tasks/schema_fev100.yaml`, from the dataset card at
 revision `d3e7e720f4158eab03ebcb021f1cce779cd92acc`. Regenerate with

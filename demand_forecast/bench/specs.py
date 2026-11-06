@@ -6,9 +6,11 @@ the benchmark extra. Omitted task settings follow fev 0.10.0 defaults.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from copy import deepcopy
+from dataclasses import InitVar, asdict, dataclass, field, fields
 from importlib.resources import files
 from pathlib import Path
+from reprlib import recursive_repr
 from typing import Any, Literal
 
 import yaml
@@ -107,7 +109,12 @@ class FevTaskSpec:
     id_column: str = "id"
     timestamp_column: str = "timestamp"
 
-    def __post_init__(self):
+    # Keep legacy dataclasses.asdict snapshots byte-identical. Retain this
+    # constructor input on the instance (also preserved by dataclasses.replace)
+    # and serialize it explicitly through to_dict/task_definition when present.
+    event_dynamics: InitVar[dict[str, list[str]] | None] = None
+
+    def __post_init__(self, event_dynamics):
         if isinstance(self.target, list) and (
             not self.target or len(set(self.target)) != len(self.target)
         ):
@@ -124,10 +131,47 @@ class FevTaskSpec:
             raise ValueError("target_support must be 'nonnegative' or 'real'")
         if not set(self.categorical_statics) <= set(self.static_columns):
             raise ValueError("categorical_statics must be a subset of static_columns")
+        events = {} if event_dynamics is None else event_dynamics
+        if not isinstance(events, dict) or any(
+            not isinstance(column, str)
+            or not isinstance(tokens, list)
+            or any(not isinstance(token, str) for token in tokens)
+            for column, tokens in events.items()
+        ):
+            raise ValueError(
+                f"{self.name}: event_dynamics must map column names to lists of strings"
+            )
+        if not set(events) <= set(self.known_dynamic + self.past_dynamic):
+            raise ValueError(
+                f"{self.name}: event_dynamics columns must be known/past dynamic columns"
+            )
+        self.event_dynamics = deepcopy(events)
+
+    def __eq__(self, other):
+        if other.__class__ is not self.__class__:
+            return NotImplemented
+        names = [f.name for f in fields(self) if f.compare] + ["event_dynamics"]
+        return tuple(getattr(self, name) for name in names) == tuple(
+            getattr(other, name) for name in names
+        )
+
+    @recursive_repr()
+    def __repr__(self):
+        values = [f"{f.name}={getattr(self, f.name)!r}" for f in fields(self) if f.repr]
+        if self.event_dynamics:
+            values.append(f"event_dynamics={self.event_dynamics!r}")
+        return f"{self.__class__.__qualname__}({', '.join(values)})"
 
     @property
     def targets(self) -> list[str]:
         return [self.target] if isinstance(self.target, str) else self.target
+
+    def to_dict(self) -> dict:
+        """Serialize the full spec, omitting empty event profiles for compatibility."""
+        values = asdict(self)
+        if self.event_dynamics:
+            values["event_dynamics"] = deepcopy(self.event_dynamics)
+        return values
 
     def task_definition(self) -> dict:
         """Return the evaluation boundaries included in a model run's identity."""
@@ -141,6 +185,7 @@ class FevTaskSpec:
             "seasonality": self.seasonality,
             "quantile_levels": list(self.quantile_levels),
             **({"targets": list(self.target)} if isinstance(self.target, list) else {}),
+            **({"event_dynamics": deepcopy(self.event_dynamics)} if self.event_dynamics else {}),
         }
 
     def to_task(self) -> fev.Task:  # noqa: F821 -- optional import stays local.
@@ -193,7 +238,8 @@ def _local_path(dataset_path: str | Path) -> Path | None:
 def load_task_specs(selector: str | Path, profiles: Path | None = None) -> list[FevTaskSpec]:
     """Read ``weekly``, ``heldout``, ``fev100``, comma-separated task names, or task YAML.
 
-    Profiles map task names to ``target_support`` and ``categorical_statics``.
+    Profiles map task names to ``target_support``, ``categorical_statics`` and
+    optional ``event_dynamics`` (dynamic column -> no-event string tokens).
     Custom YAML may supply ``name`` (or fev's ``task_name``); otherwise the
     dataset config, or local file stem, identifies its profile. Relative local
     parquet paths are resolved against the YAML file's directory.
@@ -253,6 +299,8 @@ def load_task_specs(selector: str | Path, profiles: Path | None = None) -> list[
             raise ValueError("profile missing")
         if "target_support" not in profile:
             raise ValueError(f"target_support missing from profile: {name}")
+        if not isinstance(profile.get("event_dynamics", {}), dict):
+            raise ValueError(f"{name}: event_dynamics must map column names to lists of strings")
         values = named_tasks[name].copy()
         for upstream, local in (
             ("known_dynamic_columns", "known_dynamic"),
@@ -269,6 +317,7 @@ def load_task_specs(selector: str | Path, profiles: Path | None = None) -> list[
                 **values,
                 target_support=profile["target_support"],
                 categorical_statics=profile.get("categorical_statics", []),
+                event_dynamics=profile.get("event_dynamics", {}),
             )
         )
     return specs

@@ -18,6 +18,7 @@ def write_fev_fixture(
     known: tuple[str, ...] = ("promo",),
     past: tuple[str, ...] = ("oil",),
     statics: tuple[str, ...] = ("cat",),
+    text_dynamic: tuple[str, ...] = (),
     seed: int = 0,
 ) -> Path:
     """Write fev list-column data with a 50% promotion uplift and 15% zeros.
@@ -26,6 +27,7 @@ def write_fev_fixture(
     promotion indicator is ``promo`` when present, otherwise the first known
     covariate. Randomness is local to this call and controlled by ``seed``.
     ``lengths`` optionally trims each generated series to its own length.
+    ``text_dynamic`` replaces selected dynamics with repeating 0/a/null/b text.
     """
     try:
         import datasets
@@ -34,6 +36,8 @@ def write_fev_fixture(
 
     if lengths is not None and (len(lengths) != n_series or any(n > length for n in lengths)):
         raise ValueError("lengths must have n_series entries, each at most length")
+    if not set(text_dynamic) <= set(known + past):
+        raise ValueError("text_dynamic must select known/past columns")
     rng = np.random.default_rng(seed)
     timestamps = pd.date_range(start, periods=length, freq=freq).to_numpy()
     features = datasets.Features(
@@ -44,6 +48,7 @@ def write_fev_fixture(
             **{name: datasets.Sequence(datasets.Value("int8")) for name in known},
             **{name: datasets.Sequence(datasets.Value("float32")) for name in past},
             **{name: datasets.Value("string") for name in statics},
+            **{name: datasets.Sequence(datasets.Value("string")) for name in text_dynamic},
         }
     )
     rows = []
@@ -62,6 +67,10 @@ def write_fev_fixture(
                 **known_values,
                 **{name: rng.normal(50.0, 5.0, size=length).astype(np.float32) for name in past},
                 **{name: "A" if index % 2 == 0 else "B" for name in statics},
+                **{
+                    name: [("0", "a", None, "b")[i % 4] for i in range(length)]
+                    for name in text_dynamic
+                },
             }
         )
         if lengths is not None:

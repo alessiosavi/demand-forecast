@@ -15,7 +15,7 @@ import pickle
 import shutil
 from collections import Counter
 from collections.abc import Iterable
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 
 import optuna
@@ -255,7 +255,7 @@ def tune_finetune(
         "optuna_version": optuna.__version__,
         "tasks": [
             {
-                "spec": asdict(task.spec),
+                "spec": task.spec.to_dict(),
                 "fingerprint": task.fingerprint,
                 "origin": task.origin.isoformat(),
                 "earliest_origin": task.earliest_origin.isoformat(),

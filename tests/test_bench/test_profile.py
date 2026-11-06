@@ -23,8 +23,14 @@ module_spec.loader.exec_module(profiler)
 profile_task = profiler.profile_task
 
 
-def test_profile_task_on_fixture(tmp_path):
-    row = profile_task(fixture_spec(write_fev_fixture(tmp_path)))
+@pytest.mark.parametrize("text_dynamic", [(), ("promo", "oil")])
+def test_profile_task_on_fixture(tmp_path, text_dynamic):
+    row = profile_task(
+        fixture_spec(
+            write_fev_fixture(tmp_path, text_dynamic=text_dynamic),
+            event_dynamics={name: ["0"] for name in text_dynamic},
+        )
+    )
     assert row["n_series"] == 6
     assert row["anchor_weekday"] == 6
     assert row["length_min"] == 40

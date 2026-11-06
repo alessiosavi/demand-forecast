@@ -3,6 +3,7 @@
 import csv
 import json
 from collections import Counter
+from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -100,9 +101,21 @@ def harness(tmp_path, monkeypatch):
                     "target": [1.0] * (len(dates) - 2)
                     if spec.name == "skipped"
                     else list(range(1, len(dates) - 1)),
+                    **{
+                        name: [
+                            "0" if step % 2 == 0 else "holiday" for step in range(len(dates) - 2)
+                        ]
+                        for name in spec.known_dynamic
+                    },
                 }
             )
-            future.append(FutureRow(id=str(i), timestamp=dates[-2:]))
+            future.append(
+                FutureRow(
+                    id=str(i),
+                    timestamp=dates[-2:],
+                    **{name: [None, "holiday"] for name in spec.known_dynamic},
+                )
+            )
         return past, future
 
     def to_task(spec):
@@ -369,6 +382,25 @@ def test_resume_rejects_changed_settings(harness):
     h = harness
     tune.tune_finetune(h.specs, h.settings, h.init, h.out, n_trials=1)
     h.settings.seed += 1
+    with pytest.raises(ValueError, match="study inputs"):
+        tune.tune_finetune(h.specs, h.settings, h.init, h.out, n_trials=2, resume=True)
+    assert len(study_at(h.out).trials) == 1
+
+
+def test_resume_rejects_changed_event_tokens(harness):
+    h = harness
+    h.specs = [
+        replace(spec, known_dynamic=["holiday"], event_dynamics={"holiday": ["0"]})
+        for spec in h.specs
+    ]
+    tune.tune_finetune(h.specs, h.settings, h.init, h.out, n_trials=1)
+    for panel in h.panels.values():
+        for series in panel.series:
+            assert series.dynamic["holiday"].tolist() == [i % 2 for i in range(series.length)] + [
+                0,
+                1,
+            ]
+    h.specs = [replace(spec, event_dynamics={"holiday": []}) for spec in h.specs]
     with pytest.raises(ValueError, match="study inputs"):
         tune.tune_finetune(h.specs, h.settings, h.init, h.out, n_trials=2, resume=True)
     assert len(study_at(h.out).trials) == 1
