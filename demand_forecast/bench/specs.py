@@ -168,6 +168,14 @@ def dataset_fingerprint(task) -> str:
     return task._dataset_fingerprint
 
 
+def _is_file(path: Path) -> bool:
+    """Treat strings that cannot be filesystem paths as non-files."""
+    try:
+        return path.is_file()
+    except (OSError, ValueError):
+        return False
+
+
 def _local_path(dataset_path: str | Path) -> Path | None:
     """Recognize parquet paths without treating HF repo IDs as local paths."""
     path = Path(dataset_path).expanduser()
@@ -176,7 +184,7 @@ def _local_path(dataset_path: str | Path) -> Path | None:
         or path.is_absolute()
         or path.suffix == ".parquet"
         or str(dataset_path).startswith(("./", "../", "~"))
-        or path.is_file()
+        or _is_file(path)
     ):
         return path
     return None
@@ -192,7 +200,7 @@ def load_task_specs(selector: str | Path, profiles: Path | None = None) -> list[
     """
     resources = files("demand_forecast.bench").joinpath("tasks")
     path = Path(selector)
-    custom_yaml = isinstance(selector, Path) or path.suffix in (".yaml", ".yml") or path.is_file()
+    custom_yaml = isinstance(selector, Path) or path.suffix in (".yaml", ".yml") or _is_file(path)
     if custom_yaml:
         definitions = yaml.safe_load(path.read_text(encoding="utf-8"))
     else:

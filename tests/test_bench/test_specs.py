@@ -4,13 +4,12 @@ from pathlib import Path
 
 import pytest
 import yaml
+from typer.testing import CliRunner
 
-fev = pytest.importorskip("fev")
-pytestmark = pytest.mark.bench
-
-from demand_forecast.bench.specs import FevTaskSpec, load_task_specs  # noqa: E402
-from tests.helpers.fev_fixture import fixture_task, write_fev_fixture  # noqa: E402
-from tests.helpers.fev_spec import fixture_spec  # noqa: E402
+from demand_forecast.bench.specs import FevTaskSpec, _local_path, load_task_specs
+from demand_forecast.cli import app
+from tests.helpers.fev_fixture import fixture_task, write_fev_fixture
+from tests.helpers.fev_spec import fixture_spec
 
 WEEKLY_NAMES = [
     "m5_1W",
@@ -75,7 +74,10 @@ def test_weekly_selector_still_seven():
     assert not set(HELDOUT_NAMES) & {spec.name for spec in specs}
 
 
+@pytest.mark.bench
 def test_heldout_to_task_matches_upstream_definition_except_task_name():
+    fev = pytest.importorskip("fev")
+
     # Independent upstream excerpts retain the UK task_name that the local set drops.
     upstream = yaml.safe_load(
         (Path(__file__).parent / "fixtures/fev_heldout_193e4fc.yaml").read_text()
@@ -120,7 +122,10 @@ def test_load_weekly_specs_have_profiles():
         )
 
 
+@pytest.mark.bench
 def test_weekly_tasks_preserve_every_pinned_yaml_field():
+    fev = pytest.importorskip("fev")
+
     definitions = yaml.safe_load(
         files("demand_forecast.bench").joinpath("tasks/fev_bench_weekly.yaml").read_text()
     )["tasks"]
@@ -136,6 +141,84 @@ def test_select_named_tasks_and_reject_unknown_names():
         load_task_specs("m5_1W,typo")
 
 
+def test_long_selector_matches_all_packaged_tasks():
+    definitions = yaml.safe_load(
+        files("demand_forecast.bench").joinpath("tasks/fev_bench_100_193e4fc.yaml").read_text()
+    )["tasks"]
+    names = [task.get("task_name", task["dataset_config"]) for task in definitions]
+    selector = ",".join(names)
+    assert len(names) == 100
+    assert len(selector) > 255
+    assert load_task_specs(selector) == load_task_specs("fev100")
+
+
+def test_long_reordered_subset_preserves_order():
+    specs = load_task_specs("fev100")
+    # Put slash-containing names last so a missing early directory cannot hide
+    # the overlong first path component from the filesystem probe.
+    expected = [spec for spec in reversed(specs) if "/" not in spec.name][:30]
+    expected += [spec for spec in specs if "/" in spec.name]
+    selector = ",".join(spec.name for spec in expected)
+    assert len(expected) < len(specs)
+    assert "/" in selector
+    assert len(selector.split("/", 1)[0].encode()) > 255
+    assert load_task_specs(selector) == expected
+
+
+def test_long_selector_reports_unknown_task():
+    names = [spec.name for spec in load_task_specs("fev100") if "/" not in spec.name]
+    selector = ",".join([*names, "unknown_task"])
+    assert len(selector) > 255
+    with pytest.raises(ValueError, match="^unknown task: unknown_task$"):
+        load_task_specs(selector)
+
+
+def test_plan_accepts_long_selector():
+    names = [spec.name for spec in load_task_specs("fev100")]
+    selector = ",".join(names)
+    assert len(selector) > 255
+    result = CliRunner().invoke(
+        app,
+        [
+            "fev",
+            "plan",
+            "--tasks",
+            selector,
+            "--config",
+            str(Path(__file__).resolve().parents[2] / "configs/fev-v2-survey.yaml"),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "File name too long" not in result.output
+    assert [line.split(",")[0] for line in result.output.splitlines()[1:]] == names
+
+
+@pytest.mark.parametrize("selector", ["weekly", "hermes,m5_1W"])
+def test_existing_file_takes_precedence_over_selector(tmp_path, monkeypatch, selector):
+    expected = load_task_specs("heldout")
+    content = files("demand_forecast.bench").joinpath("tasks/fev_bench_weekly_heldout.yaml")
+    (tmp_path / selector).write_text(content.read_text())
+    monkeypatch.chdir(tmp_path)
+    assert load_task_specs(selector) == expected
+
+
+@pytest.mark.parametrize("dataset_path", ["x" * 300, "invalid\x00path"])
+def test_invalid_local_path_probe_is_not_a_file(dataset_path):
+    assert _local_path(dataset_path) is None
+
+
+@pytest.mark.parametrize("error", [OSError("invalid path"), ValueError("embedded null byte")])
+def test_file_probe_errors_allow_selector_and_dataset_fallback(monkeypatch, error):
+    expected = load_task_specs("weekly")
+
+    def invalid_path(self):
+        raise error
+
+    monkeypatch.setattr(Path, "is_file", invalid_path)
+    assert load_task_specs("weekly") == expected
+    assert _local_path("example/datasets") is None
+
+
 def write_spec_files(tmp_path, task, profile):
     tasks_path = tmp_path / "tasks.yaml"
     profiles_path = tmp_path / "profiles.yaml"
@@ -144,7 +227,10 @@ def write_spec_files(tmp_path, task, profile):
     return tasks_path, profiles_path
 
 
+@pytest.mark.bench
 def test_custom_yaml_uses_fev_defaults_and_requires_profile(tmp_path):
+    fev = pytest.importorskip("fev")
+
     task = {"dataset_path": "example/datasets", "dataset_config": "custom"}
     path, profiles = write_spec_files(tmp_path, task, {})
     with pytest.raises(ValueError, match="^profile missing$"):
@@ -160,7 +246,10 @@ def test_custom_yaml_uses_fev_defaults_and_requires_profile(tmp_path):
     assert spec.to_task().to_dict() == fev.Task(**task).to_dict()
 
 
+@pytest.mark.bench
 def test_local_task_maps_roles_and_ignores_dataset_config(tmp_path):
+    pytest.importorskip("fev")
+
     parquet = write_fev_fixture(tmp_path)
     task = fixture_spec(parquet, dataset_config="ignored-for-local-file").to_task()
     assert task.dataset_config is None
@@ -172,7 +261,10 @@ def test_local_task_maps_roles_and_ignores_dataset_config(tmp_path):
     assert task.load_full_dataset() is not None
 
 
+@pytest.mark.bench
 def test_custom_yaml_keeps_window_and_column_settings(tmp_path):
+    pytest.importorskip("fev")
+
     task = {
         "name": "local",
         "dataset_path": "data.parquet",
