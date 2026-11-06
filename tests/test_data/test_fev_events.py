@@ -36,6 +36,30 @@ def event_window():
     return past, future
 
 
+@pytest.mark.parametrize("declared", [False, True])
+def test_loader_resets_format_only_for_declared_events(declared):
+    class FormattedRows(list):
+        def __init__(self, rows):
+            super().__init__(rows)
+            self.format_calls = []
+
+        def with_format(self, format_type):
+            if not declared:
+                raise AssertionError("undeclared specs must preserve dataset formatting")
+            self.format_calls.append(format_type)
+            return list(self)
+
+    past, future = event_window()
+    past[0]["promo"] = ["0"] * 7
+    future[0]["promo"] = ["1"] * 4
+    past, future = FormattedRows(past), FormattedRows(future)
+    spec = fixture_spec(Path("unused.parquet"), event_dynamics={"promo": ["0"]} if declared else {})
+    panel = panel_from_window(past, future, spec, "D")
+    assert past.format_calls == future.format_calls == ([None] if declared else [])
+    assert len(panel.series) == 1
+    np.testing.assert_array_equal(panel.series[0].dynamic["promo"], [0] * 7 + [1] * 4)
+
+
 @pytest.mark.parametrize("multi_target", [False, True])
 @pytest.mark.parametrize("past_event", [False, True])
 def test_events_preserve_values_across_targets_and_window_halves(multi_target, past_event):
@@ -75,6 +99,31 @@ def test_undeclared_text_names_task_column_and_profile_fix(part, column, text):
     assert spec.name in message and "item-a" in message and column in message
     assert "declare it under event_dynamics in the task profile" in message
     assert isinstance(exc.value.__cause__, (ValueError, TypeError))
+
+
+@pytest.mark.parametrize(
+    "known,past_only",
+    [
+        (["promo", "oil"], []),
+        (["oil", "promo"], []),
+        (["promo"], ["oil"]),
+        (["oil"], ["promo"]),
+        ([], ["promo", "oil"]),
+        ([], ["oil", "promo"]),
+    ],
+)
+def test_multiple_uncastable_columns_report_first_in_known_then_past_order(known, past_only):
+    past, future = event_window()
+    past[0]["promo"] = ["bad promo"] * 7
+    past[0]["oil"] = ["bad oil"] * 7
+    spec = fixture_spec(Path("unused.parquet"), known_dynamic=known, past_dynamic=past_only)
+    with pytest.raises(ValueError) as exc:
+        panel_from_window(past, future, spec, "D")
+    first = (known + past_only)[0]
+    assert str(exc.value) == (
+        f"Task {spec.name!r}, series 'item-a': dynamic column {first!r} cannot be cast to float; "
+        "declare it under event_dynamics in the task profile"
+    )
 
 
 @pytest.mark.parametrize("dtype", [np.float32, str])

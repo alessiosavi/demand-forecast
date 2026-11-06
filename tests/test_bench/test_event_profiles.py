@@ -1,6 +1,8 @@
 """Pinned event profiles and identities need no optional benchmark imports."""
 
+import copy
 import json
+import pickle
 from dataclasses import asdict, replace
 from importlib.resources import files
 
@@ -116,6 +118,35 @@ def test_empty_profiles_preserve_legacy_serialization(tmp_path):
     assert json.dumps(spec.task_definition()) == json.dumps(explicit.task_definition())
     assert "event_dynamics" not in spec.task_definition()
     assert "event_dynamics" not in asdict(spec)
+
+
+def test_all_fev100_specs_preserve_undeclared_serialization():
+    declared = {"rossmann_1D", "favorita_stores_1D", "favorita_transactions_1D"}
+    specs = load_task_specs("fev100")
+    assert len(specs) == 100
+    assert declared <= {spec.name for spec in specs}
+    for spec in specs:
+        has_events = spec.name in declared
+        assert ("event_dynamics" in spec.task_definition()) == has_events, spec.name
+        assert ("event_dynamics" in spec.to_dict()) == has_events, spec.name
+        assert "event_dynamics" not in asdict(spec), spec.name
+        if not has_events:
+            assert spec.to_dict() == asdict(spec), spec.name
+
+
+@pytest.mark.parametrize("name", ["rossmann_1D", "rossmann_1W"])
+@pytest.mark.parametrize("method", ["deepcopy", "pickle"])
+def test_copy_and_pickle_preserve_event_profiles(name, method):
+    spec = load_task_specs(name)[0]
+    restored = copy.deepcopy(spec) if method == "deepcopy" else pickle.loads(pickle.dumps(spec))
+    expected = {"StateHoliday": ["0"]} if name == "rossmann_1D" else {}
+    assert restored is not spec
+    assert restored == spec
+    assert restored.event_dynamics == spec.event_dynamics == expected
+    if expected:
+        restored.event_dynamics["StateHoliday"].append("no holiday")
+        assert spec.event_dynamics == {"StateHoliday": ["0"]}
+        assert restored != spec
 
 
 def test_event_profiles_participate_in_equality_and_repr():
