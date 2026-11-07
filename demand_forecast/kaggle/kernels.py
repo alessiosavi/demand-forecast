@@ -31,7 +31,8 @@ _QUOTED_STATUS = re.compile(r'has status "([^"]+)"')
 _ENUM_STATUS = re.compile(r"\bKernelWorkerStatus\.([A-Z_]+)\b")
 _BARE_STATUS = re.compile(r"[A-Z_]+")
 _FAILURE_MESSAGE = re.compile(r'Failure message: "([^"]*)"')
-_FAILED_WORDS = ("ERROR", "CANCELLED")
+_ERROR_WORD = "ERROR"
+_CANCEL_PREFIX = "CANCEL"
 
 _DRIVER_TEMPLATE = '''"""Kaggle kernel driver for {kernel_id}.
 
@@ -163,7 +164,8 @@ def parse_status(output: str) -> str:
 
     The CLI prints ``<kernel> has status "KernelWorkerStatus.<WORD>"``; the
     returned word is the verbatim ``<WORD>`` (``QUEUED``, ``RUNNING``,
-    ``COMPLETE``, ``ERROR`` or ``CANCELLED``). A bare ``KernelWorkerStatus.<WORD>``
+    ``COMPLETE``, ``ERROR``, ``CANCEL_REQUESTED``, ``CANCEL_ACKNOWLEDGED``,
+    ``NEW_SCRIPT``). A bare ``KernelWorkerStatus.<WORD>``
     token or a bare ``<WORD>`` string are accepted too; anything else raises
     ``ValueError`` rather than guessing.
     """
@@ -180,17 +182,17 @@ def parse_status(output: str) -> str:
 def check_status(returncode: int, output: str) -> None:
     """Raise ``RuntimeError`` when the status call or the kernel run failed.
 
-    A non-zero CLI return code and the ``ERROR``/``CANCELLED`` status words are
-    failures; ``QUEUED``, ``RUNNING`` and ``COMPLETE`` pass so the caller's poll
-    loop decides when to stop. The CLI's failure message, when present, is
-    included in the error.
+    A non-zero CLI return code, the ``ERROR`` word and every ``CANCEL*`` word
+    (``CANCEL_REQUESTED``, ``CANCEL_ACKNOWLEDGED``) are failures; ``QUEUED``,
+    ``RUNNING`` and ``COMPLETE`` pass so the caller's poll loop decides when to
+    stop. The CLI's failure message, when present, is included in the error.
     """
     if returncode != 0:
         raise RuntimeError(
             f"kaggle kernels status failed with exit code {returncode}: {output.strip()}"
         )
     word = parse_status(output)
-    if word in _FAILED_WORDS:
+    if word == _ERROR_WORD or word.startswith(_CANCEL_PREFIX):
         match = _FAILURE_MESSAGE.search(output)
         detail = "" if match is None else f": {match.group(1)}"
         raise RuntimeError(f"kaggle kernel run failed with status {word}{detail}")

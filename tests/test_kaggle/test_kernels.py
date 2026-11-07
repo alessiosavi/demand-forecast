@@ -126,8 +126,10 @@ def test_push_status_output_argv(tmp_path: Path):
 def test_status_failure_raises():
     with pytest.raises(RuntimeError, match="ERROR"):
         check_status(0, f'{_KERNEL_ID} has status "KernelWorkerStatus.ERROR"')
-    with pytest.raises(RuntimeError, match="CANCELLED"):
-        check_status(0, "KernelWorkerStatus.CANCELLED")
+    with pytest.raises(RuntimeError, match="CANCEL_REQUESTED"):
+        check_status(0, f'{_KERNEL_ID} has status "KernelWorkerStatus.CANCEL_REQUESTED"')
+    with pytest.raises(RuntimeError, match="CANCEL_ACKNOWLEDGED"):
+        check_status(0, f'{_KERNEL_ID} has status "KernelWorkerStatus.CANCEL_ACKNOWLEDGED"')
     with pytest.raises(RuntimeError, match="out of memory"):
         check_status(
             0,
@@ -140,6 +142,10 @@ def test_status_failure_raises():
     [
         (f'{_KERNEL_ID} has status "KernelWorkerStatus.RUNNING"', "RUNNING"),
         (f'{_KERNEL_ID} has status "KernelWorkerStatus.COMPLETE"', "COMPLETE"),
+        (
+            f'{_KERNEL_ID} has status "KernelWorkerStatus.CANCEL_ACKNOWLEDGED"',
+            "CANCEL_ACKNOWLEDGED",
+        ),
         ("KernelWorkerStatus.ERROR", "ERROR"),
         ("QUEUED", "QUEUED"),
     ],
