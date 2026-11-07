@@ -141,8 +141,16 @@ class RunnerConfig:
 
 
 def _dataset_mount(dataset_id: str) -> str:
-    """The ``/kaggle/input`` mount point of an ``owner/slug`` dataset."""
-    return f"/kaggle/input/{dataset_id.split('/', 1)[1]}"
+    """The kernel mount point of an ``owner/slug`` dataset.
+
+    Datasets created/versioned through the current Kaggle CLI (the runner's
+    own upload flow) live in the new dataset backend and mount under
+    ``/kaggle/input/datasets/<owner>/<slug>`` — verified live by a mount
+    probe: the dataset GCSFuse mounts at exactly that path. Legacy
+    image-backed datasets mount flat at ``/kaggle/input/<slug>``, but every
+    dataset this runner creates uses the new backend.
+    """
+    return f"/kaggle/input/datasets/{dataset_id}"
 
 
 def _download_argv(slug: str, raw_dir: Path) -> list[str]:

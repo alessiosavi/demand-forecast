@@ -206,8 +206,8 @@ def test_run_stages_records_commands_with_fake_runner(tmp_path):
     assert metadata["dataset_sources"] == [_DATASET_ID, _ASSETS_DATASET]
     driver = (config.kernel_dir / "main.py").read_text(encoding="utf-8")
     assert _REPO_SHA in driver
-    assert "/kaggle/input/kb-store-sales" in driver
-    assert "/kaggle/input/kb-assets/bundle-L3-first-try" in driver
+    assert "/kaggle/input/datasets/alessiosavi/kb-store-sales" in driver
+    assert "/kaggle/input/datasets/alessiosavi/kb-assets/bundle-L3-first-try" in driver
     marker = config.fetched_dir / "kb-out" / "workload.json"
     assert marker.is_file()
 
