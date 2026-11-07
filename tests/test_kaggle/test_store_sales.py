@@ -9,6 +9,9 @@ import pytest
 from demand_forecast.config import Settings
 from demand_forecast.kaggle.store_sales import SLUG, PrepareReport, prepare
 
+# The dev-only CI lap installs no parquet engine: skip this module, never fail it.
+pytest.importorskip("pyarrow")
+
 
 def _mini_raw(root: Path, *, negative_sale: bool = False) -> None:
     """Write a miniature stand-in for the raw competition files.
