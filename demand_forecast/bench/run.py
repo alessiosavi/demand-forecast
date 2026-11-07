@@ -157,6 +157,115 @@ def _save_predictions(
             temporary_path.unlink(missing_ok=True)
 
 
+def _completed_training(directory: Path, identity: str, earliest, settings: Settings) -> bool:
+    """Verify reusable artifacts without needing any observation arrays.
+
+    Keep the terminal/refit guards from train_panel: a prior successful bundle
+    cannot hide a failed or unfinished rerun. Such cases take the normal path.
+    """
+    import torch
+
+    from demand_forecast.core.run import load_bundle
+    from demand_forecast.core.training import NONFINITE_STOP_AFTER
+
+    checkpoint = directory / "checkpoints/latest.pt"
+    refit_checkpoint = directory / "checkpoints/refit/latest.pt"
+    selection_path = directory / "checkpoints/selection.json"
+    reusable = True
+    for path in (checkpoint, refit_checkpoint):
+        if not path.exists():
+            continue
+        state = torch.load(path, map_location="cpu", weights_only=False)
+        if state.get("run_identity") != identity:
+            raise ValueError("run identity mismatch")
+        reusable &= not (
+            state.get("terminal_reason") == "nonfinite_losses"
+            or state.get("consecutive_nonfinite", 0) >= NONFINITE_STOP_AFTER
+        )
+        if settings.training.refit == "full":
+            limit = state.get("step_limit", state["max_steps"])
+            reusable &= not (
+                state["step"] < limit
+                and (
+                    path == refit_checkpoint
+                    or state["patience_counter"] < settings.training.patience
+                )
+            )
+        del state
+    for path in (selection_path, directory / "run.json", directory / "bundle/manifest.json"):
+        if (
+            path.exists()
+            and json.loads(path.read_text(encoding="utf-8")).get("run_identity") != identity
+        ):
+            raise ValueError("run identity mismatch")
+    if selection_path.exists() and not refit_checkpoint.exists():
+        reusable = False
+    if not reusable:
+        return False
+    bundle = load_bundle(directory / "bundle")
+    if earliest != pd.Timestamp(bundle.panel_metadata["earliest_origin"]):
+        raise ValueError("bundle earliest_origin mismatch")
+    return True
+
+
+def _completed_task(task, spec, settings, directory, row, fingerprint, policy, identities) -> bool:
+    """Skip only after validating every completed window and its training artifacts."""
+    from demand_forecast import __version__
+    from demand_forecast.core.run import run_identity
+
+    training_dirs = (
+        [directory]
+        if policy == "first_window"
+        else [directory / f"window_{index}" for index in range(spec.num_windows)]
+    )
+    if not all((directory / f"window_{i}.npz").exists() for i in range(spec.num_windows)):
+        return False
+    if not all(
+        (path / "bundle/manifest.json").exists() and (path / "run.json").exists()
+        for path in training_dirs
+    ):
+        return False
+    window_identities = []
+    for index, window in enumerate(task.iter_windows()):
+        past, future = window.get_input_data()
+        origins = expanded_window_origins(future, spec)
+        if index == 0 or policy == "per_window":
+            identity = run_identity(
+                settings,
+                settings.seed,
+                fingerprint,
+                __version__,
+                resolved_origin(origins),
+                spec.task_definition(),
+                policy=policy,
+            )
+            if index == 0 and identities is not None:
+                identities[spec.name] = identity
+            window_identities.append(identity)
+            if policy == "first_window":
+                if row.get("run_identity") != identity:
+                    return False
+                # Include orphan windows, as the normal resume path does.
+                for path in directory.glob("window_*.npz"):
+                    with np.load(path, allow_pickle=False) as saved:
+                        _check_prediction_identity(saved, identity)
+            training_dir = directory if policy == "first_window" else directory / f"window_{index}"
+            if not _completed_training(training_dir, identity, min(origins.values()), settings):
+                return False
+        with np.load(directory / f"window_{index}.npz", allow_pickle=False) as saved:
+            _check_prediction_identity(saved, identity)
+            task.clean_and_validate_predictions(
+                assemble_predictions(spec, past, saved["ids"].tolist(), saved["arrays"])
+            )
+            if prediction_diagnostics(saved) is None:
+                return False
+    if policy == "per_window":
+        identity = hashlib.sha256(
+            json.dumps(window_identities, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+    return row.get("run_identity") == identity
+
+
 def _run_fev_tasks(
     specs: Iterable[FevTaskSpec],
     settings: Settings,
@@ -185,8 +294,8 @@ def _run_fev_tasks(
     every model and is not an out-of-time test for those items.
     """
     from demand_forecast import __version__
+    from demand_forecast.bench.panels import TaskPanelCache
     from demand_forecast.core.run import resolve_device, run_identity, train_panel
-    from demand_forecast.data.loader_fev import panel_from_window
     from demand_forecast.inference.predictor import Predictor
 
     if policy not in {"first_window", "per_window"}:
@@ -208,6 +317,21 @@ def _run_fev_tasks(
         task_settings = settings_for_task(spec, settings, task.freq)
         definition = spec.task_definition()
         task_dir = out_dir / spec.name
+        rows = summaries.loc[(summaries.task == spec.name) & (summaries.model_name == model_name)]
+        if resume and len(rows) == 1 and (stop_after is None or stop_after >= 1):
+            if _completed_task(
+                task, spec, task_settings, task_dir, rows.iloc[0], fp, policy, run_identities
+            ):
+                print(f"Skipping completed task {spec.name}", flush=True)
+                continue
+        started = time.perf_counter()
+        panel_cache = TaskPanelCache(task.load_full_dataset(), spec, task.freq)
+        logger.info(
+            "panel history: task=%s series=%d build_s=%.1f",
+            spec.name,
+            len(panel_cache.panel.series),
+            time.perf_counter() - started,
+        )
         predictions = []
         diagnostics_per_window = []
         max_distinct_origins = 0
@@ -219,7 +343,7 @@ def _run_fev_tasks(
         for index, window in enumerate(task.iter_windows()):
             past, future = window.get_input_data()
             started = time.perf_counter()
-            panel = panel_from_window(past, future, spec, task.freq)
+            panel = panel_cache.for_window(window, past)
             logger.info(
                 "panel: task=%s window=%d series=%d build_s=%.1f",
                 spec.name,
