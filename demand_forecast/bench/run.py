@@ -226,9 +226,12 @@ def _completed_task(task, spec, settings, directory, row, fingerprint, policy, i
     ):
         return False
     window_identities = []
+    training_checks = []
+    earliest_origins = []
     for index, window in enumerate(task.iter_windows()):
         past, future = window.get_input_data()
         origins = expanded_window_origins(future, spec)
+        earliest_origins.append(min(origins.values()))
         if index == 0 or policy == "per_window":
             identity = run_identity(
                 settings,
@@ -250,8 +253,7 @@ def _completed_task(task, spec, settings, directory, row, fingerprint, policy, i
                     with np.load(path, allow_pickle=False) as saved:
                         _check_prediction_identity(saved, identity)
             training_dir = directory if policy == "first_window" else directory / f"window_{index}"
-            if not _completed_training(training_dir, identity, min(origins.values()), settings):
-                return False
+            training_checks.append((training_dir, identity))
         with np.load(directory / f"window_{index}.npz", allow_pickle=False) as saved:
             _check_prediction_identity(saved, identity)
             task.clean_and_validate_predictions(
@@ -259,6 +261,13 @@ def _completed_task(task, spec, settings, directory, row, fingerprint, policy, i
             )
             if prediction_diagnostics(saved) is None:
                 return False
+    # Both policies save the task-wide floor, including items first seen later.
+    earliest = min(earliest_origins)
+    if not all(
+        _completed_training(path, training_identity, earliest, settings)
+        for path, training_identity in training_checks
+    ):
+        return False
     if policy == "per_window":
         identity = hashlib.sha256(
             json.dumps(window_identities, separators=(",", ":")).encode("utf-8")
