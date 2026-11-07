@@ -384,6 +384,59 @@ def test_ragged_ends_forecast_each_item_at_its_own_origin(tmp_path, capsys, capl
     assert file_states(out) == before
 
 
+@pytest.mark.parametrize("policy", ["first_window", "per_window"])
+@pytest.mark.parametrize("zero_shot", [False, True])
+def test_later_window_earlier_origin_uses_task_floor(
+    tmp_path, monkeypatch, request, policy, zero_shot
+):
+    import demand_forecast.data.loader_fev as loader
+
+    spec = fixture_spec(write_fev_fixture(tmp_path, lengths=(40, 38, 40, 28, 38, 8)))
+    settings = tiny_settings(base_steps=2, d_model=16)
+    if zero_shot:
+        settings.training.init_from = str(request.getfixturevalue("tiny_pretrained_bundle_dir"))
+        settings.training.zero_shot = True
+    task = spec.to_task()
+    origins = [window_origins(w.get_input_data()[1], spec.id_column) for w in task.iter_windows()]
+    assert "5" not in origins[0] and "5" in origins[1]
+    earliest = min(origins[1].values())
+    window_0_earliest = min(origins[0].values())
+    fit_origin = resolved_origin(origins[0])
+    assert earliest < window_0_earliest < fit_origin
+    built = []
+    build_panel = loader.panel_from_window
+
+    def capture_panel(*args, **kwargs):
+        panel = build_panel(*args, **kwargs)
+        built.append(len(panel))
+        return panel
+
+    monkeypatch.setattr(loader, "panel_from_window", capture_panel)
+    out = tmp_path / "out"
+    summary = run_fev([spec], settings, out, policy=policy)
+    assert built == [5, 6]  # The origin pre-pass must not build panels.
+    assert summary.num_forecasts.iloc[0] == 11 and np.isfinite(summary.SQL.iloc[0])
+    for index, expected_origins in enumerate(origins):
+        with np.load(out / spec.name / f"window_{index}.npz", allow_pickle=False) as saved:
+            assert set(saved["ids"].tolist()) == set(expected_origins)
+            assert np.isfinite(saved["arrays"]).all()
+        training_dir = out / spec.name
+        if policy == "per_window":
+            training_dir /= f"window_{index}"
+        report = json.loads((training_dir / "run.json").read_text())
+        assert report["earliest_origin"] == earliest.isoformat()
+        assert report["window_0_earliest_origin"] == window_0_earliest.isoformat()
+        assert report["all_windows_earliest_origin"] == earliest.isoformat()
+        assert report["window_0_fit_origin"] == fit_origin.isoformat()
+        assert report["items_before_window_0_fit_origin"] == 5
+        predictor = Predictor.from_bundle(training_dir / "bundle")
+        assert pd.Timestamp(predictor.bundle.panel_metadata["earliest_origin"]) == earliest
+        assert report["resolved_budget"]["max_steps"] == (0 if zero_shot else 2)
+    before = file_states(out)
+    run_fev([spec], settings, out, policy=policy, resume=True)
+    assert file_states(out) == before
+
+
 def test_ragged_run_passes_fev_report(tmp_path):
     spec = fixture_spec(write_fev_fixture(tmp_path, lengths=RAGGED), num_windows=1)
     out = tmp_path / "run"

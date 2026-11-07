@@ -408,6 +408,11 @@ reject origins before that saved floor. Unseen IDs and categories map to the unk
 slot. Bundle acceptance requires bit-identical forecast outputs after reload in a
 fresh CPU process.
 
+For fev tasks, the floor is the earliest per-item origin over all evaluation
+windows of the task, including items that enter only in later windows.
+`run.json` records the window-0 and all-window minima and counts item-window
+forecasts before the window-0 fit origin to expose cross-series calendar overlap.
+
 The fev adapter must provide exact item coverage in fev's item order. Each item has
 the median under `predictions` and quantile arrays under string knot keys such as
 `"0.1"` and `"0.9"`. Completed-window predictions are saved with their run identity
