@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import json
 import logging
 import math
@@ -18,12 +19,18 @@ import numpy as np
 import torch
 
 from demand_forecast.config.settings import ForecastConfig
-from demand_forecast.core.evaluation import evaluate, evaluate_prepared, prepare_validation
+from demand_forecast.core.evaluation import (
+    PreparedValidation,
+    evaluate,
+    evaluate_prepared,
+    prepare_validation,
+)
+from demand_forecast.core.inference_batching import batch_limit, is_oom_error
 from demand_forecast.core.validation import ValidationPlan
 from demand_forecast.data.encoders import StaticEncoder
 from demand_forecast.data.frequency import grid_range
 from demand_forecast.data.panel import Panel
-from demand_forecast.data.sampler import WindowSampler, build_origins
+from demand_forecast.data.sampler import Batch, WindowSampler, build_origins
 from demand_forecast.models.base import ForecastModel
 from demand_forecast.models.losses import pinball_loss
 
@@ -147,6 +154,27 @@ def resolve_amp(amp: bool, device: torch.device) -> tuple[bool, torch.dtype, boo
     return True, dtype, dtype is torch.float16
 
 
+def _evaluate_with_backoff(model, prepared: PreparedValidation, quantiles) -> dict[str, float]:
+    """Extend the existing validation back-off down to one row during fit."""
+    while True:
+        try:
+            return evaluate_prepared(model, prepared, quantiles)
+        except RuntimeError as exc:
+            if not is_oom_error(exc):
+                raise
+            largest = max(batch.size for batch in prepared.batches)
+            size = min(prepared.batch_limit.size or largest, largest)
+            if size == 1:
+                raise
+        # Release the failed forward's traceback before reclaiming CUDA memory.
+        gc.collect()
+        torch.cuda.empty_cache()
+        prepared.batch_limit.size = max(1, size // 2)
+        logger.warning(
+            "Validation OOM: reducing batch size from %d to %d", size, prepared.batch_limit.size
+        )
+
+
 class Trainer:
     """Train a caller-seeded model; the sampler has its own explicit seed."""
 
@@ -161,6 +189,7 @@ class Trainer:
         self.device = torch.device(device)
         self.model = model.to(self.device)
         self.cfg, self.run_identity, self.seed = cfg, run_identity, seed
+        self._micro_batch_limit = batch_limit("training")
         self.timings = _empty_timings()
         self.telemetry: list[dict] = []
         self.amp, self.amp_dtype, use_scaler = resolve_amp(cfg.amp, self.device)
@@ -172,6 +201,70 @@ class Trainer:
 
     def _lr_factor(self, step: int) -> float:
         return lr_factor(step, max_steps=self.max_steps, warmup_steps=self.warmup_steps)
+
+    def _backward_microbatch(self, cpu_batch: Batch, quantiles, total_cells: int | None) -> float:
+        # A separate frame releases device inputs and activations both on success
+        # (before transferring the next chunk) and when an OOM unwinds the call.
+        batch = cpu_batch.to(self.device)
+        with torch.autocast(self.device.type, dtype=self.amp_dtype, enabled=self.amp):
+            loss, cells = pinball_loss(
+                self.model(batch), batch.labels, batch.label_mask, batch.loss_eligible, quantiles
+            )
+            if total_cells is not None:
+                loss = loss * (cells / max(total_cells, 1))
+        value = float(loss.detach().item())
+        if math.isfinite(value):
+            self.scaler.scale(loss).backward()
+        return value
+
+    def _backward_batch(self, cpu_batch: Batch, quantiles) -> float:
+        """Retry the same effective batch, discarding all failed-attempt gradients."""
+        rng = torch.get_rng_state()
+        rng_device = self.device
+        cuda_rng = (
+            torch.cuda.get_rng_state(rng_device)
+            if rng_device.type == "cuda"
+            and torch.cuda.is_available()
+            and torch.cuda.is_initialized()
+            else None
+        )
+        while True:
+            size = min(self._micro_batch_limit.size or cpu_batch.size, cpu_batch.size)
+            self.optimizer.zero_grad(set_to_none=True)
+            try:
+                if size == cpu_batch.size:
+                    # Preserve the original loss and gradient arithmetic without OOM.
+                    return self._backward_microbatch(cpu_batch, quantiles, None)
+                total_cells = int(
+                    (cpu_batch.label_mask & cpu_batch.loss_eligible[:, None]).sum().item()
+                )
+                value = 0.0
+                for start in range(0, cpu_batch.size, size):
+                    chunk = cpu_batch._map_tensors(lambda tensor: tensor[start : start + size])
+                    value += self._backward_microbatch(chunk, quantiles, total_cells)
+                    if not math.isfinite(value):
+                        self.optimizer.zero_grad(set_to_none=True)
+                        break
+                return value
+            except RuntimeError as exc:
+                if not is_oom_error(exc):
+                    raise
+                self.optimizer.zero_grad(set_to_none=True)
+                if size == 1:
+                    raise
+            # The exception and traceback must be gone before empty_cache().
+            gc.collect()
+            torch.cuda.empty_cache()
+            torch.set_rng_state(rng)
+            if cuda_rng is not None:
+                torch.cuda.set_rng_state(cuda_rng, rng_device)
+            self._micro_batch_limit.size = max(1, size // 2)
+            logger.warning(
+                "Training OOM: reducing micro-batch size from %d to %d at step %d",
+                size,
+                self._micro_batch_limit.size,
+                self.step + 1,
+            )
 
     def fit(
         self,
@@ -204,6 +297,13 @@ class Trainer:
         After 20 consecutive non-finite losses, checkpoint (defaulting to
         ``checkpoints/``) and return ``nonfinite_losses``; resume preserves
         that terminal result without further training.
+        Transfer/forward/backward OOMs retry the same sampled batch with smaller
+        micro-batches down to one row. Losses and gradients are weighted by
+        observed eligible cells; clipping and optimizer/scheduler updates still
+        run once per effective batch. Reductions survive checkpoint/resume and
+        are shared with refits inside a task_batch_limits context.
+        Optimizer updates are not replayed: AdamW can partially mutate its state
+        and parameters before throwing, so retrying requires separate rollback.
         """
         if stop_after is not None and stop_after < 1:
             raise ValueError("stop_after must be positive")
@@ -311,7 +411,7 @@ class Trainer:
         ):
             eval_started = time.perf_counter()
             if prepared is not None:
-                metrics = evaluate_prepared(self.model, prepared, forecast_cfg.quantiles)
+                metrics = _evaluate_with_backoff(self.model, prepared, forecast_cfg.quantiles)
             else:
                 metrics = evaluate_fn(
                     self.model,
@@ -356,20 +456,9 @@ class Trainer:
                 self.sampler.set_epoch(self.sampler.epoch + 1)
             train_started = time.perf_counter()
             for batch in self.sampler.batches(self.cfg.batch_size):
-                batch = batch.to(self.device)
-                self.optimizer.zero_grad(set_to_none=True)
-                with torch.autocast(self.device.type, dtype=self.amp_dtype, enabled=self.amp):
-                    loss, _ = pinball_loss(
-                        self.model(batch),
-                        batch.labels,
-                        batch.label_mask,
-                        batch.loss_eligible,
-                        quantiles,
-                    )
-                loss_value = float(loss.detach().item())
+                loss_value = self._backward_batch(batch, quantiles)
                 finite_loss = math.isfinite(loss_value)
                 if finite_loss:
-                    self.scaler.scale(loss).backward()
                     self.scaler.unscale_(self.optimizer)
                     torch.nn.utils.clip_grad_norm_(parameters, self.cfg.grad_clip)
                     self.scaler.step(self.optimizer)
@@ -413,7 +502,9 @@ class Trainer:
                 ):
                     eval_started = time.perf_counter()
                     if prepared is not None:
-                        metrics = evaluate_prepared(self.model, prepared, forecast_cfg.quantiles)
+                        metrics = _evaluate_with_backoff(
+                            self.model, prepared, forecast_cfg.quantiles
+                        )
                     else:
                         metrics = evaluate_fn(
                             self.model,
@@ -560,6 +651,7 @@ class Trainer:
             "optimizer": self.optimizer.state_dict(),
             "scheduler": self.scheduler.state_dict(),
             "scaler": self.scaler.state_dict(),
+            "micro_batch_size": self._micro_batch_limit.size,
             "rng": {
                 "torch": torch.get_rng_state(),
                 "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
@@ -614,6 +706,11 @@ class Trainer:
         self.optimizer.load_state_dict(state["optimizer"])
         self.scheduler.load_state_dict(state["scheduler"])
         self.scaler.load_state_dict(state["scaler"])
+        saved_limit = state.get("micro_batch_size")
+        if saved_limit is not None:
+            self._micro_batch_limit.size = min(
+                self._micro_batch_limit.size or saved_limit, saved_limit
+            )
         self.sampler.seed = state["sampler_seed"]
         self.sampler.load_state(state["sampler"])
         self.step_limit = state.get("step_limit", state["max_steps"])
