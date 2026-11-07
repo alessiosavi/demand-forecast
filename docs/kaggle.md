@@ -53,7 +53,7 @@ Run everything through the operator script (defaults to store-sales):
 | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `download` | `kaggle competitions download -c <slug> -p raw/ --unzip` into the run dir                                                                                                                                                 |
 | `prepare`  | converts `raw/` with the competition module into `prepared/` (`official/` and `mirror/` variants, settings, `prepare.json`)                                                                                               |
-| `upload`   | writes `dataset-metadata.json` and creates the private prepared dataset, or versions it when it already exists (always with a changelog message)                                                                          |
+| `upload`   | stages `dataset-metadata.json` and a single prepared archive under `upload/`, then creates the private prepared dataset or versions it when it already exists (always with a changelog message)                           |
 | `kernel`   | writes the kernel dir (metadata + generated driver), pushes `alessiosavi/kb-<slug>-run`, then polls `kaggle kernels status` until `COMPLETE`; `ERROR`, `CANCEL*`, CLI failures and unparseable status output abort loudly |
 | `fetch`    | clears `fetched/`, downloads the kernel output tree (`kaggle kernels output`) and requires the `workload.json` completeness marker                                                                                        |
 | `score`    | scores the mirror window (`scores.json`), assembles `submission.csv` from the fetched official fine-tune predictions and validates it against the prepared `sample_submission.csv`, then writes `REPORT.md`               |
@@ -68,6 +68,7 @@ so the candidate can be inspected first.
 runs/<slug>/
   raw/               downloaded competition files (never published)
   prepared/          official/ + mirror/ converter output, settings, prepare.json
+  upload/            staged dataset payload: dataset-metadata.json + one prepared archive
   kernel/            pushable kernel dir (kernel-metadata.json + generated main.py)
   fetched/           kernel output tree; workload.json is the completeness marker
   scores.json        mirror-window scores (baseline + zero-shot + fine-tune)
