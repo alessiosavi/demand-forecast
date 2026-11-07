@@ -226,9 +226,12 @@ def _completed_task(task, spec, settings, directory, row, fingerprint, policy, i
     ):
         return False
     window_identities = []
+    training_checks = []
+    earliest_origins = []
     for index, window in enumerate(task.iter_windows()):
         past, future = window.get_input_data()
         origins = expanded_window_origins(future, spec)
+        earliest_origins.append(min(origins.values()))
         if index == 0 or policy == "per_window":
             identity = run_identity(
                 settings,
@@ -250,8 +253,7 @@ def _completed_task(task, spec, settings, directory, row, fingerprint, policy, i
                     with np.load(path, allow_pickle=False) as saved:
                         _check_prediction_identity(saved, identity)
             training_dir = directory if policy == "first_window" else directory / f"window_{index}"
-            if not _completed_training(training_dir, identity, min(origins.values()), settings):
-                return False
+            training_checks.append((training_dir, identity))
         with np.load(directory / f"window_{index}.npz", allow_pickle=False) as saved:
             _check_prediction_identity(saved, identity)
             task.clean_and_validate_predictions(
@@ -259,6 +261,13 @@ def _completed_task(task, spec, settings, directory, row, fingerprint, policy, i
             )
             if prediction_diagnostics(saved) is None:
                 return False
+    # Both policies save the task-wide floor, including items first seen later.
+    earliest = min(earliest_origins)
+    if not all(
+        _completed_training(path, training_identity, earliest, settings)
+        for path, training_identity in training_checks
+    ):
+        return False
     if policy == "per_window":
         identity = hashlib.sha256(
             json.dumps(window_identities, separators=(",", ":")).encode("utf-8")
@@ -295,7 +304,7 @@ def _run_fev_tasks(
     """
     from demand_forecast import __version__
     from demand_forecast.bench.panels import TaskPanelCache
-    from demand_forecast.core.run import resolve_device, run_identity, train_panel
+    from demand_forecast.core.run import _write_run, resolve_device, run_identity, train_panel
     from demand_forecast.inference.predictor import Predictor
 
     if policy not in {"first_window", "per_window"}:
@@ -316,6 +325,24 @@ def _run_fev_tasks(
         fp = dataset_fingerprint(task)
         task_settings = settings_for_task(spec, settings, task.freq)
         definition = spec.task_definition()
+        # Later windows can introduce items whose own cutoffs precede window 0.
+        # Read only origins here; build each heavy panel once in the forecast loop.
+        origins_per_window = [
+            expanded_window_origins(window.get_input_data()[1], spec)
+            for window in task.iter_windows()
+        ]
+        window_0_fit_origin = resolved_origin(origins_per_window[0])
+        earliest = min(origin for origins in origins_per_window for origin in origins.values())
+        origin_diagnostics = {
+            "window_0_earliest_origin": min(origins_per_window[0].values()).isoformat(),
+            "all_windows_earliest_origin": earliest.isoformat(),
+            "window_0_fit_origin": window_0_fit_origin.isoformat(),
+            "items_before_window_0_fit_origin": sum(
+                origin < window_0_fit_origin
+                for origins in origins_per_window
+                for origin in origins.values()
+            ),
+        }
         task_dir = out_dir / spec.name
         rows = summaries.loc[(summaries.task == spec.name) & (summaries.model_name == model_name)]
         if resume and len(rows) == 1 and (stop_after is None or stop_after >= 1):
@@ -351,9 +378,8 @@ def _run_fev_tasks(
                 len(panel.series),
                 time.perf_counter() - started,
             )
-            origins = expanded_window_origins(future, spec)
+            origins = origins_per_window[index]
             origin = resolved_origin(origins)
-            earliest = min(origins.values())
             n_origins = len(set(origins.values()))
             max_distinct_origins = max(max_distinct_origins, n_origins)
             logger.info(
@@ -361,7 +387,7 @@ def _run_fev_tasks(
                 spec.name,
                 index,
                 n_origins,
-                earliest,
+                min(origins.values()),
                 origin,
             )
             if index == 0 or policy == "per_window":
@@ -408,6 +434,9 @@ def _run_fev_tasks(
                     policy=policy,
                 )
                 report = json.loads((training_dir / "run.json").read_text(encoding="utf-8"))
+                if any(report.get(key) != value for key, value in origin_diagnostics.items()):
+                    report.update(origin_diagnostics)
+                    _write_run(training_dir / "run.json", report)
                 cumulative = report["timings"].get("cumulative", {})
                 training_time_s = (
                     sum(cumulative[key] for key in ("train_s", "eval_s", "checkpoint_s"))

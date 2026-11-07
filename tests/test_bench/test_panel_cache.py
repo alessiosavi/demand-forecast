@@ -1,3 +1,6 @@
+import hashlib
+import json
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -143,6 +146,40 @@ def test_completed_resume_skips_before_panel_build(tmp_path, monkeypatch, capsys
     monkeypatch.setattr(TaskPanelCache, "__init__", forbidden)
     run_fev([spec], settings, out, policy=policy, resume=True)
     assert f"Skipping completed task {spec.name}" in capsys.readouterr().out
+    assert {path: path.read_bytes() for path in out.rglob("*") if path.is_file()} == before
+
+
+@pytest.mark.parametrize(
+    "policy,index", [("first_window", 0), ("per_window", 0), ("per_window", 1)]
+)
+def test_completed_resume_rejects_different_task_floor(tmp_path, monkeypatch, policy, index):
+    from demand_forecast.bench.panels import TaskPanelCache
+
+    spec = fixture_spec(write_fev_fixture(tmp_path, lengths=(40, 38, 40, 28, 38, 8)))
+    settings = tiny_settings(base_steps=2, d_model=8)
+    out = tmp_path / "out"
+    run_fev([spec], settings, out, policy=policy)
+    training_dir = out / spec.name
+    if policy == "per_window":
+        training_dir /= f"window_{index}"
+    panel_path = training_dir / "bundle/panel.json"
+    metadata = json.loads(panel_path.read_text())
+    metadata["earliest_origin"] = (
+        pd.Timestamp(metadata["earliest_origin"]) + pd.Timedelta(weeks=1)
+    ).isoformat()
+    panel_path.write_text(json.dumps(metadata))
+    manifest_path = training_dir / "bundle/manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["sha256"]["panel.json"] = hashlib.sha256(panel_path.read_bytes()).hexdigest()
+    manifest_path.write_text(json.dumps(manifest))
+    before = {path: path.read_bytes() for path in out.rglob("*") if path.is_file()}
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("floor mismatch must be rejected before building panels")
+
+    monkeypatch.setattr(TaskPanelCache, "__init__", forbidden)
+    with pytest.raises(ValueError, match="^bundle earliest_origin mismatch$"):
+        run_fev([spec], settings, out, policy=policy, resume=True)
     assert {path: path.read_bytes() for path in out.rglob("*") if path.is_file()} == before
 
 
