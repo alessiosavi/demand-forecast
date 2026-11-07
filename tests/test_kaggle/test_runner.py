@@ -1,8 +1,8 @@
 """Runner orchestration tests (fake CommandRunner; no network, no Kaggle CLI).
 
 The fake runner records argv and returns scripted ``CompletedProcess``
-results, so the whole stage sequence is exercised hermetically. The single
-score-stage test below needs a parquet engine and skips (never fails) without
+results, so the whole stage sequence is exercised hermetically. The score-stage
+and mlcspp tests below need a parquet engine and skip (never fail) without
 pyarrow, keeping the rest of the module runnable in the dev-only CI lap.
 """
 
@@ -45,9 +45,9 @@ _REPO_SHA = "0123456789abcdef0123456789abcdef01234567"
 Responder = Callable[[list[str]], subprocess.CompletedProcess[str] | None]
 
 
-def _config(tmp_path: Path) -> RunnerConfig:
+def _config(tmp_path: Path, *, slug: str = _SLUG) -> RunnerConfig:
     return RunnerConfig(
-        slug=_SLUG,
+        slug=slug,
         evidence_root=tmp_path / "runs" / "store-sales",
         dataset_id=_DATASET_ID,
         kernel_id=_KERNEL_ID,
@@ -720,6 +720,164 @@ def test_score_stage_rejects_non_mapping_workload(tmp_path):
 
     with pytest.raises(RuntimeError, match="not a mapping"):
         run_stages(config, _recording_runner([]), stages=["score"])
+
+
+# --------------------------------------------------------------------------- #
+# mlcspp dispatch (the fixture satisfies the pinned horizon=157 default)
+# --------------------------------------------------------------------------- #
+
+_MLCSPP_SLUG = "mlcspp"
+_MLCSPP_DATASET_ID = "alessiosavi/kb-mlcspp"
+_MLCSPP_KERNEL_ID = "alessiosavi/kb-mlcspp-run"
+_MLCSPP_STOCKS = ("1101", "2327", "2352", "2385", "2449", "2915", "3005", "3532", "6176", "9945")
+_MLCSPP_FIELDS = (
+    "Turnover",
+    "Volume",
+    "close",
+    "eps",
+    "high",
+    "low",
+    "open",
+    "ups_and_downs",
+    "ups_percent",
+)
+_MLCSPP_TOTAL_DAYS = 317
+_MLCSPP_HORIZON = 157
+
+
+def _mlcspp_config(tmp_path: Path) -> RunnerConfig:
+    return RunnerConfig(
+        slug=_MLCSPP_SLUG,
+        evidence_root=tmp_path / "runs" / _MLCSPP_SLUG,
+        dataset_id=_MLCSPP_DATASET_ID,
+        kernel_id=_MLCSPP_KERNEL_ID,
+        assets_dataset=_ASSETS_DATASET,
+        repo_sha=_REPO_SHA,
+    )
+
+
+def _write_mlcspp_raw(raw: Path) -> None:
+    """A raw mlcspp fixture the pinned horizon fits: 160 observed + 157 missing days."""
+    raw.mkdir(parents=True, exist_ok=True)
+    dates = list(range(1000, 1000 + _MLCSPP_TOTAL_DAYS))
+    observed = _MLCSPP_TOTAL_DAYS - _MLCSPP_HORIZON
+    rank_of = {date: rank for rank, date in enumerate(dates)}
+    order = dates[::2] + dates[1::2]  # target file: evens then odds, never sorted
+    pd.DataFrame(
+        {
+            "date": order,
+            "0056_close_y": [
+                10.0 + rank_of[date] if rank_of[date] < observed else float("nan") for date in order
+            ],
+        }
+    ).to_csv(raw / "0056.csv", index=False)
+    for index, stock in enumerate(_MLCSPP_STOCKS):
+        rotated = order[index:] + order[:index]
+        data = {"date": rotated}
+        for field in _MLCSPP_FIELDS:
+            data[f"{stock}_{field}"] = [float(date) for date in rotated]
+        pd.DataFrame(data).to_csv(raw / f"{stock}.csv", index=False)
+    pd.DataFrame(
+        {
+            "date": list(reversed(dates[-_MLCSPP_HORIZON:])),
+            "0056_close_y": [0.0] * _MLCSPP_HORIZON,
+        }
+    ).to_csv(raw / "sample_submission.csv", index=False)
+
+
+def test_prepare_stage_routes_mlcspp_to_mlcspp_prepare(tmp_path):
+    pytest.importorskip("pyarrow")
+    config = _mlcspp_config(tmp_path)
+    _write_mlcspp_raw(config.raw_dir)
+
+    run_stages(config, _recording_runner([]), stages=["prepare"])
+
+    report = json.loads(
+        (config.prepared_dir / "official" / "prepare.json").read_text(encoding="utf-8")
+    )
+    assert report["slug"] == "mlcspp"
+    assert report["train_days"] == _MLCSPP_TOTAL_DAYS - _MLCSPP_HORIZON
+    assert report["test_days"] == _MLCSPP_HORIZON
+    assert (config.prepared_dir / "official" / "date_map.parquet").is_file()
+    assert (config.prepared_dir / "mirror" / "truth.parquet").is_file()
+
+
+def test_prepare_stage_rejects_unknown_competition_slug(tmp_path):
+    config = _config(tmp_path, slug="mystery-competition")
+
+    with pytest.raises(RuntimeError, match="mystery-competition"):
+        run_stages(config, _recording_runner([]), stages=["prepare"])
+
+
+def test_score_stage_rejects_unknown_competition_slug(tmp_path):
+    config = _config(tmp_path, slug="mystery-competition")
+    root = config.fetched_dir / "kb-out"
+    (root / "finetune" / "mirror").mkdir(parents=True)
+    (root / "workload.json").write_text(json.dumps({"modes": ["finetune"]}), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="mystery-competition"):
+        run_stages(config, _recording_runner([]), stages=["score"])
+
+    assert not config.scores_path.exists()  # an unknown slug writes nothing
+
+
+def _write_mlcspp_fetched_tree(config: RunnerConfig) -> dict[int, float]:
+    """Fake kernel output for the mlcspp tree; return the expected official points."""
+    root = config.fetched_dir / "kb-out"
+    (root / "finetune" / "mirror").mkdir(parents=True)
+    (root / "finetune" / "official").mkdir(parents=True)
+    (root / "workload.json").write_text(
+        json.dumps({"modes": ["finetune"], "windows": ["mirror", "official"]}),
+        encoding="utf-8",
+    )
+
+    truth = pd.read_parquet(config.prepared_dir / "mirror" / "truth.parquet")
+    mirror_points = truth["close"] + 1.0
+    pd.DataFrame(
+        {
+            "series_id": truth["series_id"],
+            "timestamp": truth["date"],
+            "point": mirror_points,
+            "q0.5": mirror_points,
+        }
+    ).to_csv(root / "finetune" / "mirror" / "predictions.csv", index=False)
+
+    sample = pd.read_csv(config.prepared_dir / "official" / "sample_submission.csv")
+    date_map = pd.read_parquet(config.prepared_dir / "official" / "date_map.parquet")
+    window = date_map[date_map["date_int"].isin(sample["date"])]
+    raw_dates = [int(value) for value in window["date_int"]]
+    points = [float(index + 1) for index in range(len(window))]
+    stamps = window["date"].reset_index(drop=True)
+    pd.DataFrame(
+        {"series_id": "0056", "timestamp": stamps, "point": points, "q0.5": points}
+    ).to_csv(root / "finetune" / "official" / "predictions.csv", index=False)
+    return dict(zip(raw_dates, points))
+
+
+def test_score_stage_assembles_mlcspp_submission(tmp_path):
+    pytest.importorskip("pyarrow")
+    config = _mlcspp_config(tmp_path)
+    _write_mlcspp_raw(config.raw_dir)
+    run_stages(config, _recording_runner([]), stages=["prepare"])
+    expected_points = _write_mlcspp_fetched_tree(config)
+    calls: list[list[str]] = []
+
+    run_stages(config, _recording_runner(calls), stages=["score"])
+
+    assert calls == []  # scoring runs locally: no CLI commands
+    scores = json.loads(config.scores_path.read_text(encoding="utf-8"))
+    assert list(scores) == ["baseline", "finetune"]
+    assert scores["finetune"] == pytest.approx(1.0)  # mirror points are truth + 1
+    assert all(math.isfinite(value) for value in scores.values())
+    sample = pd.read_csv(config.prepared_dir / "official" / "sample_submission.csv")
+    submission = pd.read_csv(config.submission_path)
+    assert submission["date"].tolist() == sample["date"].tolist()
+    assert submission["0056_close_y"].tolist() == [
+        expected_points[date] for date in submission["date"]
+    ]
+    report = config.report_path.read_text(encoding="utf-8")
+    assert "mirror (non-official)" in report
+    assert "| finetune |" in report
 
 
 # --------------------------------------------------------------------------- #

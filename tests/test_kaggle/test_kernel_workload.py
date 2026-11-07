@@ -8,7 +8,7 @@ import pytest
 
 from demand_forecast.config import DatasetConfig, Settings
 from demand_forecast.core.run import train_from_settings
-from demand_forecast.kaggle.kernel_workload import run_workload
+from demand_forecast.kaggle.kernel_workload import _rewrite_data_paths, run_workload
 from demand_forecast.kaggle.settings import build_settings, load_template, write_settings
 
 # The dev-only CI lap installs no parquet engine: skip this module, never fail it.
@@ -274,3 +274,31 @@ def test_run_workload_rewrites_missing_dataset_paths(tmp_path: Path):
     assert result["runs"] == [
         {"mode": "finetune", "window": "mirror", "origin": _MIRROR_ORIGIN, "init_from": None}
     ]
+
+
+def test_rewrite_data_paths_keeps_none_and_rewrites_missing(tmp_path: Path):
+    """A static-less competition keeps ``None``; only set-but-missing paths move."""
+    window_root = tmp_path / "window"
+    window_root.mkdir()
+    settings = build_settings(
+        load_template(_TEMPLATES["finetune"]),
+        data=_dataset_config(window_root),
+        horizon=_HORIZON,
+    )
+    settings.data.path = None
+    settings.data.static_path = None
+
+    _rewrite_data_paths(settings, window_root)
+
+    assert settings.data.path is None  # statics-free: never synthesized into a file path
+    assert settings.data.static_path is None
+
+    existing = tmp_path / "present.parquet"
+    existing.write_bytes(b"present")
+    settings.data.path = tmp_path / "elsewhere" / "long.parquet"
+    settings.data.static_path = existing
+
+    _rewrite_data_paths(settings, window_root)
+
+    assert settings.data.path == window_root / "long.parquet"
+    assert settings.data.static_path == existing  # an existing path is left alone

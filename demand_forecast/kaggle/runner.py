@@ -5,7 +5,10 @@ One shared runner drives a competition through the pinned stage sequence —
 ``submit``. Subprocess stages receive every argv through an injectable
 ``CommandRunner``, so the whole sequence runs against fakes in tests without
 touching the network or the Kaggle CLI; the direct-call stages (``prepare``,
-``score``) call the bench modules in-process.
+``score``) call the bench modules in-process. The competition-specific pieces —
+the converter, the mirror scorer and the submission assembler — are looked up
+by ``RunnerConfig.slug`` in module-level registries; an unregistered slug fails
+loudly before any artifact is written.
 
 Evidence lives under ``RunnerConfig.evidence_root`` (``runs/<slug>/`` per the
 plan):
@@ -43,11 +46,12 @@ import zipfile
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Literal, TypeVar
 
 import pandas as pd  # type: ignore[import-untyped]  # repo venv carries no pandas stubs
 
 from demand_forecast.data.loader_long import read_table
+from demand_forecast.kaggle import mlcspp, store_sales
 from demand_forecast.kaggle.dataset import dataset_argv, write_dataset_metadata
 from demand_forecast.kaggle.kernels import (
     check_status,
@@ -86,6 +90,41 @@ _BUNDLE_DIRNAME = "bundle-L3-first-try"
 _BUNDLE_IDENTITY = "83d6acb1f7f2c1b57ba33c0ca0a870775369d52bf8fb739a9e3f7e28858826c2"
 _SUBMISSION_MESSAGE = "demand-forecast L3"
 _SUBMISSION_REF = re.compile(r"Submission ref:\s*(\d+)")
+
+_Handler = TypeVar("_Handler")
+
+
+def _competition_handler(registry: dict[str, _Handler], slug: str, stage: str) -> _Handler:
+    """The per-competition handler registered for ``slug`` at ``stage``.
+
+    An unknown slug raises ``RuntimeError`` naming it, so a misconfigured run
+    fails before any stage artifact is written.
+    """
+    handler = registry.get(slug)
+    if handler is None:
+        raise RuntimeError(f"unknown competition slug {slug!r}: no {stage} handler registered")
+    return handler
+
+
+def _prepare_store_sales(raw_dir: Path, out_dir: Path) -> store_sales.PrepareReport:
+    """Route store-sales prepare through the module-level ``prepare`` binding.
+
+    The registry entry is a named function rather than the bare import so the
+    runner's store-sales prepare seam stays exactly where tests patch it
+    (``runner.prepare``).
+    """
+    return prepare(raw_dir, out_dir)
+
+
+_PREPARE_BY_SLUG: dict[str, Callable[[Path, Path], store_sales.PrepareReport]] = {
+    store_sales.SLUG: _prepare_store_sales,
+    mlcspp.SLUG: mlcspp.prepare,
+}
+
+_SCORE_BY_SLUG: dict[str, Callable[[Path, dict[str, pd.DataFrame]], dict[str, float]]] = {
+    store_sales.SLUG: score_mirror,
+    mlcspp.SLUG: mlcspp.score_mirror,
+}
 
 
 @dataclass(frozen=True)
@@ -286,7 +325,8 @@ def _download(config: RunnerConfig, run: CommandRunner) -> None:
 
 
 def _prepare(config: RunnerConfig, run: CommandRunner) -> None:
-    prepare(config.raw_dir, config.prepared_dir)
+    handler = _competition_handler(_PREPARE_BY_SLUG, config.slug, "prepare")
+    handler(config.raw_dir, config.prepared_dir)
 
 
 def _stage_upload(config: RunnerConfig) -> Path:
@@ -364,33 +404,56 @@ def _read_workload(marker: Path) -> dict[str, object]:
     return workload
 
 
+def _assemble_store_sales(config: RunnerConfig, out_root: Path) -> None:
+    """Build and validate the store-sales submission from the fetched official points."""
+    predictions = pd.read_csv(out_root / "finetune" / "official" / "predictions.csv")
+    test_ids = read_table(config.prepared_dir / "official" / "test_ids.parquet")
+    candidate = build_store_sales_submission(predictions, test_ids, config.submission_path)
+    sample = pd.read_csv(config.prepared_dir / "official" / "sample_submission.csv")
+    validate_submission(candidate, sample)
+
+
+def _assemble_mlcspp(config: RunnerConfig, out_root: Path) -> None:
+    """Build and validate the mlcspp submission from the fetched official points."""
+    predictions = pd.read_csv(out_root / "finetune" / "official" / "predictions.csv")
+    candidate = mlcspp.build_submission(
+        predictions, config.prepared_dir / "official", config.submission_path
+    )
+    sample = pd.read_csv(config.prepared_dir / "official" / "sample_submission.csv")
+    mlcspp.validate_submission(candidate, sample)
+
+
+_ASSEMBLE_BY_SLUG: dict[str, Callable[[RunnerConfig, Path], None]] = {
+    store_sales.SLUG: _assemble_store_sales,
+    mlcspp.SLUG: _assemble_mlcspp,
+}
+
+
 def _score(config: RunnerConfig, run: CommandRunner) -> None:
     """Score the mirror window, assemble the submission, and write the report.
 
     The fetched predictions are anchored at the marker's parent — the kernel
     workload's out root, which holds ``<mode>/<window>/predictions.csv``. The
-    submission candidate is assembled from the fetched official fine-tune
-    predictions and validated against the prepared ``sample_submission.csv``;
-    a validation failure raises here, before the submit stage can see it.
+    scorer and the submission assembler are dispatched by the competition slug;
+    the candidate is validated against the prepared ``sample_submission.csv``,
+    so a validation failure raises here, before the submit stage can see it.
     """
     marker = _require_workload(config.fetched_dir)
     workload = _read_workload(marker)
     modes = workload.get("modes")
     if not isinstance(modes, list) or "finetune" not in modes:
         raise RuntimeError(f"{marker}: workload.json does not list the finetune mode")
+    score = _competition_handler(_SCORE_BY_SLUG, config.slug, "score")
     out_root = marker.parent
     frames = {
         str(mode): pd.read_csv(out_root / str(mode) / "mirror" / "predictions.csv")
         for mode in modes
     }
     prepared = config.prepared_dir
-    scores = score_mirror(prepared / "mirror", frames)
+    scores = score(prepared / "mirror", frames)
     config.scores_path.write_text(json.dumps(scores, indent=2) + "\n", encoding="utf-8")
-    predictions = pd.read_csv(out_root / "finetune" / "official" / "predictions.csv")
-    test_ids = read_table(prepared / "official" / "test_ids.parquet")
-    candidate = build_store_sales_submission(predictions, test_ids, config.submission_path)
-    sample = pd.read_csv(prepared / "official" / "sample_submission.csv")
-    validate_submission(candidate, sample)
+    assemble = _competition_handler(_ASSEMBLE_BY_SLUG, config.slug, "assemble")
+    assemble(config, out_root)
     write_report(config.evidence_root, scores)
 
 
