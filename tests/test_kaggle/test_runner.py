@@ -12,6 +12,7 @@ import importlib.util
 import json
 import math
 import subprocess
+import zipfile
 from collections.abc import Callable
 from pathlib import Path
 from typing import cast
@@ -134,7 +135,7 @@ def test_plan_stages_lists_expected_commands(tmp_path):
     ]
     assert plan[1] == []  # prepare calls store_sales.prepare directly
     assert plan[2][:3] == ["kaggle", "datasets", "version"]
-    assert plan[2][3:5] == ["-p", str(config.prepared_dir)]
+    assert plan[2][3:5] == ["-p", str(config.upload_dir)]
     assert plan[2][plan[2].index("-m") + 1]  # version always carries a message
     assert plan[3] == [
         "kaggle",
@@ -186,7 +187,7 @@ def test_run_stages_records_commands_with_fake_runner(tmp_path):
     assert prefixes[0] == ["kaggle", "competitions", "download"]
     assert ["kaggle", "datasets", "status"] in prefixes
     version = next(argv for argv in calls if argv[:3] == ["kaggle", "datasets", "version"])
-    assert version[3:5] == ["-p", str(config.prepared_dir)]
+    assert version[3:5] == ["-p", str(config.upload_dir)]
     push = next(argv for argv in calls if argv[:3] == ["kaggle", "kernels", "push"])
     assert push[3:5] == ["-p", str(config.kernel_dir)]
     assert prefixes[-1] == ["kaggle", "kernels", "output"]
@@ -198,7 +199,7 @@ def test_run_stages_records_commands_with_fake_runner(tmp_path):
         assert prefixes.index(earlier) < prefixes.index(later)
     # The packaging stages wrote their artifacts, with the pinned mounts and SHA.
     assert json.loads(
-        (config.prepared_dir / "dataset-metadata.json").read_text(encoding="utf-8")
+        (config.upload_dir / "dataset-metadata.json").read_text(encoding="utf-8")
     ) == {"title": f"kb {_SLUG} prepared", "id": _DATASET_ID, "licenses": [{"name": "other"}]}
     metadata = json.loads((config.kernel_dir / "kernel-metadata.json").read_text(encoding="utf-8"))
     assert metadata["id"] == _KERNEL_ID
@@ -245,7 +246,7 @@ def test_upload_versions_existing_dataset(tmp_path):
 
     assert calls[0] == ["kaggle", "datasets", "status", _DATASET_ID]
     assert calls[1][:3] == ["kaggle", "datasets", "version"]
-    assert calls[1][3:5] == ["-p", str(config.prepared_dir)]
+    assert calls[1][3:5] == ["-p", str(config.upload_dir)]
     assert calls[1][calls[1].index("-m") + 1] == f"demand-forecast L3 {_SLUG} prepared"
 
 
@@ -266,11 +267,69 @@ def test_upload_creates_missing_dataset(tmp_path):
         "datasets",
         "create",
         "-p",
-        str(config.prepared_dir),
+        str(config.upload_dir),
         "--dir-mode",
         "zip",
     ]
     assert "-m" not in calls[-1]  # create takes no message
+
+
+_UPLOAD_FIXTURE: dict[str, bytes] = {
+    "official/long.parquet": b"official long bytes",
+    "official/sample_submission.csv": b"id,sales\n1,0.0\n",
+    "mirror/prepare.json": b'{"mirror_origin": "2017-08-03"}',
+    "mirror/static.parquet": b"mirror static bytes",
+    "mirror/truth.parquet": b"mirror truth bytes",
+}
+
+
+def _write_minimal_prepared_tree(config: RunnerConfig) -> None:
+    """A prepared-tree fixture of plain bytes: no parquet engine required."""
+    for relative, content in _UPLOAD_FIXTURE.items():
+        path = config.prepared_dir / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+
+
+def test_upload_stages_prepared_tree_as_single_archive(tmp_path):
+    config = _config(tmp_path)
+    _write_minimal_prepared_tree(config)
+    calls: list[list[str]] = []
+
+    run_stages(config, _recording_runner(calls), stages=["upload"])
+
+    assert sorted(path.name for path in config.upload_dir.iterdir()) == [
+        "dataset-metadata.json",
+        f"{_SLUG}-prepared.zip",
+    ]
+    with zipfile.ZipFile(config.upload_dir / f"{_SLUG}-prepared.zip") as bundle:
+        # The entries are the prepared tree's relative paths: the dataset layout.
+        assert set(bundle.namelist()) == set(_UPLOAD_FIXTURE)
+        assert bundle.read("mirror/truth.parquet") == b"mirror truth bytes"
+
+
+def test_upload_rerun_rebuilds_staging_without_stale_entries(tmp_path):
+    config = _config(tmp_path)
+    _write_minimal_prepared_tree(config)
+    calls: list[list[str]] = []
+
+    run_stages(config, _recording_runner(calls), stages=["upload"])
+    stale_file = config.upload_dir / "stale.txt"
+    stale_file.write_text("stale", encoding="utf-8")
+    stale_dir = config.upload_dir / "stale-dir"
+    stale_dir.mkdir()
+    (stale_dir / "junk.parquet").write_bytes(b"junk")
+
+    run_stages(config, _recording_runner(calls), stages=["upload"])
+
+    assert not stale_file.exists()
+    assert not stale_dir.exists()
+    assert sorted(path.name for path in config.upload_dir.iterdir()) == [
+        "dataset-metadata.json",
+        f"{_SLUG}-prepared.zip",
+    ]
+    with zipfile.ZipFile(config.upload_dir / f"{_SLUG}-prepared.zip") as bundle:
+        assert set(bundle.namelist()) == set(_UPLOAD_FIXTURE)
 
 
 def test_upload_without_prepared_tree_raises(tmp_path):

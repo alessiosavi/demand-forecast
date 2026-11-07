@@ -13,6 +13,13 @@ plan):
 - ``raw/`` — downloaded competition files (never published);
 - ``prepared/`` — the competition module's converter output (official and
   mirror variants, settings, ``prepare.json``);
+- ``upload/`` — the dataset upload staging area: ``dataset-metadata.json``
+  plus one zip of the prepared tree whose entries are the tree's relative
+  paths, i.e. the dataset's final layout. Uploading ``prepared/`` directly
+  cannot work: ``--dir-mode zip`` archives each top-level directory flat (the
+  variants collide on filenames) and ``datasets version`` skips directories by
+  default, while the server extracts uploaded archives preserving their
+  internal paths, so one pre-built archive uploads correctly through both;
 - ``kernel/`` — the pushable kernel directory (metadata and generated driver);
 - ``fetched/`` — the kernel output tree; a ``workload.json`` marker (written at
   the workload's out root) is the completeness check;
@@ -32,6 +39,7 @@ import re
 import shutil
 import subprocess
 import time
+import zipfile
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -102,6 +110,10 @@ class RunnerConfig:
     @property
     def prepared_dir(self) -> Path:
         return self.evidence_root / "prepared"
+
+    @property
+    def upload_dir(self) -> Path:
+        return self.evidence_root / "upload"
 
     @property
     def kernel_dir(self) -> Path:
@@ -199,7 +211,7 @@ def plan_stages(config: RunnerConfig) -> list[list[str]]:
     return [
         _download_argv(config.slug, config.raw_dir),
         [],
-        dataset_argv("version", config.prepared_dir, message=_upload_message(config.slug)),
+        dataset_argv("version", config.upload_dir, message=_upload_message(config.slug)),
         push_argv(config.kernel_dir),
         output_argv(config.kernel_id, config.fetched_dir),
         [],
@@ -269,9 +281,39 @@ def _prepare(config: RunnerConfig, run: CommandRunner) -> None:
     prepare(config.raw_dir, config.prepared_dir)
 
 
+def _stage_upload(config: RunnerConfig) -> Path:
+    """Rebuild the upload staging area from the prepared tree; return it.
+
+    The staging area holds ``dataset-metadata.json`` plus a single zip whose
+    entries are the prepared tree's relative paths, POSIX-style
+    (``official/long.parquet``, ``mirror/truth.parquet``, …) — exactly the
+    dataset's final layout. Uploading ``prepared_dir`` directly cannot work:
+    ``--dir-mode zip`` archives each top-level directory flat (the official
+    and mirror variants would collide on filenames), and ``datasets version``
+    skips directories by default. The server extracts uploaded archives
+    preserving their internal paths — observed live: a folder holding only
+    such an archive uploads cleanly through both commands, its paths becoming
+    the dataset layout. The area is cleared first so re-runs leave nothing
+    stale.
+    """
+    upload = config.upload_dir
+    shutil.rmtree(upload, ignore_errors=True)
+    upload.mkdir(parents=True, exist_ok=True)
+    write_dataset_metadata(upload, dataset_id=config.dataset_id, title=f"kb {config.slug} prepared")
+    with zipfile.ZipFile(
+        upload / f"{config.slug}-prepared.zip", "w", zipfile.ZIP_DEFLATED
+    ) as bundle:
+        for path in sorted(config.prepared_dir.rglob("*")):
+            if path.is_file():
+                bundle.write(path, path.relative_to(config.prepared_dir).as_posix())
+    return upload
+
+
 def _upload(config: RunnerConfig, run: CommandRunner) -> None:
     """Create the private prepared dataset on first upload, version it later.
 
+    The prepared tree is staged first (see ``_stage_upload``) and the staged
+    directory — never ``prepared_dir`` — is what the CLI receives.
     ``kaggle datasets status`` probes membership: success means the dataset
     exists and gets a new version (always carrying a message — the CLI
     requires ``-m`` for ``version``), failure means it is created empty of
@@ -279,14 +321,12 @@ def _upload(config: RunnerConfig, run: CommandRunner) -> None:
     """
     if not config.prepared_dir.is_dir():
         raise RuntimeError(f"prepared tree {config.prepared_dir} is missing; run 'prepare' first")
-    write_dataset_metadata(
-        config.prepared_dir, dataset_id=config.dataset_id, title=f"kb {config.slug} prepared"
-    )
+    staged = _stage_upload(config)
     status = run(["kaggle", "datasets", "status", config.dataset_id])
     if status.returncode == 0:
-        argv = dataset_argv("version", config.prepared_dir, message=_upload_message(config.slug))
+        argv = dataset_argv("version", staged, message=_upload_message(config.slug))
     else:
-        argv = dataset_argv("create", config.prepared_dir)
+        argv = dataset_argv("create", staged)
     _checked(run, argv)
 
 
