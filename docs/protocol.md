@@ -530,8 +530,11 @@ fit IDs and can differ. Refit and per-window repetition add work.
 Validation and prediction keep their existing batches when they fit. On CUDA OOM
 (or a runtime error containing “out of memory”), they release the cache, halve
 the batch and retry the same rows down to a floor of eight. A failure at that
-floor propagates. Reduced limits persist only within that task, independently
-for validation and prediction. Training batches never back off. Slicing preserves
+floor propagates outside fitting; validation during fitting continues down to
+one row. Reduced limits persist only within that task, independently for
+validation and prediction. Training OOMs halve micro-batches down to one row,
+preserving the effective batch and optimizer/scheduler step counts; the training
+limit is saved in checkpoints and shared with task-local refits. Slicing preserves
 input padding and item order; different batched kernels can still differ in the
 last floating-point bits after back-off. No-OOM runs retain their original path.
 

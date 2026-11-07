@@ -25,7 +25,7 @@ from demand_forecast.core.evaluation import (
     evaluate_prepared,
     prepare_validation,
 )
-from demand_forecast.core.inference_batching import batch_limit
+from demand_forecast.core.inference_batching import batch_limit, is_oom_error
 from demand_forecast.core.validation import ValidationPlan
 from demand_forecast.data.encoders import StaticEncoder
 from demand_forecast.data.frequency import grid_range
@@ -160,10 +160,7 @@ def _evaluate_with_backoff(model, prepared: PreparedValidation, quantiles) -> di
         try:
             return evaluate_prepared(model, prepared, quantiles)
         except RuntimeError as exc:
-            if (
-                not isinstance(exc, torch.cuda.OutOfMemoryError)
-                and "out of memory" not in str(exc).lower()
-            ):
+            if not is_oom_error(exc):
                 raise
             largest = max(batch.size for batch in prepared.batches)
             size = min(prepared.batch_limit.size or largest, largest)
@@ -224,7 +221,13 @@ class Trainer:
         """Retry the same effective batch, discarding all failed-attempt gradients."""
         rng = torch.get_rng_state()
         rng_device = self.device
-        cuda_rng = torch.cuda.get_rng_state(rng_device) if rng_device.type == "cuda" else None
+        cuda_rng = (
+            torch.cuda.get_rng_state(rng_device)
+            if rng_device.type == "cuda"
+            and torch.cuda.is_available()
+            and torch.cuda.is_initialized()
+            else None
+        )
         while True:
             size = min(self._micro_batch_limit.size or cpu_batch.size, cpu_batch.size)
             self.optimizer.zero_grad(set_to_none=True)
@@ -243,7 +246,9 @@ class Trainer:
                         self.optimizer.zero_grad(set_to_none=True)
                         break
                 return value
-            except torch.cuda.OutOfMemoryError:
+            except RuntimeError as exc:
+                if not is_oom_error(exc):
+                    raise
                 self.optimizer.zero_grad(set_to_none=True)
                 if size == 1:
                     raise

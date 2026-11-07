@@ -1,4 +1,8 @@
-"""Task-local OOM back-off for validation and prediction, never training."""
+"""Task-local OOM back-off for validation, prediction and training micro-batches.
+
+Training halves micro-batches down to one row while preserving effective batch
+and step counts; its limit survives checkpoints and is shared with task-local refits.
+"""
 
 import gc
 import logging
@@ -34,6 +38,11 @@ def batch_limit(kind: str) -> BatchLimit:
     return BatchLimit() if limits is None else limits.setdefault(kind, BatchLimit())
 
 
+def is_oom_error(exc: RuntimeError) -> bool:
+    """Recognize typed CUDA OOMs and message-based runtime OOMs consistently."""
+    return isinstance(exc, torch.cuda.OutOfMemoryError) or "out of memory" in str(exc).lower()
+
+
 @torch.no_grad()
 def _predict(model, cpu_batch):
     # Keep device tensors in this frame so unwinding releases them before retry.
@@ -59,10 +68,7 @@ def predict_batches(model, cpu_batch, limit: BatchLimit):
         try:
             predictions = _predict(model, chunk)
         except RuntimeError as exc:
-            if (
-                not isinstance(exc, torch.cuda.OutOfMemoryError)
-                and "out of memory" not in str(exc).lower()
-            ):
+            if not is_oom_error(exc):
                 raise
             if size <= 8:
                 raise

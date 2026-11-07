@@ -105,8 +105,9 @@ def test_no_oom_matches_original_full_batch_loop(case, monkeypatch):
 
 
 @pytest.mark.parametrize("failure", ["forward", "backward", "transfer"])
+@pytest.mark.parametrize("error_type", [torch.cuda.OutOfMemoryError, RuntimeError])
 def test_training_oom_retries_same_step_and_preserves_effective_batch(
-    case, monkeypatch, caplog, failure
+    case, monkeypatch, caplog, failure, error_type
 ):
     cfg, args = case
     baseline = trainer_for(cfg)
@@ -125,11 +126,11 @@ def test_training_oom_retries_same_step_and_preserves_effective_batch(
             if failure == "backward":
 
                 def oom(grad):
-                    raise torch.cuda.OutOfMemoryError("simulated backward OOM")
+                    raise error_type("simulated backward out of memory")
 
                 predictions.register_hook(oom)
             elif failure == "forward":
-                raise torch.cuda.OutOfMemoryError("simulated forward OOM")
+                raise error_type("simulated forward out of memory")
         return predictions
 
     monkeypatch.setattr(actual.model, "forward", maybe_fail)
@@ -143,7 +144,7 @@ def test_training_oom_retries_same_step_and_preserves_effective_batch(
             if actual.step == 2 and not failed:
                 failed = True
                 calls.append((actual.step, batch.size))
-                raise torch.cuda.OutOfMemoryError("simulated transfer OOM")
+                raise error_type("simulated transfer out of memory")
             return transfer(batch, device)
 
         monkeypatch.setattr(Batch, "to", fail_transfer)
