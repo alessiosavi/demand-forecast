@@ -41,7 +41,8 @@ def assert_panels_equal(actual, expected):
 @pytest.mark.parametrize("cutoff", [None, 12, "2022-05-01"])
 @pytest.mark.parametrize("freq", ["W-SUN", "MS", "5min"])
 @pytest.mark.parametrize("events,multiple", [(False, False), (True, True)])
-def test_cached_panels_equal_window_rebuilds(tmp_path, cutoff, freq, events, multiple):
+@pytest.mark.parametrize("seasonality", [None, 1, 96])
+def test_cached_panels_equal_window_rebuilds(tmp_path, cutoff, freq, events, multiple, seasonality):
     from datasets import Dataset
 
     from demand_forecast.bench.panels import TaskPanelCache
@@ -70,6 +71,7 @@ def test_cached_panels_equal_window_rebuilds(tmp_path, cutoff, freq, events, mul
         )[-1].isoformat()
     spec = fixture_spec(
         parquet,
+        seasonality=seasonality,
         initial_cutoff=cutoff,
         window_step_size=3,
         static_columns=["cat", "number"],
@@ -97,7 +99,9 @@ def test_cached_panels_equal_window_rebuilds(tmp_path, cutoff, freq, events, mul
 def test_cached_run_writes_same_forecasts_as_rebuild(tmp_path, monkeypatch, policy):
     from demand_forecast.bench.panels import TaskPanelCache
 
-    spec = fixture_spec(write_fev_fixture(tmp_path, lengths=[40, 38, 40, 28, 38, 40]))
+    spec = fixture_spec(
+        write_fev_fixture(tmp_path, lengths=[40, 38, 40, 28, 38, 40]), seasonality=4
+    )
     settings = tiny_settings(base_steps=2, d_model=8)
     cached = tmp_path / "cached"
     reference = tmp_path / "reference"
@@ -128,14 +132,27 @@ def test_cached_run_writes_same_forecasts_as_rebuild(tmp_path, monkeypatch, poli
 
 
 @pytest.mark.parametrize("policy", ["first_window", "per_window"])
-def test_completed_resume_skips_before_panel_build(tmp_path, monkeypatch, capsys, policy):
+@pytest.mark.parametrize("freq,seasonality", [("W-SUN", 1), ("D", 7), ("15min", 96)])
+def test_completed_resume_skips_before_panel_build(
+    tmp_path, monkeypatch, capsys, policy, freq, seasonality
+):
     from demand_forecast.bench.panels import TaskPanelCache
     from demand_forecast.data import loader_fev
 
-    spec = fixture_spec(write_fev_fixture(tmp_path))
+    spec = fixture_spec(write_fev_fixture(tmp_path, freq=freq, length=160), seasonality=seasonality)
     settings = tiny_settings(base_steps=2, d_model=8)
     out = tmp_path / "out"
-    run_fev([spec], settings, out, policy=policy)
+    definition = type(spec).task_definition
+    with monkeypatch.context() as legacy:
+        if freq == "D":
+            # Build artifacts with the pre-change identity for a matching period.
+            legacy.setattr(type(spec), "task_definition", lambda self, freq=None: definition(self))
+        run_fev([spec], settings, out, policy=policy)
+    if freq == "D":
+        for path in out.rglob("run.json"):
+            report = json.loads(path.read_text())
+            del report["seasonal_period"], report["seasonal_period_source"]
+            path.write_text(json.dumps(report))
     capsys.readouterr()
     before = {path: path.read_bytes() for path in out.rglob("*") if path.is_file()}
 

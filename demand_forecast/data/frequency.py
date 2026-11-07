@@ -25,14 +25,14 @@ class GridError(ValueError):
 
 
 def to_offset(freq: str | pd.offsets.BaseOffset) -> pd.offsets.BaseOffset:
-    """Parse an offset, accepting the legacy H/M aliases on pandas 2 and 3."""
+    """Parse an offset, accepting the legacy H/M/T aliases on pandas 2 and 3."""
     legacy = None
     if isinstance(freq, str):
-        # H and M warn in pandas 2.2 and are removed in pandas 3.
-        legacy = re.fullmatch(r"(\d*)(H|M)", freq.strip())
+        # These aliases warn in pandas 2.2 and are removed in pandas 3.
+        legacy = re.fullmatch(r"(\d*)(H|M|T)", freq.strip())
         if legacy:
             count, alias = legacy.groups()
-            freq = count + {"H": "h", "M": "ME"}[alias]
+            freq = count + {"H": "h", "M": "ME", "T": "min"}[alias]
     try:
         return pd.tseries.frequencies.to_offset(freq)
     except ValueError:

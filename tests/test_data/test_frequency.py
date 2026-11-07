@@ -30,6 +30,7 @@ from demand_forecast.data.frequency import (
         ("M", 12),
         ("1M", 12),
         ("15min", 1),
+        ("15T", 1),
         ("60min", 24),
         ("24h", 7),
         ("2D", 1),
@@ -63,6 +64,7 @@ def test_seasonal_period_rejects_invalid_frequency():
         ("2H", pd.offsets.Hour(2)),
         ("M", pd.offsets.MonthEnd()),
         ("2M", pd.offsets.MonthEnd(2)),
+        ("15T", pd.offsets.Minute(15)),
     ],
 )
 def test_to_offset_normalizes_legacy_aliases_without_warnings(alias, expected):

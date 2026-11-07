@@ -120,7 +120,10 @@ def test_statics_follow_declared_types_and_preserve_missing_values(tmp_path):
 @pytest.mark.parametrize(
     "freq,start,period", [("D", "2023-01-01", 7), ("h", "2023-01-01", 24), ("MS", "2023-01-01", 12)]
 )
-def test_custom_column_names_no_covariates_and_frequency(tmp_path, freq, start, period):
+@pytest.mark.parametrize("seasonality", [None, 99])
+def test_custom_column_names_no_covariates_and_frequency(
+    tmp_path, freq, start, period, seasonality
+):
     from datasets import Dataset
 
     parquet = write_fev_fixture(
@@ -140,13 +143,13 @@ def test_custom_column_names_no_covariates_and_frequency(tmp_path, freq, start, 
         past_dynamic=[],
         static_columns=[],
         categorical_statics=[],
-        seasonality=99,
+        seasonality=seasonality,
     )
     task = spec.to_task()
     past, future = next(task.iter_windows()).get_input_data()
     panel = panel_from_window(past, future, spec, task.freq)
     assert panel.freq == pd.tseries.frequencies.to_offset(freq)
-    assert panel.seasonal_period == period
+    assert panel.seasonal_period == (period if seasonality is None else seasonality)
     assert panel.roles == Roles("sales", (), (), (), ())
     assert item_ids(panel) == list(past["item"])
     for series, row in zip(panel.series, past, strict=True):
