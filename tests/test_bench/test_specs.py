@@ -239,11 +239,20 @@ def test_custom_yaml_uses_fev_defaults_and_requires_profile(tmp_path):
     spec = load_task_specs(str(path), profiles)[0]
     assert spec.target_support == "real"
     assert spec.target == "target"
-    assert spec.horizon == spec.num_windows == spec.seasonality == spec.min_context_length == 1
+    assert spec.horizon == spec.num_windows == spec.min_context_length == 1
+    assert spec.seasonality is None
     assert spec.initial_cutoff is None
     assert spec.eval_metric == "MASE"
     assert spec.quantile_levels == spec.extra_metrics == []
     assert spec.to_task().to_dict() == fev.Task(**task).to_dict()
+
+
+@pytest.mark.parametrize("seasonality", [0, -1, 1.5, True])
+def test_task_seasonality_must_be_a_positive_integer(seasonality):
+    with pytest.raises(ValueError, match="seasonality"):
+        FevTaskSpec(
+            name="invalid", dataset_path="unused", target_support="real", seasonality=seasonality
+        )
 
 
 @pytest.mark.bench

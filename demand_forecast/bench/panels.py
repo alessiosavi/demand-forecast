@@ -8,7 +8,6 @@ import pandas as pd
 from demand_forecast.bench.specs import FevTaskSpec
 from demand_forecast.data.frequency import (
     grid_range,
-    seasonal_period,
     steps_between,
     to_offset,
     validate_on_grid,
@@ -136,7 +135,7 @@ class TaskPanelCache:
             [series for target in spec.targets for series in by_target[target]],
             roles,
             offset,
-            seasonal_period(offset),
+            spec.effective_seasonal_period(offset),
             support,
         )
 

@@ -264,9 +264,11 @@ item, horizon and quantile axes.
 with each later window's expanded past. `window_origins` reads every item's first
 future timestamp. `resolved_origin` uses their latest timestamp for training,
 inner validation and run identity; the bundle's permissible origin floor is the
-earliest timestamp in the first window. With `per_window`, each window uses its
-own panel, latest training origin, earliest forecast origin, encoder and bundle
-under `<task>/window_<w>/`; predictions remain at `<task>/window_<w>.npz`.
+earliest per-item origin over all evaluation windows of the task, including items
+that only enter later windows (`run.json` records the window-0 and all-window
+minima). With `per_window`, each window uses its own panel, latest training
+origin, encoder and bundle under `<task>/window_<w>/`, all sharing that task-wide
+floor; predictions remain at `<task>/window_<w>.npz`.
 Window identities include `policy: per_window`. Summary identity is SHA256 of the
 ordered window identities as a compact UTF-8 JSON list, and training time sums
 all windows. Default first-window identity payloads are unchanged.

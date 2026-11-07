@@ -84,7 +84,7 @@ def _prepare_tasks(specs: Iterable[FevTaskSpec], settings: Settings) -> list[_Ta
                 origin,
                 min(origins.values()),
                 fingerprint,
-                spec.task_definition(),
+                spec.task_definition(task.freq),
                 len(plan.fit_ids),
             )
         )

@@ -6,7 +6,7 @@ from dataclasses import replace
 import pandas as pd
 
 from demand_forecast.bench.specs import FevTaskSpec
-from demand_forecast.data.frequency import seasonal_period, to_offset
+from demand_forecast.data.frequency import to_offset
 from demand_forecast.data.panel import Panel, Roles, build_series
 
 
@@ -45,6 +45,8 @@ def panel_from_window(past_data, future_data, spec: FevTaskSpec, freq: str) -> P
     timestamp on the supplied task frequency. Only known covariates are read
     from future rows; each item's last past timestamp fixes its history end.
     Statics come from the past and follow the spec's categorical/numeric roles.
+    Use the task's explicit seasonality, falling back to the frequency only
+    when the spec omits it.
 
     Use ``missing_target="nan"`` because fev already represents missing values
     with NaN; the trainer applies the configured missing-target policy later.
@@ -171,7 +173,7 @@ def panel_from_window(past_data, future_data, spec: FevTaskSpec, freq: str) -> P
         if isinstance(spec.target_support, dict)
         else spec.target_support
     )
-    return Panel(series, roles, offset, seasonal_period(offset), support)
+    return Panel(series, roles, offset, spec.effective_seasonal_period(offset), support)
 
 
 def item_ids(panel: Panel) -> list[str]:

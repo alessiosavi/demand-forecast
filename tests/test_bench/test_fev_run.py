@@ -64,6 +64,40 @@ def test_predictions_for_fev_reorders_and_fails_on_missing():
         predictions_for_fev(["b", "a"], ARR, ["a", "b", "c"], Q9)
 
 
+@pytest.mark.parametrize("policy", ["first_window", "per_window"])
+@pytest.mark.parametrize(
+    "freq,seasonality,expected,source",
+    [("15min", 96, 96, "task_spec"), ("15min", None, 1, "frequency"), ("D", 7, 7, "task_spec")],
+)
+def test_run_audits_effective_seasonality(
+    tmp_path, caplog, freq, seasonality, expected, source, policy
+):
+    spec = fixture_spec(
+        write_fev_fixture(tmp_path, n_series=2, length=160, freq=freq), seasonality=seasonality
+    )
+    settings = tiny_settings(base_steps=1, d_model=8)
+    settings.forecast.max_context = 8
+    out = tmp_path / "out"
+    with caplog.at_level("INFO", logger="demand_forecast.bench.run"):
+        summary = run_fev([spec], settings, out, policy=policy)
+    assert np.isfinite(summary.SQL.iloc[0])
+    task_dir = out / spec.name
+    training_dirs = (
+        [task_dir]
+        if policy == "first_window"
+        else [task_dir / f"window_{index}" for index in range(spec.num_windows)]
+    )
+    for directory in training_dirs:
+        report = json.loads((directory / "run.json").read_text())
+        assert report["task_definition"] == spec.task_definition(freq)
+        assert report["seasonal_period"] == expected
+        assert report["seasonal_period_source"] == source
+        assert "seasonal_period_source" not in report["task_definition"]
+        metadata = json.loads((directory / "bundle/panel.json").read_text())
+        assert metadata["seasonal_period"] == expected
+    assert f"seasonal_period={expected} seasonal_period_source={source}" in caplog.text
+
+
 def test_offline_fev_task_end_to_end_with_resume_and_replacement(tmp_path, monkeypatch):
     from demand_forecast.core import run
     from demand_forecast.inference.predictor import Predictor

@@ -15,6 +15,8 @@ from typing import Any, Literal
 
 import yaml
 
+from demand_forecast.data.frequency import seasonal_period
+
 FEV_DATASETS_REVISION = "d3e7e720f4158eab03ebcb021f1cce779cd92acc"
 
 
@@ -93,7 +95,9 @@ class FevTaskSpec:
     dataset_config: str | None = None
     horizon: int = 1
     num_windows: int = 1
-    seasonality: int = 1
+    # None retains omission for the panel's frequency fallback. fev itself
+    # still uses its default seasonality of 1 when this setting is absent.
+    seasonality: int | None = None
     quantile_levels: list[float] = field(default_factory=list)
     target: str | list[str] = "target"
     known_dynamic: list[str] = field(default_factory=list)
@@ -115,6 +119,12 @@ class FevTaskSpec:
     event_dynamics: InitVar[dict[str, list[str]] | None] = None
 
     def __post_init__(self, event_dynamics):
+        if self.seasonality is not None and (
+            isinstance(self.seasonality, bool)
+            or not isinstance(self.seasonality, int)
+            or self.seasonality < 1
+        ):
+            raise ValueError("seasonality must be a positive integer or None")
         if isinstance(self.target, list) and (
             not self.target or len(set(self.target)) != len(self.target)
         ):
@@ -173,9 +183,17 @@ class FevTaskSpec:
             values["event_dynamics"] = deepcopy(self.event_dynamics)
         return values
 
-    def task_definition(self) -> dict:
-        """Return the evaluation boundaries included in a model run's identity."""
-        return {
+    def effective_seasonal_period(self, freq) -> int:
+        """Use explicit task seasonality, or the frequency's period when omitted."""
+        return self.seasonality if self.seasonality is not None else seasonal_period(freq)
+
+    def task_definition(self, freq: str | None = None) -> dict:
+        """Include a panel period only when it changes frequency-only behavior.
+
+        Identity callers supply the resolved task frequency; without it, return
+        the legacy evaluation definition.
+        """
+        definition = {
             "name": self.name,
             "horizon": self.horizon,
             "num_windows": self.num_windows,
@@ -187,6 +205,11 @@ class FevTaskSpec:
             **({"targets": list(self.target)} if isinstance(self.target, list) else {}),
             **({"event_dynamics": deepcopy(self.event_dynamics)} if self.event_dynamics else {}),
         }
+        if freq is not None:
+            period = self.effective_seasonal_period(freq)
+            if period != seasonal_period(freq):
+                definition["seasonal_period"] = period
+        return definition
 
     def to_task(self) -> fev.Task:  # noqa: F821 -- optional import stays local.
         """Construct the pinned fev task without loading its dataset."""
@@ -200,6 +223,8 @@ class FevTaskSpec:
         values["known_dynamic_columns"] = values.pop("known_dynamic")
         values["past_dynamic_columns"] = values.pop("past_dynamic")
         del values["categorical_statics"], values["target_support"]
+        if self.seasonality is None:
+            del values["seasonality"]
         local_path = _local_path(self.dataset_path)
         values["dataset_path"] = str(local_path or self.dataset_path)
         if local_path is not None:

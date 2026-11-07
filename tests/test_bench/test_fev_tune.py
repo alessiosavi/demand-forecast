@@ -169,6 +169,15 @@ def harness(tmp_path, monkeypatch):
     return h
 
 
+@pytest.mark.parametrize("seasonality", [None, 1, 7])
+def test_prepared_task_uses_panel_period_in_identity(harness, seasonality):
+    spec = replace(harness.specs[-1], seasonality=seasonality)
+    prepared = tune._prepare_tasks([spec], harness.settings)[0]
+    assert prepared.panel.seasonal_period == (seasonality or 1)
+    assert prepared.definition == spec.task_definition("W-SUN")
+    assert ("seasonal_period" in prepared.definition) == (seasonality == 7)
+
+
 def test_baseline_ratios_cache_order_settings_and_cleanup(harness):
     h = harness
     original = h.settings.model_dump()

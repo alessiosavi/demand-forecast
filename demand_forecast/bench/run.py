@@ -239,7 +239,7 @@ def _completed_task(task, spec, settings, directory, row, fingerprint, policy, i
                 fingerprint,
                 __version__,
                 resolved_origin(origins),
-                spec.task_definition(),
+                spec.task_definition(task.freq),
                 policy=policy,
             )
             if index == 0 and identities is not None:
@@ -324,7 +324,8 @@ def _run_fev_tasks(
         task = spec.to_task()
         fp = dataset_fingerprint(task)
         task_settings = settings_for_task(spec, settings, task.freq)
-        definition = spec.task_definition()
+        definition = spec.task_definition(task.freq)
+        period_source = "task_spec" if spec.seasonality is not None else "frequency"
         # Later windows can introduce items whose own cutoffs precede window 0.
         # Read only origins here; build each heavy panel once in the forecast loop.
         origins_per_window = [
@@ -372,11 +373,14 @@ def _run_fev_tasks(
             started = time.perf_counter()
             panel = panel_cache.for_window(window, past)
             logger.info(
-                "panel: task=%s window=%d series=%d build_s=%.1f",
+                "panel: task=%s window=%d series=%d build_s=%.1f "
+                "seasonal_period=%d seasonal_period_source=%s",
                 spec.name,
                 index,
                 len(panel.series),
                 time.perf_counter() - started,
+                panel.seasonal_period,
+                period_source,
             )
             origins = origins_per_window[index]
             origin = resolved_origin(origins)
@@ -434,8 +438,13 @@ def _run_fev_tasks(
                     policy=policy,
                 )
                 report = json.loads((training_dir / "run.json").read_text(encoding="utf-8"))
-                if any(report.get(key) != value for key, value in origin_diagnostics.items()):
-                    report.update(origin_diagnostics)
+                run_diagnostics = {
+                    **origin_diagnostics,
+                    "seasonal_period": panel.seasonal_period,
+                    "seasonal_period_source": period_source,
+                }
+                if any(report.get(key) != value for key, value in run_diagnostics.items()):
+                    report.update(run_diagnostics)
                     _write_run(training_dir / "run.json", report)
                 cumulative = report["timings"].get("cumulative", {})
                 training_time_s = (
@@ -662,7 +671,7 @@ def check_panel(spec: FevTaskSpec) -> None:
     past, future = window.get_input_data()
     panel = panel_from_window(past, future, spec, task.freq)
     arrays = np.empty((len(panel.series), spec.horizon, len(spec.quantile_levels)))
-    period = max(spec.seasonality, panel.seasonal_period)
+    period = max(task.seasonality, panel.seasonal_period)
     for index, series in enumerate(panel.series):
         values = pd.Series(series.target).ffill().fillna(0).to_numpy()
         tail = values[-period:]
@@ -678,7 +687,7 @@ def check_panel(spec: FevTaskSpec) -> None:
     window.compute_metrics(
         cleaned,
         metrics=[get_metric(metric) for metric in [spec.eval_metric, *spec.extra_metrics]],
-        seasonality=spec.seasonality,
+        seasonality=task.seasonality,
         quantile_levels=spec.quantile_levels,
     )
     print(
