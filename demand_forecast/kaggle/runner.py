@@ -6,9 +6,9 @@ One shared runner drives a competition through the pinned stage sequence —
 ``CommandRunner``, so the whole sequence runs against fakes in tests without
 touching the network or the Kaggle CLI; the direct-call stages (``prepare``,
 ``score``) call the bench modules in-process. The competition-specific pieces —
-the converter, the mirror scorer and the submission assembler — are looked up
-by ``RunnerConfig.slug`` in module-level registries; an unregistered slug fails
-loudly before any artifact is written.
+the converter, the mirror scorer, the submission assembler and the submission
+validator — are looked up by ``RunnerConfig.slug`` in module-level registries;
+an unregistered slug fails loudly before any artifact is written.
 
 Evidence lives under ``RunnerConfig.evidence_root`` (``runs/<slug>/`` per the
 plan):
@@ -126,6 +126,11 @@ _PREPARE_BY_SLUG: dict[str, Callable[[Path, Path], store_sales.PrepareReport]] =
 _SCORE_BY_SLUG: dict[str, Callable[[Path, dict[str, pd.DataFrame]], dict[str, float]]] = {
     store_sales.SLUG: score_mirror,
     mlcspp.SLUG: mlcspp.score_mirror,
+}
+
+_VALIDATE_BY_SLUG: dict[str, Callable[[pd.DataFrame, pd.DataFrame], None]] = {
+    store_sales.SLUG: validate_submission,
+    mlcspp.SLUG: mlcspp.validate_submission,
 }
 
 
@@ -505,17 +510,19 @@ def _record_submission(config: RunnerConfig, run: CommandRunner, submit_stdout: 
 def _submit(config: RunnerConfig, run: CommandRunner) -> None:
     """Submit the validated candidate once, then record the listing and ref.
 
-    The candidate is re-validated against the prepared sample immediately
-    before the upload, so a mismatched file can never reach the server. On a
-    non-zero CLI exit the stage raises with the CLI message and never retries:
-    submission slots are limited and a blind retry risks a duplicate.
+    The candidate is re-validated against the prepared sample by the
+    competition's registered validator immediately before the upload, so a
+    mismatched file can never reach the server. On a non-zero CLI exit the
+    stage raises with the CLI message and never retries: submission slots are
+    limited and a blind retry risks a duplicate.
     """
     scores = _read_scores(config)
     sample = pd.read_csv(config.prepared_dir / "official" / "sample_submission.csv")
     if not config.submission_path.is_file():
         raise RuntimeError(f"{config.submission_path} is missing; run the 'score' stage first")
     candidate = pd.read_csv(config.submission_path)
-    validate_submission(candidate, sample)
+    validate = _competition_handler(_VALIDATE_BY_SLUG, config.slug, "validate")
+    validate(candidate, sample)
     result = _checked(run, _submit_argv(config.slug, config.submission_path))
     _record_submission(config, run, result.stdout)
     ref = _submission_ref(result.stdout)

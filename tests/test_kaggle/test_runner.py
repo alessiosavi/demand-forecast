@@ -969,6 +969,85 @@ def test_score_stage_assembles_mlcspp_submission(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
+# Submit re-validation dispatch (per competition)
+# --------------------------------------------------------------------------- #
+
+
+_MLCSPP_SAMPLE_DATES = [7846, 7845, 7844]
+
+
+def _write_mlcspp_submit_fixture(
+    config: RunnerConfig, *, submission_dates: list[int] | None = None
+) -> None:
+    """The submit-stage inputs in the mlcspp shape: prepared sample, candidate, scores."""
+    official = config.prepared_dir / "official"
+    official.mkdir(parents=True)
+    pd.DataFrame({"date": _MLCSPP_SAMPLE_DATES, "0056_close_y": [0.0, 0.0, 0.0]}).to_csv(
+        official / "sample_submission.csv", index=False
+    )
+    dates = _MLCSPP_SAMPLE_DATES if submission_dates is None else submission_dates
+    pd.DataFrame({"date": dates, "0056_close_y": [375.44, 376.1, 377.2]}).to_csv(
+        config.submission_path, index=False
+    )
+    config.scores_path.write_text(json.dumps({"baseline": 0.5, "finetune": 0.3}), encoding="utf-8")
+
+
+def test_submit_stage_validates_mlcspp_submission_and_submits(tmp_path: Path) -> None:
+    config = _mlcspp_config(tmp_path)
+    _write_mlcspp_submit_fixture(config)
+    calls: list[list[str]] = []
+    submit_stdout = "Submission ref: 4242\n"
+    listing_stdout = "ref   fileName        date\n4242  submission.csv  2026-11-08\n"
+
+    def responder(argv: list[str]) -> subprocess.CompletedProcess[str] | None:
+        if argv[:3] == ["kaggle", "competitions", "submit"]:
+            return subprocess.CompletedProcess(argv, 0, submit_stdout, "")
+        if argv[:3] == ["kaggle", "competitions", "submissions"]:
+            return subprocess.CompletedProcess(argv, 0, listing_stdout, "")
+        return None
+
+    run_stages(config, _recording_runner(calls, responder), stages=["submit"])
+
+    assert calls == [
+        [
+            "kaggle",
+            "competitions",
+            "submit",
+            "-c",
+            _MLCSPP_SLUG,
+            "-f",
+            str(config.submission_path),
+            "-m",
+            "demand-forecast L3",
+        ],
+        ["kaggle", "competitions", "submissions", "-c", _MLCSPP_SLUG],
+    ]
+    assert "submission_ref: 4242" in config.report_path.read_text(encoding="utf-8")
+
+
+def test_submit_stage_rejects_invalid_mlcspp_submission_before_cli(tmp_path: Path) -> None:
+    config = _mlcspp_config(tmp_path)
+    _write_mlcspp_submit_fixture(config, submission_dates=[7845, 7846, 7844])  # swapped
+    calls: list[list[str]] = []
+
+    with pytest.raises(ValueError, match="date order"):
+        run_stages(config, _recording_runner(calls), stages=["submit"])
+
+    assert calls == []  # a mismatched candidate never reaches the CLI
+
+
+def test_submit_stage_rejects_unknown_competition_slug(tmp_path: Path) -> None:
+    config = _config(tmp_path, slug="mystery-competition")
+    _write_submit_fixture(config)
+    calls: list[list[str]] = []
+
+    with pytest.raises(RuntimeError, match="mystery-competition"):
+        run_stages(config, _recording_runner(calls), stages=["submit"])
+
+    assert calls == []  # an unknown slug never reaches the CLI
+
+
+# --------------------------------------------------------------------------- #
 # Operator script dry run
 # --------------------------------------------------------------------------- #
 
