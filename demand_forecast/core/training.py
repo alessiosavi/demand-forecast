@@ -81,6 +81,22 @@ class NonFiniteTraining(RuntimeError):  # noqa: N818 - public training failure s
     """Consecutive non-finite losses stopped training with a terminal checkpoint."""
 
 
+# Settings controls consumed by the run protocol rather than the trainer.
+TRAIN_CONFIG_EXCLUDE = frozenset(
+    {
+        "refit",
+        "min_train_history",
+        "val_items_max",
+        "init_from",
+        "zero_shot",
+        "eval_at_start",
+        "trainable",
+        "series_embedding",
+        "exception_policy",
+    }
+)
+
+
 @dataclass
 class TrainConfig:
     base_steps: int = 3000

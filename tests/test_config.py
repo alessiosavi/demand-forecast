@@ -1,6 +1,6 @@
 """Configuration migration and validation of the public v2 schema."""
 
-from dataclasses import asdict
+from dataclasses import asdict, fields
 from pathlib import Path
 
 import pytest
@@ -76,25 +76,23 @@ def test_model_invalid_options(options, message):
 
 
 def test_training_defaults_match_trainer():
-    from demand_forecast.core.training import TrainConfig
+    from demand_forecast.core.training import TRAIN_CONFIG_EXCLUDE, TrainConfig
 
     config = TrainingConfig()
-    assert config.model_dump(
-        exclude={
-            "refit",
-            "min_train_history",
-            "val_items_max",
-            "init_from",
-            "zero_shot",
-            "eval_at_start",
-            "trainable",
-            "series_embedding",
-        }
-    ) == asdict(TrainConfig())
+    assert config.model_dump(exclude=TRAIN_CONFIG_EXCLUDE) == asdict(TrainConfig())
     assert config.min_train_history is None and config.refit == "none"
     assert config.init_from is None
     assert config.zero_shot is False and config.eval_at_start is False
     assert "seed" not in TrainingConfig.model_fields
+
+
+def test_training_fields_match_trainer():
+    from demand_forecast.core.training import TRAIN_CONFIG_EXCLUDE, TrainConfig
+
+    assert TRAIN_CONFIG_EXCLUDE <= TrainingConfig.model_fields.keys()
+    assert TrainingConfig.model_fields.keys() - TRAIN_CONFIG_EXCLUDE == {
+        field.name for field in fields(TrainConfig)
+    }
 
 
 @pytest.mark.parametrize(

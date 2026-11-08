@@ -121,6 +121,40 @@ def test_refit_skips_zero_step_and_exception_with_reason(
         )
 
 
+@pytest.mark.parametrize("refit", ["none", "full"])
+def test_smoothed_terminal_selection_is_completed_by_both_resume_paths(
+    tmp_path, protocol_case, monkeypatch, refit
+):
+    from demand_forecast.bench.run import _completed_training
+    from demand_forecast.core import run
+
+    panel, origin, settings = protocol_case
+    settings.training.selection = "smoothed"
+    settings.training.patience = 1
+    settings.training.refit = refit
+    scores = iter([1.2, 0.8, 1.0])
+    monkeypatch.setattr(training, "evaluate_prepared", lambda *a, **k: {"SQL": next(scores)})
+    _, report = _run(protocol_case, tmp_path)
+    state = torch.load(tmp_path / "checkpoints/latest.pt", weights_only=False)
+    assert state["terminal_reason"] == report["fit_result"]["stop_reason"] == "early_stop"
+    assert state["step"] == 3 < state["max_steps"]
+    # Finalizing the right edge improves selection and resets patience after stopping.
+    assert state["patience_counter"] == 0 < settings.training.patience
+    assert _completed_training(tmp_path, report["run_identity"], origin, settings)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("completed training must reuse the bundle")
+
+    monkeypatch.setattr(run, "_initial_model", forbidden)
+    monkeypatch.setattr(Trainer, "fit", forbidden)
+    before = {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
+    assert (
+        train_panel(panel, origin, settings, tmp_path, dataset_fingerprint="fp", resume=True)
+        == tmp_path / "bundle"
+    )
+    assert before == {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
+
+
 @pytest.mark.parametrize("stop_after", [6, 7])
 def test_refit_interruption_resumes_refit_without_selection(
     tmp_path, protocol_case, monkeypatch, stop_after

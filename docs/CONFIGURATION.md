@@ -53,6 +53,10 @@ Existing default identities and the single-state bundle format are preserved.
 | `training.select_min_gain` | `0.0` | Finite fraction in `[0, 1)`. With `eval_at_start`, a later checkpoint's selection score (smoothed when enabled) must be strictly below `(1 - select_min_gain) * raw_step_0_SQL` to replace step 0. Without a step-0 evaluation the margin has no effect. |
 | `training.exception_policy` | `final` | For short histories with no inner validation, `pretrained` ships the transferred step-0 weights when `init_from` is set, while still completing/checkpointing the fixed-budget training run. Refit is skipped. Without `init_from`, this uses the final state. `exception_policy_applied` records `pretrained` or `final` for exception runs and `null` otherwise. |
 
+With `select_min_gain > 0`, checkpoints that do not clear the margin also
+increment patience. If later checkpoints never clear it, training can early-stop
+with step 0 still selected.
+
 The live weights and optimizer remain paired during averaging; the EMA shadow
 stays on the model's device, while tail and smoothing snapshots live on CPU.
 Checkpoints retain the EMA shadow or tail snapshots, the last two evaluated states needed by

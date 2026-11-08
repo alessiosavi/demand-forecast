@@ -21,6 +21,7 @@ from demand_forecast.config import Settings
 from demand_forecast.core.bundle import load_bundle, load_bundle_manifest, save_bundle
 from demand_forecast.core.training import (
     NONFINITE_STOP_AFTER,
+    TRAIN_CONFIG_EXCLUDE,
     InterruptedRun,
     NonFiniteTraining,
     TrainConfig,
@@ -386,21 +387,7 @@ def train_panel(
             },
         )
     else:
-        cfg = TrainConfig(
-            **settings.training.model_dump(
-                exclude={
-                    "refit",
-                    "min_train_history",
-                    "val_items_max",
-                    "init_from",
-                    "zero_shot",
-                    "eval_at_start",
-                    "trainable",
-                    "series_embedding",
-                    "exception_policy",
-                }
-            )
-        )
+        cfg = TrainConfig(**settings.training.model_dump(exclude=TRAIN_CONFIG_EXCLUDE))
         fit_started = time.perf_counter()
         selection_steps_this_call = 0
         if selection is None:

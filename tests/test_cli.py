@@ -283,7 +283,22 @@ def test_run_identity_canonical_json(run_settings):
     for key in ("max_steps_cap", "val_items_max"):
         if settings["training"][key] is None:
             del settings["training"][key]
-    for key in ("init_from", "zero_shot", "eval_at_start", "trainable", "series_embedding"):
+    # Reconstruct the legacy payload independently of production canonicalisation.
+    for key in (
+        "init_from",
+        "zero_shot",
+        "eval_at_start",
+        "trainable",
+        "series_embedding",
+        "warmup_frac",
+        "min_steps",
+        "selection",
+        "weight_average",
+        "ema_decay",
+        "average_last_k",
+        "select_min_gain",
+        "exception_policy",
+    ):
         del settings["training"][key]
     del settings["forecast"]["scale_floor_frac"]
     payload = {

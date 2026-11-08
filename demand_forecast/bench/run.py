@@ -188,7 +188,10 @@ def _completed_training(directory: Path, identity: str, earliest, settings: Sett
                 state["step"] < limit
                 and (
                     path == refit_checkpoint
-                    or state["patience_counter"] < settings.training.patience
+                    or (
+                        state.get("terminal_reason") not in {"early_stop", "max_steps"}
+                        and state["patience_counter"] < settings.training.patience
+                    )
                 )
             )
         del state
