@@ -376,7 +376,7 @@ optional column have defaults.
 | `train` | `--config`, `--out` | `--resume` |
 | `forecast` | `--bundle`, `--config`, `--origin`, `--out` | None |
 | `fev run` | `--config`, `--out-dir` | `--tasks`, `--policy`, `--profiles`, `--resume`, `--model-name`, `--stop-after` |
-| `fev baseline` | `--out-dir` | `--tasks`, `--profiles`, `--verbose` / `-v` |
+| `fev baseline` | `--out-dir` | `--tasks`, `--model`, `--profiles`, `--verbose` / `-v` |
 | `fev leaderboard` | Positional summary CSV | `--baseline` |
 | `generate-data` | Positional output path | `--days`, `--products`, `--stores`, `--seed`, `--verbose` / `-v`, `--format`, `--freq`, `--start` |
 | `generate-sales` | `--products`, `--output` / `-o` | `--start`, `--end`, `--seed`, `--promo-share`, `--verbose` / `-v` |
@@ -390,6 +390,13 @@ overrides the target-support/static-role profiles. `--policy` defaults to
 after that many training steps in the current call, saving a checkpoint if
 training has not already finished. `fev baseline` is resumable without a resume
 flag. `fev leaderboard` defaults to the `seasonal_naive` reference model.
+
+`fev baseline --model` selects `seasonal_naive` (the default), `auto_ets`,
+`auto_theta`, or `median3`. The ensemble takes the cell-wise median of the
+three models' quantiles for each item and horizon step, then sorts quantiles.
+Each arm writes its own `model_name` into `summaries.csv`; resume skips only
+completed task/model pairs, preserving rows from other arms. All arms use a
+seasonal-naive fallback if a StatsForecast model fails.
 
 `generate-data` defaults to sales-format CSV; `--format long` instead writes
 `long.csv` and `static.csv` in an output directory. In long format, `--days`

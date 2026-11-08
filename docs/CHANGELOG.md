@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Classical `fev baseline --model` arms: `auto_ets`, `auto_theta`, and `median3`
+  (cell-wise median quantiles alongside the unchanged default `seasonal_naive`),
+  with seasonal-naive fallback and resume by task/model pair in `summaries.csv`.
+
 - **Pretraining recipe v3, round 1 (in progress)** — versioned recipe/grid/period
   controls preserving legacy identities and bundle config payloads; a separate
   real-grid shard reader with crop-aware starts, homogeneous panels, row maps and
