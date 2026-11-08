@@ -64,6 +64,10 @@ def test_legacy_fifty_batches_golden(tmp_path, every, expected):
             digest.update(sampler.last_kind.encode())
             for field in fields(batch):
                 value = getattr(batch, field.name)
+                if field.name == "loss_weight":
+                    # The legacy golden predates task-only loss weights.
+                    assert torch.equal(value, torch.ones_like(value))
+                    continue
                 for key, tensor in (
                     sorted(value.items()) if isinstance(value, dict) else [(field.name, value)]
                 ):
