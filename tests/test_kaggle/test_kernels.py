@@ -3,6 +3,7 @@
 import ast
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -23,9 +24,8 @@ _ASSETS = "alessiosavi/kb-assets"
 _REPO_SHA = "0123456789abcdef0123456789abcdef01234567"
 _BUNDLE_IDENTITY = "83d6acb1f7f2c1b57ba33c0ca0a870775369d52bf8fb739a9e3f7e28858826c2"
 _WORKLOAD_KWARGS = {
-    "prepared_root": "/kaggle/input/kb-store-sales",
     "out_root": "/kaggle/working/kb-out",
-    "init_from": "/kaggle/input/kb-assets/bundle-L3-first-try",
+    "bundle_dirname": "bundle-L3-first-try",
     "bundle_identity": _BUNDLE_IDENTITY,
 }
 # The verbatim live rejection: printed on stdout with exit code 0.
@@ -71,16 +71,24 @@ def test_kernel_metadata_fields(tmp_path: Path):
     }
 
 
-def test_driver_pins_repo_sha_and_calls_workload(tmp_path: Path):
+def test_driver_resolves_mounts_at_runtime_and_calls_workload(tmp_path: Path) -> None:
     _write_kernel(tmp_path)
     driver = (tmp_path / "main.py").read_text(encoding="utf-8")
     assert (
         'subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", '
         f'"git+https://github.com/alessiosavi/demand-forecast@{_REPO_SHA}"])' in driver
     )
-    assert "/kaggle/input/kb-store-sales" in driver
-    assert "/kaggle/input/kb-assets/bundle-L3-first-try" in driver
+    # The resolver probes both of Kaggle's layouts; no dataset mount is baked in.
+    assert "def _mount(dataset: str) -> Path:" in driver
+    assert 'Path("/kaggle/input") / dataset.split("/", 1)[1]' in driver
+    assert 'Path("/kaggle/input/datasets") / dataset' in driver
+    assert "str(_mount('alessiosavi/kb-store-sales'))" in driver
+    assert "str(_mount('alessiosavi/kb-assets') / 'bundle-L3-first-try')" in driver
     assert "/kaggle/working/kb-out" in driver
+    assert _BUNDLE_IDENTITY in driver
+    for dataset in (_PREPARED, _ASSETS):
+        assert f"/kaggle/input/{dataset.split('/', 1)[1]}" not in driver
+        assert f"/kaggle/input/datasets/{dataset}" not in driver
     assert "from demand_forecast.kaggle.kernel_workload import run_workload" in driver
     assert "run_workload(**WORKLOAD_KWARGS)" in driver
     assert driver.rstrip().endswith('print("WORKLOAD_OK", flush=True)')
@@ -93,7 +101,46 @@ def test_driver_pins_repo_sha_and_calls_workload(tmp_path: Path):
         and any(getattr(target, "id", None) == "WORKLOAD_KWARGS" for target in node.targets)
     ]
     assert len(assignments) == 1
-    assert ast.literal_eval(assignments[0].value) == _WORKLOAD_KWARGS
+    value = assignments[0].value
+    assert isinstance(value, ast.Dict)
+    keys = [key.value for key in value.keys if isinstance(key, ast.Constant)]
+    assert keys == ["prepared_root", "out_root", "init_from", "bundle_identity"]
+    compile(driver, "main.py", "exec")  # syntax sanity check; never executed here
+
+
+def _mount_source(driver: str) -> str:
+    """The generated driver's ``_mount`` function source, verbatim."""
+    for node in ast.parse(driver).body:
+        if isinstance(node, ast.FunctionDef) and node.name == "_mount":
+            source = ast.get_source_segment(driver, node)
+            assert source is not None
+            return source
+    raise AssertionError("generated driver has no _mount resolver")
+
+
+def test_driver_mount_resolver_probes_both_layouts(tmp_path: Path) -> None:
+    """Exec the resolver alone against a fake input tree: both candidates resolve."""
+    _write_kernel(tmp_path)
+    driver = (tmp_path / "main.py").read_text(encoding="utf-8")
+    fake_root = tmp_path / "kaggle" / "input"
+    source = _mount_source(driver)
+    nested_root = str(fake_root / "datasets")
+    source = source.replace('Path("/kaggle/input/datasets")', f"Path({nested_root!r})")
+    source = source.replace('Path("/kaggle/input")', f"Path({str(fake_root)!r})")
+    namespace: dict[str, Any] = {"Path": Path}
+    exec(source, namespace)
+    mount = namespace["_mount"]
+
+    nested = fake_root / "datasets" / "owner" / "slug"
+    nested.mkdir(parents=True)
+    assert mount("owner/slug") == nested  # the new backend's nested layout
+
+    flat = fake_root / "legacy"
+    flat.mkdir()
+    assert mount("owner/legacy") == flat  # the flat legacy layout
+
+    with pytest.raises(FileNotFoundError, match="not mounted under any known root"):
+        mount("owner/absent")
 
 
 def test_push_status_output_argv(tmp_path: Path):

@@ -181,19 +181,6 @@ class RunnerConfig:
         return self.evidence_root / "REPORT.md"
 
 
-def _dataset_mount(dataset_id: str) -> str:
-    """The kernel mount point of an ``owner/slug`` dataset.
-
-    Datasets created/versioned through the current Kaggle CLI (the runner's
-    own upload flow) live in the new dataset backend and mount under
-    ``/kaggle/input/datasets/<owner>/<slug>`` — verified live by a mount
-    probe: the dataset GCSFuse mounts at exactly that path. Legacy
-    image-backed datasets mount flat at ``/kaggle/input/<slug>``, but every
-    dataset this runner creates uses the new backend.
-    """
-    return f"/kaggle/input/datasets/{dataset_id}"
-
-
 def _download_argv(slug: str, raw_dir: Path) -> list[str]:
     return ["kaggle", "competitions", "download", "-c", slug, "-p", str(raw_dir), "--unzip"]
 
@@ -221,11 +208,16 @@ def _upload_message(slug: str) -> str:
 
 
 def _workload_kwargs(config: RunnerConfig) -> dict[str, str]:
-    """The kernel workload kwargs: mount paths plus the pinned bundle identity."""
+    """The runner-supplied kernel workload kwargs.
+
+    The dataset mounts are not computed here: the generated driver resolves
+    them at run time, because Kaggle's dataset mount layout varies per run.
+    This mapping carries everything else the driver needs — the out root, the
+    bundle directory name under the assets mount and the pinned identity.
+    """
     return {
-        "prepared_root": _dataset_mount(config.dataset_id),
         "out_root": _KERNEL_OUT_ROOT,
-        "init_from": f"{_dataset_mount(config.assets_dataset)}/{_BUNDLE_DIRNAME}",
+        "bundle_dirname": _BUNDLE_DIRNAME,
         "bundle_identity": _BUNDLE_IDENTITY,
     }
 
