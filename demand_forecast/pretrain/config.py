@@ -6,6 +6,7 @@ import hashlib
 import json
 from fractions import Fraction
 from pathlib import Path
+from typing import Literal
 
 from pydantic import (
     BaseModel,
@@ -17,6 +18,12 @@ from pydantic import (
 )
 
 from demand_forecast.config.settings import ForecastConfig, ModelConfig
+
+LEGACY_RECIPE_DEFAULTS = {
+    "recipe": "v2",
+    "period_policy": "legacy_one",
+    "grid_policy": "legacy_weekly",
+}
 
 
 class SourceShards(BaseModel):
@@ -152,9 +159,21 @@ class PretrainConfig(BaseModel):
     forecast: _PretrainForecastConfig
     model: ModelConfig
     training: PretrainTrainingConfig
+    recipe: Literal["v2", "v3"] = "v2"
+    period_policy: Literal["legacy_one", "frequency"] = "legacy_one"
+    grid_policy: Literal["legacy_weekly", "source"] = "legacy_weekly"
     seed: int = 0
     device: str | None = None
     log_level: str = "INFO"
+
+    @model_serializer(mode="wrap")
+    def serialize_compatible(self, handler):
+        """Keep legacy bundle config payloads byte-equivalent at default controls."""
+        payload = handler(self)
+        for name, default in LEGACY_RECIPE_DEFAULTS.items():
+            if payload.get(name) == default:
+                payload.pop(name)
+        return payload
 
     @field_validator("forecast", mode="before")
     @classmethod
@@ -190,6 +209,9 @@ def pretrain_identity(
     # The shared forecast schema gained a task-only switch. Do not invalidate
     # existing pretraining checkpoints by hashing its inactive default.
     payload["config"]["forecast"].pop("scale_floor_frac", None)
+    for name, default in LEGACY_RECIPE_DEFAULTS.items():
+        if payload["config"].get(name) == default:
+            payload["config"].pop(name)
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()

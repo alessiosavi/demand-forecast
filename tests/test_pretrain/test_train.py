@@ -10,6 +10,33 @@ pyarrow = pytest.importorskip("pyarrow")
 pytestmark = pytest.mark.bench
 
 
+@pytest.mark.parametrize("checkpoint_recipe,requested_recipe", [("v2", "v3"), ("v3", "v2")])
+def test_restore_rejects_cross_recipe_before_loading_state(
+    tmp_path, tiny_pretrain_cfg, checkpoint_recipe, requested_recipe
+):
+    from demand_forecast.pretrain.config import PretrainConfig, pretrain_identity
+    from demand_forecast.pretrain.train import _PretrainLoop
+
+    def identity(recipe):
+        cfg = PretrainConfig.model_validate(
+            tiny_pretrain_cfg.model_dump(mode="json") | {"recipe": recipe}
+        )
+        return pretrain_identity(cfg, "2.0.0", {})
+
+    saved, requested = identity(checkpoint_recipe), identity(requested_recipe)
+    checkpoint = tmp_path / "checkpoint.pt"
+    torch.save({"identity": saved}, checkpoint)
+    # Exercise the real restore guard without training or constructing a v3 model.
+    # No mutable model/optimizer/sampler exists: the guard must reject first.
+    loop = _PretrainLoop.__new__(_PretrainLoop)
+    loop.identity = requested
+    with pytest.raises(
+        ValueError,
+        match=f"pretrain identity mismatch: checkpoint {saved}; requested {requested}",
+    ):
+        loop.restore(checkpoint)
+
+
 @pytest.mark.parametrize("kernel_synth_every", [1, 10])
 def test_pretrain_requires_kernel_shards_when_enabled(tiny_pretrain_cfg, kernel_synth_every):
     from demand_forecast.pretrain.train import _PretrainLoop

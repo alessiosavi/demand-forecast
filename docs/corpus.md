@@ -13,6 +13,29 @@ It records every included source's licence, attribution, URL and bucket,
 and every exclusion from the reviewed shortlist. The recipe and all nested
 sections reject unknown keys.
 
+## Recipe v3 (in progress)
+
+The pretraining recipe is separate from the corpus version. Round 1 adds explicit
+`recipe: v3`, `grid_policy: source`, and `period_policy: frequency` controls.
+Defaults remain `v2`, `legacy_weekly`, and `legacy_one`; default controls are
+omitted from serialized configs and identity hashes to preserve existing bundle
+manifests and pretraining identities. Cross-recipe checkpoints fail the existing
+identity check before state is restored.
+
+The new reader retains real-source `start`/`freq`, advances the start when keeping
+the latest 8,192 points, and groups rows by offset and calendar availability with
+an original-row index map. Real rows missing a usable grid use the synthetic
+weekly coordinates and increment `grid_fallback`; synthetic sources always keep
+those coordinates and period 1. The pretraining-only scaler convention is:
+5T → 288, 10T → 144, 15T → 96, 30T → 48, H → 24, D → 7, W → 1,
+M → 12, Q → 4, Y → 1. Equivalent tick durations share periods; begin/end and
+calendar anchors are preserved. Unspecified offsets and unsupported multipliers
+use period 1. Benchmark frequency conventions are unchanged.
+
+These are reader/config foundations; training and validation still use the legacy
+reader. Calendar schema/transfer, horizon/resume state, selection, and integration
+arrive in later rounds. This is not yet a runnable v3 training recipe.
+
 ## Contents and exclusions
 
 Chronos includes electricity, exchange rates, car parts, COVID deaths, London

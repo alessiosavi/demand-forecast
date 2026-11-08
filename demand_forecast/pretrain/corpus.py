@@ -7,12 +7,14 @@ import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 import pandas as pd
 from numpy.typing import DTypeLike
 
 from demand_forecast.data.panel import Panel, Roles, Series
+from demand_forecast.pretrain.periods import pretrain_offset, pretrain_period
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +77,147 @@ def read_shard(path: Path, *, dtype: DTypeLike = np.float32) -> list[Series]:
 def shard_panel(series: list[Series]) -> Panel:
     """Wrap corpus series for batching on a synthetic weekly grid."""
     return Panel(series, CORPUS_ROLES, PRETRAIN_FREQ, seasonal_period=1, target_support="real")
+
+
+@dataclass(frozen=True)
+class ShardRecord:
+    """A cropped row and its grid/provenance, before frequency grouping."""
+
+    series: Series
+    freq: pd.offsets.BaseOffset
+    calendar_available: bool
+    row_index: int
+    source: str
+    folder: str | None
+    crop_offset: int
+
+
+@dataclass(frozen=True)
+class ShardRecords:
+    """Rows in file order; grid_fallback counts real rows missing a usable grid."""
+
+    records: list[ShardRecord]
+    grid_fallback: int
+
+
+@dataclass(frozen=True)
+class ShardPanelGroup:
+    """One homogeneous panel; row_indices maps panel positions to shard rows."""
+
+    panel: Panel
+    row_indices: tuple[int, ...]
+    calendar_available: bool
+
+
+def read_shard_v3(
+    path: Path,
+    *,
+    kind: str,
+    grid_policy: Literal["legacy_weekly", "source"] = "source",
+    dtype: DTypeLike = np.float32,
+) -> ShardRecords:
+    """Keep real source grids; synthetic or unusable grids use legacy coordinates.
+
+    Corpus-v2 real shards store scalar ``start``, ``freq``, ``source`` and
+    ``folder`` columns. No frequency is inferred from synthetic timestamps.
+    Missing/invalid real metadata is counted per row and disables its calendar.
+    """
+    import pyarrow.parquet as pq
+
+    if kind not in CORPUS_KINDS:
+        raise ValueError(f"Unknown corpus kind: {kind}")
+    if grid_policy not in ("legacy_weekly", "source"):
+        raise ValueError(f"Unknown pretraining grid policy: {grid_policy}")
+    names = pq.read_schema(path).names
+    columns = ["id", "target"] + [
+        name for name in ("start", "freq", "source", "folder") if name in names
+    ]
+    table = pq.read_table(path, columns=columns)
+    records = []
+    grid_fallback = truncated = 0
+    real_grid = grid_policy == "source" and kind in ("chronos_real", "gifteval_pretrain")
+    for row_index in range(table.num_rows):
+        row = {name: table[name][row_index].as_py() for name in columns}
+        values = np.asarray(row["target"], dtype=dtype)
+        crop_offset = max(0, len(values) - MAX_SERIES_POINTS)
+        if crop_offset:
+            values = values[-MAX_SERIES_POINTS:].copy()
+            truncated += 1
+        start, freq = PRETRAIN_START, pretrain_offset(PRETRAIN_FREQ)
+        calendar_available = False
+        if real_grid:
+            try:
+                if row.get("start") is None or not row.get("freq"):
+                    raise ValueError("Missing source start/frequency")
+                source_start = pd.Timestamp(row["start"])
+                source_freq = pretrain_offset(row["freq"])
+                if (
+                    pd.isna(source_start)
+                    or source_freq.n <= 0
+                    or not source_freq.is_on_offset(source_start)
+                ):
+                    raise ValueError("Invalid source start/frequency")
+                # Day grids retain local time across DST, like pd.date_range;
+                # subdaily ticks advance by elapsed time, anchored offsets by calendar.
+                shift = (
+                    pd.DateOffset(days=crop_offset * source_freq.n)
+                    if isinstance(source_freq, pd.offsets.Day)
+                    else crop_offset * source_freq
+                )
+                start = source_start + shift if crop_offset else source_start
+                freq, calendar_available = source_freq, True
+            except (ValueError, TypeError, OverflowError):
+                grid_fallback += 1
+        records.append(
+            ShardRecord(
+                Series(row["id"], start, len(values), values, {}, {}),
+                freq,
+                calendar_available,
+                row_index,
+                row.get("source") or kind,
+                row.get("folder"),
+                crop_offset,
+            )
+        )
+    logger.info(
+        "Truncated %d series in shard %s to the most recent %d points; grid_fallback=%d",
+        truncated,
+        path,
+        MAX_SERIES_POINTS,
+        grid_fallback,
+    )
+    return ShardRecords(records, grid_fallback)
+
+
+def shard_panels(
+    records: list[ShardRecord],
+    *,
+    period_policy: Literal["legacy_one", "frequency"] = "frequency",
+) -> list[ShardPanelGroup]:
+    """Group equivalent offsets and calendar availability, preserving shard order."""
+    if period_policy not in ("legacy_one", "frequency"):
+        raise ValueError(f"Unknown pretraining period policy: {period_policy}")
+    grouped = {}
+    for record in records:
+        # pandas 2 equates Day and 24 * Hour even though their DST grids differ.
+        key = (type(record.freq), record.freq, record.calendar_available)
+        grouped.setdefault(key, []).append(record)
+    return [
+        ShardPanelGroup(
+            Panel(
+                [record.series for record in group],
+                CORPUS_ROLES,
+                freq,
+                seasonal_period=(
+                    pretrain_period(freq) if period_policy == "frequency" and available else 1
+                ),
+                target_support="real",
+            ),
+            tuple(record.row_index for record in group),
+            available,
+        )
+        for (_, freq, available), group in grouped.items()
+    ]
 
 
 @dataclass(frozen=True)
