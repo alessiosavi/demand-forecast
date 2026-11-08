@@ -5,9 +5,10 @@
 pip-installs the repo at the pinned commit, then calls
 ``demand_forecast.kaggle.kernel_workload.run_workload`` on the mounted prepared
 dataset and pretrained bundle and prints the ``WORKLOAD_OK`` marker. The
-``push_argv``, ``status_argv``, ``output_argv``, ``parse_status`` and
-``check_status`` helpers compose and interpret the ``kaggle kernels`` commands
-the host runner executes; nothing here invokes a process.
+``push_argv``, ``status_argv``, ``output_argv``, ``parse_status``,
+``check_status`` and ``check_push`` helpers compose and interpret the
+``kaggle kernels`` commands the host runner executes; nothing here invokes a
+process.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ from pprint import pformat
 from typing import Any
 
 __all__ = [
+    "check_push",
     "check_status",
     "output_argv",
     "parse_status",
@@ -31,6 +33,7 @@ _QUOTED_STATUS = re.compile(r'has status "([^"]+)"')
 _ENUM_STATUS = re.compile(r"\bKernelWorkerStatus\.([A-Z_]+)\b")
 _BARE_STATUS = re.compile(r"[A-Z_]+")
 _FAILURE_MESSAGE = re.compile(r'Failure message: "([^"]*)"')
+_PUSH_ERROR_PREFIX = "Kernel push error:"
 _ERROR_WORD = "ERROR"
 _CANCEL_PREFIX = "CANCEL"
 
@@ -196,3 +199,15 @@ def check_status(returncode: int, output: str) -> None:
         match = _FAILURE_MESSAGE.search(output)
         detail = "" if match is None else f": {match.group(1)}"
         raise RuntimeError(f"kaggle kernel run failed with status {word}{detail}")
+
+
+def check_push(output: str) -> None:
+    """Raise ``RuntimeError`` when the CLI reported a rejected kernel push.
+
+    ``kaggle kernels push`` prints the server's rejection to stdout and still
+    exits 0 (e.g. the concurrent-GPU-session cap), so the exit code alone does
+    not tell a push from a rejection; the marker line does.
+    """
+    for line in output.splitlines():
+        if line.startswith(_PUSH_ERROR_PREFIX):
+            raise RuntimeError(line.strip())

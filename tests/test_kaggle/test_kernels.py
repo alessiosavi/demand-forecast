@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from demand_forecast.kaggle.kernels import (
+    check_push,
     check_status,
     output_argv,
     parse_status,
@@ -27,6 +28,12 @@ _WORKLOAD_KWARGS = {
     "init_from": "/kaggle/input/kb-assets/bundle-L3-first-try",
     "bundle_identity": _BUNDLE_IDENTITY,
 }
+# The verbatim live rejection: printed on stdout with exit code 0.
+_PUSH_REJECTION = "Kernel push error: Maximum batch GPU session count of 2 reached."
+_PUSH_SUCCESS = (
+    "Kernel version 1 successfully pushed.  "
+    "Please check progress at https://www.kaggle.com/code/alessiosavi/kb-store-sales-run"
+)
 
 
 def _write_kernel(directory: Path, *, kernel_id: str = _KERNEL_ID) -> Path:
@@ -168,6 +175,22 @@ def test_check_status_allows_queued_running_and_complete():
 def test_check_status_raises_on_cli_failure():
     with pytest.raises(RuntimeError, match="exit code 1"):
         check_status(1, "403 - Permission 'kernels.get' was denied")
+
+
+def test_check_push_raises_on_rejected_push():
+    with pytest.raises(RuntimeError, match="Maximum batch GPU session count of 2 reached"):
+        check_push(_PUSH_REJECTION)
+
+
+def test_check_push_raises_when_rejection_is_mid_output():
+    output = f"Pushing kernel {_KERNEL_ID}...\n{_PUSH_REJECTION}\n"
+    with pytest.raises(RuntimeError, match="Maximum batch GPU session count of 2 reached"):
+        check_push(output)
+
+
+def test_check_push_passes_on_success_and_empty_output():
+    check_push(_PUSH_SUCCESS)
+    check_push("")
 
 
 def test_rerun_with_same_kernel_id_overwrites_cleanly(tmp_path: Path):

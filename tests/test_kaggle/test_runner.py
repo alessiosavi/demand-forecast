@@ -358,6 +358,73 @@ def test_wait_for_kernel_polls_and_completes(tmp_path):
     assert sleeps == [17.0, 17.0]
 
 
+def test_wait_for_kernel_graces_first_not_found_polls(tmp_path):
+    config = _config(tmp_path)
+    calls: list[list[str]] = []
+    sleeps: list[float] = []
+    misses = {"remaining": 2}
+
+    def responder(argv: list[str]) -> subprocess.CompletedProcess[str] | None:
+        if argv[:3] != ["kaggle", "kernels", "status"]:
+            return None
+        if misses["remaining"] > 0:
+            misses["remaining"] -= 1
+            return subprocess.CompletedProcess(argv, 1, "", "404 Not Found: GetKernelSessionStatus")
+        return subprocess.CompletedProcess(
+            argv, 0, f'{_KERNEL_ID} has status "KernelWorkerStatus.COMPLETE"', ""
+        )
+
+    wait_for_kernel(
+        config,
+        _recording_runner(calls, responder),
+        sleep=sleeps.append,
+        interval_s=17.0,
+        not_found_grace=5,
+    )
+
+    assert len(calls) == 3  # two not-found polls inside the grace, then COMPLETE
+    assert sleeps == [17.0, 17.0]
+
+
+def test_wait_for_kernel_raises_when_not_found_grace_is_exceeded(tmp_path):
+    config = _config(tmp_path)
+    calls: list[list[str]] = []
+
+    def responder(argv: list[str]) -> subprocess.CompletedProcess[str] | None:
+        if argv[:3] == ["kaggle", "kernels", "status"]:
+            return subprocess.CompletedProcess(
+                argv, 1, "", "404 Client Error: Not Found ... GetKernelSessionStatus"
+            )
+        return None
+
+    with pytest.raises(RuntimeError, match="404 Client Error"):
+        wait_for_kernel(
+            config,
+            _recording_runner(calls, responder),
+            sleep=lambda _seconds: None,
+            not_found_grace=2,
+        )
+
+    assert len(calls) == 3  # two polls inside the grace, the third exceeds it
+
+
+def test_wait_for_kernel_raises_immediately_on_other_status_cli_failures(tmp_path):
+    config = _config(tmp_path)
+    calls: list[list[str]] = []
+    sleeps: list[float] = []
+
+    def responder(argv: list[str]) -> subprocess.CompletedProcess[str] | None:
+        if argv[:3] == ["kaggle", "kernels", "status"]:
+            return subprocess.CompletedProcess(argv, 1, "", "403 - Permission 'kernels.get' denied")
+        return None
+
+    with pytest.raises(RuntimeError, match="kernels.get"):
+        wait_for_kernel(config, _recording_runner(calls, responder), sleep=sleeps.append)
+
+    assert len(calls) == 1  # a non-not-found failure stays fatal on the first poll
+    assert sleeps == []
+
+
 @pytest.mark.parametrize("word", ["ERROR", "CANCEL_REQUESTED", "CANCEL_ACKNOWLEDGED"])
 def test_kernel_stage_raises_on_failed_status(tmp_path, word):
     config = _config(tmp_path)
@@ -395,6 +462,23 @@ def test_kernel_stage_raises_on_status_cli_failure(tmp_path):
 
     with pytest.raises(RuntimeError, match="kernels.get"):
         run_stages(config, _recording_runner([], responder), stages=["kernel"])
+
+
+def test_kernel_stage_raises_on_rejected_push_without_polling(tmp_path):
+    config = _config(tmp_path)
+    calls: list[list[str]] = []
+    rejection = "Kernel push error: Maximum batch GPU session count of 2 reached."
+
+    def responder(argv: list[str]) -> subprocess.CompletedProcess[str] | None:
+        if argv[:3] == ["kaggle", "kernels", "push"]:
+            # Live CLI behavior: the rejection goes to stdout with exit code 0.
+            return subprocess.CompletedProcess(argv, 0, rejection, "")
+        return None
+
+    with pytest.raises(RuntimeError, match="Maximum batch GPU session count of 2 reached"):
+        run_stages(config, _recording_runner(calls, responder), stages=["kernel"])
+
+    assert [argv[:3] for argv in calls] == [["kaggle", "kernels", "push"]]
 
 
 # --------------------------------------------------------------------------- #

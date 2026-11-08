@@ -28,8 +28,9 @@ plan):
   the workload's out root) is the completeness check;
 - ``scores.json``, ``submission.csv``, ``submissions.txt`` and ``REPORT.md``.
 
-Failure surfacing is strict: a non-zero CLI exit, an ``ERROR`` or ``CANCEL*``
-kernel status, unparseable status output, a fetched tree without
+Failure surfacing is strict: a non-zero CLI exit, a rejected kernel push (the
+CLI prints the server's rejection on stdout and still exits 0), an ``ERROR``
+or ``CANCEL*`` kernel status, unparseable status output, a fetched tree without
 ``workload.json`` and an invalid submission all raise instead of writing
 success artifacts; the submit stage never retries — submission slots are
 limited.
@@ -54,6 +55,7 @@ from demand_forecast.data.loader_long import read_table
 from demand_forecast.kaggle import mlcspp, store_sales
 from demand_forecast.kaggle.dataset import dataset_argv, write_dataset_metadata
 from demand_forecast.kaggle.kernels import (
+    check_push,
     check_status,
     output_argv,
     parse_status,
@@ -234,6 +236,16 @@ def _cli_output(result: subprocess.CompletedProcess[str]) -> str:
     return result.stdout if not stderr else f"{result.stdout}\n{result.stderr}"
 
 
+def _looks_missing_session(output: str) -> bool:
+    """Whether a CLI failure body looks like the kernel session not existing yet.
+
+    The run session is registered asynchronously after a successful push, so
+    early ``kaggle kernels status`` polls fail with a 404 "not found" body even
+    though the kernel was pushed.
+    """
+    return "not found" in output.lower() or "404" in output
+
+
 def _checked(run: CommandRunner, argv: list[str]) -> subprocess.CompletedProcess[str]:
     """Run one CLI command; raise ``RuntimeError`` with its message on failure."""
     result = run(argv)
@@ -272,18 +284,34 @@ def wait_for_kernel(
     *,
     sleep: Callable[[float], None] = time.sleep,
     interval_s: float = _KERNEL_POLL_INTERVAL_S,
+    not_found_grace: int = 10,
 ) -> None:
     """Poll ``kaggle kernels status`` until the run reaches ``COMPLETE``.
 
-    ``check_status`` raises ``RuntimeError`` on a CLI failure and on ``ERROR``
-    or every ``CANCEL*`` status; ``parse_status`` raises ``ValueError`` on
-    unparseable output (a return code of zero with no status word). Both
-    surface to the caller. ``QUEUED``, ``RUNNING`` and ``NEW_SCRIPT`` are not
-    terminal, so the loop sleeps and keeps polling.
+    The run session registers asynchronously after a successful push, so the
+    first status polls can fail with a not-found (404) body; up to
+    ``not_found_grace`` such polls are tolerated — the default 10 polls is
+    roughly 10 minutes at the 60 s interval — before the stage fails, so a
+    truly missing kernel cannot poll forever. ``check_status`` raises
+    ``RuntimeError`` on every other CLI failure and on ``ERROR`` or every
+    ``CANCEL*`` status; ``parse_status`` raises ``ValueError`` on unparseable
+    output (a return code of zero with no status word). Both surface to the
+    caller. ``QUEUED``, ``RUNNING`` and ``NEW_SCRIPT`` are not terminal, so the
+    loop sleeps and keeps polling.
     """
+    missing_polls = 0
     while True:
         result = run(status_argv(config.kernel_id))
         output = _cli_output(result)
+        if result.returncode != 0 and _looks_missing_session(output):
+            missing_polls += 1
+            if missing_polls > not_found_grace:
+                raise RuntimeError(
+                    f"kaggle kernels status failed with exit code {result.returncode} "
+                    f"past the {not_found_grace}-poll not-found grace: {output.strip()}"
+                )
+            sleep(interval_s)
+            continue
         check_status(result.returncode, output)
         if parse_status(output) == _KERNEL_COMPLETE:
             return
@@ -389,7 +417,8 @@ def _kernel(config: RunnerConfig, run: CommandRunner) -> None:
         repo_sha=config.repo_sha,
         workload_kwargs=_workload_kwargs(config),
     )
-    _checked(run, push_argv(config.kernel_dir))
+    result = _checked(run, push_argv(config.kernel_dir))
+    check_push(_cli_output(result))
     wait_for_kernel(config, run)
 
 
