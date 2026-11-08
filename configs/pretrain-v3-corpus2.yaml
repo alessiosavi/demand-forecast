@@ -7,6 +7,8 @@ horizon_policy: fev_set
 shard_visit_quota: {}
 corpus:
   root: /home/ubuntu/fev/corpus
+  # Weekly NN5 has no 288-step window, so v3's calendar on/off diagnostic is unavailable.
+  external_validation: null
   # Corpus v2 (configs/corpus-v2.yaml, Option B research release): weighted round-robin over four kinds.
   # Real kinds take 5/12 of the batches; GiftEval-pretrain outweighs chronos_real for its 1.6x points.
   # Equal-source, frequency/horizon macro SQL on real holdouts selects raw/EMA weights.

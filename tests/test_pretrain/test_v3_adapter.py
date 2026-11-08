@@ -308,7 +308,10 @@ def test_shipped_v3_config_samples_fev_horizons_and_selects_real():
     assert (v3.forecast.calendar_schema, v3.forecast.target_lags) == ("canonical", "cycle")
     assert v3.forecast.horizon == 288 and v3.horizon_policy == "fev_set"
     assert v3.training.batch_size == v3.training.val_batch_size == 96
-    assert v3.corpus.model_dump(exclude={"selection_shards"}) == v2.corpus.model_dump()
+    assert v3.corpus.model_dump(
+        exclude={"selection_shards", "external_validation"}
+    ) == v2.corpus.model_dump(exclude={"external_validation"})
+    assert v3.corpus.external_validation is None
     assert v3.corpus.selection_shards == {"chronos_real": [9], "gifteval_pretrain": [14]}
     assert v3.training.ema_decay == 0.999 and v3.training.keep_eval_snapshots
     assert v3.training.model_dump(

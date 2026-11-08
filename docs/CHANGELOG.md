@@ -203,6 +203,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The shipped recipe-v3 config disables weekly NN5 external diagnostics at H=288,
+  where no full horizon fits, so probe and run validation can build; v2 is unchanged.
+
 - **Pipeline Bugs**
   - `scale_by_group()` not receiving `quantity_column` parameter
   - `load_sales_data()` not receiving `product_id_column` and `sales_qty_column` parameters
