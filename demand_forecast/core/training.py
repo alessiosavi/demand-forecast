@@ -464,6 +464,8 @@ class Trainer:
             seed=self.seed,
             label_upto=plan.train_upto,
             scale_floor_frac=forecast_cfg.scale_floor_frac,
+            calendar_schema=forecast_cfg.calendar_schema,
+            target_lags=forecast_cfg.target_lags,
         )
         parameters = [p for p in self.model.parameters() if p.requires_grad]
         self.optimizer = torch.optim.AdamW(
@@ -520,6 +522,8 @@ class Trainer:
                 max_context,
                 encoder,
                 scale_floor_frac=forecast_cfg.scale_floor_frac,
+                calendar_schema=forecast_cfg.calendar_schema,
+                target_lags=forecast_cfg.target_lags,
             )
             build_s = time.perf_counter() - prepare_started
             self.timings["eval_s"] += build_s

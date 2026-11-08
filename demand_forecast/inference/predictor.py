@@ -148,6 +148,8 @@ class Predictor:
             cfg.max_context,
             self.bundle.encoder,
             scale_floor_frac=cfg.scale_floor_frac,
+            calendar_schema=cfg.calendar_schema,
+            target_lags=cfg.target_lags,
         )
         predictions = np.empty((len(ids), cfg.horizon, len(cfg.quantiles)), dtype=np.float32)
         model = self.bundle.model

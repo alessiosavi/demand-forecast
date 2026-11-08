@@ -1,9 +1,11 @@
 """Recipe-v3 scaler conventions leave shared benchmark frequency logic alone."""
 
+import warnings
+
 import pandas as pd
 import pytest
 
-from demand_forecast.pretrain.periods import pretrain_offset, pretrain_period
+from demand_forecast.pretrain.periods import pretrain_long_lag, pretrain_offset, pretrain_period
 
 
 @pytest.mark.parametrize(
@@ -83,3 +85,60 @@ def test_equivalent_ticks_normalize_without_losing_daily_calendar_semantics():
     assert pretrain_offset("300s") == pretrain_offset("5T")
     assert isinstance(pretrain_offset("24h"), pd.offsets.Hour)
     assert isinstance(pretrain_offset("D"), pd.offsets.Day)
+
+
+@pytest.mark.parametrize("alias,month", [("QS", 1), ("QS-APR", 4), ("Q", 12), ("QE-MAR", 3)])
+def test_quarter_starting_month_is_supported_without_warnings(alias, month):
+    # startingMonth is supported on pandas 2.x and 3.x; month is not its replacement.
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        offset = pretrain_offset(alias)
+        assert offset.startingMonth == month and pretrain_period(offset) == 4
+
+
+@pytest.mark.parametrize(
+    "freq,expected", [("5T", 288), ("10T", 144), ("15T", 96), ("30T", 48), ("H", 24), ("D", 7)]
+)
+def test_period_tick_mapping_does_not_warn(freq, expected):
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert pretrain_period(freq) == expected
+
+
+@pytest.mark.parametrize(
+    "freq,expected",
+    [
+        ("5T", 2016),
+        ("300s", 2016),
+        ("10T", 1008),
+        ("15T", 672),
+        ("30T", 336),
+        ("H", 168),
+        ("60min", 168),
+        ("D", 364),
+        ("24h", 364),
+        ("W-MON", 52),
+        ("W-SUN", 52),
+        ("M", 24),
+        ("MS", 24),
+        ("Q", 8),
+        ("QS-APR", 8),
+        ("min", 1),
+        ("2h", 1),
+        ("2D", 1),
+        ("2M", 1),
+        ("2QS", 1),
+        (None, 1),
+        ("invalid", 1),
+    ],
+)
+def test_long_lag_convention(freq, expected):
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert pretrain_long_lag(freq) == expected
+
+
+def test_long_lag_fallback_uses_task_period_for_unsupported_frequencies():
+    assert pretrain_long_lag("min", 1440) == 1440
+    assert pretrain_long_lag("2h", 12) == 12
+    assert pretrain_long_lag("D", 1) == 364

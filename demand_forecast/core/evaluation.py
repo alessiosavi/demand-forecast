@@ -48,6 +48,8 @@ def prepare_validation(
     batch_size: int = 512,
     *,
     scale_floor_frac: float = 0.0,
+    calendar_schema: str = "legacy",
+    target_lags: str = "none",
 ) -> PreparedValidation:
     """Build ordered CPU batches and metric inputs once, without model work.
 
@@ -61,7 +63,13 @@ def prepare_validation(
     y_past = []
     batch_panel = align_to_origin(panel, positions)
     builder = BatchBuilder(
-        batch_panel, horizon, max_context, encoder, scale_floor_frac=scale_floor_frac
+        batch_panel,
+        horizon,
+        max_context,
+        encoder,
+        scale_floor_frac=scale_floor_frac,
+        calendar_schema=calendar_schema,
+        target_lags=target_lags,
     )
     for row, (i, pos) in enumerate(positions):
         series = panel.series[i]
@@ -112,6 +120,8 @@ def evaluate(
     batch_size: int = 512,
     *,
     scale_floor_frac: float = 0.0,
+    calendar_schema: str = "legacy",
+    target_lags: str = "none",
 ) -> dict[str, float]:
     """Prepare and score validation inputs for callers that do not retain them."""
     return evaluate_prepared(
@@ -125,6 +135,8 @@ def evaluate(
             encoder,
             batch_size,
             scale_floor_frac=scale_floor_frac,
+            calendar_schema=calendar_schema,
+            target_lags=target_lags,
         ),
         quantiles,
     )

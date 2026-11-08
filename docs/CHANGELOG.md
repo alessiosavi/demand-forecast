@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Optional canonical calendar schema (16 named sine/cosine values and masks,
+  including sub-daily time-of-day and quarterly quarter slots) and target-cycle
+  lag channels read from full history in the sample's target frame. Task
+  training, validation and bundle inference share the layout; bundles retain
+  named schema metadata. Defaults preserve existing tensors, identities and
+  bundle config layouts. Recipe-v3 tick periods use explicit Timedelta units
+  for pandas/NumPy compatibility.
+
 - Classical `fev baseline --model` arms: `auto_ets`, `auto_theta`, and `median3`
   (cell-wise median quantiles alongside the unchanged default `seasonal_naive`),
   with seasonal-naive fallback and resume by task/model pair in `summaries.csv`.

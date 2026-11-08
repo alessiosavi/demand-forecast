@@ -25,6 +25,24 @@ legacy contract and are not integrated into the shared pipeline. Old hackathon e
 
 Use the linked README, Settings schema and frozen protocol for current commands and contracts.
 
+## Input schemas
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `forecast.calendar_schema` | `legacy` | `canonical` reserves 16 named values and 16 masks: sine/cosine pairs for `tod, hour, dow, dom, doy, woy, month, quarter`, in that order. Only fields available at the frequency are populated. Weekly grids expose week/month; daily grids expose weekday/day-of-month/day-of-year/week/month; sub-daily grids additionally expose time-of-day (local seconds since midnight / 86400) and hour; monthly and quarterly grids expose month/quarter; yearly grids expose month. Unavailable slots are zero with false masks. `legacy` keeps all existing frequency-specific layouts, including month-only quarterly grids. |
+| `forecast.target_lags` | `none` | `cycle` adds known channels `lag_period` (the task's seasonal period `m`) and `lag_long`, each with a mask, between calendar and task covariates. Values use `(y[p-k] - loc) / scale` in the sample's target frame and read full history even when `k > max_context`. Missing/non-finite values, negative source positions, and source positions at or after the origin are masked; decoder lag `k` is available only for `h < k`. The period slot is fully masked when `m == 1`. |
+
+The long-lag table is `5T: 2016`, `10T: 1008`, `15T: 672`, `30T: 336`,
+`H: 168`, `D: 364`, `W: 52`, `M: 24`, `Q: 8` (equivalent aliases and
+calendar anchors are accepted). Other frequencies use the task's `m`.
+These knobs apply consistently to task training, validation and bundle inference.
+Defaults preserve existing tensors, identities and serialized bundle config
+layouts; non-default settings enter the run identity and the bundle's `forecast`.
+Named schema metadata is stored in `model_spec`; old bundles load unnamed schemas
+as `None`. Pretraining batch adaptation and transfer by name are subsequent v3
+work; the existing transfer still zeroes all calendar, lag and task-covariate
+projection weights.
+
 ## Fine-tune ablations
 
 | Setting | Default | Effect |

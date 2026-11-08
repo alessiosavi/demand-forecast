@@ -12,12 +12,38 @@ import pandas as pd
 import torch
 
 from demand_forecast.data.encoders import StaticEncoder
-from demand_forecast.data.frequency import calendar_feature_names, calendar_features, grid_range
+from demand_forecast.data.frequency import (
+    calendar_feature_mask,
+    calendar_feature_names,
+    calendar_features,
+    grid_range,
+)
 from demand_forecast.data.panel import Panel
 from demand_forecast.data.scaling import sample_frame
+from demand_forecast.pretrain.periods import pretrain_long_lag
 
 COVARIATE_BOUND: float = 1e3
 REL_STD_FLOOR: float = 1e-3
+TARGET_LAG_SCHEMA = ("lag_period", "lag_long")
+
+
+def target_lag_names(policy: str) -> tuple[str, ...]:
+    """Ordered target-derived known slots, separate from task covariates."""
+    if policy not in ("none", "cycle"):
+        raise ValueError("target_lags must be 'none' or 'cycle'")
+    return TARGET_LAG_SCHEMA if policy == "cycle" else ()
+
+
+def _target_lag_values(source, start, origin, stop, lag, frame):
+    """Read full-history lags in the target frame, never reading future targets."""
+    positions = np.arange(start, stop) - lag
+    mask = (positions >= 0) & (positions < min(origin, len(source)))
+    values = np.zeros(stop - start, dtype=np.float64)
+    values[mask] = source[positions[mask]]
+    mask &= np.isfinite(values)
+    values[mask] = (values[mask] - frame.loc) / frame.scale
+    values[~mask] = 0
+    return values.astype(np.float32), mask
 
 
 class DynamicDiagnostics(NamedTuple):
@@ -252,6 +278,8 @@ class BatchBuilder:
         encoder: StaticEncoder,
         *,
         calendar: bool = True,
+        calendar_schema: str = "legacy",
+        target_lags: str = "none",
         scale_floor_frac: float = 0.0,
     ) -> None:
         _positive(horizon, "horizon")
@@ -259,6 +287,15 @@ class BatchBuilder:
         self.panel, self.encoder = panel, encoder
         self.horizon, self.max_context = horizon, max_context
         self.calendar = calendar
+        self.calendar_schema = calendar_schema
+        self.calendar_names = tuple(calendar_feature_names(panel.freq, calendar_schema))
+        self.calendar_mask = calendar_feature_mask(panel.freq, calendar_schema)
+        self.lag_schema = target_lag_names(target_lags)
+        self.lags = (
+            (panel.seasonal_period, pretrain_long_lag(panel.freq, panel.seasonal_period))
+            if self.lag_schema
+            else ()
+        )
         self.scale_floor_frac = scale_floor_frac
         self.floored_target_samples = 0
         self._lengths = {}
@@ -276,7 +313,7 @@ class BatchBuilder:
             # Build at full length on first use: a short same-start series must
             # not bound the label cut-off cached for a later, longer request.
             grid = grid_range(key[0], self._lengths[key] + self.horizon, self.panel.freq)
-            self._grids[key] = grid, calendar_features(grid, self.panel.freq)
+            self._grids[key] = grid, calendar_features(grid, self.panel.freq, self.calendar_schema)
         return self._grids[key]
 
     def _label_limit(self, key, grid, label_upto):
@@ -303,10 +340,11 @@ class BatchBuilder:
                 raise ValueError("origin position exceeds series history_length")
         size = len(items)
         length = min(max_context, int(items[:, 1].max())) if size else 0
-        n_calendar = len(calendar_feature_names(panel.freq))
+        n_calendar = len(self.calendar_names)
+        n_shared = n_calendar + len(self.lag_schema)
         known = panel.roles.known_dynamic
         dynamic = (*known, *panel.roles.past_dynamic)
-        n_enc, n_dec = n_calendar + len(dynamic), n_calendar + len(known)
+        n_enc, n_dec = n_shared + len(dynamic), n_shared + len(known)
         arrays = dict(
             target=np.zeros((size, length), dtype=np.float32),
             observed=np.zeros((size, length), dtype=bool),
@@ -374,9 +412,20 @@ class BatchBuilder:
                 calendar = full_calendar[start : origin + horizon]
                 arrays["enc_cov"][row, dest, :n_calendar] = calendar[:context_length]
                 arrays["dec_cov"][row, :, :n_calendar] = calendar[context_length:]
-                arrays["enc_cov_mask"][row, dest, :n_calendar] = True
-                arrays["dec_cov_mask"][row, :, :n_calendar] = True
-            for column, name in enumerate(dynamic, start=n_calendar):
+                arrays["enc_cov_mask"][row, dest, :n_calendar] = self.calendar_mask
+                arrays["dec_cov_mask"][row, :, :n_calendar] = self.calendar_mask
+            for slot, lag in enumerate(self.lags):
+                if slot == 0 and lag == 1:
+                    continue
+                values, mask = _target_lag_values(
+                    series.target, start, origin, origin + horizon, lag, frame
+                )
+                column = n_calendar + slot
+                arrays["enc_cov"][row, dest, column] = values[:context_length]
+                arrays["enc_cov_mask"][row, dest, column] = mask[:context_length]
+                arrays["dec_cov"][row, :, column] = values[context_length:]
+                arrays["dec_cov_mask"][row, :, column] = mask[context_length:]
+            for column, name in enumerate(dynamic, start=n_shared):
                 is_known = column < n_dec
                 stop = origin + horizon if is_known else origin
                 values, mask, diagnostics = _dynamic_values(
@@ -424,11 +473,20 @@ def make_batch(
     label_upto: pd.Timestamp | None = None,
     *,
     calendar: bool = True,
+    calendar_schema: str = "legacy",
+    target_lags: str = "none",
     scale_floor_frac: float = 0.0,
 ) -> Batch:
     """Build one batch; retain a BatchBuilder to reuse features across calls."""
     return BatchBuilder(
-        panel, horizon, max_context, encoder, calendar=calendar, scale_floor_frac=scale_floor_frac
+        panel,
+        horizon,
+        max_context,
+        encoder,
+        calendar=calendar,
+        calendar_schema=calendar_schema,
+        target_lags=target_lags,
+        scale_floor_frac=scale_floor_frac,
     ).build(items, label_upto)
 
 
@@ -450,6 +508,9 @@ class WindowSampler:
         seed: int = 0,
         label_upto: pd.Timestamp | None = None,
         scale_floor_frac: float = 0.0,
+        *,
+        calendar_schema: str = "legacy",
+        target_lags: str = "none",
     ) -> None:
         _positive(horizon, "horizon")
         _positive(max_context, "max_context")
@@ -469,7 +530,13 @@ class WindowSampler:
         self.horizon, self.max_context = horizon, max_context
         self.seed, self.label_upto = int(seed), label_upto
         self.builder = BatchBuilder(
-            panel, horizon, max_context, encoder, scale_floor_frac=scale_floor_frac
+            panel,
+            horizon,
+            max_context,
+            encoder,
+            scale_floor_frac=scale_floor_frac,
+            calendar_schema=calendar_schema,
+            target_lags=target_lags,
         )
         self.set_epoch(0)
 

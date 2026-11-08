@@ -7,6 +7,11 @@ import pandas as pd
 
 DAY_NS = pd.Timedelta(1, "D").value
 HOUR_NS = pd.Timedelta(1, "h").value
+CANONICAL_CALENDAR_SCHEMA = tuple(
+    f"{name}_{function}"
+    for name in ("tod", "hour", "dow", "dom", "doy", "woy", "month", "quarter")
+    for function in ("sin", "cos")
+)
 
 
 class GridError(ValueError):
@@ -180,14 +185,18 @@ def steps_between(a: pd.Timestamp, b: pd.Timestamp, freq: str | pd.offsets.BaseO
     return int(steps)
 
 
-def _calendar_components(offset: pd.offsets.BaseOffset) -> list[tuple[str, int]]:
+def _calendar_components(
+    offset: pd.offsets.BaseOffset, *, canonical: bool = False
+) -> list[tuple[str, int]]:
     daily = [("dow", 7), ("dom", 31), ("doy", 366), ("woy", 53), ("month", 12)]
     if isinstance(offset, pd.offsets.Week):
         return [("woy", 53), ("month", 12)]
     if isinstance(offset, pd.offsets.Day):
         return daily
     if isinstance(offset, pd.offsets.Tick):
-        return [("hour", 24), *daily] if offset.nanos < DAY_NS else daily
+        if offset.nanos < DAY_NS:
+            return ([("tod", 86400)] if canonical else []) + [("hour", 24), *daily]
+        return daily
     if isinstance(
         offset,
         (
@@ -200,11 +209,17 @@ def _calendar_components(offset: pd.offsets.BaseOffset) -> list[tuple[str, int]]
         ),
     ):
         return [("month", 12), ("quarter", 4)]
+    if canonical and isinstance(offset, (pd.offsets.QuarterBegin, pd.offsets.QuarterEnd)):
+        return [("month", 12), ("quarter", 4)]
     return [("month", 12)]
 
 
-def calendar_feature_names(freq: str | pd.offsets.BaseOffset) -> list[str]:
+def calendar_feature_names(freq: str | pd.offsets.BaseOffset, schema: str = "legacy") -> list[str]:
     """Names in output order, with sine immediately followed by cosine."""
+    if schema == "canonical":
+        return list(CANONICAL_CALENDAR_SCHEMA)
+    if schema != "legacy":
+        raise ValueError("calendar_schema must be 'legacy' or 'canonical'")
     return [
         f"{name}_{function}"
         for name, _ in _calendar_components(to_offset(freq))
@@ -212,15 +227,33 @@ def calendar_feature_names(freq: str | pd.offsets.BaseOffset) -> list[str]:
     ]
 
 
-def calendar_features(index: pd.DatetimeIndex, freq: str | pd.offsets.BaseOffset) -> np.ndarray:
+def calendar_feature_mask(freq: str | pd.offsets.BaseOffset, schema: str = "legacy") -> np.ndarray:
+    """Availability of each named slot for this frequency, independent of dates."""
+    available = {
+        f"{name}_{function}"
+        for name, _ in _calendar_components(to_offset(freq), canonical=schema == "canonical")
+        for function in ("sin", "cos")
+    }
+    return np.array([name in available for name in calendar_feature_names(freq, schema)])
+
+
+def calendar_features(
+    index: pd.DatetimeIndex, freq: str | pd.offsets.BaseOffset, schema: str = "legacy"
+) -> np.ndarray:
     """Encode calendar fields as float32 sine/cosine pairs in named column order.
 
     Use pandas' native numbering (hour/day-of-week start at zero, other fields
     at one), ISO weeks, and fixed cycle lengths 24/7/31/366/53/12/4. Fixed maxima
     keep the same date's encoding independent of its series and leap-year status.
     """
-    components = _calendar_components(to_offset(freq))
+    names = calendar_feature_names(freq, schema)
+    components = _calendar_components(to_offset(freq), canonical=schema == "canonical")
     fields = {
+        "tod": index.hour * 3600
+        + index.minute * 60
+        + index.second
+        + index.microsecond / 1e6
+        + index.nanosecond / 1e9,
         "hour": index.hour,
         "dow": index.day_of_week,
         "dom": index.day,
@@ -229,9 +262,10 @@ def calendar_features(index: pd.DatetimeIndex, freq: str | pd.offsets.BaseOffset
         "month": index.month,
         "quarter": index.quarter,
     }
-    features = np.empty((len(index), 2 * len(components)), dtype=np.float32)
-    for column, (name, period) in enumerate(components):
+    features = np.zeros((len(index), len(names)), dtype=np.float32)
+    for name, period in components:
+        column = names.index(f"{name}_sin")
         angle = fields[name].to_numpy(dtype=np.float64, na_value=np.nan) * (2 * np.pi / period)
-        features[:, 2 * column] = np.sin(angle)
-        features[:, 2 * column + 1] = np.cos(angle)
+        features[:, column] = np.sin(angle)
+        features[:, column + 1] = np.cos(angle)
     return features

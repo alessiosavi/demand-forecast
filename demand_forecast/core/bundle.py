@@ -110,7 +110,11 @@ def save_bundle(
                 "backbone_kwargs": backbone_kwargs,
                 "forecast": forecast_cfg.model_dump(mode="json"),
                 "dataset": dataset_cfg.model_dump(mode="json") if dataset_cfg is not None else None,
-                "model_spec": asdict(model.spec),
+                "model_spec": {
+                    name: value
+                    for name, value in asdict(model.spec).items()
+                    if name not in ("calendar_schema", "lag_schema") or value is not None
+                },
             },
         )
         _write_json(temporary / "encoder.json", encoder.to_json())
@@ -172,7 +176,16 @@ def load_bundle(directory: Path | str, device: torch.device | str = "cpu") -> Bu
         json.loads((directory / "encoder.json").read_text(encoding="utf-8"))
     )
     spec_data = config["model_spec"]
-    spec = ModelSpec(**{**spec_data, "quantiles": tuple(spec_data["quantiles"])})
+    spec = ModelSpec(
+        **{
+            **spec_data,
+            "quantiles": tuple(spec_data["quantiles"]),
+            **{
+                name: tuple(spec_data[name]) if spec_data.get(name) is not None else None
+                for name in ("calendar_schema", "lag_schema")
+            },
+        }
+    )
     model = build_model(config["family"], spec, config["backbone_kwargs"]).to(device)
     model.load_state_dict(
         torch.load(directory / "model.pt", map_location=device, weights_only=True)

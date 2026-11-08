@@ -325,6 +325,8 @@ def test_scale_floor_counts_training_and_prediction_samples(tmp_path, protocol_c
         ("training", "select_min_gain", 0.05),
         ("training", "exception_policy", "pretrained"),
         ("forecast", "scale_floor_frac", 0.1),
+        ("forecast", "calendar_schema", "canonical"),
+        ("forecast", "target_lags", "cycle"),
     ],
 )
 def test_protocol_nondefault_changes_identity(section, field, value):
@@ -334,6 +336,44 @@ def test_protocol_nondefault_changes_identity(section, field, value):
     setattr(getattr(settings, section), field, value)
     assert _identity_settings(settings)[section][field] == value
     assert run_identity(settings, *args) != before
+
+
+def test_schema_defaults_preserve_identity_and_serialized_forecast():
+    settings = tiny_settings()
+    before = _identity_settings(settings)
+    settings.forecast.calendar_schema = "legacy"
+    settings.forecast.target_lags = "none"
+    assert _identity_settings(settings) == before
+    assert "calendar_schema" not in before["forecast"] and "target_lags" not in before["forecast"]
+    assert "calendar_schema" not in settings.forecast.model_dump()
+    assert "target_lags" not in settings.forecast.model_dump()
+
+
+def test_schema_knobs_reach_training_validation_and_bundle_inference(
+    tmp_path, protocol_case, monkeypatch
+):
+    panel, origin, settings = protocol_case
+    settings.forecast.calendar_schema = "canonical"
+    settings.forecast.target_lags = "cycle"
+    prepared_batches = []
+    original = training.prepare_validation
+
+    def capture(*args, **kwargs):
+        prepared = original(*args, **kwargs)
+        prepared_batches.extend(prepared.batches)
+        return prepared
+
+    monkeypatch.setattr(training, "prepare_validation", capture)
+    bundle, _ = _run(protocol_case, tmp_path)
+    assert prepared_batches
+    assert all(
+        batch.enc_cov.shape[-1] == 20 and batch.dec_cov.shape[-1] == 19
+        for batch in prepared_batches
+    )
+    assert bundle.model.spec.enc_channels == 42 and bundle.model.spec.dec_channels == 38
+    assert bundle.model.spec.calendar_schema[-2:] == ("quarter_sin", "quarter_cos")
+    _, arrays = Predictor(bundle).forecast_arrays(panel, origin)
+    assert arrays.shape == (3, settings.forecast.horizon, 9) and np.isfinite(arrays).all()
 
 
 @pytest.mark.parametrize("value", [-0.1, 1.0, float("nan"), float("inf")])

@@ -12,7 +12,7 @@ from demand_forecast.config.settings import ForecastConfig
 from demand_forecast.data.encoders import StaticEncoder
 from demand_forecast.data.frequency import calendar_feature_names
 from demand_forecast.data.panel import Panel
-from demand_forecast.data.sampler import Batch
+from demand_forecast.data.sampler import Batch, target_lag_names
 from demand_forecast.models.heads import MonotoneQuantileHead
 
 
@@ -30,6 +30,8 @@ class ModelSpec:
     target_support: str | dict[str, str]
     width_factor: float = 2.0
     use_vsn: bool = True
+    calendar_schema: tuple[str, ...] | None = None
+    lag_schema: tuple[str, ...] | None = None
 
     @classmethod
     def from_panel(
@@ -41,8 +43,9 @@ class ModelSpec:
         cat_emb_dim: int,
     ) -> ModelSpec:
         """Match the calendar, known/past covariate and fitted static batch layout."""
-        n_calendar = len(calendar_feature_names(panel.freq))
-        n_dec = n_calendar + len(panel.roles.known_dynamic)
+        calendar = tuple(calendar_feature_names(panel.freq, forecast_cfg.calendar_schema))
+        lags = target_lag_names(forecast_cfg.target_lags)
+        n_dec = len(calendar) + len(lags) + len(panel.roles.known_dynamic)
         n_enc = n_dec + len(panel.roles.past_dynamic)
         return cls(
             d_model=d_model,
@@ -53,6 +56,8 @@ class ModelSpec:
             n_numeric=encoder.n_numeric,
             cat_emb_dim=cat_emb_dim,
             target_support=panel.target_support,
+            calendar_schema=calendar if forecast_cfg.calendar_schema == "canonical" else None,
+            lag_schema=lags or None,
         )
 
 

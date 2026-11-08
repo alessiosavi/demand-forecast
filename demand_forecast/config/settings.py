@@ -3,7 +3,14 @@
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 
 class DatasetConfig(BaseModel):
@@ -36,6 +43,17 @@ class ForecastConfig(BaseModel):
     max_context: int = 512
     min_context: int = 1
     scale_floor_frac: float = Field(0.0, ge=0, lt=1)
+    calendar_schema: Literal["legacy", "canonical"] = "legacy"
+    target_lags: Literal["none", "cycle"] = "none"
+
+    @model_serializer(mode="wrap")
+    def serialize_compatible(self, handler):
+        """Keep default task/pretraining configs and bundles byte-compatible."""
+        payload = handler(self)
+        for name, default in (("calendar_schema", "legacy"), ("target_lags", "none")):
+            if payload.get(name) == default:
+                payload.pop(name)
+        return payload
 
     @field_validator("quantiles")
     @classmethod

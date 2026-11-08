@@ -73,6 +73,40 @@ def test_spec_matches_sampler_channels_without_optional_statics(freq, n_calendar
     assert torch.isfinite(model.predict(batch)).all()
 
 
+@pytest.mark.parametrize("calendar_schema,n_calendar", [("legacy", 4), ("canonical", 16)])
+@pytest.mark.parametrize("target_lags,n_lags", [("none", 0), ("cycle", 2)])
+def test_named_schema_channel_arithmetic_order_and_forward(
+    calendar_schema, n_calendar, target_lags, n_lags
+):
+    panel = weekly_panel([60])  # One known and one past-only task covariate.
+    encoder = StaticEncoder().fit(panel, ["a"])
+    cfg = ForecastConfig(horizon=3, calendar_schema=calendar_schema, target_lags=target_lags)
+    spec = ModelSpec.from_panel(panel, encoder, cfg, 8, 4)
+    n_enc, n_dec = n_calendar + n_lags + 2, n_calendar + n_lags + 1
+    assert spec.enc_channels == 2 + 2 * n_enc
+    assert spec.dec_channels == 2 * n_dec
+    assert (spec.calendar_schema is None) == (calendar_schema == "legacy")
+    assert spec.lag_schema == (("lag_period", "lag_long") if n_lags else None)
+    batch = make_batch(
+        panel, [(0, 60)], 3, 8, encoder, calendar_schema=calendar_schema, target_lags=target_lags
+    )
+    model = ForecastModel(spec, ToyBackbone(8))
+    enc, dec = model.encoder_inputs(batch), model.decoder_inputs(batch)
+    assert enc.shape == (1, 8, spec.enc_channels)
+    assert dec.shape == (1, 3, spec.dec_channels)
+    assert torch.equal(enc[..., 0], batch.target)
+    assert torch.equal(enc[..., 1], batch.observed.float())
+    assert torch.equal(enc[..., 2 : 2 + n_enc], batch.enc_cov)
+    assert torch.equal(enc[..., 2 + n_enc :], batch.enc_cov_mask.float())
+    assert torch.equal(dec[..., :n_dec], batch.dec_cov)
+    assert torch.equal(dec[..., n_dec:], batch.dec_cov_mask.float())
+    assert torch.equal(
+        batch.enc_cov[..., -2:], make_batch(panel, [(0, 60)], 3, 8, encoder).enc_cov[..., -2:]
+    )
+    assert model(batch).shape == (1, 3, 9)
+    assert torch.isfinite(model.predict(batch)).all()
+
+
 def test_input_channels_projections_and_padding_mask(spec29, panel29, encoder29):
     panel29.series[1].target[3] = np.nan
     batch = make_batch(panel29, [(0, 12), (1, 6)], 13, 64, encoder29)
