@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Recipe-v3 round 3: feasible pinned-fev horizon draws per frequency-group batch,
+  full-future windows, series-uniform draws with uniform eligible origins,
+  per-source pair quotas and exact sampler continuation.
+  Resumable source/group/horizon and eligible-label exposure is published in
+  progress and bundle metadata. The v3 config uses batch 96 and maximum H=288,
+  pending the round-5 L4 memory probe; legacy v2 streams and identities are unchanged.
 - Recipe-v3 pretraining adapter: real source grids, canonical calendar and target
   lag inputs, projection zero initialization, resumable feature exposure counts,
   matching validation periods, and transfer by feature name into task layouts.

@@ -19,6 +19,7 @@ from demand_forecast.data.encoders import StaticEncoder
 from demand_forecast.data.panel import Series
 from demand_forecast.data.sampler import Batch, BatchBuilder, _positive
 from demand_forecast.pretrain import corpus
+from demand_forecast.pretrain.config import FEV_HORIZONS
 from demand_forecast.pretrain.corpus import ShardPanelGroup, ShardRecords, ShardRef
 
 Kind = str
@@ -37,6 +38,15 @@ class StreamState:
     shard_cursor: int
     batch_cursor: int
     rng_state: dict[str, Any]
+
+
+@dataclass
+class V3StreamState(StreamState):
+    """V3 next pair slot, resolved visit budget and empty-pass detection."""
+
+    visit_cursor: int
+    visit_quota: int
+    pass_has_batches: bool
 
 
 @dataclass
@@ -67,12 +77,16 @@ class WeightedSamplerState:
 
 def sampler_state_from_dict(value: dict) -> CorpusSamplerState | WeightedSamplerState:
     """Read legacy checkpoints as well as weighted checkpoints."""
+
+    def stream(v):
+        return (V3StreamState if "visit_cursor" in v else StreamState)(**v)
+
     if "streams" in value:
         return WeightedSamplerState(
-            **(value | {"streams": {k: StreamState(**v) for k, v in value["streams"].items()}})
+            **(value | {"streams": {k: stream(v) for k, v in value["streams"].items()}})
         )
     return CorpusSamplerState(
-        value["step"], StreamState(**value["tsmixup"]), StreamState(**value["kernel_synth"])
+        value["step"], stream(value["tsmixup"]), stream(value["kernel_synth"])
     )
 
 
@@ -324,7 +338,7 @@ class V3BatchBuilder:
                     raise ValueError("v3 rows must address exactly one panel group")
                 self._routes[row_index] = (group_index, local_index)
 
-    def build(self, items) -> Batch:
+    def build(self, items, *, horizon: int | None = None) -> Batch:
         items = np.asarray(items, dtype=np.int64).reshape(-1, 2)
         chunks, positions = [], []
         selected_groups = {}
@@ -338,6 +352,14 @@ class V3BatchBuilder:
         for group_index, (selected, pairs) in selected_groups.items():
             group, builder = self.builders[group_index]
             chunk = builder.build(pairs)
+            if horizon is not None:
+                if not 1 <= horizon <= builder.horizon:
+                    raise ValueError("sampled horizon must fit the builder horizon")
+                # The decoder takes its length from these tensors, not the config.
+                # Keep one grid/builder per group, rather than one per horizon.
+                for name in ("dec_cov", "dec_cov_mask", "labels", "label_mask"):
+                    setattr(chunk, name, getattr(chunk, name)[:, :horizon])
+                chunk.loss_eligible = chunk.eligible & chunk.label_mask.any(dim=1)
             chunk.series_index = self._row_indices[group_index][chunk.series_index]
             chunks.append(chunk)
             positions.extend(selected)
@@ -374,13 +396,41 @@ class V3BatchBuilder:
 
 
 class V3ShardStream(ShardStream):
-    """Reuse the legacy schedule/state with a real-grid, named-input adapter."""
+    """Sample full windows within a group, with a resumable pair-slot quota.
 
-    def __init__(self, *args, period_policy, grid_policy, scale_floor_frac, **kwargs):
+    Groups are selected proportional to their usable-series counts. Conditional
+    on that group, horizons are uniform over its feasible set. Each pair draws
+    a feasible series uniformly, then an eligible origin uniformly within that
+    series, with replacement. Default visits draw as many pairs as there are
+    usable series, retaining a partial batch.
+    """
+
+    def __init__(
+        self,
+        *args,
+        period_policy,
+        grid_policy,
+        scale_floor_frac,
+        horizon_policy="fixed",
+        shard_visit_quota=None,
+        **kwargs,
+    ):
         self.period_policy = period_policy
         self.grid_policy = grid_policy
         self.scale_floor_frac = scale_floor_frac
+        if horizon_policy not in ("fixed", "fev_set"):
+            raise ValueError("unknown horizon_policy")
+        if shard_visit_quota is not None:
+            _positive(shard_visit_quota, "shard_visit_quota")
+        self.horizon_policy = horizon_policy
+        self.configured_quota = shard_visit_quota
+        self.visit_cursor = self._visit_quota = 0
+        self._groups = []
+        self.last_group = ""
         super().__init__(*args, **kwargs)
+        if horizon_policy == "fev_set" and self.horizon != max(FEV_HORIZONS):
+            self.close()
+            raise ValueError("fev_set requires horizon = 288")
 
     def _read(self, path: Path) -> ShardRecords:
         records = corpus.read_shard_v3(path, kind=self.kind, grid_policy=self.grid_policy)
@@ -394,22 +444,143 @@ class V3ShardStream(ShardStream):
         else:
             future, self._future = self._future, None
             loaded = future.result()
+        groups = corpus.shard_panels(loaded.records, period_policy=self.period_policy)
         self._builder = V3BatchBuilder(
-            corpus.shard_panels(loaded.records, period_policy=self.period_policy),
+            groups,
             self.horizon,
             self.max_context,
             self.encoder,
             scale_floor_frac=self.scale_floor_frac,
         )
-        lengths = np.array([record.series.length for record in loaded.records], dtype=np.int64)
-        indices = np.flatnonzero(lengths > self.min_context)
+        self._groups = []
+        horizons = FEV_HORIZONS if self.horizon_policy == "fev_set" else (self.horizon,)
+        for group in groups:
+            minimum = max(8, group.panel.seasonal_period + 1)
+            lengths = np.array([s.history_length for s in group.panel.series], dtype=np.int64)
+            feasible = {}
+            for horizon in horizons:
+                counts = np.maximum(0, lengths - horizon - minimum + 1)
+                indices = np.flatnonzero(counts)
+                if len(indices):
+                    feasible[horizon] = (indices, counts[indices])
+            if feasible:
+                usable = len(next(iter(feasible.values()))[0])
+                key = (
+                    f"{group.panel.freq.freqstr}|m={group.panel.seasonal_period}"
+                    f"|calendar={int(group.calendar_available)}"
+                )
+                self._groups.append((group, minimum, feasible, usable, key))
+        usable = sum(g[3] for g in self._groups)
+        self._visit_quota = (self.configured_quota or usable) if usable else 0
         self._rng = np.random.default_rng(
             (self.seed, KIND_CODE[self.kind], self.pass_index, ref.index)
         )
-        origins = self._rng.integers(self.min_context, lengths[indices])
-        draws = np.column_stack((indices, origins))
-        self._draws = draws[self._rng.permutation(len(draws))]
         self._prefetch_next()
+
+    def _prefetch_next(self) -> None:
+        if self._executor is None:
+            return
+        cursor, order = self.shard_cursor + 1, self._order
+        if cursor == len(order):
+            if not self._visit_quota and not self._pass_has_batches:
+                return
+            cursor, order = 0, self._shard_order(self.pass_index + 1)
+        self._future = self._executor.submit(self._read, self.refs[int(order[cursor])].path)
+
+    def __next__(self) -> Batch:
+        if self._closed:
+            raise StopIteration
+        try:
+            if not self.refs:
+                raise ValueError(f"{self.kind} source has no usable windows")
+            while True:
+                if self._builder is None:
+                    self._load_shard()
+                if self.visit_cursor < self._visit_quota:
+                    weights = np.array([g[3] for g in self._groups], dtype=np.float64)
+                    group, minimum, feasible, _, key = self._groups[
+                        int(self._rng.choice(len(weights), p=weights / weights.sum()))
+                    ]
+                    horizon = int(self._rng.choice(tuple(feasible)))
+                    indices, counts = feasible[horizon]
+                    size = min(self.batch_size, self._visit_quota - self.visit_cursor)
+                    rows = self._rng.integers(len(indices), size=size)
+                    origins = minimum + self._rng.integers(counts[rows])
+                    original_rows = np.asarray(group.row_indices)[indices[rows]]
+                    batch = self._builder.build(
+                        np.column_stack((original_rows, origins)), horizon=horizon
+                    )
+                    self.last_group = key
+                    self.visit_cursor += size
+                    self.batch_cursor += 1
+                    self._pass_has_batches = True
+                    return batch
+                self._builder = None
+                self._groups = []
+                self.visit_cursor = self._visit_quota = self.batch_cursor = 0
+                self.shard_cursor += 1
+                if self.shard_cursor == len(self.refs):
+                    if not self._pass_has_batches:
+                        raise ValueError(f"{self.kind} source has no usable windows")
+                    self.pass_index += 1
+                    self.shard_cursor = 0
+                    self._order = self._shard_order(self.pass_index)
+                    self._pass_has_batches = False
+        except Exception:
+            self.close()
+            raise
+
+    def state(self) -> V3StreamState:
+        return V3StreamState(
+            self.pass_index,
+            self.shard_cursor,
+            self.batch_cursor,
+            deepcopy(self._rng.bit_generator.state),
+            self.visit_cursor,
+            self._visit_quota,
+            self._pass_has_batches,
+        )
+
+    def load_state(self, state: StreamState) -> None:
+        if self._closed:
+            raise RuntimeError("cannot restore a closed shard stream")
+        if not isinstance(state, V3StreamState):
+            raise ValueError("v3 sampler requires v3 window-policy state")
+        for name in ("pass_index", "shard_cursor", "batch_cursor", "visit_cursor", "visit_quota"):
+            _positive(getattr(state, name) + 1, name + " + 1")
+        if state.shard_cursor >= max(1, len(self.refs)):
+            raise ValueError("shard_cursor is outside the corpus")
+        self._discard_prefetch()
+        self._builder = None
+        self._groups = []
+        self.pass_index, self.shard_cursor = state.pass_index, state.shard_cursor
+        self.batch_cursor, self.visit_cursor = state.batch_cursor, state.visit_cursor
+        self._order = self._shard_order(self.pass_index)
+        self._pass_has_batches = state.pass_has_batches
+        self._visit_quota = 0
+        try:
+            if self.batch_cursor:
+                self._load_shard()
+                if (
+                    self._visit_quota != state.visit_quota
+                    or not 0 < self.visit_cursor <= self._visit_quota
+                    or self.batch_cursor
+                    > (self._visit_quota + self.batch_size - 1) // self.batch_size
+                    or not self._pass_has_batches
+                    or self.visit_cursor
+                    != min(self.batch_cursor * self.batch_size, self._visit_quota)
+                ):
+                    raise ValueError("v3 visit cursor/quota is outside the shard")
+            elif state.visit_cursor or state.visit_quota:
+                raise ValueError("unstarted v3 visit must have zero cursor/quota")
+            self._rng.bit_generator.state = deepcopy(state.rng_state)
+        except Exception:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        super().close()
+        self._groups = []
 
 
 class CorpusSampler:
@@ -443,6 +614,8 @@ class CorpusSampler:
         recipe: str = "v2",
         period_policy: str = "legacy_one",
         grid_policy: str = "legacy_weekly",
+        horizon_policy: str = "fixed",
+        shard_visit_quota: dict[str, int] | None = None,
         scale_floor_frac: float = 0.0,
     ) -> None:
         _positive(kernel_synth_every + 1, "kernel_synth_every + 1")
@@ -493,12 +666,18 @@ class CorpusSampler:
                 period_policy=period_policy,
                 grid_policy=grid_policy,
                 scale_floor_frac=scale_floor_frac,
+                horizon_policy=horizon_policy,
             )
         elif recipe != "v2":
             raise ValueError("recipe must be v2 or v3")
         try:
             for kind, refs in refs_by_kind.items():
-                self.streams[kind] = stream_type(refs, kind, **kwargs)
+                extra = (
+                    dict(shard_visit_quota=(shard_visit_quota or {}).get(kind))
+                    if recipe == "v3"
+                    else {}
+                )
+                self.streams[kind] = stream_type(refs, kind, **kwargs, **extra)
         except BaseException:
             for stream in self.streams.values():
                 stream.close()
