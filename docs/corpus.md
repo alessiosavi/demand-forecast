@@ -74,6 +74,9 @@ store the resolved quota, pair and batch cursors, pass/shard positions, empty-pa
 flag and RNG state; prefetch performs no sampling. The v3 sampling policy enters
 the identity, so round-2b checkpoints cannot silently resume with new semantics.
 V2 config payloads, identities, checkpoint states and stream draws are unchanged.
+The shipped v3 config sets `shard_visit_quota: {gifteval_pretrain: 9600}`
+(100 batches of 96 pairs per visit) to amortise measured shard reads of about
+23 s that otherwise yield only 2 batches, leaving other source quotas at their defaults.
 
 The configured maximum horizon is 288 and context remains capped at 512. The
 adapter caches one builder/grid per group and slices future tensors to the drawn

@@ -947,6 +947,21 @@ infer cache availability from the old volume ID.
 The shipped v3 config disables the external calendar on/off diagnostic at H=288
 with `corpus.external_validation: null` because weekly NN5 has no 288-step window.
 
+The 2026-11-08 L4 probe (`v3probe2`, main `6a9bff9`) measured 0.62–1.01 s/step
+(0.687 s weighted), 12.43 GB peak CUDA memory at H=288 and 236 s per raw+EMA
+evaluation. Shard reads took about 20–23 s; default visits yielded 521 batches
+for each synthetic source, 209 for `chronos_real`, but only 2 for
+`gifteval_pretrain`. GiftEval shard wait cost 11.7 s per GiftEval step and
+2.96 s/step weighted, inflating the 78k-step estimate to 5,530 minutes (92 h)
+versus about 17 h of compute: a `shard_load_s_per_step` near 2.96 in
+`progress.json` signals this bottleneck. The shipped
+`shard_visit_quota: {gifteval_pretrain: 9600}` amortises reads over 100 batches
+of 96 pairs, sampled with replacement under the round-3 series-uniform rule;
+other sources keep their default quotas. The 19,500 GiftEval batches need about
+195 visits across 14 training shards, about 14 visits per shard.
+A `--probe-json` from the previous config is rejected by `measurement_config`
+after this quota change; omit it so the run builds its live estimate instead.
+
 Allow about $1 for the probe session; $7–10 for the pilot quarter; $20–25 for the
 remaining 58k steps, about $25–35 for training in all. These are planning ranges,
 not measurements. Zero-shot rows cost about $5; composite rows cost $15–20 for

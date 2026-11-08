@@ -307,6 +307,7 @@ def test_shipped_v3_config_samples_fev_horizons_and_selects_real():
     assert (v3.recipe, v3.period_policy, v3.grid_policy) == ("v3", "frequency", "source")
     assert (v3.forecast.calendar_schema, v3.forecast.target_lags) == ("canonical", "cycle")
     assert v3.forecast.horizon == 288 and v3.horizon_policy == "fev_set"
+    assert v3.shard_visit_quota == {"gifteval_pretrain": 9600}
     assert v3.training.batch_size == v3.training.val_batch_size == 96
     assert v3.corpus.model_dump(
         exclude={"selection_shards", "external_validation"}
