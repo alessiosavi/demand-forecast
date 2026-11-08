@@ -29,6 +29,54 @@ from tests.helpers.panels import weekly_panel
 SCRIPT_RELOAD = Path(__file__).resolve().parents[1] / "helpers" / "reload_forecast.py"
 
 
+def test_saved_pretraining_frame_survives_reload(
+    tmp_path, tiny_v2_trained, forecast29, encoder29, panel29, cutoff29, origin29
+):
+    panel = replace(panel29, seasonal_period=7)
+    cfg = forecast29.model_copy(update={"scaler_period": "pretraining"})
+    save_bundle(
+        tmp_path / "bundle",
+        model=tiny_v2_trained,
+        family="v2",
+        backbone_kwargs=asdict(tiny_v2_trained.backbone.cfg),
+        forecast_cfg=cfg,
+        dataset_cfg=None,
+        encoder=encoder29,
+        panel=panel,
+        training_cutoff=cutoff29,
+        earliest_origin=origin29,
+        manifest={},
+        scaler_period=1,
+    )
+    predictor = Predictor.from_bundle(tmp_path / "bundle")
+    assert predictor.bundle.scaler_period == 1
+    assert predictor.bundle.forecast_cfg.scaler_period == "pretraining"
+    tiny_v2_trained.eval()
+    batch = make_batch(panel, [(i, 29) for i in range(3)], 13, 64, encoder29, scaler_period=1)
+    expected = tiny_v2_trained.predict(batch).numpy()
+    _, actual = predictor.forecast_arrays(panel, origin29)
+    np.testing.assert_array_equal(actual, expected)
+    task_batch = make_batch(panel, [(i, 29) for i in range(3)], 13, 64, encoder29)
+    assert not torch.equal(batch.scale, task_batch.scale)
+
+
+def test_legacy_bundle_without_scaler_fields_loads_as_task(bundle_dir, panel29, origin29):
+    _, expected = Predictor.from_bundle(bundle_dir).forecast_arrays(panel29, origin29)
+    path = bundle_dir / "config.json"
+    config = json.loads(path.read_text())
+    config.pop("scaler_period")
+    config["forecast"].pop("scaler_period")
+    path.write_text(json.dumps(config))
+    manifest_path = bundle_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["sha256"]["config.json"] = hashlib.sha256(path.read_bytes()).hexdigest()
+    manifest_path.write_text(json.dumps(manifest))
+    predictor = Predictor.from_bundle(bundle_dir)
+    assert predictor.bundle.scaler_period == predictor.bundle.forecast_cfg.scaler_period == "task"
+    _, actual = predictor.forecast_arrays(panel29, origin29)
+    np.testing.assert_array_equal(actual, expected)
+
+
 def test_fresh_process_reload_parity(
     tmp_path, bundle_dir, panel29, origin29, tiny_v2_trained, forecast29, encoder29
 ):

@@ -298,9 +298,11 @@ def test_run_identity_canonical_json(run_settings):
         "average_last_k",
         "select_min_gain",
         "exception_policy",
+        "loss_weight",
     ):
         del settings["training"][key]
     del settings["forecast"]["scale_floor_frac"]
+    del settings["forecast"]["scaler_period"]
     payload = {
         "settings": settings,
         "seed": 3,

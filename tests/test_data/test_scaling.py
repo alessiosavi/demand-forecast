@@ -3,7 +3,7 @@ from dataclasses import FrozenInstanceError
 import numpy as np
 import pytest
 
-from demand_forecast.data.scaling import Frame, sample_frame, seasonal_error
+from demand_forecast.data.scaling import Frame, metric_scale_weight, sample_frame, seasonal_error
 
 pytestmark = pytest.mark.filterwarnings("error::RuntimeWarning")
 
@@ -114,3 +114,26 @@ def test_frame_is_frozen():
     frame = sample_frame(np.array([1.0, 3.0]), np.array([1.0, 3.0]), 1)
     with pytest.raises(FrozenInstanceError):
         frame.scale = 2.0
+
+
+@pytest.mark.parametrize(
+    "scale,expected,clipped", [(0.01, 0.1, True), (20, 10, True), (1, 1, False)]
+)
+def test_metric_scale_weight_clips_both_ends(scale, expected, clipped):
+    frame = Frame(0, scale, scale, True, True)
+    assert metric_scale_weight(frame, np.arange(10), 1) == (expected, clipped)
+
+
+@pytest.mark.parametrize("past", [[1, 1, 1], [1], [np.nan, np.nan], [1, np.inf]])
+def test_metric_scale_weight_excludes_nonpositive_or_nonfinite_task_scale(past):
+    frame = Frame(0, 1, 1, True, True)
+    assert metric_scale_weight(frame, np.array(past), 1) == (0, False)
+
+
+@pytest.mark.parametrize("relative_floor", [0.0, 0.1])
+def test_weight_uses_effective_scale_when_a_floor_changes_the_frame(relative_floor):
+    past = np.array([100, 100 + 1e-8])
+    frame = sample_frame(past, past, 1, scale_floor_frac=relative_floor)
+    weight, clipped = metric_scale_weight(frame, past, 1)
+    assert frame.scale > frame.scale_raw
+    assert weight == 10 and clipped

@@ -94,10 +94,13 @@ def test_pretrain_config_loads_shipped_yaml_and_rejects_unknown_keys(tmp_path, s
         "external_validation": "monash_nn5_weekly",
     }
     assert isinstance(cfg.forecast, ForecastConfig)
-    assert (
-        cfg.forecast.model_dump()
-        == ForecastConfig(horizon=52, max_context=512, min_context=8).model_dump()
+    # Task-only scaler_period stays in the shared schema, outside pretraining dumps.
+    expected_forecast = ForecastConfig(horizon=52, max_context=512, min_context=8).model_dump(
+        exclude={"scaler_period"}
     )
+    assert cfg.forecast.model_dump() == expected_forecast
+    assert cfg.model_dump(mode="json")["forecast"] == expected_forecast
+    assert json.loads(cfg.model_dump_json())["forecast"] == expected_forecast
     assert cfg.model == ModelConfig(
         d_model=320,
         nhead=5,

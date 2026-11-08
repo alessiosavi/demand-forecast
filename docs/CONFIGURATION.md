@@ -33,7 +33,36 @@ Use the linked README, Settings schema and frozen protocol for current commands 
 | `training.trainable` | `all` | `heads_only` freezes every backbone parameter. Input projections, static embeddings/gates and the quantile head remain trainable; the optimizer contains only trainable parameters. |
 | `training.series_embedding` | `true` | `false` omits the `__series__` vocabulary and embedding. Task categorical and numeric statics are retained. Bundles with either form load normally, including tasks without any statics. |
 | `forecast.scale_floor_frac` | `0.0` | A fraction in `[0, 1)`. When positive, eligible target scales are at least this fraction times the mean absolute observed value in the sample's cropped context, in addition to `1e-6`. Training, validation and inference share the transform. Zero/undefined seasonal scales retain their existing eligibility and fallback behavior. |
+| `forecast.scaler_period` | `task` | `task` uses the task's seasonal period for the sample frame. `pretraining` uses period 1 for corpus-v2 bundles, including manifests without recipe controls. A source manifest with `config.recipe: v3` and `config.period_policy: frequency` uses `pretrain_period(task.freq)`. Without `training.init_from`, it falls back to the task period. |
+| `training.loss_weight` | `none` | `metric_scale` weights each sample by its effective frame scale divided by its task-period seasonal error, using only the complete history before that sample's origin. Non-finite or zero task scales give weight zero; positive ratios are clipped to `[0.1, 10]`. |
 | CLI `fev run --policy` | `first_window` | `per_window` trains/selects a separate model on each window's own available past, using the same settings; optional refit applies to each window. |
+
+Both new controls are omitted from the run identity at their defaults; each
+non-default value enters the identity, including `pretraining` without a source.
+The frame location remains the cropped-context median. The frame period applies
+to training and validation inputs/labels and to prediction; inner-validation
+eligibility and all metric denominators always retain the **task period**.
+`run.json.scaler_period_resolved` records `requested`, `source`, numeric `period`,
+and `reason` (`no_init_from` explains the fallback).
+
+The bundle's `config.json.scaler_period` stores the effective numeric period for
+pretraining frames, or `"task"` for task frames. `Bundle.scaler_period` defaults
+to `"task"` when absent, so old bundles retain their inference behavior. The
+requested setting is retained separately in `config.json.forecast.scaler_period`.
+The pretraining trainer and its configuration identity are unchanged.
+
+Weighted pinball reduces as `sum(w * loss) / sum(w)` over observed, frame-eligible
+cells and quantile knots; micro-batches carry the same cell weight mass. Unit
+weights preserve the original mean arithmetic exactly. Matching periods give
+unit weights on eligible samples when neither scale floor changes the frame.
+The effective scale includes the absolute and relative floors, so a floored frame
+can give a non-unit weight even with matching periods. Before clipping, multiplying
+by the ratio restores each SQL numerator cell. The weighted mean uses weight mass
+as its denominator and therefore generally differs from SQL's arithmetic mean;
+clipping also limits exact numerator alignment. Zero total weight returns a
+graph-connected zero loss. `run.json.loss_weight_clipped` and
+`loss_weight_excluded` count sampled rows across training, refit and resumed
+sessions; validation and prediction do not contribute to these counters.
 
 ### Optional fine-tune hygiene
 

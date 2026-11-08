@@ -148,6 +148,9 @@ class Predictor:
             cfg.max_context,
             self.bundle.encoder,
             scale_floor_frac=cfg.scale_floor_frac,
+            scaler_period=(
+                None if self.bundle.scaler_period == "task" else self.bundle.scaler_period
+            ),
         )
         predictions = np.empty((len(ids), cfg.horizon, len(cfg.quantiles)), dtype=np.float32)
         model = self.bundle.model

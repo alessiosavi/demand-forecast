@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, fields, replace
 from types import SimpleNamespace
-from typing import Any, NamedTuple
+from typing import Any, Literal, NamedTuple
 
 import numpy as np
 import pandas as pd
@@ -14,7 +14,7 @@ import torch
 from demand_forecast.data.encoders import StaticEncoder
 from demand_forecast.data.frequency import calendar_feature_names, calendar_features, grid_range
 from demand_forecast.data.panel import Panel
-from demand_forecast.data.scaling import sample_frame
+from demand_forecast.data.scaling import metric_scale_weight, sample_frame
 
 COVARIATE_BOUND: float = 1e3
 REL_STD_FLOOR: float = 1e-3
@@ -54,6 +54,12 @@ class Batch:
     cold_covariates: torch.Tensor
     clipped_covariates: torch.Tensor
     floored_covariates: torch.Tensor
+    loss_weight: torch.Tensor | None = None
+
+    def __post_init__(self) -> None:
+        # Legacy/manual batch constructors retain unit weights on the same device.
+        if self.loss_weight is None:
+            self.loss_weight = self.target.new_ones(self.target.shape[0])
 
     @property
     def size(self) -> int:
@@ -253,6 +259,8 @@ class BatchBuilder:
         *,
         calendar: bool = True,
         scale_floor_frac: float = 0.0,
+        scaler_period: int | None = None,
+        loss_weight: Literal["none", "metric_scale"] = "none",
     ) -> None:
         _positive(horizon, "horizon")
         _positive(max_context, "max_context")
@@ -260,7 +268,15 @@ class BatchBuilder:
         self.horizon, self.max_context = horizon, max_context
         self.calendar = calendar
         self.scale_floor_frac = scale_floor_frac
+        if scaler_period is not None:
+            _positive(scaler_period, "scaler_period")
+        if loss_weight not in {"none", "metric_scale"}:
+            raise ValueError("unknown loss_weight")
+        self.scaler_period = panel.seasonal_period if scaler_period is None else scaler_period
+        self.loss_weight = loss_weight
         self.floored_target_samples = 0
+        self.loss_weight_clipped = 0
+        self.loss_weight_excluded = 0
         self._lengths = {}
         for series in panel.series:
             # Timestamp equality compares instants, while calendar features use
@@ -319,6 +335,7 @@ class BatchBuilder:
             num_mask=np.zeros((size, encoder.n_numeric), dtype=bool),
             labels=np.zeros((size, horizon), dtype=np.float32),
             label_mask=np.zeros((size, horizon), dtype=bool),
+            loss_weight=np.ones(size, dtype=np.float32),
             eligible=np.zeros(size, dtype=bool),
             has_context=np.zeros(size, dtype=bool),
             series_index=np.array(items[:, 0], dtype=np.int64, copy=True),
@@ -355,10 +372,17 @@ class BatchBuilder:
             frame = sample_frame(
                 context,
                 series.target[:origin],
-                panel.seasonal_period,
+                self.scaler_period,
                 scale_floor_frac=self.scale_floor_frac,
             )
             self.floored_target_samples += int(frame.scale_floored)
+            if self.loss_weight == "metric_scale":
+                weight, clipped = metric_scale_weight(
+                    frame, series.target[:origin], panel.seasonal_period
+                )
+                arrays["loss_weight"][row] = weight
+                self.loss_weight_clipped += int(clipped)
+                self.loss_weight_excluded += int(weight == 0)
             observed = ~np.isnan(context)
             arrays["target"][row, dest] = np.where(
                 observed, (context - frame.loc) / frame.scale, 0
@@ -425,10 +449,19 @@ def make_batch(
     *,
     calendar: bool = True,
     scale_floor_frac: float = 0.0,
+    scaler_period: int | None = None,
+    loss_weight: Literal["none", "metric_scale"] = "none",
 ) -> Batch:
     """Build one batch; retain a BatchBuilder to reuse features across calls."""
     return BatchBuilder(
-        panel, horizon, max_context, encoder, calendar=calendar, scale_floor_frac=scale_floor_frac
+        panel,
+        horizon,
+        max_context,
+        encoder,
+        calendar=calendar,
+        scale_floor_frac=scale_floor_frac,
+        scaler_period=scaler_period,
+        loss_weight=loss_weight,
     ).build(items, label_upto)
 
 
@@ -450,6 +483,8 @@ class WindowSampler:
         seed: int = 0,
         label_upto: pd.Timestamp | None = None,
         scale_floor_frac: float = 0.0,
+        scaler_period: int | None = None,
+        loss_weight: Literal["none", "metric_scale"] = "none",
     ) -> None:
         _positive(horizon, "horizon")
         _positive(max_context, "max_context")
@@ -469,7 +504,13 @@ class WindowSampler:
         self.horizon, self.max_context = horizon, max_context
         self.seed, self.label_upto = int(seed), label_upto
         self.builder = BatchBuilder(
-            panel, horizon, max_context, encoder, scale_floor_frac=scale_floor_frac
+            panel,
+            horizon,
+            max_context,
+            encoder,
+            scale_floor_frac=scale_floor_frac,
+            scaler_period=scaler_period,
+            loss_weight=loss_weight,
         )
         self.set_epoch(0)
 

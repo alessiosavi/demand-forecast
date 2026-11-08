@@ -141,6 +141,9 @@ class _PretrainForecastConfig(ForecastConfig):
 
     model_config = ConfigDict(extra="forbid")
 
+    # Task-only control: keep pretraining config serialization and identities intact.
+    scaler_period: Literal["task"] = Field("task", exclude=True)
+
     @field_validator("scale_floor_frac")
     @classmethod
     def reject_relative_floor(cls, value: float) -> float:

@@ -55,6 +55,49 @@ def assert_state_equal(actual, expected):
     assert all(torch.equal(actual[k], v) for k, v in expected.items())
 
 
+@pytest.mark.parametrize("weights", [[0.1, 0.2, 0], [0.1, 3.0, 10], [1, 1, 1], [0, 0, 0]])
+def test_weighted_microbatches_preserve_loss_and_gradients(weights):
+    from demand_forecast.core.inference_batching import BatchLimit
+
+    class ScalarModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.bias = torch.nn.Parameter(torch.tensor(0.25))
+
+        def forward(self, batch):
+            return self.bias.expand(batch.size, 2, 3)
+
+    panel = weekly_panel([40] * 3)
+    encoder = StaticEncoder().fit(panel, [s.series_id for s in panel.series])
+    batch = make_batch(panel, [(0, 28), (1, 28), (2, 28)], 2, 8, encoder)
+    batch.loss_weight = torch.tensor(weights, dtype=torch.float32)
+    batch.labels[:] = torch.tensor([[1, -2], [-3, 4], [5, -6]])
+    batch.label_mask[1, 1] = False
+    results = []
+    for size in (None, 1, 2):
+        trainer = Trainer(
+            ScalarModel(), TrainConfig(amp=False, loss_weight="metric_scale"), cpu, RUN_ID, SEED
+        )
+        trainer.optimizer = torch.optim.SGD(trainer.model.parameters(), lr=0.01)
+        trainer._micro_batch_limit = BatchLimit(size)
+        loss = trainer._backward_batch(batch, torch.tensor([0.1, 0.5, 0.9]))
+        results.append((loss, trainer.model.bias.grad.item()))
+    np.testing.assert_allclose(results, [results[0]] * 3, atol=1e-6)
+
+
+def test_unit_metric_weights_preserve_training_bit_for_bit(
+    fresh, panel_long, plan_long, encoder_long
+):
+    results = []
+    for mode in ("none", "metric_scale"):
+        trainer = Trainer(
+            fresh(), TrainConfig(base_steps=3, amp=False, loss_weight=mode), cpu, RUN_ID, SEED
+        )
+        results.append(trainer.fit(panel_long, plan_long, ForecastConfig(horizon=4), encoder_long))
+    assert results[0].history == results[1].history
+    assert_state_equal(results[0].best_state, results[1].best_state)
+
+
 def test_fit_prepares_validation_once(
     tmp_path, monkeypatch, fresh, panel_long, plan_long, encoder_long, caplog
 ):

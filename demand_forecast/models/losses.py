@@ -344,20 +344,35 @@ def pinball_loss(
     label_mask: torch.Tensor,
     loss_eligible: torch.Tensor,
     quantiles: torch.Tensor,
-) -> tuple[torch.Tensor, int]:
+    weights: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, int | float]:
     """Mean doubled pinball over observed, eligible cells and quantile knots.
 
     Predictions have shape (B, H, Q), labels and their boolean mask (B, H),
     boolean sample eligibility (B,), and quantiles (Q,). Predictions and labels
     share the sample's normalised frame. The count is selected cells, not knots.
-    With no selected cell, return zero attached to the prediction graph.
+    Optional sample weights give sum(w * loss) / sum(w) over selected cells;
+    the second result is then their weight mass, excluding quantile knots.
+    Unit weights retain the original mean arithmetic exactly. Zero weights
+    exclude cells before arithmetic, including any NaNs in their predictions.
     """
     selected = label_mask & loss_eligible[:, None]
+    if weights is not None:
+        selected = selected & (weights[:, None] > 0)
     n = int(selected.sum().item())
     if n == 0:
+        if weights is not None:
+            return pred[selected].sum() * 0.0, 0.0
         return pred.sum() * 0.0, 0
 
     # Select before arithmetic so excluded NaNs cannot contaminate gradients.
     errors = labels[selected].unsqueeze(-1) - pred[selected]
     losses = 2 * torch.maximum(quantiles * errors, (quantiles - 1) * errors)
+    if weights is not None:
+        cell_weights = weights[:, None].expand_as(selected)[selected]
+        if not bool((cell_weights == 1).all().item()):
+            mass = cell_weights.sum()
+            return (losses * cell_weights[:, None]).sum() / (mass * pred.shape[-1]), float(
+                mass.item()
+            )
     return losses.mean(), n

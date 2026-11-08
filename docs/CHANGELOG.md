@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Optional `forecast.scaler_period: pretraining` to reuse corpus-v2 or recipe-v3
+  frame periods, persisted for inference while inner SQL retains the task period.
+  Optional `training.loss_weight: metric_scale` adds clipped context-only scale
+  ratios, weighted-mean pinball, micro-batch weight mass and resumable counters.
+  Defaults preserve task frames, loss arithmetic and existing run identities.
+
 - Classical `fev baseline --model` arms: `auto_ets`, `auto_theta`, and `median3`
   (cell-wise median quantiles alongside the unchanged default `seasonal_naive`),
   with seasonal-naive fallback and resume by task/model pair in `summaries.csv`.
