@@ -18,6 +18,66 @@ ROOT = Path(__file__).resolve().parents[2]
 SHIPPED_CONFIG = ROOT / "configs/pretrain-v2-first-try.yaml"
 
 
+def test_corpus2_identity_and_serialized_config_remain_legacy():
+    from demand_forecast.pretrain.config import PretrainConfig, pretrain_identity
+
+    cfg = PretrainConfig.from_yaml(ROOT / "configs/pretrain-v2-corpus2.yaml")
+    # Measured before recipe-v3 changes; package version 2.0.0, no shard digests.
+    assert pretrain_identity(cfg, "2.0.0", {}) == (
+        "00129853f6e85e9dcadaa049ae4838654a05ca013393580a7574ce90ffd0993c"
+    )
+    assert not {"recipe", "period_policy", "grid_policy"} & cfg.model_dump(mode="json").keys()
+
+
+@pytest.mark.parametrize(
+    "controls",
+    [
+        {"recipe": "v3"},
+        {"recipe": "v3", "period_policy": "frequency"},
+        {"recipe": "v3", "grid_policy": "source"},
+        {"recipe": "v3", "period_policy": "frequency", "grid_policy": "source"},
+    ],
+)
+def test_recipe_controls_change_identity_and_roundtrip(tmp_path, controls):
+    from demand_forecast.pretrain.config import PretrainConfig, pretrain_identity
+
+    cfg = PretrainConfig.from_yaml(ROOT / "configs/pretrain-v2-corpus2.yaml")
+    raw = cfg.model_dump(mode="json") | controls
+    changed = PretrainConfig.model_validate(raw)
+    assert pretrain_identity(changed, "2.0.0", {}) != pretrain_identity(cfg, "2.0.0", {})
+    if len(controls) > 1:
+        recipe_only = PretrainConfig.model_validate(cfg.model_dump(mode="json") | {"recipe": "v3"})
+        assert pretrain_identity(changed, "2.0.0", {}) != pretrain_identity(
+            recipe_only, "2.0.0", {}
+        )
+    path = tmp_path / "recipe.yaml"
+    changed.to_yaml(path)
+    assert PretrainConfig.from_yaml(path) == changed
+    for name, value in controls.items():
+        assert changed.model_dump(mode="json")[name] == value
+
+
+def test_explicit_legacy_recipe_defaults_do_not_change_config_or_identity():
+    from demand_forecast.pretrain.config import PretrainConfig, pretrain_identity
+
+    cfg = PretrainConfig.from_yaml(ROOT / "configs/pretrain-v2-corpus2.yaml")
+    explicit = PretrainConfig.model_validate(
+        cfg.model_dump(mode="json")
+        | {"recipe": "v2", "period_policy": "legacy_one", "grid_policy": "legacy_weekly"}
+    )
+    assert explicit.model_dump(mode="json") == cfg.model_dump(mode="json")
+    assert pretrain_identity(explicit, "2.0.0", {}) == pretrain_identity(cfg, "2.0.0", {})
+
+
+@pytest.mark.parametrize("name", ["recipe", "period_policy", "grid_policy"])
+def test_recipe_controls_reject_unknown_values(name):
+    from demand_forecast.pretrain.config import PretrainConfig
+
+    raw = yaml.safe_load(SHIPPED_CONFIG.read_text()) | {name: "typo"}
+    with pytest.raises(ValidationError, match=name):
+        PretrainConfig.model_validate(raw)
+
+
 @pytest.mark.parametrize("section", [None, "corpus", "forecast", "model", "training"])
 def test_pretrain_config_loads_shipped_yaml_and_rejects_unknown_keys(tmp_path, section):
     from demand_forecast.pretrain.config import PretrainConfig

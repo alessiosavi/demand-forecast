@@ -13,6 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (cell-wise median quantiles alongside the unchanged default `seasonal_naive`),
   with seasonal-naive fallback and resume by task/model pair in `summaries.csv`.
 
+- **Pretraining recipe v3, round 1 (in progress)** — versioned recipe/grid/period
+  controls preserving legacy identities and bundle config payloads; a separate
+  real-grid shard reader with crop-aware starts, homogeneous panels, row maps and
+  fallback counts; pretraining-only frequency periods with anchored alias support.
+
 - Optional fine-tune hygiene controls for proportional warmup, a configurable
   budget floor, smoothed checkpoint selection, EMA/tail weight averaging,
   step-zero selection margins, and a pretrained short-history exception policy.
