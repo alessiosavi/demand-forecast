@@ -118,6 +118,7 @@ class TrainConfig:
     ema_decay: float = 0.99
     average_last_k: int = 3
     select_min_gain: float = 0.0
+    loss_weight: Literal["none", "metric_scale"] = "none"
 
 
 @dataclass
@@ -132,6 +133,8 @@ class FitResult:
     stop_reason: str
     timings: dict
     telemetry: list[dict]
+    loss_weight_clipped: int = 0
+    loss_weight_excluded: int = 0
 
 
 def resolve_budget(
@@ -305,16 +308,25 @@ class Trainer:
     def _lr_factor(self, step: int) -> float:
         return lr_factor(step, max_steps=self.max_steps, warmup_steps=self.warmup_steps)
 
-    def _backward_microbatch(self, cpu_batch: Batch, quantiles, total_cells: int | None) -> float:
+    def _backward_microbatch(
+        self, cpu_batch: Batch, quantiles, total_cells: int | float | None
+    ) -> float:
         # A separate frame releases device inputs and activations both on success
         # (before transferring the next chunk) and when an OOM unwinds the call.
         batch = cpu_batch.to(self.device)
         with torch.autocast(self.device.type, dtype=self.amp_dtype, enabled=self.amp):
             loss, cells = pinball_loss(
-                self.model(batch), batch.labels, batch.label_mask, batch.loss_eligible, quantiles
+                self.model(batch),
+                batch.labels,
+                batch.label_mask,
+                batch.loss_eligible,
+                quantiles,
+                **(
+                    {"weights": batch.loss_weight} if self.cfg.loss_weight == "metric_scale" else {}
+                ),
             )
             if total_cells is not None:
-                loss = loss * (cells / max(total_cells, 1))
+                loss = loss * (cells / (total_cells if total_cells > 0 else 1))
         value = float(loss.detach().item())
         if math.isfinite(value):
             self.scaler.scale(loss).backward()
@@ -341,6 +353,9 @@ class Trainer:
                 total_cells = int(
                     (cpu_batch.label_mask & cpu_batch.loss_eligible[:, None]).sum().item()
                 )
+                if self.cfg.loss_weight == "metric_scale":
+                    selected = cpu_batch.label_mask & cpu_batch.loss_eligible[:, None]
+                    total_cells = float((selected * cpu_batch.loss_weight[:, None]).sum().item())
                 value = 0.0
                 for start in range(0, cpu_batch.size, size):
                     chunk = cpu_batch._map_tensors(lambda tensor: tensor[start : start + size])
@@ -384,6 +399,7 @@ class Trainer:
         step_limit: int | None = None,
         schedule_max_steps: int | None = None,
         keep_initial: bool = False,
+        scaler_period: int | None = None,
     ) -> FitResult:
         """Fit the permitted split, or continue its checkpoint without reseeding.
 
@@ -421,6 +437,8 @@ class Trainer:
             raise ValueError("unknown selection")
         if self.cfg.weight_average not in {"none", "ema", "tail"}:
             raise ValueError("unknown weight_average")
+        if self.cfg.loss_weight not in {"none", "metric_scale"}:
+            raise ValueError("unknown loss_weight")
         if not 0 <= self.cfg.ema_decay < 1 or self.cfg.average_last_k < 1:
             raise ValueError("ema_decay must be in [0, 1); average_last_k must be positive")
         if not 0 <= self.cfg.select_min_gain < 1:
@@ -464,6 +482,8 @@ class Trainer:
             seed=self.seed,
             label_upto=plan.train_upto,
             scale_floor_frac=forecast_cfg.scale_floor_frac,
+            scaler_period=scaler_period,
+            loss_weight=self.cfg.loss_weight,
         )
         parameters = [p for p in self.model.parameters() if p.requires_grad]
         self.optimizer = torch.optim.AdamW(
@@ -482,6 +502,7 @@ class Trainer:
         self.selection_left_score: float | None = None
         self.initial_score: float | None = None
         self.timings, self.telemetry = _empty_timings(), []
+        self.loss_weight_clipped = self.loss_weight_excluded = 0
         self._last_eval_step, self._last_eval_train_s = 0, 0.0
         if resume and checkpoint_path is not None and checkpoint_path.exists():
             self.resume(checkpoint_path)
@@ -520,6 +541,7 @@ class Trainer:
                 max_context,
                 encoder,
                 scale_floor_frac=forecast_cfg.scale_floor_frac,
+                scaler_period=scaler_period,
             )
             build_s = time.perf_counter() - prepare_started
             self.timings["eval_s"] += build_s
@@ -579,6 +601,8 @@ class Trainer:
         self.model.train()
         session_steps = 0
         floored_before = self.sampler.builder.floored_target_samples
+        clipped_before = self.sampler.builder.loss_weight_clipped
+        excluded_before = self.sampler.builder.loss_weight_excluded
         while (
             self.step < self.step_limit
             and self.terminal_reason is None
@@ -620,6 +644,11 @@ class Trainer:
                 floored_now = self.sampler.builder.floored_target_samples
                 self.timings["floored_target_samples"] += floored_now - floored_before
                 floored_before = floored_now
+                clipped_now = self.sampler.builder.loss_weight_clipped
+                excluded_now = self.sampler.builder.loss_weight_excluded
+                self.loss_weight_clipped += clipped_now - clipped_before
+                self.loss_weight_excluded += excluded_now - excluded_before
+                clipped_before, excluded_before = clipped_now, excluded_now
                 self.history.append(record)
                 if self.consecutive_nonfinite >= NONFINITE_STOP_AFTER:
                     self.terminal_reason = "nonfinite_losses"
@@ -808,6 +837,8 @@ class Trainer:
             stop_reason=reason,
             timings=deepcopy(self.timings),
             telemetry=deepcopy(self.telemetry),
+            loss_weight_clipped=self.loss_weight_clipped,
+            loss_weight_excluded=self.loss_weight_excluded,
         )
 
     def _sample_peak(self) -> None:
@@ -874,6 +905,8 @@ class Trainer:
             "telemetry": self.telemetry,
             "last_eval_step": self._last_eval_step,
             "last_eval_train_s": self._last_eval_train_s,
+            "loss_weight_clipped": self.loss_weight_clipped,
+            "loss_weight_excluded": self.loss_weight_excluded,
         }
         if self.cfg.weight_average != "none":
             state["weight_average"] = self.average.state_dict()
@@ -954,6 +987,8 @@ class Trainer:
             if member in archive.namelist():
                 self.timings.update(json.loads(archive.read(member)))
         self.telemetry = state.get("telemetry", [])
+        self.loss_weight_clipped = state.get("loss_weight_clipped", 0)
+        self.loss_weight_excluded = state.get("loss_weight_excluded", 0)
         self._last_eval_step = state.get("last_eval_step", self.step)
         self._last_eval_train_s = state.get("last_eval_train_s", self.timings["train_s"])
         # Restore last: model/optimizer/sampler construction must not consume

@@ -325,6 +325,8 @@ def test_scale_floor_counts_training_and_prediction_samples(tmp_path, protocol_c
         ("training", "select_min_gain", 0.05),
         ("training", "exception_policy", "pretrained"),
         ("forecast", "scale_floor_frac", 0.1),
+        ("forecast", "scaler_period", "pretraining"),
+        ("training", "loss_weight", "metric_scale"),
     ],
 )
 def test_protocol_nondefault_changes_identity(section, field, value):
@@ -353,6 +355,7 @@ def test_scale_floor_rejects_invalid_fractions(value):
         ("average_last_k", 3),
         ("select_min_gain", 0.0),
         ("exception_policy", "final"),
+        ("loss_weight", "none"),
     ],
 )
 def test_hygiene_defaults_are_omitted_from_identity(field, value):

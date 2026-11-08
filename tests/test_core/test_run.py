@@ -27,6 +27,133 @@ def quick_panel_and_settings():
     return panel, panel.timestamps(0, 41)[40], settings
 
 
+@pytest.mark.parametrize("recipe,expected", [(None, 1), ("v2", 1), ("v3", 7)])
+def test_pretraining_frame_resolution_keeps_inner_sql_task_period(
+    tmp_path, tiny_pretrained_bundle_dir, monkeypatch, recipe, expected
+):
+    from dataclasses import replace
+
+    import torch
+
+    from demand_forecast.core import training
+    from demand_forecast.core.evaluation import evaluate_prepared
+    from demand_forecast.data.scaling import seasonal_error
+    from demand_forecast.metrics import sql
+
+    source = shutil.copytree(tiny_pretrained_bundle_dir, tmp_path / "source")
+    manifest_path = source / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    if recipe is None:
+        manifest.pop("config", None)
+    else:
+        manifest["config"]["recipe"] = recipe
+        manifest["config"]["period_policy"] = "frequency" if recipe == "v3" else "legacy_one"
+    manifest_path.write_text(json.dumps(manifest))
+    panel = replace(weekly_panel([40] * 2), freq=to_offset("D"), seasonal_period=14)
+    for series in panel.series:
+        series.target = np.arange(40, dtype=float)
+    origin = panel.timestamps(0, 41)[40]
+    settings = tiny_settings(base_steps=2)
+    settings.training.init_from = str(source)
+    settings.forecast.scaler_period = "pretraining"
+    prepared = []
+    prepare = training.prepare_validation
+
+    def capture(*args, **kwargs):
+        result = prepare(*args, **kwargs)
+        prepared.append(result)
+        return result
+
+    monkeypatch.setattr(training, "prepare_validation", capture)
+    path = train_panel(panel, origin, settings, tmp_path / "run", dataset_fingerprint="fp")
+    bundle = load_bundle(path)
+    report = json.loads((tmp_path / "run/run.json").read_text())
+    assert report["scaler_period_resolved"]["period"] == expected
+    assert report["scaler_period_resolved"]["source"] == "pretraining"
+    assert bundle.scaler_period == expected
+    assert prepared and prepared[0].seasonal_period == 14
+    batch = prepared[0].batches[0]
+    assert batch.scale.tolist() == [float(expected)] * 2
+    assert seasonal_error(prepared[0].y_past[0], 14) == 14
+    with torch.no_grad():
+        predictions = bundle.model.predict(batch).numpy()
+    measured = evaluate_prepared(bundle.model, prepared[0], settings.forecast.quantiles)["SQL"]
+    reference = sql(
+        prepared[0].y_true, predictions, prepared[0].y_past, 14, settings.forecast.quantiles
+    )
+    assert measured == pytest.approx(reference)
+    assert measured != pytest.approx(
+        sql(
+            prepared[0].y_true,
+            predictions,
+            prepared[0].y_past,
+            expected,
+            settings.forecast.quantiles,
+        )
+    )
+
+
+def test_pretraining_period_without_source_reports_task_fallback(tmp_path, tiny_panel_and_settings):
+    panel, origin, settings = tiny_panel_and_settings
+    panel.seasonal_period = 7
+    settings.forecast.scaler_period = "pretraining"
+    path = train_panel(panel, origin, settings, tmp_path, dataset_fingerprint="fp")
+    report = json.loads((tmp_path / "run.json").read_text())
+    assert report["scaler_period_resolved"] == {
+        "requested": "pretraining",
+        "source": "task",
+        "period": 7,
+        "reason": "no_init_from",
+    }
+    assert load_bundle(path).scaler_period == "task"
+
+
+def test_scaler_defaults_are_omitted_from_identity():
+    settings = tiny_settings()
+    assert settings.forecast.scaler_period == "task"
+    assert settings.training.loss_weight == "none"
+    assert "scaler_period" not in _identity_settings(settings)["forecast"]
+    assert "loss_weight" not in _identity_settings(settings)["training"]
+
+
+def test_loss_weight_counters_are_cumulative_across_resume(tmp_path, monkeypatch):
+    from demand_forecast.core import training
+
+    panel = weekly_panel([40] * 3)
+    panel.seasonal_period = 7
+    panel.series[0].target = 1000 + np.arange(40) * 1e-4
+    panel.series[1].target = np.resize([0, 10, 0, 10, 0, 10, 0], 40).astype(float)
+    panel.series[2].target[:] = 5
+    origin = panel.timestamps(0, 41)[40]
+    settings = tiny_settings(base_steps=4, d_model=8)
+    settings.forecast.scale_floor_frac = 0.1
+    settings.training.loss_weight = "metric_scale"
+    settings.training.min_train_history = 1000
+    monkeypatch.setattr(
+        training, "build_origins", lambda *a, **k: np.array([(i, 28) for i in range(3)])
+    )
+    with pytest.raises(InterruptedRun):
+        train_panel(panel, origin, settings, tmp_path, dataset_fingerprint="fp", stop_after=2)
+    path = train_panel(panel, origin, settings, tmp_path, dataset_fingerprint="fp", resume=True)
+    report = json.loads((tmp_path / "run.json").read_text())
+    assert report["fit_result"]["steps"] == 4
+    assert report["loss_weight_clipped"] == 4
+    assert report["loss_weight_excluded"] == 8
+    assert load_bundle(path).manifest["run"] == report
+
+
+@pytest.mark.parametrize(
+    "section,field", [("forecast", "scaler_period"), ("training", "loss_weight")]
+)
+def test_scaler_and_loss_weight_reject_invalid_values(section, field):
+    from demand_forecast.config import Settings
+
+    data = tiny_settings().model_dump()
+    data[section][field] = "invalid"
+    with pytest.raises(ValueError, match=field):
+        Settings.model_validate(data)
+
+
 def test_quick_fields_subsample_validation_and_are_reported(
     tmp_path, quick_panel_and_settings, caplog
 ):
@@ -78,9 +205,11 @@ def test_identity_ignores_unset_quick_fields_and_changes_when_set(field):
         "average_last_k",
         "select_min_gain",
         "exception_policy",
+        "loss_weight",
     ):
         del expected["training"][key]
     del expected["forecast"]["scale_floor_frac"]
+    del expected["forecast"]["scaler_period"]
     assert _identity_settings(settings) == expected
     assert settings.model_dump(mode="json") == dumped
     quick = settings.model_copy(deep=True)
