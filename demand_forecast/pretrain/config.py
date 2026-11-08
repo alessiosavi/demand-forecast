@@ -6,7 +6,7 @@ import hashlib
 import json
 from fractions import Fraction
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import (
     BaseModel,
@@ -24,7 +24,12 @@ LEGACY_RECIPE_DEFAULTS = {
     "recipe": "v2",
     "period_policy": "legacy_one",
     "grid_policy": "legacy_weekly",
+    "horizon_policy": "fixed",
+    "shard_visit_quota": {},
 }
+
+# Unique horizons in bench/tasks/fev_bench_100_193e4fc.yaml.
+FEV_HORIZONS = (5, 8, 12, 13, 14, 24, 28, 39, 48, 52, 60, 61, 96, 144, 168, 288)
 
 
 class SourceShards(BaseModel):
@@ -166,9 +171,24 @@ class PretrainConfig(BaseModel):
     recipe: Literal["v2", "v3"] = "v2"
     period_policy: Literal["legacy_one", "frequency"] = "legacy_one"
     grid_policy: Literal["legacy_weekly", "source"] = "legacy_weekly"
+    horizon_policy: Literal["fixed", "fev_set"] = "fixed"
+    shard_visit_quota: dict[str, Annotated[int, Field(gt=0, strict=True)]] = Field(
+        default_factory=dict
+    )
     seed: int = 0
     device: str | None = None
     log_level: str = "INFO"
+
+    @model_validator(mode="after")
+    def validate_sampling(self):
+        if self.recipe != "v3" and (self.horizon_policy != "fixed" or self.shard_visit_quota):
+            raise ValueError("horizon_policy and shard_visit_quota require recipe v3")
+        if self.horizon_policy == "fev_set" and self.forecast.horizon != max(FEV_HORIZONS):
+            raise ValueError("fev_set requires forecast.horizon = 288")
+        for kind in self.shard_visit_quota:
+            if kind not in self.corpus.selections():
+                raise ValueError("shard_visit_quota requires configured sources and positive pairs")
+        return self
 
     @model_validator(mode="before")
     @classmethod
@@ -260,6 +280,12 @@ def pretrain_identity(
             "calendar_schema": CANONICAL_CALENDAR_SCHEMA,
             "lag_schema": TARGET_LAG_SCHEMA,
             "target_lags": "cycle",
+        }
+        payload["sampler_policy"] = {
+            "version": 1,
+            "pairs": "series_uniform_origin_uniform",
+            "window": "full_future_min_origin_max_8_m_plus_1",
+            "fev_horizons": FEV_HORIZONS if cfg.horizon_policy == "fev_set" else None,
         }
     for name, default in LEGACY_RECIPE_DEFAULTS.items():
         if payload["config"].get(name) == default:

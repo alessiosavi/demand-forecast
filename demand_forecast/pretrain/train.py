@@ -143,6 +143,8 @@ class _PretrainLoop:
                     period_policy=cfg.period_policy,
                     grid_policy=cfg.grid_policy,
                     scale_floor_frac=cfg.forecast.scale_floor_frac,
+                    horizon_policy=cfg.horizon_policy,
+                    shard_visit_quota=cfg.shard_visit_quota,
                 )
                 if cfg.recipe == "v3"
                 else {}
@@ -204,6 +206,8 @@ class _PretrainLoop:
                 self.timings["feature_exposure"] = {
                     side: dict.fromkeys(names, 0) for side in ("encoder", "decoder")
                 }
+                self.timings["sampling_exposure"] = {}
+                self.timings["horizon_histogram"] = {}
             self.batches = self.sampler.batches()
             self.model.train()
             if self.device.type == "cuda":
@@ -233,6 +237,21 @@ class _PretrainLoop:
         _sync(self.device)
         started = time.perf_counter()
         if self.cfg.recipe == "v3":
+            kind = self.sampler.last_kind
+            group = self.sampler.streams[kind].last_group
+            horizon = str(batch.labels.shape[1])
+            groups = self.timings["sampling_exposure"].setdefault(kind, {})
+            cell = groups.setdefault(group, {}).setdefault(
+                horizon, dict(batches=0, pairs=0, eligible_labels=0, label_cells=0)
+            )
+            cell["batches"] += 1
+            cell["pairs"] += batch.size
+            cell["eligible_labels"] += int(
+                (batch.label_mask & batch.loss_eligible[:, None]).sum().item()
+            )
+            cell["label_cells"] += batch.labels.numel()
+            histogram = self.timings["horizon_histogram"]
+            histogram[horizon] = histogram.get(horizon, 0) + 1
             for side, mask in (("encoder", batch.enc_cov_mask), ("decoder", batch.dec_cov_mask)):
                 counts = mask.sum(dim=(0, 1)).tolist()
                 exposure = self.timings["feature_exposure"][side]
@@ -266,6 +285,7 @@ class _PretrainLoop:
         self.timings["nonfinite_losses"] += int(not finite)
         self.history.append(
             dict(step=self.step, loss=loss_value, lr=lr, kind=self.sampler.last_kind)
+            | (dict(horizon=int(horizon), group=group) if self.cfg.recipe == "v3" else {})
         )
         _sync(self.device)
         self.timings["train_s"] += batch_s + time.perf_counter() - started
@@ -467,7 +487,14 @@ def pretrain(
                     "shards": loop.shards,
                     "external_diagnostic": external,
                     **(
-                        {"feature_exposure": loop.timings["feature_exposure"]}
+                        {
+                            key: loop.timings[key]
+                            for key in (
+                                "feature_exposure",
+                                "sampling_exposure",
+                                "horizon_histogram",
+                            )
+                        }
                         if cfg.recipe == "v3"
                         else {}
                     ),

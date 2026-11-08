@@ -66,6 +66,8 @@ def _shard_transition(loop: _PretrainLoop) -> float:
                 period_policy=cfg.period_policy,
                 grid_policy=cfg.grid_policy,
                 scale_floor_frac=cfg.forecast.scale_floor_frac,
+                horizon_policy=cfg.horizon_policy,
+                shard_visit_quota=cfg.shard_visit_quota.get("tsmixup"),
             )
             if cfg.recipe == "v3"
             else {}
@@ -73,10 +75,18 @@ def _shard_transition(loop: _PretrainLoop) -> float:
     )
     try:
         next(stream)
-        n_eligible = len(stream._draws)
-        stream.load_state(
-            replace(stream.state(), batch_cursor=math.ceil(n_eligible / cfg.training.batch_size))
-        )
+        state = stream.state()
+        if cfg.recipe == "v3":
+            state = replace(
+                state,
+                visit_cursor=state.visit_quota,
+                batch_cursor=math.ceil(state.visit_quota / cfg.training.batch_size),
+            )
+        else:
+            state = replace(
+                state, batch_cursor=math.ceil(len(stream._draws) / cfg.training.batch_size)
+            )
+        stream.load_state(state)
         started = time.perf_counter()
         next(stream)
         return time.perf_counter() - started
@@ -128,9 +138,11 @@ def pretrain_probe(cfg: PretrainConfig, *, steps: int = 50, out: Path) -> dict:
             if cfg.recipe == "v3":
                 stream = loop.sampler.streams[loop.sampler.last_kind]
                 builder = stream._builder
-                items = stream._draws[: cfg.training.batch_size]
+                items = np.column_stack((batch.series_index.numpy(), batch.origin_pos.numpy()))
             started = time.perf_counter()
-            builder.build(items)
+            builder.build(
+                items, **(dict(horizon=batch.labels.shape[1]) if cfg.recipe == "v3" else {})
+            )
             batch_times.append(time.perf_counter() - started)
         train_peak = _cuda_peak(loop.device)
         shard_load_s = _shard_transition(loop)

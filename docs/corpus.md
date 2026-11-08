@@ -56,11 +56,40 @@ The transfer API requires the destination panel and forecast layout and checks
 schema metadata before changing weights. Legacy v2 sources retain their original
 target/observed-only transfer. Backbone, head and static-bias handling are shared.
 
-`configs/pretrain-v3-corpus2.yaml` enables the adapter. Validation uses the same
+Round 3 adds `horizon_policy: fev_set`: each training batch draws uniformly from
+the pinned horizons `{5, 8, 12, 13, 14, 24, 28, 39, 48, 52, 60, 61, 96, 144,
+168, 288}` that fit its active frequency group. Every origin is at least
+`max(8, m + 1)` positions into the series and has a full future grid window;
+missing labels remain masked. A source with no geometrically usable windows
+raises after a full shard pass. Undefined scales and missing labels do not remove
+windows; their actual eligible-label exposure is recorded.
+
+Within a shard visit, groups are drawn proportional to their usable-series
+counts, then each pair draws a feasible series uniformly and an eligible origin
+uniformly within that series, with replacement, matching v2's per-series weighting. The
+optional `shard_visit_quota: {source: positive_pair_count}` controls each source's
+pairs per shard visit; omission draws the number of usable series, the v2 visit
+budget equivalent. Partial batches retain the remaining pair slots. Checkpoints
+store the resolved quota, pair and batch cursors, pass/shard positions, empty-pass
+flag and RNG state; prefetch performs no sampling. The v3 sampling policy enters
+the identity, so round-2b checkpoints cannot silently resume with new semantics.
+V2 config payloads, identities, checkpoint states and stream draws are unchanged.
+
+The configured maximum horizon is 288 and context remains capped at 512. The
+adapter caches one builder/grid per group and slices future tensors to the drawn
+horizon; the existing decoder emits that many steps without a model change.
+Training and validation batch sizes are 96. The estimated 14.4 GB L4 memory peak
+at H=288 is unmeasured: round 5 must probe forward/backward/optimizer memory.
+`progress.json` timings and bundle manifests contain `sampling_exposure`, keyed
+by source, frequency/period/calendar group and horizon, with batch/pair counts,
+eligible-label counts and total label cells; `horizon_histogram` counts batches.
+Both resume cumulatively, as does named `feature_exposure` telemetry.
+
+`configs/pretrain-v3-corpus2.yaml` enables horizon sampling. Validation uses the same
 adapter and per-frequency periods for normalization and SQL, but synthetic
-holdouts still select checkpoints and real holdouts remain diagnostics. Fixed
-horizon sampling and selection match v2 for now; round 3 adds horizon sampling
-and its resume state, and round 4 adds real-holdout selection, EMA and snapshots.
+holdouts still select checkpoints at the configured maximum horizon and real
+holdouts remain diagnostics. Round 4 adds stratified real-holdout selection,
+EMA and snapshots.
 
 ## Contents and exclusions
 

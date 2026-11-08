@@ -117,9 +117,10 @@ def test_v3_stream_reproducible_row_mapping_and_resume(tmp_path, prefetch):
         )
     ) as stream:
         first = next(stream)
-        assert first.series_index.tolist() == stream._draws[:3, 0].tolist()
         reference, _, _ = _builder(path)
-        expected = reference.build(stream._draws[:3])
+        expected = reference.build(
+            list(zip(first.series_index.tolist(), first.origin_pos.tolist()))
+        )
         assert torch.equal(first.enc_cov, expected.enc_cov)
         state = stream.state()
         expected = [next(stream) for _ in range(4)]
@@ -297,7 +298,7 @@ def test_v3_pretrain_probe_measures_named_inputs(tmp_path, tiny_pretrain_cfg):
     assert report["shard_load_s"] > 0
 
 
-def test_shipped_v3_config_keeps_v2_horizon_and_selection():
+def test_shipped_v3_config_samples_fev_horizons_and_keeps_selection():
     from pathlib import Path
 
     configs = Path(__file__).resolve().parents[2] / "configs"
@@ -305,5 +306,9 @@ def test_shipped_v3_config_keeps_v2_horizon_and_selection():
     v3 = PretrainConfig.from_yaml(configs / "pretrain-v3-corpus2.yaml")
     assert (v3.recipe, v3.period_policy, v3.grid_policy) == ("v3", "frequency", "source")
     assert (v3.forecast.calendar_schema, v3.forecast.target_lags) == ("canonical", "cycle")
-    assert v3.forecast.horizon == v2.forecast.horizon
-    assert v3.corpus == v2.corpus and v3.training == v2.training
+    assert v3.forecast.horizon == 288 and v3.horizon_policy == "fev_set"
+    assert v3.training.batch_size == v3.training.val_batch_size == 96
+    assert v3.corpus == v2.corpus
+    assert v3.training.model_dump(
+        exclude={"batch_size", "val_batch_size"}
+    ) == v2.training.model_dump(exclude={"batch_size", "val_batch_size"})

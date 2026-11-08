@@ -1,8 +1,11 @@
-# Recipe v3 round 2b: real grids, canonical calendar and target-cycle lag inputs.
-# Horizon sampling and selection still follow v2; changes follow in rounds 3-4.
+# Recipe v3 round 3: full windows, fev horizons and resumable pair-slot visits.
+# Real-holdout selection follows in round 4.
 recipe: v3
 period_policy: frequency
 grid_policy: source
+horizon_policy: fev_set
+# Optional per-source pair count per shard visit; omission uses usable-series count.
+shard_visit_quota: {}
 corpus:
   root: /home/ubuntu/fev/corpus
   # Corpus v2 (configs/corpus-v2.yaml, Option B research release): weighted round-robin over four kinds.
@@ -29,7 +32,8 @@ corpus:
 forecast:
   calendar_schema: canonical
   target_lags: cycle
-  horizon: 52
+  # Round 5 must measure H=288 forward/backward memory on the L4 (estimate: 14.4 GB).
+  horizon: 288
   max_context: 512
   min_context: 8
 model:
@@ -40,5 +44,7 @@ model:
   dim_feedforward: 1280
   hidden_continuous_size: 320
 training:
+  batch_size: 96
+  val_batch_size: 96
   max_steps: 78000
   eval_every: 5000
