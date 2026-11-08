@@ -3,8 +3,9 @@ recipe: v3
 period_policy: frequency
 grid_policy: source
 horizon_policy: fev_set
-# Optional per-source pair count per shard visit; omission uses usable-series count.
-shard_visit_quota: {}
+# L4 probe: default GiftEval-pretrain visits yield 2 batches; shard reads take about 23 s.
+# Use 9,600 pairs (100 batches of 96) per visit to amortise reads.
+shard_visit_quota: {gifteval_pretrain: 9600}
 corpus:
   root: /home/ubuntu/fev/corpus
   # Weekly NN5 has no 288-step window, so v3's calendar on/off diagnostic is unavailable.

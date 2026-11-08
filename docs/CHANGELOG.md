@@ -180,6 +180,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The shipped recipe-v3 config uses 9,600 pairs (100 batches) per GiftEval-pretrain
+  shard visit to amortise measured reads of about 23 s, instead of the default
+  2 batches per visit; other source quotas retain their defaults.
+
 - **Configuration Propagation Improvements**
   - `extract_metafeatures()` now accepts `date_column` parameter (was hardcoded to "date")
   - `extract_metafeatures()` now receives `store_column` from config
