@@ -21,8 +21,8 @@ to this port.
 `models/statsforecast/model.py` at tag `v0.10.0`:
 https://github.com/autogluon/fev/blob/v0.10.0/models/statsforecast/model.py
 
-The port is restricted to `SeasonalNaive`, replaces AutoGluon's seasonality
-helper with this project's frequency convention, guards optional dependencies,
+The port keeps `SeasonalNaive`, `AutoETS` and `AutoTheta` (plus their cell-wise
+median, `median3`), replaces AutoGluon's seasonality helper with this project's frequency convention, guards optional dependencies,
 and exposes the number of workers (default 1). It retains the upstream
 1,000-observation context cap but never reduces the task's seasonal period.
 It also preserves fractional interval levels for custom quantiles and fills

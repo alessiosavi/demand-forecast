@@ -586,18 +586,21 @@ def _run_fev_tasks(
     return pd.read_csv(path, float_precision="round_trip")
 
 
-def run_baseline(specs: Iterable[FevTaskSpec], out_dir: Path) -> pd.DataFrame:
-    """Save each completed task; skip existing seasonal-naive task rows.
+def run_baseline(
+    specs: Iterable[FevTaskSpec], out_dir: Path, model: str = "seasonal_naive"
+) -> pd.DataFrame:
+    """Save each completed task; skip existing rows for the requested baseline.
 
     Resume is keyed by task name and model. Use a new output directory when
     changing a task definition or its dataset. The returned frame uses the
     CSV representation, including string-valued lists and metric definitions.
     """
     try:
-        from demand_forecast.bench.baselines import SeasonalNaiveBaseline, baseline_summary
+        from demand_forecast.bench.baselines import baseline_summary, make_baseline
     except ImportError as exc:
         raise ImportError("install demand-forecast[bench]") from exc
 
+    model_name = make_baseline(model).model_name
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / "summaries.csv"
     summaries = (
@@ -605,14 +608,12 @@ def run_baseline(specs: Iterable[FevTaskSpec], out_dir: Path) -> pd.DataFrame:
         if path.exists()
         else pd.DataFrame(columns=["task", "model_name"])
     )
-    completed = set(
-        summaries.loc[summaries["model_name"] == SeasonalNaiveBaseline.model_name, "task"]
-    )
+    completed = set(summaries.loc[summaries["model_name"] == model_name, "task"])
     for spec in specs:
         if spec.name in completed:
-            print(f"Skipping completed task {spec.name}", flush=True)
+            print(f"Skipping completed task {spec.name} for model {model_name}", flush=True)
             continue
-        summary = {"task": spec.name, **baseline_summary(spec.to_task())}
+        summary = {"task": spec.name, **baseline_summary(spec.to_task(), model=model_name)}
         row = pd.DataFrame([summary])
         summaries = row if summaries.empty else pd.concat([summaries, row], ignore_index=True)
         _save_summaries(summaries, path)

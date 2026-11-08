@@ -483,18 +483,21 @@ def fev_baseline(
         "weekly", "--tasks", help="weekly, heldout, comma-separated weekly names, or task YAML"
     ),
     out_dir: Path = typer.Option(..., "--out-dir", help="Directory for resumable summaries.csv"),
+    model: str = typer.Option(
+        "seasonal_naive", "--model", help="seasonal_naive, auto_ets, auto_theta, or median3"
+    ),
     profiles: Path | None = typer.Option(
         None, "--profiles", exists=True, dir_okay=False, help="Override task role profiles YAML"
     ),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable debug logging"),
 ):
-    """Evaluate seasonal naive, skipping tasks already saved in the output directory."""
+    """Evaluate a classical baseline, skipping saved task/model pairs."""
     from demand_forecast.bench.run import run_baseline
     from demand_forecast.bench.specs import load_task_specs
 
     configure_logging("DEBUG" if verbose else "INFO")
     try:
-        run_baseline(load_task_specs(tasks, profiles), out_dir)
+        run_baseline(load_task_specs(tasks, profiles), out_dir, model=model)
     except (ValueError, FileNotFoundError, ImportError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     typer.echo(f"Summaries saved to {out_dir / 'summaries.csv'}")

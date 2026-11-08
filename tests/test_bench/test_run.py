@@ -32,7 +32,9 @@ def test_run_baseline_on_fixture_is_resumable(tmp_path, monkeypatch):
     assert {"skill_score_lower", "skill_score_upper"} <= set(board.columns)
 
 
-def test_run_persists_each_completed_task_and_preserves_other_models(tmp_path, monkeypatch, capsys):
+def test_baseline_persists_each_completed_task_and_preserves_other_models(
+    tmp_path, monkeypatch, capsys
+):
     first_spec = fixture_spec(write_fev_fixture(tmp_path / "first"), name="first")
     second_spec = fixture_spec(write_fev_fixture(tmp_path / "second"), name="second")
     real_to_task = type(first_spec).to_task
@@ -54,8 +56,8 @@ def test_run_persists_each_completed_task_and_preserves_other_models(tmp_path, m
     monkeypatch.setattr(type(first_spec), "to_task", real_to_task)
     resumed = run_baseline([first_spec, second_spec, second_spec], out)
     assert capsys.readouterr().out.splitlines() == [
-        "Skipping completed task first",
-        "Skipping completed task second",
+        "Skipping completed task first for model seasonal_naive",
+        "Skipping completed task second for model seasonal_naive",
     ]
     assert list(zip(resumed["task"], resumed["model_name"], strict=True)) == [
         ("first", "seasonal_naive"),
@@ -121,6 +123,44 @@ def test_cli_runs_local_baseline_then_leaderboard(tmp_path):
     board = runner.invoke(app, ["fev", "leaderboard", str(tmp_path / "out/summaries.csv")])
     assert board.exit_code == 0, board.output
     assert "seasonal_naive" in board.output and "skill_score" in board.output
+
+
+@pytest.mark.parametrize("model_name", ["auto_ets", "auto_theta", "median3"])
+def test_cli_baseline_selects_model(tmp_path, model_name):
+    parquet = write_fev_fixture(tmp_path)
+    tasks = tmp_path / "tasks.yaml"
+    tasks.write_text(
+        yaml.safe_dump({"tasks": [{"name": "fixture", "dataset_path": str(parquet), "horizon": 4}]})
+    )
+    profiles = tmp_path / "profiles.yaml"
+    profiles.write_text("fixture:\n  target_support: nonnegative\n")
+    result = CliRunner().invoke(
+        app,
+        [
+            "fev",
+            "baseline",
+            "--model",
+            model_name,
+            "--tasks",
+            str(tasks),
+            "--profiles",
+            str(profiles),
+            "--out-dir",
+            str(tmp_path / "out"),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    saved = pd.read_csv(tmp_path / "out/summaries.csv")
+    assert saved["model_name"].tolist() == [model_name]
+
+
+def test_cli_baseline_rejects_unknown_model(tmp_path):
+    result = CliRunner().invoke(
+        app, ["fev", "baseline", "--model", "unknown", "--out-dir", str(tmp_path / "out")]
+    )
+    assert result.exit_code == 2, result.output
+    assert "Unknown baseline model" in result.output
+    assert not (tmp_path / "out").exists()
 
 
 def test_cli_and_specs_import_without_bench_and_operations_explain_missing_extra():
