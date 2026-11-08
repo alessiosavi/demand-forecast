@@ -319,7 +319,7 @@ def pretrain_identity(
         payload["sampler_policy"] = {
             "version": 1,
             "pairs": "series_uniform_origin_uniform",
-            "window": "full_future_min_origin_max_8_m_plus_1",
+            "window": "full_future_min_origin_max_min_context_m_plus_1",
             "fev_horizons": FEV_HORIZONS if cfg.horizon_policy == "fev_set" else None,
         }
     for name, default in LEGACY_RECIPE_DEFAULTS.items():

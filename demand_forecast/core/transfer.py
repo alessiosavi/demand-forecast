@@ -52,6 +52,13 @@ class TransferReport:
     static_bias_norm: float
 
 
+@dataclass
+class NamedTransferReport(TransferReport):
+    """V3 value/mask column names copied into each projection."""
+
+    copied_columns: dict[str, list[dict]]
+
+
 def _require_equal(name: str, source: object, target: object) -> None:
     if source != target:
         raise TransferError(f"{name}: source {source}, target {target}")
@@ -174,7 +181,7 @@ def init_from_pretrained(
     shared = [
         name for name, _ in model.named_parameters() if name.startswith(("backbone.", "head."))
     ]
-    return TransferReport(
+    report = TransferReport(
         copied=sorted(
             [*shared, "enc_proj.weight", "enc_proj.bias", "dec_proj.bias", "static_proj.bias"]
             + (["dec_proj.weight"] if columns is not None else [])
@@ -186,4 +193,25 @@ def init_from_pretrained(
             if name.startswith(("statics.", "static_gate."))
         ),
         static_bias_norm=s0.norm().item(),
+    )
+    if columns is None:
+        return report
+    names = (*source.model.spec.calendar_schema, *source.model.spec.lag_schema)
+    return NamedTransferReport(
+        **{field.name: getattr(report, field.name) for field in fields(report)},
+        copied_columns={
+            projection: [
+                dict(
+                    name=names[(src - offset) % len(names)],
+                    role="value" if src - offset < len(names) else "mask",
+                    source=src,
+                    target=dest,
+                )
+                for dest, src in mapping
+            ]
+            for projection, mapping, offset in (
+                ("enc_proj.weight", enc_columns, 2),
+                ("dec_proj.weight", dec_columns, 0),
+            )
+        },
     )

@@ -185,8 +185,11 @@ def pretrain_run(
     out: Path = typer.Option(..., "--out", help="Run directory for checkpoints and bundle"),
     resume: bool = typer.Option(False, "--resume"),
     stop_after: int | None = typer.Option(None, "--stop-after", min=1),
+    probe_json: Path | None = typer.Option(None, "--probe-json", exists=True, dir_okay=False),
 ):
     """Train to the fixed pretraining budget, or resume a matching checkpoint."""
+    import json
+
     import yaml
 
     from demand_forecast.pretrain.config import PretrainConfig
@@ -195,13 +198,36 @@ def pretrain_run(
     try:
         cfg = PretrainConfig.from_yaml(config)
         configure_logging(cfg.log_level)
-        pretrain(cfg, out, resume=resume, stop_after=stop_after)
+        probe = json.loads(probe_json.read_text()) if probe_json else None
+        pretrain(cfg, out, resume=resume, stop_after=stop_after, probe=probe)
     except (ValueError, OSError, ImportError, yaml.YAMLError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     except RuntimeError as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=1) from exc
     typer.echo(f"Bundle saved to {out / 'bundle'}")
+
+
+@pretrain_app.command("plan")
+def pretrain_plan_command(
+    config: Path = typer.Option(..., "--config", exists=True, dir_okay=False),
+    probe_json: Path | None = typer.Option(None, "--probe-json", exists=True, dir_okay=False),
+):
+    """Print resolved schemas, sampling, selection and measured cost; read no shards."""
+    import json
+
+    import yaml
+
+    from demand_forecast.pretrain.config import PretrainConfig
+    from demand_forecast.pretrain.planning import pretrain_plan
+
+    try:
+        cfg = PretrainConfig.from_yaml(config)
+        probe = json.loads(probe_json.read_text()) if probe_json else None
+        report = pretrain_plan(cfg, probe)
+    except (ValueError, OSError, ImportError, yaml.YAMLError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    typer.echo(json.dumps(report, indent=2, allow_nan=False))
 
 
 @pretrain_app.command("export")
