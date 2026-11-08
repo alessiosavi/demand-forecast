@@ -65,6 +65,7 @@ class CorpusConfig(BaseModel):
     val_pairs_per_kind: int = 4096
     external_validation: str | None = "monash_nn5_weekly"
     sources: dict[str, SourceShards] | None = None
+    selection_shards: dict[str, list[int]] | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -109,6 +110,8 @@ class CorpusConfig(BaseModel):
     @model_serializer(mode="wrap")
     def serialize_compatible(self, handler):
         payload = handler(self)
+        if self.selection_shards is None:
+            payload.pop("selection_shards", None)
         if self.sources is None:
             payload.pop("sources", None)
         elif "kernel_synth_every" not in self.model_fields_set:
@@ -140,6 +143,16 @@ class PretrainTrainingConfig(BaseModel):
     checkpoint_every: int = Field(1000, ge=1)
     amp: bool = True
     val_batch_size: int = Field(128, ge=1)
+    ema_decay: float | None = Field(None, gt=0, lt=1, allow_inf_nan=False)
+    keep_eval_snapshots: bool = False
+
+    @model_serializer(mode="wrap")
+    def serialize_compatible(self, handler):
+        payload = handler(self)
+        for name, default in (("ema_decay", None), ("keep_eval_snapshots", False)):
+            if payload.get(name) == default:
+                payload.pop(name, None)
+        return payload
 
 
 class _PretrainForecastConfig(ForecastConfig):
@@ -185,6 +198,27 @@ class PretrainConfig(BaseModel):
             raise ValueError("horizon_policy and shard_visit_quota require recipe v3")
         if self.horizon_policy == "fev_set" and self.forecast.horizon != max(FEV_HORIZONS):
             raise ValueError("fev_set requires forecast.horizon = 288")
+        if self.recipe != "v3" and (
+            self.training.ema_decay is not None
+            or self.training.keep_eval_snapshots
+            or self.corpus.selection_shards is not None
+        ):
+            raise ValueError(
+                "selection_shards, ema_decay and keep_eval_snapshots require recipe v3"
+            )
+        if self.corpus.selection_shards is not None:
+            for kind, indices in self.corpus.selection_shards.items():
+                selections = self.corpus.selections()
+                if (
+                    kind not in ("chronos_real", "gifteval_pretrain")
+                    or kind not in selections
+                    or not indices
+                    or len(set(indices)) != len(indices)
+                    or not set(indices) <= set(selections[kind][1])
+                ):
+                    raise ValueError("selection_shards must name real held-out shards")
+            if not self.corpus.selection_shards:
+                raise ValueError("selection_shards must not be empty")
         for kind in self.shard_visit_quota:
             if kind not in self.corpus.selections():
                 raise ValueError("shard_visit_quota requires configured sources and positive pairs")
@@ -281,6 +315,7 @@ def pretrain_identity(
             "lag_schema": TARGET_LAG_SCHEMA,
             "target_lags": "cycle",
         }
+        payload["selection_pair_policy"] = selection_pair_policy_hash()
         payload["sampler_policy"] = {
             "version": 1,
             "pairs": "series_uniform_origin_uniform",
@@ -292,4 +327,23 @@ def pretrain_identity(
             payload["config"].pop(name)
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+# Changing construction or aggregation deliberately invalidates v3 continuation.
+SELECTION_PAIR_POLICY = {
+    "version": 1,
+    "quota": "min_4096_configured_per_source",
+    "cells": "shard_panels_conventional_period_cross_feasible_fev_horizons_or_fixed",
+    "allocation": "sorted_cells_round_robin_capacity_capped",
+    "pairs": "seeded_series_without_replacement_final_full_future",
+    "window": "origin_ge_max_min_context_m_plus_1",
+    "aggregation": "equal_source_mean_of_equal_cell_sql_all_cells_finite",
+}
+
+
+def selection_pair_policy_hash() -> str:
+    """Hash the frozen validation-pair construction and aggregation contract."""
+    return hashlib.sha256(
+        json.dumps(SELECTION_PAIR_POLICY, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()

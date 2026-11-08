@@ -478,6 +478,40 @@ evaluation and verified bundle hashes. Record `ext_sql` and `ext_sql_naive` for 
 external diagnostic. Corpus hold-out SQL selects the checkpoint; external/fev scores
 do not select capacity or training configuration. Stop and reconcile.
 
+### Recipe v3 checkpoint selection and diagnostic exports
+
+For `configs/pretrain-v3-corpus2.yaml`, select on real holdouts `chronos_real: [9]`
+and `gifteval_pretrain: [14]`. Keep both shards excluded from training. Frozen,
+stratified validation pairs total at most 4,096 per real source; SQL uses each
+frequency/horizon cell's conventional period. `val_sql` is the equal-source mean
+of equal-cell means. Every predetermined cell must be finite: inspect
+`selection_sources.*.failed_cells`, counts and scores in the `evaluations` entries
+in progress and the bundle manifest; never drop a cell to repair the aggregate.
+
+The YAML enables EMA decay 0.999 and raw evaluation snapshots. Every evaluation
+scores raw and EMA weights, records `selected_weights`, and selects the smaller
+finite real-holdout SQL (ties retain raw). Record `best_step`, `best_score` and
+`best_weights`. Synthetic scores and external calendar-on/off measurements are
+only diagnostics: v3 uses the explicit `ext_sql_calendar_on` / `_naive_calendar_on`
+and `ext_sql_calendar_off` / `_naive_calendar_off` labels. The off measurement
+uses v3's lag inputs; keep historical v2 `ext_sql` results labelled separately.
+
+Budget about 16 × 49 MB for `checkpoints/step-<n>.pt` at 5k intervals plus 78k.
+These are raw model-only weights; `latest.pt` also contains the current EMA,
+optimizer and exact continuation state. `eval_snapshots` lists available exports.
+Export without loading or downloading corpus shards, including during a stopped run:
+
+```bash
+demand-forecast pretrain export --run-dir "$PRETRAIN_RUN" --step 20000 --out "$RUNS/v3-step-20000"
+demand-forecast pretrain export --run-dir "$PRETRAIN_RUN" --weights ema --out "$RUNS/v3-ema-latest"
+```
+
+EMA export uses the latest checkpoint step only; an earlier `--step` is rejected.
+Round 5 must independently probe L4 H=288 memory and full raw/EMA evaluation cost,
+verify held-out frequency coverage, and run the 81 shifted fev backtests at
+20k/40k/60k/end from exports. Those checks remain ops diagnostics and never feed
+checkpoint selection. Snapshot averaging is a later zero-shot comparison.
+
 ## 10. Evaluation sweep order
 
 **Operator**: `launch start --label eval --minutes "$MINUTES_E" --consume-hold eval`.

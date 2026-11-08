@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Recipe-v3 round 4: frozen, stratified real-holdout pairs and equal-source,
+  frequency/horizon macro SQL selection with conventional periods and explicit
+  non-finite-cell failures. Synthetic and external scores remain diagnostics.
+  Optional exact-resume EMA competes with raw weights; raw evaluation snapshots
+  and `pretrain export` support corpus-free snapshot/latest-EMA bundles.
+  Progress and manifests retain cell scores/counts, both candidates and snapshots;
+  calendar-on/off external scores carry separate labels. The shipped v3 config
+  enables real shard 9/14 selection, EMA 0.999 and snapshots. The v3 origin floor
+  now honors `forecast.min_context`; shipped defaults and v2 contracts are unchanged.
+
 - Recipe-v3 round 3: feasible pinned-fev horizon draws per frequency-group batch,
   full-future windows, series-uniform draws with uniform eligible origins,
   per-source pair quotas and exact sampler continuation.

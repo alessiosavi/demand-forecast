@@ -298,7 +298,7 @@ def test_v3_pretrain_probe_measures_named_inputs(tmp_path, tiny_pretrain_cfg):
     assert report["shard_load_s"] > 0
 
 
-def test_shipped_v3_config_samples_fev_horizons_and_keeps_selection():
+def test_shipped_v3_config_samples_fev_horizons_and_selects_real():
     from pathlib import Path
 
     configs = Path(__file__).resolve().parents[2] / "configs"
@@ -308,7 +308,9 @@ def test_shipped_v3_config_samples_fev_horizons_and_keeps_selection():
     assert (v3.forecast.calendar_schema, v3.forecast.target_lags) == ("canonical", "cycle")
     assert v3.forecast.horizon == 288 and v3.horizon_policy == "fev_set"
     assert v3.training.batch_size == v3.training.val_batch_size == 96
-    assert v3.corpus == v2.corpus
+    assert v3.corpus.model_dump(exclude={"selection_shards"}) == v2.corpus.model_dump()
+    assert v3.corpus.selection_shards == {"chronos_real": [9], "gifteval_pretrain": [14]}
+    assert v3.training.ema_decay == 0.999 and v3.training.keep_eval_snapshots
     assert v3.training.model_dump(
-        exclude={"batch_size", "val_batch_size"}
+        exclude={"batch_size", "val_batch_size", "ema_decay", "keep_eval_snapshots"}
     ) == v2.training.model_dump(exclude={"batch_size", "val_batch_size"})

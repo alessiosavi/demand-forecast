@@ -15,7 +15,7 @@ from demand_forecast.data.encoders import StaticEncoder
 from demand_forecast.data.panel import Panel, Series
 from demand_forecast.data.sampler import BatchBuilder, _items_array, _positive
 from demand_forecast.models.base import ForecastModel
-from demand_forecast.pretrain.config import PretrainConfig
+from demand_forecast.pretrain.config import FEV_HORIZONS, PretrainConfig, selection_pair_policy_hash
 from demand_forecast.pretrain.corpus import (
     CHRONOS_REVISION,
     CORPUS_REPO,
@@ -38,6 +38,122 @@ class V3Pairs:
 
     groups: list[ShardPanelGroup]
     items: np.ndarray
+
+
+@dataclass(frozen=True)
+class V3SelectionCell:
+    """Immutable pair membership in one predetermined frequency/horizon cell."""
+
+    key: str
+    horizon: int
+    group: ShardPanelGroup
+    items: tuple[tuple[int, int], ...]
+
+
+def selection_pairs_v3(shards, cfg: PretrainConfig) -> tuple[V3SelectionCell, ...]:
+    """Freeze capacity-capped, balanced cell quotas over real hold-out sources.
+
+    A row may appear at several horizons. Within a cell it is sampled once,
+    without replacement, with its final full future as the validation window.
+    """
+    records = []
+    for shard in sorted(shards, key=lambda ref: ref.index):
+        loaded = read_shard_v3(shard.path, kind=shard.kind, grid_policy=cfg.grid_policy)
+        offset = len(records)
+        records.extend(replace(row, row_index=offset + i) for i, row in enumerate(loaded.records))
+    groups = shard_panels(records, period_policy="frequency")
+    horizons = FEV_HORIZONS if cfg.horizon_policy == "fev_set" else (cfg.forecast.horizon,)
+    candidates = []
+    for group in groups:
+        minimum = max(cfg.forecast.min_context, group.panel.seasonal_period + 1)
+        key = (
+            f"{group.panel.freq.freqstr}|m={group.panel.seasonal_period}"
+            f"|calendar={int(group.calendar_available)}"
+        )
+        for horizon in horizons:
+            items = [
+                (index, series.length - horizon)
+                for index, series in zip(group.row_indices, group.panel.series, strict=True)
+                if series.length - horizon >= minimum
+            ]
+            if items:
+                candidates.append((key, horizon, group, items))
+    candidates.sort(key=lambda cell: (cell[0], cell[1]))
+    budget = min(4096, cfg.corpus.val_pairs_per_kind)
+    if not candidates or budget < len(candidates):
+        raise ValueError("real selection requires at least one pair in every available cell")
+    quotas = [0] * len(candidates)
+    remaining = min(budget, sum(len(cell[3]) for cell in candidates))
+    while remaining:
+        for i, cell in enumerate(candidates):
+            if quotas[i] < len(cell[3]) and remaining:
+                quotas[i] += 1
+                remaining -= 1
+    rng = np.random.default_rng(cfg.seed)
+    cells = tuple(
+        V3SelectionCell(
+            f"{key}|h={horizon}",
+            horizon,
+            group,
+            tuple(items[int(i)] for i in rng.choice(len(items), size=quota, replace=False)),
+        )
+        for (key, horizon, group, items), quota in zip(candidates, quotas, strict=True)
+    )
+    # Retain only sampled histories, shared across horizons, rather than whole shards.
+    selected_rows = {}
+    for cell in cells:
+        selected_rows.setdefault(id(cell.group), set()).update(index for index, _ in cell.items)
+    compact = {}
+    for group in groups:
+        if id(group) in selected_rows:
+            chosen = selected_rows[id(group)]
+            retained = [
+                (i, series)
+                for i, series in zip(group.row_indices, group.panel.series, strict=True)
+                if i in chosen
+            ]
+            compact[id(group)] = replace(
+                group,
+                row_indices=tuple(i for i, _ in retained),
+                panel=replace(group.panel, series=[series for _, series in retained]),
+            )
+    return tuple(replace(cell, group=compact[id(cell.group)]) for cell in cells)
+
+
+def evaluate_selection_v3(model, cells, **options) -> dict:
+    """Macro-average fixed cells; any non-finite cell invalidates the source."""
+    scores = {}
+    builders = {}
+    for cell in cells:
+        key = id(cell.group)
+        if key not in builders:
+            builders[key] = V3BatchBuilder(
+                [cell.group],
+                max(c.horizon for c in cells if c.group is cell.group),
+                options["max_context"],
+                options["encoder"],
+                scale_floor_frac=options.get("scale_floor_frac", 0.0),
+            )
+        result = evaluate_pairs_v3(
+            model,
+            V3Pairs([cell.group], np.asarray(cell.items, dtype=np.int64)),
+            **(
+                options | {"horizon": cell.horizon, "slice_horizon": True, "builder": builders[key]}
+            ),
+        )
+        scores[cell.key] = result | {
+            "period": cell.group.panel.seasonal_period,
+            "horizon": cell.horizon,
+        }
+    failed = [key for key, score in scores.items() if not np.isfinite(score["SQL"])]
+    return {
+        "SQL": float(np.mean([score["SQL"] for score in scores.values()]))
+        if not failed
+        else float("nan"),
+        "cells": scores,
+        "failed_cells": failed,
+        "n_items": sum(score["n_items"] for score in scores.values()),
+    }
 
 
 def holdout_pairs_v3(shards, cfg: PretrainConfig) -> V3Pairs:
@@ -64,13 +180,15 @@ def evaluate_pairs_v3(model, source: V3Pairs, *, scale_floor_frac=0.0, **kwargs)
     """Use the training adapter and pool SQL cells with each row's own period."""
     horizon, quantiles = kwargs["horizon"], kwargs["quantiles"]
     batch_size = kwargs["batch_size"]
-    builder = V3BatchBuilder(
-        source.groups,
-        horizon,
-        kwargs["max_context"],
-        kwargs["encoder"],
-        scale_floor_frac=scale_floor_frac,
-    )
+    builder = kwargs.get("builder")
+    if builder is None:
+        builder = V3BatchBuilder(
+            source.groups,
+            horizon,
+            kwargs["max_context"],
+            kwargs["encoder"],
+            scale_floor_frac=scale_floor_frac,
+        )
     rows = {
         index: (series, group.panel.seasonal_period)
         for group in source.groups
@@ -85,7 +203,12 @@ def evaluate_pairs_v3(model, source: V3Pairs, *, scale_floor_frac=0.0, **kwargs)
     try:
         with torch.no_grad():
             for start in range(0, len(labels), batch_size):
-                batch = builder.build(source.items[start : start + batch_size]).to(kwargs["device"])
+                items = source.items[start : start + batch_size]
+                batch = (
+                    builder.build(items, horizon=horizon)
+                    if kwargs.get("slice_horizon")
+                    else builder.build(items)
+                ).to(kwargs["device"])
                 predictions[start : start + batch.size] = model.predict(batch).cpu().numpy()
         for row, (index, origin) in enumerate(source.items):
             series, period = rows[int(index)]
@@ -239,9 +362,9 @@ def evaluate_pairs(
 class ValidationSet:
     """Panels sampled once per session, with fixed evaluation settings.
 
-    Each selected shard contributes up to ``val_pairs_per_kind`` items; multiple
-    shards of a kind are concatenated in shard-index order. Only the two corpus
-    scores enter model selection. The external scores are diagnostic.
+    Legacy diagnostics concatenate per-shard quotas in index order. V2 selects
+    on the synthetic mean; v3 selects on frozen real frequency/horizon cells.
+    Synthetic and external scores remain separately inspectable.
     """
 
     tsmixup: tuple[Panel, np.ndarray] | None
@@ -255,6 +378,7 @@ class ValidationSet:
     diagnostics: dict[str, tuple[Panel, np.ndarray] | None] = field(default_factory=dict)
     v3_sources: dict[str, V3Pairs | None] | None = None
     scale_floor_frac: float = 0.0
+    selection: dict[str, tuple[V3SelectionCell, ...]] | None = None
 
     @classmethod
     def build(
@@ -311,7 +435,25 @@ class ValidationSet:
                     [ShardPanelGroup(panel, tuple(range(len(panel))), True)],
                     np.column_stack((np.arange(len(origins)), origins)),
                 )
+        selection = None
+        if cfg.recipe == "v3":
+            selection = {}
+            selection_shards = cfg.corpus.selection_shards
+            if selection_shards is None:
+                selection_shards = {
+                    kind: held_out
+                    for kind, (_, held_out) in cfg.corpus.selections().items()
+                    if kind in ("chronos_real", "gifteval_pretrain") and held_out
+                }
+            if not selection_shards:
+                raise ValueError("recipe v3 selection requires real held-out shards")
+            for kind, indices in selection_shards.items():
+                selected = [ref for ref in refs if ref.kind == kind and ref.index in indices]
+                if {ref.index for ref in selected} != set(indices):
+                    raise ValueError(f"missing real selection shards for {kind}")
+                selection[kind] = selection_pairs_v3(selected, cfg)
         return cls(
+            selection=selection,
             tsmixup=sets.pop("tsmixup", None),
             kernel_synth=sets.pop("kernel_synth", None),
             diagnostics=sets,
@@ -378,4 +520,43 @@ class ValidationSet:
             for key in ("val_sql_tsmixup", "val_sql_kernel_synth")
         ]
         result["val_sql"] = float(np.mean(corpus_scores))
+        if self.selection is not None:
+            selection_scores = {
+                kind: evaluate_selection_v3(
+                    model,
+                    cells,
+                    max_context=self.max_context,
+                    encoder=self.encoder,
+                    quantiles=self.quantiles,
+                    batch_size=self.batch_size,
+                    device=device,
+                    scale_floor_frac=self.scale_floor_frac,
+                )
+                for kind, cells in self.selection.items()
+            }
+            result["selection_sources"] = selection_scores
+            result["selection_pair_policy"] = selection_pair_policy_hash()
+            result["val_sql"] = float(
+                np.mean([score["SQL"] for score in selection_scores.values()])
+            )
+            # Label both calendar variants separately from historical v2 measurements.
+            result["ext_sql_calendar_on"] = result.pop("ext_sql")
+            result["ext_sql_naive_calendar_on"] = result.pop("ext_sql_naive")
+            if self.external is not None:
+                source = self.v3_sources["external"]
+                historical = evaluate_pairs_v3(
+                    model,
+                    V3Pairs(
+                        [replace(group, calendar_available=False) for group in source.groups],
+                        source.items,
+                    ),
+                    horizon=self.horizon,
+                    max_context=self.max_context,
+                    encoder=self.encoder,
+                    quantiles=self.quantiles,
+                    batch_size=self.batch_size,
+                    device=device,
+                )
+                result["ext_sql_calendar_off"] = historical["SQL"]
+                result["ext_sql_naive_calendar_off"] = historical["naive_sql"]
         return result

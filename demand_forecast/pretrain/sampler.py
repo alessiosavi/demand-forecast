@@ -455,7 +455,7 @@ class V3ShardStream(ShardStream):
         self._groups = []
         horizons = FEV_HORIZONS if self.horizon_policy == "fev_set" else (self.horizon,)
         for group in groups:
-            minimum = max(8, group.panel.seasonal_period + 1)
+            minimum = max(self.min_context, group.panel.seasonal_period + 1)
             lengths = np.array([s.history_length for s in group.panel.series], dtype=np.int64)
             feasible = {}
             for horizon in horizons:

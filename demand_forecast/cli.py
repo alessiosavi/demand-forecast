@@ -204,6 +204,23 @@ def pretrain_run(
     typer.echo(f"Bundle saved to {out / 'bundle'}")
 
 
+@pretrain_app.command("export")
+def pretrain_export(
+    run_dir: Path = typer.Option(..., "--run-dir", exists=True, file_okay=False),
+    out: Path = typer.Option(..., "--out"),
+    step: int | None = typer.Option(None, "--step", min=1),
+    weights: str = typer.Option("raw", "--weights", help="raw snapshot/latest or latest ema"),
+):
+    """Export an evaluation snapshot or latest EMA without loading the corpus."""
+    from demand_forecast.pretrain.train import export_pretrain
+
+    try:
+        export_pretrain(run_dir, out, step=step, weights=weights)
+    except (ValueError, OSError, RuntimeError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    typer.echo(f"Bundle saved to {out}")
+
+
 @pretrain_app.command("probe")
 def pretrain_probe_command(
     config: Path = typer.Option(..., "--config", exists=True, dir_okay=False),
