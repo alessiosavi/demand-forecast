@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Recipe-v3 pretraining adapter: real source grids, canonical calendar and target
+  lag inputs, projection zero initialization, resumable feature exposure counts,
+  matching validation periods, and transfer by feature name into task layouts.
+  Added `pretrain-v3-corpus2.yaml`; v2 paths and identities remain unchanged.
+- Task timing probes resolve the pretraining scaler period for both training and
+  validation. Metric-scale loss weights reuse the frame scale at matching periods.
+
 - Optional `forecast.scaler_period: pretraining` to reuse corpus-v2 or recipe-v3
   frame periods, persisted for inference while inner SQL retains the task period.
   Optional `training.loss_weight: metric_scale` adds clipped context-only scale

@@ -12,6 +12,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    ValidationError,
     field_validator,
     model_serializer,
     model_validator,
@@ -152,28 +153,6 @@ class _PretrainForecastConfig(ForecastConfig):
             raise ValueError("scale_floor_frac is only supported for task training")
         return value
 
-    @field_validator("calendar_schema")
-    @classmethod
-    def reject_calendar_schema(cls, value: str) -> str:
-        """Keep legacy pretraining batches until the v3 adapter supports named schemas."""
-        if value != "legacy":
-            raise ValueError(
-                "non-default calendar_schema is only supported for task training; "
-                "pretraining requires 'legacy'"
-            )
-        return value
-
-    @field_validator("target_lags")
-    @classmethod
-    def reject_target_lags(cls, value: str) -> str:
-        """Keep pretraining lag-free until the v3 adapter supports target lags."""
-        if value != "none":
-            raise ValueError(
-                "non-default target_lags is only supported for task training; "
-                "pretraining requires 'none'"
-            )
-        return value
-
 
 class PretrainConfig(BaseModel):
     """Standalone pretraining configuration; loading never accesses corpus files."""
@@ -190,6 +169,45 @@ class PretrainConfig(BaseModel):
     seed: int = 0
     device: str | None = None
     log_level: str = "INFO"
+
+    @model_validator(mode="before")
+    @classmethod
+    def resolve_input_schema(cls, value):
+        """V3 always uses canonical calendar/cycle lags; v2 keeps its old layout."""
+        if not isinstance(value, dict):
+            return value
+        value = dict(value)
+        forecast = value.get("forecast", {})
+        forecast = forecast.model_dump() if isinstance(forecast, ForecastConfig) else forecast
+        if not isinstance(forecast, dict):
+            return value
+        forecast = dict(forecast)
+        if value.get("recipe", "v2") == "v3":
+            # Omitted/default task knobs resolve to the fixed v3 layout.
+            if forecast.get("calendar_schema", "legacy") == "legacy":
+                forecast["calendar_schema"] = "canonical"
+            if forecast.get("target_lags", "none") == "none":
+                forecast["target_lags"] = "cycle"
+        else:
+            errors = []
+            for name, default in (("calendar_schema", "legacy"), ("target_lags", "none")):
+                if forecast.get(name, default) != default:
+                    errors.append(
+                        dict(
+                            type="value_error",
+                            loc=("forecast", name),
+                            input=forecast[name],
+                            ctx={
+                                "error": ValueError(
+                                    f"{name} is only supported for task training or recipe v3"
+                                )
+                            },
+                        )
+                    )
+            if errors:
+                raise ValidationError.from_exception_data(cls.__name__, errors)
+        value["forecast"] = forecast
+        return value
 
     @model_serializer(mode="wrap")
     def serialize_compatible(self, handler):
@@ -234,6 +252,15 @@ def pretrain_identity(
     # The shared forecast schema gained a task-only switch. Do not invalidate
     # existing pretraining checkpoints by hashing its inactive default.
     payload["config"]["forecast"].pop("scale_floor_frac", None)
+    if cfg.recipe == "v3":
+        from demand_forecast.data.frequency import CANONICAL_CALENDAR_SCHEMA
+        from demand_forecast.data.sampler import TARGET_LAG_SCHEMA
+
+        payload["input_schema"] = {
+            "calendar_schema": CANONICAL_CALENDAR_SCHEMA,
+            "lag_schema": TARGET_LAG_SCHEMA,
+            "target_lags": "cycle",
+        }
     for name, default in LEGACY_RECIPE_DEFAULTS.items():
         if payload["config"].get(name) == default:
             payload["config"].pop(name)

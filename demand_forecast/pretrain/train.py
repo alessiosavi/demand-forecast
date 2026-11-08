@@ -30,6 +30,8 @@ from demand_forecast.core.training import (
     lr_factor,
     resolve_amp,
 )
+from demand_forecast.data.frequency import CANONICAL_CALENDAR_SCHEMA
+from demand_forecast.data.sampler import TARGET_LAG_SCHEMA
 from demand_forecast.models.base import ModelSpec
 from demand_forecast.models.losses import pinball_loss
 from demand_forecast.models.registry import build_model
@@ -135,19 +137,34 @@ class _PretrainLoop:
             seed=cfg.seed,
             kernel_synth_every=cfg.corpus.kernel_synth_every,
             holdout=holdout,
+            **(
+                dict(
+                    recipe=cfg.recipe,
+                    period_policy=cfg.period_policy,
+                    grid_policy=cfg.grid_policy,
+                    scale_floor_frac=cfg.forecast.scale_floor_frac,
+                )
+                if cfg.recipe == "v3"
+                else {}
+            ),
         )
         try:
             # Match the primary stream's first seeded pass, not manifest order.
             first = np.random.default_rng((cfg.seed, 0, 0)).permutation(len(selected["tsmixup"]))[0]
             self.first_ref = selected["tsmixup"][first]
             started = time.perf_counter()
-            self.panel = shard_panel(read_shard(self.first_ref.path))
+            self.panel = shard_panel([] if cfg.recipe == "v3" else read_shard(self.first_ref.path))
             initial_load_s = time.perf_counter() - started
             self.encoder = self.sampler.encoder
             spec = ModelSpec.from_panel(
                 self.panel, self.encoder, cfg.forecast, cfg.model.d_model, cfg.model.cat_emb_dim
             )
             self.model = build_model("v2", spec, cfg.model.backbone_kwargs()).to(self.device)
+            if cfg.recipe == "v3":
+                # Values and masks start inert, including slots never exposed by this corpus.
+                with torch.no_grad():
+                    self.model.enc_proj.weight[:, 2:].zero_()
+                    self.model.dec_proj.weight.zero_()
             self.validation = ValidationSet.build(cfg, self.refs, self.encoder)
             self.optimizer = torch.optim.AdamW(
                 self.model.parameters(),
@@ -182,6 +199,11 @@ class _PretrainLoop:
                 nonfinite_losses=0,
                 scaler_skips=0,
             )
+            if cfg.recipe == "v3":
+                names = (*CANONICAL_CALENDAR_SCHEMA, *TARGET_LAG_SCHEMA)
+                self.timings["feature_exposure"] = {
+                    side: dict.fromkeys(names, 0) for side in ("encoder", "decoder")
+                }
             self.batches = self.sampler.batches()
             self.model.train()
             if self.device.type == "cuda":
@@ -210,6 +232,12 @@ class _PretrainLoop:
         """Mirror Trainer's finite-loss, scaling, clipping and scheduler contract."""
         _sync(self.device)
         started = time.perf_counter()
+        if self.cfg.recipe == "v3":
+            for side, mask in (("encoder", batch.enc_cov_mask), ("decoder", batch.dec_cov_mask)):
+                counts = mask.sum(dim=(0, 1)).tolist()
+                exposure = self.timings["feature_exposure"][side]
+                for name, count in zip(exposure, counts, strict=True):
+                    exposure[name] += count
         batch = batch.to(self.device)
         self.optimizer.zero_grad(set_to_none=True)
         lr = self.optimizer.param_groups[0]["lr"]
@@ -438,6 +466,11 @@ def pretrain(
                     "config": cfg.model_dump(mode="json"),
                     "shards": loop.shards,
                     "external_diagnostic": external,
+                    **(
+                        {"feature_exposure": loop.timings["feature_exposure"]}
+                        if cfg.recipe == "v3"
+                        else {}
+                    ),
                 }
             ),
         )

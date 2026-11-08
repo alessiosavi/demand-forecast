@@ -14,7 +14,7 @@ import torch
 
 from demand_forecast.bench.specs import FevTaskSpec
 from demand_forecast.config import Settings
-from demand_forecast.core.run import _write_run, resolve_device
+from demand_forecast.core.run import _resolve_scaler_period, _write_run, resolve_device
 from demand_forecast.core.training import Trainer
 from demand_forecast.pretrain.config import PretrainConfig
 from demand_forecast.pretrain.train import _peak_rss, _PretrainLoop, _seed, _sync
@@ -47,10 +47,11 @@ def _shard_transition(loop: _PretrainLoop) -> float:
     an actual read, panel/draw setup and its first batch. Public resume state
     skips the remaining batches of the first shard without optimizer work.
     """
-    from demand_forecast.pretrain.sampler import ShardStream
+    from demand_forecast.pretrain.sampler import ShardStream, V3ShardStream
 
     cfg = loop.cfg
-    stream = ShardStream(
+    stream_type = V3ShardStream if cfg.recipe == "v3" else ShardStream
+    stream = stream_type(
         loop.sampler.tsmixup.refs,
         "tsmixup",
         horizon=cfg.forecast.horizon,
@@ -60,10 +61,19 @@ def _shard_transition(loop: _PretrainLoop) -> float:
         seed=cfg.seed,
         encoder=loop.encoder,
         prefetch=0,
+        **(
+            dict(
+                period_policy=cfg.period_policy,
+                grid_policy=cfg.grid_policy,
+                scale_floor_frac=cfg.forecast.scale_floor_frac,
+            )
+            if cfg.recipe == "v3"
+            else {}
+        ),
     )
     try:
         next(stream)
-        n_eligible = sum(series.length > cfg.forecast.min_context for series in loop.panel.series)
+        n_eligible = len(stream._draws)
         stream.load_state(
             replace(stream.state(), batch_cursor=math.ceil(n_eligible / cfg.training.batch_size))
         )
@@ -115,6 +125,10 @@ def pretrain_probe(cfg: PretrainConfig, *, steps: int = 50, out: Path) -> dict:
                 for i, series in enumerate(loop.panel.series)
                 if series.length > cfg.forecast.min_context
             ][: cfg.training.batch_size]
+            if cfg.recipe == "v3":
+                stream = loop.sampler.streams[loop.sampler.last_kind]
+                builder = stream._builder
+                items = stream._draws[: cfg.training.batch_size]
             started = time.perf_counter()
             builder.build(items)
             batch_times.append(time.perf_counter() - started)
@@ -207,6 +221,7 @@ def task_probe(
         panel, origins = _window_panel(task, 0, spec, max_series)
         task_settings = settings_for_task(spec, settings, task.freq)
         forecast = task_settings.forecast
+        scaler_period = _resolve_scaler_period(task_settings, panel)["period"]
         plan = plan_inner_validation(
             panel, resolved_origin(origins), forecast.horizon, settings.training.min_train_history
         )
@@ -239,7 +254,9 @@ def task_probe(
         trainer = _ProbeTrainer(model, train_cfg, device, f"probe-{spec.name}", settings.seed)
         _sync(device)
         started = time.perf_counter()
-        result = trainer.fit(panel, replace(plan, exception=True), forecast, encoder)
+        result = trainer.fit(
+            panel, replace(plan, exception=True), forecast, encoder, scaler_period=scaler_period
+        )
         _sync(device)
         fit_wall_s = time.perf_counter() - started
         # Trainer's train_s excludes origin enumeration, fallback and optimizer
@@ -271,6 +288,7 @@ def task_probe(
             scale_floor_frac=forecast.scale_floor_frac,
             calendar_schema=forecast.calendar_schema,
             target_lags=forecast.target_lags,
+            scaler_period=scaler_period,
         )
         prep_s = time.perf_counter() - started
         _reset_peak(device)

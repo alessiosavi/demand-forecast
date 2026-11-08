@@ -1,4 +1,4 @@
-"""Initialise task-shaped V2 models from calendar-off univariate pretraining.
+"""Initialise task-shaped V2 models from univariate pretraining.
 
 ForecastModel.encoder_inputs always places the normalised target and observation
 mask at columns 0 and 1. Columns 2 onward contain calendar/known/past covariate
@@ -12,7 +12,10 @@ Collapse the source's constant code-0 static contribution into static_proj.bias.
 For identical targets, normalisation and horizon in evaluation mode, forward()
 then matches the source up to floating-point rounding of the static path
 (<= 5e-7 measured at d_model=16), hence atol=rtol=1e-5 rather than bitwise equality.
-The source must be a calendar-off, covariate-free pretrained bundle; the static
+Unnamed sources retain this legacy behavior. Named v3 sources instead copy
+calendar and target-lag value/mask columns by name into the supplied task layout;
+task-specific dynamic columns remain zero. Complete schema metadata is validated
+before mutation. Both paths require a covariate-free pretrained source; static
 shape checks alone do not establish how an arbitrary bundle was trained.
 """
 
@@ -20,7 +23,11 @@ from dataclasses import dataclass, fields
 
 import torch
 
+from demand_forecast.config.settings import ForecastConfig
 from demand_forecast.core.bundle import Bundle
+from demand_forecast.data.frequency import CANONICAL_CALENDAR_SCHEMA, calendar_feature_names
+from demand_forecast.data.panel import Panel
+from demand_forecast.data.sampler import TARGET_LAG_SCHEMA, target_lag_names
 from demand_forecast.models.base import ForecastModel
 from demand_forecast.models.v2 import V2Backbone, V2Config
 
@@ -50,8 +57,64 @@ def _require_equal(name: str, source: object, target: object) -> None:
         raise TransferError(f"{name}: source {source}, target {target}")
 
 
+def _named_columns(model, source, target_panel, target_forecast):
+    """Validate complete schema metadata before returning value/mask column maps."""
+    spec = source.model.spec
+    if spec.calendar_schema is None and spec.lag_schema is None:
+        return None
+    if (
+        spec.calendar_schema != CANONICAL_CALENDAR_SCHEMA
+        or spec.lag_schema != TARGET_LAG_SCHEMA
+        or source.forecast_cfg.calendar_schema != "canonical"
+        or source.forecast_cfg.target_lags != "cycle"
+    ):
+        raise TransferError(
+            "inconsistent source schema metadata: expected canonical calendar and cycle lags"
+        )
+    names = (*spec.calendar_schema, *spec.lag_schema)
+    n_source = len(names)
+    if spec.enc_channels != 2 + 2 * n_source or spec.dec_channels != 2 * n_source:
+        raise TransferError("inconsistent source schema metadata: projection channel counts")
+    if target_panel is None or target_forecast is None:
+        raise TransferError("named transfer requires the target panel and forecast layout metadata")
+    calendar = tuple(calendar_feature_names(target_panel.freq, target_forecast.calendar_schema))
+    lags = target_lag_names(target_forecast.target_lags)
+    if model.spec.calendar_schema != (
+        calendar if target_forecast.calendar_schema == "canonical" else None
+    ) or model.spec.lag_schema != (lags or None):
+        raise TransferError("inconsistent target schema metadata: calendar/lag names")
+    shared = (*calendar, *lags)
+    n_dec = len(shared) + len(target_panel.roles.known_dynamic)
+    n_enc = n_dec + len(target_panel.roles.past_dynamic)
+    if model.spec.enc_channels != 2 + 2 * n_enc or model.spec.dec_channels != 2 * n_dec:
+        raise TransferError("inconsistent target schema metadata: projection channel counts")
+    for label, candidate in (("source", source.model), ("target", model)):
+        if tuple(candidate.enc_proj.weight.shape) != (
+            candidate.spec.d_model,
+            candidate.spec.enc_channels,
+        ) or tuple(candidate.dec_proj.weight.shape) != (
+            candidate.spec.d_model,
+            candidate.spec.dec_channels,
+        ):
+            raise TransferError(f"inconsistent {label} schema metadata: projection tensor shapes")
+    lookup = {name: column for column, name in enumerate(names)}
+    enc, dec = [], []
+    for dest, name in enumerate(shared):
+        if name in lookup:
+            src = lookup[name]
+            enc.extend(((2 + dest, 2 + src), (2 + n_enc + dest, 2 + n_source + src)))
+            dec.extend(((dest, src), (n_dec + dest, n_source + src)))
+    return enc, dec
+
+
 @torch.no_grad()
-def init_from_pretrained(model: ForecastModel, source: Bundle) -> TransferReport:
+def init_from_pretrained(
+    model: ForecastModel,
+    source: Bundle,
+    *,
+    target_panel: Panel | None = None,
+    target_forecast: ForecastConfig | None = None,
+) -> TransferReport:
     """Copy shared weights in place, preserving trainability and the source model.
 
     Validate compatibility before changing any target tensors. Static vocabulary
@@ -87,6 +150,7 @@ def init_from_pretrained(model: ForecastModel, source: Bundle) -> TransferReport
             f"n_numeric: source {pretrained.spec.n_numeric}, "
             f"target {model.spec.n_numeric}; expected source 0"
         )
+    columns = _named_columns(model, source, target_panel, target_forecast)
 
     # One categorical block makes the source's optional softmax gate identity.
     s0 = pretrained.static_proj(pretrained.statics[0].weight[0:1])[0]
@@ -96,6 +160,12 @@ def init_from_pretrained(model: ForecastModel, source: Bundle) -> TransferReport
     model.enc_proj.weight[:, :2].copy_(pretrained.enc_proj.weight[:, :2])
     model.enc_proj.bias.copy_(pretrained.enc_proj.bias)
     model.dec_proj.weight.zero_()
+    if columns is not None:
+        enc_columns, dec_columns = columns
+        for dest, src in enc_columns:
+            model.enc_proj.weight[:, dest].copy_(pretrained.enc_proj.weight[:, src])
+        for dest, src in dec_columns:
+            model.dec_proj.weight[:, dest].copy_(pretrained.dec_proj.weight[:, src])
     model.dec_proj.bias.copy_(pretrained.dec_proj.bias)
     model.static_proj.weight.zero_()
     model.static_proj.bias.copy_(s0)
@@ -107,6 +177,7 @@ def init_from_pretrained(model: ForecastModel, source: Bundle) -> TransferReport
     return TransferReport(
         copied=sorted(
             [*shared, "enc_proj.weight", "enc_proj.bias", "dec_proj.bias", "static_proj.bias"]
+            + (["dec_proj.weight"] if columns is not None else [])
         ),
         zeroed=sorted(["enc_proj.weight", "dec_proj.weight", "static_proj.weight"]),
         fresh=sorted(

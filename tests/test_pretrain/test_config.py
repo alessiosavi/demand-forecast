@@ -332,6 +332,11 @@ def test_pretrain_rejects_task_only_input_schema(tmp_path, recipe, options):
     raw["forecast"].update(options)
     path = tmp_path / "unsupported-schema.yaml"
     path.write_text(yaml.safe_dump(raw))
+    if recipe == "v3":
+        cfg = PretrainConfig.from_yaml(path)
+        assert cfg.forecast.calendar_schema == "canonical"
+        assert cfg.forecast.target_lags == "cycle"
+        return
     for payload in (raw, raw | {"forecast": ForecastConfig(**raw["forecast"])}):
         with pytest.raises(ValidationError) as exc:
             PretrainConfig.model_validate(payload)

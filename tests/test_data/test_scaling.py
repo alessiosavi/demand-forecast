@@ -137,3 +137,20 @@ def test_weight_uses_effective_scale_when_a_floor_changes_the_frame(relative_flo
     weight, clipped = metric_scale_weight(frame, past, 1)
     assert frame.scale > frame.scale_raw
     assert weight == 10 and clipped
+
+
+def test_matching_metric_period_reuses_raw_frame_scale_and_has_exact_unit_weight(monkeypatch):
+    from demand_forecast.data import scaling
+
+    past = np.array([0.1, 2.0, 1.0, 8.1, 12.2])
+    frame = sample_frame(past, past, 2)
+
+    def unexpected_recompute(*args):
+        raise AssertionError("matching frame/metric periods must reuse the seasonal scale")
+
+    monkeypatch.setattr(scaling, "seasonal_error", unexpected_recompute)
+    assert metric_scale_weight(frame, past, 2, m_frame=2) == (1.0, False)
+    # The reuse also keeps the effective/raw floor ratio.
+    assert metric_scale_weight(
+        Frame(0, 2 * frame.scale, frame.scale_raw, True, True), past, 2, m_frame=2
+    ) == (2.0, False)
