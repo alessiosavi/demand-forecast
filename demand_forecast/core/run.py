@@ -41,6 +41,7 @@ from demand_forecast.data.panel import Panel
 from demand_forecast.inference.predictor import Predictor
 from demand_forecast.models.base import ModelSpec
 from demand_forecast.models.registry import build_model
+from demand_forecast.pretrain.periods import pretrain_period
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +67,7 @@ def _identity_settings(settings: Settings) -> dict:
         ("average_last_k", 3),
         ("select_min_gain", 0.0),
         ("exception_policy", "final"),
+        ("loss_weight", "none"),
     ):
         if training[key] == default:
             training.pop(key)
@@ -74,6 +76,8 @@ def _identity_settings(settings: Settings) -> dict:
     for name, default in (("calendar_schema", "legacy"), ("target_lags", "none")):
         if payload["forecast"].get(name, default) == default:
             payload["forecast"].pop(name, None)
+    if payload["forecast"]["scaler_period"] == "task":
+        payload["forecast"].pop("scaler_period")
     if settings.training.init_from is not None:
         path = Path(settings.training.init_from)
         manifest = load_bundle_manifest(path)
@@ -156,6 +160,23 @@ def _check_fit_result(result, checkpoint: Path) -> None:
         raise InterruptedRun(
             f"Training interrupted at step {result.steps}; resume from {checkpoint}"
         )
+
+
+def _resolve_scaler_period(settings: Settings, panel: Panel) -> dict:
+    """Resolve only the sample frame; task eligibility and metrics keep their lag."""
+    requested = settings.forecast.scaler_period
+    source, period, reason = "task", panel.seasonal_period, "task_requested"
+    if requested == "pretraining":
+        if settings.training.init_from is None:
+            reason = "no_init_from"
+        else:
+            config = load_bundle_manifest(settings.training.init_from).get("config", {})
+            source = "pretraining"
+            if config.get("recipe") == "v3" and config.get("period_policy") == "frequency":
+                period, reason = pretrain_period(panel.freq), "recipe_v3_frequency"
+            else:
+                period, reason = 1, "legacy_period_one"
+    return {"requested": requested, "source": source, "period": period, "reason": reason}
 
 
 def _combine_timings(selection: dict, refit: dict) -> dict:
@@ -341,6 +362,12 @@ def train_panel(
     )
     backbone_kwargs = settings.model.backbone_kwargs()
     model, transfer = _initial_model(settings, spec)
+    scaler_period_resolved = _resolve_scaler_period(settings, panel)
+    scaler_period = (
+        scaler_period_resolved["period"]
+        if scaler_period_resolved["source"] == "pretraining"
+        else None
+    )
     device = resolve_device(settings)
     refit = {
         "mode": settings.training.refit,
@@ -373,6 +400,7 @@ def train_panel(
         resolved_budget = {"max_steps": 0, "eval_every": 0}
         n_val_items, amp_dtype, telemetry = 0, None, []
         timings = _empty_timings() | {"sessions": 1}
+        loss_weight_clipped = loss_weight_excluded = 0
         _write_run(
             out_dir / "checkpoints/progress.json",
             {
@@ -405,6 +433,7 @@ def train_panel(
                 stop_after=stop_after,
                 eval_at_start=settings.training.eval_at_start,
                 keep_initial=keep_initial,
+                scaler_period=scaler_period,
             )
             _check_fit_result(result, checkpoint)
             selection_steps_this_call = result.steps - resumed_from_step
@@ -425,6 +454,8 @@ def train_panel(
                 "timings": result.timings,
                 "telemetry": result.telemetry,
                 "validation_history": [entry for entry in result.history if "SQL" in entry],
+                "loss_weight_clipped": result.loss_weight_clipped,
+                "loss_weight_excluded": result.loss_weight_excluded,
             }
             # A completed selection is durable before the first refit step.
             if settings.training.refit == "full" and not plan.exception and result.best_step > 0:
@@ -435,6 +466,8 @@ def train_panel(
         n_val_items = len(plan.val_items)
         amp_dtype = selection["amp_dtype"]
         timings, telemetry = selection["timings"], selection["telemetry"]
+        loss_weight_clipped = selection.get("loss_weight_clipped", 0)
+        loss_weight_excluded = selection.get("loss_weight_excluded", 0)
         validation_history = selection["validation_history"]
         if settings.training.refit == "full":
             if plan.exception:
@@ -467,9 +500,12 @@ def train_panel(
                     stop_after=remaining,
                     step_limit=fit_result["best_step"],
                     schedule_max_steps=resolved_budget["max_steps"],
+                    scaler_period=scaler_period,
                 )
                 _check_fit_result(refit_result, refit_checkpoint)
                 timings = _combine_timings(timings, refit_result.timings)
+                loss_weight_clipped += refit_result.loss_weight_clipped
+                loss_weight_excluded += refit_result.loss_weight_excluded
                 training_cutoff = full_plan.train_upto
                 refit.update(
                     performed=True,
@@ -491,6 +527,9 @@ def train_panel(
         "resumed_from_step": resumed_from_step,
         "device": str(device),
         "resolved_budget": resolved_budget,
+        "scaler_period_resolved": scaler_period_resolved,
+        "loss_weight_clipped": loss_weight_clipped,
+        "loss_weight_excluded": loss_weight_excluded,
         "resolved_warmup_steps": (
             resolve_warmup(
                 resolved_budget["max_steps"],
@@ -555,6 +594,7 @@ def train_panel(
         panel=panel,
         training_cutoff=training_cutoff,
         earliest_origin=earliest_origin,
+        scaler_period=scaler_period if scaler_period is not None else "task",
         manifest={
             "run_identity": identity,
             "seed": settings.seed,

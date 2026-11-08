@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Optional `forecast.scaler_period: pretraining` to reuse corpus-v2 or recipe-v3
+  frame periods, persisted for inference while inner SQL retains the task period.
+  Optional `training.loss_weight: metric_scale` adds clipped context-only scale
+  ratios, weighted-mean pinball, micro-batch weight mass and resumable counters.
+  Defaults preserve task frames, loss arithmetic and existing run identities.
+
 - Optional canonical calendar schema (16 named sine/cosine values and masks,
   including sub-daily time-of-day and quarterly quarter slots) and target-cycle
   lag channels read from full history in the sample's target frame. Task

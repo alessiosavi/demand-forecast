@@ -43,6 +43,7 @@ class ForecastConfig(BaseModel):
     max_context: int = 512
     min_context: int = 1
     scale_floor_frac: float = Field(0.0, ge=0, lt=1)
+    scaler_period: Literal["task", "pretraining"] = "task"
     calendar_schema: Literal["legacy", "canonical"] = "legacy"
     target_lags: Literal["none", "cycle"] = "none"
 
@@ -144,6 +145,7 @@ class TrainingConfig(BaseModel):
     average_last_k: int = Field(3, ge=1)
     select_min_gain: float = Field(0.0, ge=0, lt=1, allow_inf_nan=False)
     exception_policy: Literal["final", "pretrained"] = "final"
+    loss_weight: Literal["none", "metric_scale"] = "none"
 
     @model_validator(mode="after")
     def validate_refit(self):

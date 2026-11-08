@@ -50,6 +50,7 @@ def prepare_validation(
     scale_floor_frac: float = 0.0,
     calendar_schema: str = "legacy",
     target_lags: str = "none",
+    scaler_period: int | None = None,
 ) -> PreparedValidation:
     """Build ordered CPU batches and metric inputs once, without model work.
 
@@ -70,6 +71,7 @@ def prepare_validation(
         scale_floor_frac=scale_floor_frac,
         calendar_schema=calendar_schema,
         target_lags=target_lags,
+        scaler_period=scaler_period,
     )
     for row, (i, pos) in enumerate(positions):
         series = panel.series[i]
@@ -122,6 +124,7 @@ def evaluate(
     scale_floor_frac: float = 0.0,
     calendar_schema: str = "legacy",
     target_lags: str = "none",
+    scaler_period: int | None = None,
 ) -> dict[str, float]:
     """Prepare and score validation inputs for callers that do not retain them."""
     return evaluate_prepared(
@@ -137,6 +140,7 @@ def evaluate(
             scale_floor_frac=scale_floor_frac,
             calendar_schema=calendar_schema,
             target_lags=target_lags,
+            scaler_period=scaler_period,
         ),
         quantiles,
     )

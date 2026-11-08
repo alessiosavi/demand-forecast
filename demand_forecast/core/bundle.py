@@ -11,6 +11,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import Literal
 
 import pandas as pd
 import torch
@@ -43,6 +44,7 @@ class Bundle:
     encoder: StaticEncoder
     panel_metadata: dict
     manifest: dict
+    scaler_period: int | Literal["task"] = "task"
 
 
 def _git_sha() -> str | None:
@@ -87,6 +89,7 @@ def save_bundle(
     training_cutoff: pd.Timestamp,
     earliest_origin: pd.Timestamp,
     manifest: dict,
+    scaler_period: int | Literal["task"] = "task",
 ) -> None:
     """Save state_dict weights, reconstruction data and artifact hashes.
 
@@ -115,6 +118,7 @@ def save_bundle(
                     for name, value in asdict(model.spec).items()
                     if name not in ("calendar_schema", "lag_schema") or value is not None
                 },
+                "scaler_period": scaler_period,
             },
         )
         _write_json(temporary / "encoder.json", encoder.to_json())
@@ -204,4 +208,5 @@ def load_bundle(directory: Path | str, device: torch.device | str = "cpu") -> Bu
         encoder=encoder,
         panel_metadata=json.loads((directory / "panel.json").read_text(encoding="utf-8")),
         manifest=manifest,
+        scaler_period=config.get("scaler_period", "task"),
     )
