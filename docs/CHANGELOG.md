@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Pretraining recipe v3, round 1 (in progress)** — versioned recipe/grid/period
+  controls preserving legacy identities and bundle config payloads; a separate
+  real-grid shard reader with crop-aware starts, homogeneous panels, row maps and
+  fallback counts; pretraining-only frequency periods with anchored alias support.
+
 - **Pretraining Phase C (2026-11-01)** — opt-in EC2 runbook, self-contained
   bootstrap user data, setup/parity and dataset warm-up script, fail-closed boot
   deadline unit, and cost guard with reserved sessions and AWS stop/cleanup schedules.
