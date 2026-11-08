@@ -147,6 +147,8 @@ def _initial_model(settings: Settings, spec: ModelSpec, panel: Panel):
             "zeroed": transferred.zeroed,
             "fresh": transferred.fresh,
         }
+        if hasattr(transferred, "copied_columns"):
+            transfer["copied_columns"] = transferred.copied_columns
     if settings.training.trainable == "heads_only":
         model.backbone.requires_grad_(False)
     return model, transfer

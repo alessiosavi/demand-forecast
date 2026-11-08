@@ -500,3 +500,29 @@ def test_coverage_from_window_metrics(tmp_path, report_template):  # noqa: F811 
     np.savez_compressed(path, **payload)
     with pytest.raises(ValueError, match="non-finite predictions"):
         fev_report.window_metrics(damaged, specs[0].to_task())
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_v3_external_provenance_calendar_on_fallback(experiment, legacy):
+    for run in experiment["runs"].values():
+        for path in run.glob("*/run.json"):
+            settings = json.loads(path.read_text())["settings"]
+            source = settings["training"].get("init_from")
+            if source:
+                manifest_path = Path(source) / "manifest.json"
+                manifest = json.loads(manifest_path.read_text())
+                manifest["external_diagnostic"] = {
+                    "name": "nn5",
+                    "ext_sql_calendar_on": 0.6,
+                    "ext_sql_naive_calendar_on": 1.1,
+                    "ext_sql_calendar_off": 99,
+                    **({"ext_sql": 0.7, "ext_sql_naive": 1.2} if legacy else {}),
+                }
+                manifest_path.write_text(json.dumps(manifest))
+    report = report_module().build_report(**experiment)
+    # Existing labels and explicitly present legacy values retain precedence.
+    assert "external SQL" in report and "external naive SQL" in report
+    transferred = [r for r in table(report, "Provenance") if r["run"] in ("zero-shot", "finetune")]
+    assert len(transferred) == 19
+    assert all(r["external SQL"] == ("0.7" if legacy else "0.6") for r in transferred)
+    assert all(r["external naive SQL"] == ("1.2" if legacy else "1.1") for r in transferred)

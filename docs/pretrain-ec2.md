@@ -507,10 +507,10 @@ demand-forecast pretrain export --run-dir "$PRETRAIN_RUN" --weights ema --out "$
 ```
 
 EMA export uses the latest checkpoint step only; an earlier `--step` is rejected.
-Round 5 must independently probe L4 H=288 memory and full raw/EMA evaluation cost,
-verify held-out frequency coverage, and run the 81 shifted fev backtests at
-20k/40k/60k/end from exports. Those checks remain ops diagnostics and never feed
-checkpoint selection. Snapshot averaging is a later zero-shot comparison.
+Before launch, use section 15 to probe L4 H=288 memory and full raw/EMA
+validation plus snapshot cost, verify held-out frequency coverage, and run the
+81 shifted fev backtests at 20k/40k/60k/end from exports. Those diagnostics never
+feed checkpoint selection. Snapshot averaging is a later zero-shot comparison.
 
 ## 10. Evaluation sweep order
 
@@ -931,3 +931,168 @@ demand-forecast fev run --tasks weekly --config "$TUNE/best-finetune.yaml" \
 Report this result as a **post-hoc row**, alongside the original frozen rows,
 with the study's baseline and best inner objectives and total trial count. Do
 not use this fev measurement to select another recipe or replace an original row.
+
+
+## 15. Recipe v3 run
+
+Use the owner-approved merged round-5 SHA and `configs/pretrain-v3-corpus2.yaml`:
+78,000 steps, batch/validation batch 96, context 512, the 16 pinned horizons,
+source mix 6:1:2:3, canonical calendars and cycle lags. `frame_loc` pilot arm is
+NO-GO: v3 stays pure. Seasonal-lag channels are v3-only; do not change historical
+benchmark-side inputs. The dataset EBS volume expires **2026-11-11T07:45Z**;
+if it is gone, re-warm from the pinned Hub inputs, rerun section 4's environment,
+lock, dataset-byte/fingerprint gates and section 5's corpus verification. Never
+infer cache availability from the old volume ID.
+
+Allow about $1 for the probe session; $7–10 for the pilot quarter; $20–25 for the
+remaining 58k steps, about $25–35 for training in all. These are planning ranges,
+not measurements. Zero-shot rows cost about $5; composite rows cost $15–20 for
+only the groups whose backtest arms change. Reserve and reconcile each session
+in the existing guard ledger; do not launch concurrent GPU work during probing.
+
+On the operator, retain `P2_SHA` (full merged SHA), `PRETRAIN_CONFIG`, `LABEL`,
+`PRETRAIN_MINUTES` and `RESUME=0|1` with the existing `pd-pretrain.sh` chain.
+That chain reruns `scripts/ec2/pretrain-setup.sh`, dispatches
+`/home/ubuntu/pretrain-guest.sh`, waits, copies run metadata back excluding
+`checkpoints/*.pt`, then stops and reconciles. Use one stable guest run directory
+across pilot and continuation. Keep raw snapshots and `latest.pt` on persistent
+storage: the metadata copy is **not** a resumable checkpoint backup. Export
+bundles before stopping, and copy the bundles with metadata. If replacing the
+volume, explicitly preserve and restore the full checkpoint directory too.
+
+First reserve a short probe session using section 7's `launch`/`guard` chain:
+
+```bash
+# Operator, with the same ledger and supervisor as sections 2–4.
+export P2_SHA='<full approved merged round-5 SHA>'
+launch start --label v3-probe --minutes 60
+guard watch --interval 300  # second supervised terminal
+```
+
+Guest, after checking out the approved SHA and sourcing the established `env.sh`:
+
+```bash
+export FEV_SHA="$P2_SHA"
+bash scripts/ec2/pretrain-setup.sh
+export PRETRAIN_CONFIG=configs/pretrain-v3-corpus2.yaml
+export PROBE_JSON="$RUNS/probes-v3/pretrain-v3.json"
+mkdir -p "$(dirname "$PROBE_JSON")"
+demand-forecast pretrain plan --config "$PRETRAIN_CONFIG" > "$OPS/v3-plan-before.json"
+demand-forecast pretrain probe --config "$PRETRAIN_CONFIG" --steps 50 --out "$PROBE_JSON"
+demand-forecast pretrain plan --config "$PRETRAIN_CONFIG" --probe-json "$PROBE_JSON" \
+  > "$OPS/v3-plan-measured.json"
+```
+
+`plan` reads no manifest or shards. The v3 probe measures all 16 horizons,
+allocating 50 updates per horizon across feasible sources (at least one per
+source), plus ten warm-up updates total. Each horizon reports batch construction,
+forward/backward/optimizer time, peak allocated CUDA memory and eligible windows
+seen; CPU peaks are process RSS, not device memory. Full future windows at final
+origins exercise the maximum available context. Check H=288 reaches context 512
+and batch 96 on the actual corpus. Keep the probe near ten GPU minutes for the
+800 measured updates; the one-hour reservation includes setup/copy/gates.
+Record actual elapsed time rather than treating that target as a guarantee.
+
+The probe's `eval_s` measures the real evaluation path: raw **and** EMA weights,
+synthetic holdouts, real frequency/horizon selection cells, external calendars
+on/off, and the raw snapshot write. `checkpoint_s` separately measures latest
+checkpoint serialization. Reject nonfinite losses, nonfinite selection cells or
+missing horizon/source coverage; inspect exposure counters and H=288 memory
+against the 18 GB ceiling before spending on training. Reprobe a smaller batch
+if required; freeze the final config/identity before the pilot. Source/horizon
+step measurements are weighted by source mix and feasible horizon distribution
+on the first usable probe shard (not a full-corpus coverage inventory). Frozen
+selection-cell coverage must still be inspected separately. Shard overhead, evaluations, checkpoints, publication and 15% reserve enter the
+duration estimate. Early live estimates label missing/imputed cells explicitly.
+Copy probe/plan JSONs back, then `launch stop` and `guard reconcile`.
+
+The pilot is the **first 20,000 steps of the full 78,000-step run**. Keep
+`training.max_steps: 78000`, the original cosine/warm-up schedule, seed, SHA,
+config and output directory. Do not create a separate 20k config or restart at
+zero. The existing wrapper interface has no stop-step argument: for this first
+session the guest's training dispatch must use the existing CLI interruption
+control shown below, instead of an unbounded `pretrain run`. Do not rely on a
+wall-clock reservation to stop at exactly 20k. Keep the wrapper's setup, wait,
+copy-back, stop and reconcile steps around this bounded dispatch:
+
+```bash
+# Operator inputs to the existing chain; minutes come from the measured plan.
+export P2_SHA='<full approved merged round-5 SHA>'
+export PRETRAIN_CONFIG=configs/pretrain-v3-corpus2.yaml
+export LABEL=v3-pilot RESUME=0 PRETRAIN_MINUTES='<reserved pilot minutes>'
+# After wiring the bounded guest dispatch below, invoke the existing chain:
+bash pd-pretrain.sh
+# Guest training line inside pretrain-guest.sh, with the stable PRETRAIN_RUN:
+JOB=$(bash /home/ubuntu/dispatch-job.sh v3-pilot demand-forecast pretrain run \
+  --config "$PRETRAIN_CONFIG" --out "$PRETRAIN_RUN" --probe-json "$PROBE_JSON" \
+  --stop-after 20000)
+bash /home/ubuntu/wait-job.sh "$JOB" 1 "$JOB_TIMEOUT_SECONDS"
+```
+
+Exit 1 is expected **only** for `Pretraining interrupted at step 20000`; require
+`checkpoints/progress.json` step 20000, stop_reason `interrupted`, zero nonfinite
+losses and the raw `checkpoints/step-20000.pt`. An unrelated failure is not a
+completed pilot. At 20k, export while the checkpoint volume is mounted. Set
+`BACKTEST_TASKS` to the retained frozen `v2survey-tasks/bt-a81.yaml` (81 shifted
+backtests), `BACKTEST_PROFILES` to its frozen profiles and `CORPUS2_ZS_BT` to the
+retained corpus-v2 `zs-bt-a` rows. Verify all 81 paired rows are present before
+computing geometric ratios. Preserve their hashes with the results; never
+substitute the real-window `fev100` task set for this diagnostic.
+
+```bash
+export SNAPSHOT="$RUNS/v3-step-20000"
+demand-forecast pretrain export --run-dir "$PRETRAIN_RUN" --step 20000 --out "$SNAPSHOT"
+# Create the evaluation YAML without altering frozen task definitions/profiles.
+python - <<'PYCFG'
+import os
+from pathlib import Path
+import yaml
+cfg = yaml.safe_load(Path('configs/fev-v2-pretrained-zero-shot.yaml').read_text())
+cfg['forecast'].update(calendar_schema='canonical', target_lags='cycle')
+Path(os.environ['OPS'], 'v3-zero-shot.yaml').write_text(yaml.safe_dump(cfg))
+PYCFG
+SNAPSHOT_ID=$(python - "$SNAPSHOT/manifest.json" <<'PYID'
+import json, sys
+m = json.load(open(sys.argv[1]))
+print(f"{m['pretrain_identity']}-{m['exported_step']}-{m['exported_weights']}-{m['sha256']['model.pt'][:16]}")
+PYID
+)
+demand-forecast fev run --tasks "$BACKTEST_TASKS" --profiles "$BACKTEST_PROFILES" \
+  --config "$OPS/v3-zero-shot.yaml" --init-from "$SNAPSHOT" \
+  --out-dir "$RUNS/v3-backtests/$SNAPSHOT_ID"
+```
+
+Run this in a separate reserved lane, or after the checkpointed interruption;
+do not overlap it with the memory probe. Record geometric SQL ratios against
+`CORPUS2_ZS_BT`, all-task and by frozen frequency group, then apply the pilot
+gate below. Stop/copy/reconcile regardless of outcome. Continue only on a pass:
+
+```bash
+# Operator: same SHA/config/stable PRETRAIN_RUN, a distinct reservation label.
+P2_SHA="$P2_SHA" PRETRAIN_MINUTES='<measured remaining minutes>' \
+  LABEL=v3-resume-1 RESUME=1 PRETRAIN_CONFIG="$PRETRAIN_CONFIG" bash pd-pretrain.sh
+# Its normal guest training dispatch must append --resume, without --stop-after:
+# demand-forecast pretrain run --config "$PRETRAIN_CONFIG" --out "$PRETRAIN_RUN" --resume
+```
+
+The continuation has no second warm-up and repeats no completed steps. Subsequent
+resumes use unique labels and the same continuation state. `progress.json` and
+logs publish duration at start (probe-seeded, or collecting first steps) and
+refresh at each evaluation; use measured remaining minutes for reservations.
+Repeat the frozen shifted-backtest diagnostic at raw snapshots 40k, 60k and end
+(78k), changing `--step` and `SNAPSHOT` in the export command. Each gets its own
+snapshot-identity output directory. These are reporting only; real holdout cells
+alone select the training checkpoint/weights, and no choice uses real test
+windows. At completion, require max_steps, finite scores, zero nonfinite losses,
+verified bundle hashes and inspect both raw/EMA scores and selection-cell counts.
+Run the final 100-task zero-shot standing in a separate output directory, then
+rerun composite rows only for groups passing the adoption gate.
+
+Pre-register these gates in the ledger before the GPU starts (verbatim plan text):
+
+- Pilot gate: the 20k pilot's zero-shot on the 81 shifted backtests against corpus-v2's final zero-shot rows (zs-bt-a),
+  geometric SQL ratio per group: continue to the full run if the all-task ratio is at most 1.00, or at least two groups are at
+  or below 0.95 (the pilot has a quarter of the steps). Otherwise stop, report, and spend nothing more on this recipe.
+- Adoption gate for the full run: zero-shot standing on the 100 tasks against corpus-v2 (0.219); the new bundle becomes the
+  base model only below a 0.97 ratio of geometric SQL on the backtests, group by group; composite rows are re-run only for
+  groups that pass. Nothing is chosen on real test windows.

@@ -216,6 +216,13 @@ def test_ema_exact_resume_snapshots_manifest_export_without_corpus(selection_cfg
             assert score["n_items"] == 4
             assert sum(c["n_items"] for c in score["cells"].values()) == 4
     # Export uses saved metadata only, even during an interrupted run.
+    b["history"][b["best_step"] - 1].update(
+        ext_sql_calendar_on=0.7,
+        ext_sql_naive_calendar_on=1.2,
+        ext_sql_calendar_off=0.8,
+        ext_sql_naive_calendar_off=float("nan"),
+    )
+    torch.save(b, tmp_path / "part/checkpoints/latest.pt")
     selection_cfg.corpus.root.rename(tmp_path / "corpus-hidden")
     result = CliRunner().invoke(
         app,
@@ -235,6 +242,14 @@ def test_ema_exact_resume_snapshots_manifest_export_without_corpus(selection_cfg
     snapshot = torch.load(tmp_path / "part/checkpoints/step-2.pt", weights_only=True)
     assert all(torch.equal(v, snapshot[k]) for k, v in bundle.model.state_dict().items())
     assert bundle.manifest["exported_step"] == 2
+    assert bundle.manifest["exported_weights"] == "raw"
+    for name in ("best_step", "best_score", "best_weights"):
+        assert bundle.manifest[name] == b[name]
+    record = b["history"][b["best_step"] - 1]
+    assert bundle.manifest["external_diagnostic"] == {
+        "name": selection_cfg.corpus.external_validation,
+        **{k: v if np.isfinite(v) else None for k, v in record.items() if k.startswith("ext_sql")},
+    }
     export_pretrain(tmp_path / "part", tmp_path / "ema-export", weights="ema")
     ema = load_bundle(tmp_path / "ema-export")
     assert all(torch.equal(v, b["ema_shadow"][k]) for k, v in ema.model.state_dict().items())

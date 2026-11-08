@@ -98,6 +98,8 @@ def pretrain_probe(cfg: PretrainConfig, *, steps: int = 50, out: Path) -> dict:
     """Warm up for ten steps, then measure training and independent overheads."""
     if steps < 1:
         raise ValueError("steps must be positive")
+    if cfg.recipe == "v3":
+        return _pretrain_probe_v3(cfg, steps=steps, out=out)
     started = time.perf_counter()
     loop = _PretrainLoop(cfg)
     try:
@@ -135,14 +137,8 @@ def pretrain_probe(cfg: PretrainConfig, *, steps: int = 50, out: Path) -> dict:
                 for i, series in enumerate(loop.panel.series)
                 if series.length > cfg.forecast.min_context
             ][: cfg.training.batch_size]
-            if cfg.recipe == "v3":
-                stream = loop.sampler.streams[loop.sampler.last_kind]
-                builder = stream._builder
-                items = np.column_stack((batch.series_index.numpy(), batch.origin_pos.numpy()))
             started = time.perf_counter()
-            builder.build(
-                items, **(dict(horizon=batch.labels.shape[1]) if cfg.recipe == "v3" else {})
-            )
+            builder.build(items)
             batch_times.append(time.perf_counter() - started)
         train_peak = _cuda_peak(loop.device)
         shard_load_s = _shard_transition(loop)
@@ -178,6 +174,218 @@ def pretrain_probe(cfg: PretrainConfig, *, steps: int = 50, out: Path) -> dict:
         _write_run(Path(out), report)
         return report
     finally:
+        loop.sampler.close()
+
+
+def _pretrain_probe_v3(cfg: PretrainConfig, *, steps: int, out: Path) -> dict:
+    """Measure every horizon and source in at most max(steps, sources) updates/H.
+
+    Independent fixed-horizon streams keep the production draw/resume policy
+    untouched. Resident builds use final full windows, reaching full context
+    where the sampled series supports it. Shard reads are timed separately.
+    """
+    from demand_forecast.pretrain.planning import (
+        group_horizon_distribution,
+        horizons,
+        measured_duration,
+        measurement_config,
+        source_mix,
+    )
+    from demand_forecast.pretrain.sampler import V3ShardStream
+
+    started = time.perf_counter()
+    loop = _PretrainLoop(cfg)
+    original = loop.sampler.streams.copy()
+    try:
+        _sync(loop.device)
+        init_s = time.perf_counter() - started
+        for _ in range(10):
+            batch, batch_s, _ = loop.next_batch()
+            loop.train_step(batch, batch_s)
+        if loop.timings["nonfinite_losses"]:
+            raise RuntimeError("pretraining probe observed nonfinite_losses during warmup")
+        # Warm-up prefetches must not keep another corpus copy resident while
+        # the independent per-horizon streams are being measured.
+        for stream in original.values():
+            stream.close()
+        for key in ("source_horizon_timings", "sampling_exposure", "horizon_histogram"):
+            loop.timings[key] = {}
+        for counts in loop.timings["feature_exposure"].values():
+            for name in counts:
+                counts[name] = 0
+        per_horizon, source_timings = {}, {kind: {} for kind in source_mix(cfg)}
+        distributions = {}
+        train_peaks = []
+        # Longest first: establish the worst horizon before the rest of the probe.
+        for horizon in reversed(horizons(cfg)):
+            streams, first_batches, loads = {}, {}, {}
+            try:
+                for kind in source_mix(cfg):
+                    stream = streams[kind] = V3ShardStream(
+                        original[kind].refs,
+                        kind,
+                        horizon=horizon,
+                        max_context=cfg.forecast.max_context,
+                        min_context=cfg.forecast.min_context,
+                        batch_size=cfg.training.batch_size,
+                        seed=cfg.seed,
+                        encoder=loop.encoder,
+                        prefetch=0,
+                        period_policy=cfg.period_policy,
+                        grid_policy=cfg.grid_policy,
+                        scale_floor_frac=cfg.forecast.scale_floor_frac,
+                        shard_visit_quota=max(
+                            cfg.training.batch_size * steps, cfg.training.batch_size
+                        ),
+                    )
+                    before = time.perf_counter()
+                    try:
+                        first_batches[kind] = next(stream)
+                    except ValueError as exc:
+                        if str(exc) != f"{kind} source has no usable windows":
+                            raise
+                        source_timings[kind][str(horizon)] = {"steps": 0, "feasible": False}
+                        continue
+                    loads[kind] = time.perf_counter() - before
+                if not first_batches:
+                    raise RuntimeError(f"probe has no eligible windows for horizon {horizon}")
+                # At least one update per feasible source, then distribute the
+                # remaining slots by configured weights (largest remainder).
+                mix = source_mix(cfg)
+                kinds = list(first_batches)
+                slots = max(steps, len(kinds)) - len(kinds)
+                total_weight = sum(mix[k] for k in kinds)
+                shares = {k: slots * mix[k] / total_weight for k in kinds}
+                counts = {k: 1 + math.floor(shares[k]) for k in kinds}
+                for kind in sorted(kinds, key=lambda k: shares[k] % 1, reverse=True)[
+                    : max(steps, len(kinds)) - sum(counts.values())
+                ]:
+                    counts[kind] += 1
+                _reset_peak(loop.device)
+                eligible = 0
+                context_tokens = []
+                for kind in kinds:
+                    stream = streams[kind]
+                    loop.sampler.streams[kind] = stream
+                    loop.sampler.last_kind = kind
+                    lengths = {
+                        row: series.history_length
+                        for group, _ in stream._builder.builders
+                        for row, series in zip(group.row_indices, group.panel.series, strict=True)
+                    }
+                    if kind not in distributions:
+                        distributions[kind] = group_horizon_distribution(
+                            cfg, [g for g, _ in stream._builder.builders]
+                        )
+                    for index in range(counts[kind]):
+                        batch = first_batches[kind] if index == 0 else next(stream)
+                        items = [(i, lengths[i] - horizon) for i in batch.series_index.tolist()]
+                        before = time.perf_counter()
+                        batch = stream._builder.build(items, horizon=horizon)
+                        batch_s = time.perf_counter() - before
+                        eligible += int(batch.loss_eligible.sum().item())
+                        context_tokens.extend(batch.padding.sum(dim=1).tolist())
+                        loop.train_step(batch, batch_s)
+                    cell = loop.timings["source_horizon_timings"][kind][str(horizon)]
+                    cell["shard_load_s"] = loads[kind]
+                    cell["feasible"] = True
+                    # The production visit quota counts series feasible at any
+                    # configured horizon, not just this probe's forced horizon.
+                    usable = sum(
+                        series.history_length
+                        >= max(cfg.forecast.min_context, group.panel.seasonal_period + 1)
+                        + min(horizons(cfg))
+                        for group, _ in stream._builder.builders
+                        for series in group.panel.series
+                    )
+                    cell["steps_per_shard"] = math.ceil(
+                        cfg.shard_visit_quota.get(kind, usable) / cfg.training.batch_size
+                    )
+                    source_timings[kind][str(horizon)] = dict(cell)
+                cells = [source_timings[k][str(horizon)] for k in kinds]
+                n_steps = sum(c["steps"] for c in cells)
+                train_s = sum(c["train_s"] for c in cells)
+                batch_s = sum(c["batch_build_s"] for c in cells)
+                peak = _cuda_peak(loop.device)
+                train_peaks.append(peak)
+                per_horizon[str(horizon)] = dict(
+                    steps=n_steps,
+                    s_per_step=train_s / n_steps,
+                    batch_build_s_per_step=batch_s / n_steps,
+                    forward_backward_s_per_step=(train_s - batch_s) / n_steps,
+                    peak_cuda_mem_bytes=peak,
+                    peak_rss_bytes=_peak_rss(),
+                    eligible_windows_seen=eligible,
+                    batch_size=cfg.training.batch_size,
+                    min_context_tokens=min(context_tokens),
+                    max_context_tokens=max(context_tokens),
+                    sources={k: source_timings[k][str(horizon)] for k in source_timings},
+                )
+            finally:
+                loop.sampler.streams.update(original)
+                for stream in streams.values():
+                    stream.close()
+        nonfinite = loop.timings["nonfinite_losses"]
+        if nonfinite:
+            raise RuntimeError(f"pretraining probe observed nonfinite_losses={nonfinite}")
+        shard_load_s = _shard_transition(loop)
+        _reset_peak(loop.device)
+        with TemporaryDirectory(prefix="pretrain-probe-") as directory:
+            before = time.perf_counter()
+            loop.evaluate()  # Actual raw + optional EMA, synthetic/real/external on/off.
+            if cfg.training.keep_eval_snapshots:
+                loop.snapshot(Path(directory))
+            _sync(loop.device)
+            eval_s = time.perf_counter() - before
+            eval_peak = _cuda_peak(loop.device)
+            before = time.perf_counter()
+            loop.checkpoint(Path(directory) / "latest.pt")
+            checkpoint_s = time.perf_counter() - before
+        val_sql = loop.history[-1]["val_sql"]
+        if val_sql is None or not math.isfinite(val_sql):
+            raise RuntimeError(
+                f"pretraining probe requires a finite val_sql; observed val_sql={val_sql}"
+            )
+        report = dict(
+            recipe="v3",
+            measurement_config=measurement_config(cfg),
+            horizon_distribution=distributions,
+            horizon_distribution_basis="first_feasible_probe_shard",
+            per_horizon=per_horizon,
+            source_horizon_timings=source_timings,
+            context_policy="final_full_future_maximum_available_context",
+            nonfinite_losses=nonfinite,
+            val_sql=val_sql,
+            init_s=init_s,
+            shard_load_s=shard_load_s,
+            checkpoint_s=checkpoint_s,
+            eval_s=eval_s,
+            evaluation_measured=True,
+            ema_decay=cfg.training.ema_decay,
+            keep_eval_snapshots=cfg.training.keep_eval_snapshots,
+            snapshot_s=loop.timings["snapshot_s"],
+            eval_peak_cuda_mem_bytes=eval_peak,
+            peak_cuda_mem_bytes=max([*train_peaks, eval_peak]) if eval_peak is not None else None,
+            peak_rss_bytes=_peak_rss(),
+            params=sum(p.numel() for p in loop.model.parameters()),
+            **{
+                key: loop.timings[key]
+                for key in ("feature_exposure", "sampling_exposure", "horizon_histogram")
+            },
+        )
+        duration = measured_duration(cfg, report)
+        report.update(
+            probe_wall_s=time.perf_counter() - started,
+            s_per_step=duration["s_per_step"],
+            duration_estimate=duration,
+            batch_build_s_per_step=float(
+                np.mean([r["batch_build_s_per_step"] for r in per_horizon.values()])
+            ),
+        )
+        _write_run(Path(out), report)
+        return report
+    finally:
+        loop.sampler.streams.update(original)
         loop.sampler.close()
 
 

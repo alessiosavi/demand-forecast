@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Recipe-v3 round 5: CPU config-to-bundle/export-to-fine-tune integration,
+  per-horizon/source timing and eligible-window exposure, measured raw/EMA
+  validation plus snapshot costs, weighted duration estimates in progress/logs,
+  and corpus-free `pretrain plan` with optional `--probe-json`. Named transfer
+  reports include copied calendar/lag value and mask columns. Export manifests
+  retain best-checkpoint provenance; reports accept v3 external diagnostic keys.
+  The EC2 recipe-v3 runbook fixes the 20k continuation gate within the unchanged
+  78k schedule, diagnostics, costs and adoption gate. Legacy v2 paths are preserved.
+
 - Recipe-v3 round 4: frozen, stratified real-holdout pairs and equal-source,
   frequency/horizon macro SQL selection with conventional periods and explicit
   non-finite-cell failures. Synthetic and external scores remain diagnostics.

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import random
@@ -245,6 +246,11 @@ class _PretrainLoop:
                 }
                 self.timings["sampling_exposure"] = {}
                 self.timings["horizon_histogram"] = {}
+                self.timings.update(
+                    source_horizon_timings={}, snapshot_s=0.0, evaluations=0, checkpoints=0
+                )
+                self.duration_probe = None
+                self.duration_estimate = {"status": "collecting"}
             self.batches = self.sampler.batches()
             self.model.train()
             if self.device.type == "cuda":
@@ -328,7 +334,19 @@ class _PretrainLoop:
             | (dict(horizon=int(horizon), group=group) if self.cfg.recipe == "v3" else {})
         )
         _sync(self.device)
-        self.timings["train_s"] += batch_s + time.perf_counter() - started
+        elapsed = batch_s + time.perf_counter() - started
+        self.timings["train_s"] += elapsed
+        if self.cfg.recipe == "v3":
+            cell = (
+                self.timings["source_horizon_timings"]
+                .setdefault(kind, {})
+                .setdefault(
+                    horizon, dict(steps=0, train_s=0.0, batch_build_s=0.0, shard_load_s=0.0)
+                )
+            )
+            cell["steps"] += 1
+            cell["train_s"] += elapsed
+            cell["batch_build_s"] += batch_s
 
     def evaluate(self) -> None:
         _sync(self.device)
@@ -373,14 +391,57 @@ class _PretrainLoop:
             self.best_weights = choice
         _sync(self.device)
         self.timings["eval_s"] += time.perf_counter() - started
+        if self.cfg.recipe == "v3":
+            self.timings["evaluations"] += 1
 
     def snapshot(self, directory: Path) -> None:
         """Keep raw model-only evaluation weights for later averaging/export."""
+        _sync(self.device)
+        started = time.perf_counter()
         path = Path(directory) / "checkpoints" / f"step-{self.step}.pt"
         _atomic_model_save(_cpu_state(self.model), path)
         record = {"step": self.step, "path": f"checkpoints/{path.name}", "weights": "raw"}
         if record not in self.eval_snapshots:
             self.eval_snapshots.append(record)
+        if self.cfg.recipe == "v3":
+            self.timings["snapshot_s"] += time.perf_counter() - started
+
+    def refresh_duration(self) -> None:
+        """Refresh from measured cells without perturbing sampler/model state."""
+        from demand_forecast.pretrain.planning import measured_duration
+
+        if self.cfg.recipe != "v3":
+            return
+        n_evals = self.timings["evaluations"]
+        n_ckpts = self.timings["checkpoints"]
+        measurements = dict(self.duration_probe or {})
+        if not self.duration_probe:
+            measurements.update(
+                source_horizon_timings=self.timings["source_horizon_timings"],
+                init_s=self.timings.get("init_s", 0.0),
+            )
+        else:
+            # Retain probe coverage for unseen cells; replace measured cells
+            # with actual run timings as the run progresses.
+            cells = deepcopy(measurements.get("source_horizon_timings", {}))
+            for kind, observed in self.timings["source_horizon_timings"].items():
+                cells.setdefault(kind, {}).update(observed)
+            measurements["source_horizon_timings"] = cells
+        if n_evals:
+            measurements.update(
+                eval_s=(self.timings["eval_s"] + self.timings["snapshot_s"]) / n_evals,
+                evaluation_measured=True,
+            )
+        else:
+            measurements.setdefault("evaluation_measured", False)
+        if n_ckpts:
+            measurements["checkpoint_s"] = self.timings["checkpoint_s"] / n_ckpts
+        self.duration_estimate = measured_duration(
+            self.cfg, measurements, completed_steps=self.step
+        )
+        logging.getLogger(__name__).info(
+            "Pretrain duration estimate at step %s: %s", self.step, self.duration_estimate
+        )
 
     def evaluation_metadata(self) -> dict:
         from demand_forecast.pretrain.config import selection_pair_policy_hash
@@ -389,6 +450,10 @@ class _PretrainLoop:
             return {}
         return {
             "best_weights": self.best_weights,
+            "input_schema": {
+                "calendar_schema": list(CANONICAL_CALENDAR_SCHEMA),
+                "lag_schema": list(TARGET_LAG_SCHEMA),
+            },
             "selection_pair_policy": selection_pair_policy_hash(),
             "evaluations": [row for row in self.history if "val_sql" in row],
             "eval_snapshots": self.eval_snapshots,
@@ -406,6 +471,8 @@ class _PretrainLoop:
         _sync(self.device)
         started = time.perf_counter()
         self.sample_peak()
+        if self.cfg.recipe == "v3":
+            self.timings["checkpoints"] += 1
         state = {
             "identity": self.identity,
             "step": self.step,
@@ -456,8 +523,13 @@ class _PretrainLoop:
             os.replace(temporary, path)
         finally:
             temporary.unlink(missing_ok=True)
+        if self.cfg.recipe == "v3":
+            self.refresh_duration()
+        self.write_progress(path.with_name("progress.json"), stop_reason)
+
+    def write_progress(self, path: Path, stop_reason: str | None = None) -> None:
         _write_run(
-            path.with_name("progress.json"),
+            path,
             {
                 "identity": self.identity,
                 "step": self.step,
@@ -467,6 +539,11 @@ class _PretrainLoop:
                 "best_score": self.best_score,
                 **self.evaluation_metadata(),
                 "timings": self.timings,
+                **(
+                    dict(duration_estimate=self.duration_estimate)
+                    if self.cfg.recipe == "v3"
+                    else {}
+                ),
                 "device": str(self.device),
                 "amp_dtype": str(self.amp_dtype).removeprefix("torch.") if self.amp else None,
             },
@@ -515,7 +592,12 @@ class _PretrainLoop:
 
 
 def pretrain(
-    cfg: PretrainConfig, out_dir: Path, *, resume: bool = False, stop_after: int | None = None
+    cfg: PretrainConfig,
+    out_dir: Path,
+    *,
+    resume: bool = False,
+    stop_after: int | None = None,
+    probe: dict | None = None,
 ) -> PretrainResult:
     """Train to the fixed budget or checkpoint and raise a terminal/session signal."""
     from demand_forecast.pretrain.corpus import PRETRAIN_START
@@ -524,16 +606,27 @@ def pretrain(
         raise ValueError("stop_after must be positive")
     out_dir = Path(out_dir)
     checkpoint = out_dir / "checkpoints/latest.pt"
+    started = time.perf_counter()
     loop = _PretrainLoop(cfg)
     try:
         if resume:
             loop.restore(checkpoint)
+        if cfg.recipe == "v3":
+            loop.timings.setdefault("init_s", time.perf_counter() - started)
+            loop.duration_probe = probe
+            loop.refresh_duration()
+            loop.write_progress(checkpoint.with_name("progress.json"))
         session_steps = 0
         while loop.step < cfg.training.max_steps:
             if loop.consecutive_nonfinite >= NONFINITE_STOP_AFTER:
                 break
-            batch, batch_s, _ = loop.next_batch()
+            batch, batch_s, load_s = loop.next_batch()
             loop.train_step(batch, batch_s)
+            if cfg.recipe == "v3":
+                cell = loop.timings["source_horizon_timings"][loop.sampler.last_kind][
+                    str(batch.labels.shape[1])
+                ]
+                cell["shard_load_s"] += load_s
             session_steps += 1
             if loop.consecutive_nonfinite >= NONFINITE_STOP_AFTER:
                 break
@@ -542,6 +635,12 @@ def pretrain(
                 loop.evaluate()
                 if cfg.training.keep_eval_snapshots:
                     loop.snapshot(out_dir)
+                if cfg.recipe == "v3":
+                    loop.refresh_duration()
+                    loop.write_progress(checkpoint.with_name("progress.json"))
+            elif cfg.recipe == "v3" and session_steps == 50:
+                loop.refresh_duration()
+                loop.write_progress(checkpoint.with_name("progress.json"))
             interrupted = not finished and stop_after is not None and session_steps >= stop_after
             if interrupted:
                 loop.checkpoint(checkpoint, "interrupted")
@@ -600,6 +699,15 @@ def pretrain(
                     "config": cfg.model_dump(mode="json"),
                     "shards": loop.shards,
                     "external_diagnostic": external,
+                    **(
+                        {
+                            "selection_sources": loop.history[loop.best_step - 1].get(
+                                "selection_sources", {}
+                            )
+                        }
+                        if cfg.recipe == "v3"
+                        else {}
+                    ),
                     **loop.evaluation_metadata(),
                     **(
                         {
@@ -671,6 +779,9 @@ def export_pretrain(
     )
     model = build_model("v2", spec, cfg.model.backbone_kwargs())
     model.load_state_dict(state)
+    best_record = (
+        checkpoint["history"][checkpoint["best_step"] - 1] if checkpoint["best_step"] else {}
+    )
     save_bundle(
         out,
         model=model,
@@ -682,18 +793,39 @@ def export_pretrain(
         panel=panel,
         training_cutoff=PRETRAIN_START,
         earliest_origin=PRETRAIN_START,
-        manifest={
-            "pretrain_identity": checkpoint["identity"],
-            "exported_step": exported_step,
-            "exported_weights": weights,
-            "config": cfg.model_dump(mode="json"),
-        },
+        manifest=_finite_json(
+            {
+                "pretrain_identity": checkpoint["identity"],
+                "exported_step": exported_step,
+                "exported_weights": weights,
+                "config": cfg.model_dump(mode="json"),
+                "best_step": checkpoint["best_step"],
+                "best_score": checkpoint["best_score"],
+                "best_weights": checkpoint["best_weights"],
+                "input_schema": {
+                    "calendar_schema": list(CANONICAL_CALENDAR_SCHEMA),
+                    "lag_schema": list(TARGET_LAG_SCHEMA),
+                },
+                "external_diagnostic": {
+                    "name": cfg.corpus.external_validation,
+                    **{
+                        key: value
+                        for key, value in best_record.items()
+                        if key.startswith("ext_sql")
+                    },
+                },
+            }
+        ),
     )
 
 
 def pretrain_duration(cfg: PretrainConfig, probe: dict) -> dict:
     """Estimate the complete run, including publication and a 15% reserve."""
     _validate_controls(cfg)
+    if cfg.recipe == "v3":
+        from demand_forecast.pretrain.planning import measured_duration
+
+        return measured_duration(cfg, probe)
     steps = cfg.training.max_steps
     n_evals = math.ceil(steps / cfg.training.eval_every)
     n_ckpts = math.ceil(steps / cfg.training.checkpoint_every)

@@ -348,8 +348,10 @@ def _provenance(run_dir: Path, row: pd.Series) -> dict:
         "task best step": report.get("fit_result", {}).get("best_step"),
         "params": params,
         "external diagnostic": diagnostic.get("name"),
-        "external SQL": diagnostic.get("ext_sql"),
-        "external naive SQL": diagnostic.get("ext_sql_naive"),
+        "external SQL": diagnostic.get("ext_sql", diagnostic.get("ext_sql_calendar_on")),
+        "external naive SQL": diagnostic.get(
+            "ext_sql_naive", diagnostic.get("ext_sql_naive_calendar_on")
+        ),
         "pretrain commit": source.get("git_sha"),
         "run commit": manifest.get("git_sha"),
     }
