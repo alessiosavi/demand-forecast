@@ -64,7 +64,6 @@ from demand_forecast.kaggle.kernels import (
     write_kernel_dir,
 )
 from demand_forecast.kaggle.report import write_report
-from demand_forecast.kaggle.scoring import score_mirror
 from demand_forecast.kaggle.store_sales import prepare
 from demand_forecast.kaggle.submission import build_store_sales_submission, validate_submission
 
@@ -124,7 +123,7 @@ _PREPARE_BY_SLUG: dict[str, Callable[[Path, Path], store_sales.PrepareReport]] =
 }
 
 _SCORE_BY_SLUG: dict[str, Callable[[Path, dict[str, pd.DataFrame]], dict[str, float]]] = {
-    store_sales.SLUG: score_mirror,
+    store_sales.SLUG: store_sales.score_mirror,
     mlcspp.SLUG: mlcspp.score_mirror,
 }
 

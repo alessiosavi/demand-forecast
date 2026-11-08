@@ -1,5 +1,8 @@
 """Store-sales submission writer and validator tests (pure: no parquet engine)."""
 
+from pathlib import Path
+
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -19,7 +22,10 @@ def _test_ids() -> pd.DataFrame:
 
 
 def _predictions() -> pd.DataFrame:
-    """All three keys in a shuffled row order, with loader-style series ids."""
+    """All three keys in a shuffled row order, with loader-style series ids.
+
+    Points are log1p-space, matching the converter's target transform.
+    """
     rows = [
         {"series_id": "1|AUTOMOTIVE", "timestamp": "2017-08-16", "point": 5.0},
         {"series_id": "1|BABY CARE", "timestamp": "2017-08-17", "point": 9.0},
@@ -28,7 +34,7 @@ def _predictions() -> pd.DataFrame:
     return pd.DataFrame(rows).iloc[[2, 0, 1]].reset_index(drop=True)
 
 
-def test_store_sales_submission_order_follows_test_ids(tmp_path):
+def test_store_sales_submission_order_and_expm1_inversion(tmp_path):
     test_ids = _test_ids()
     # Integer store numbers must join with the string parts split out of series_id.
     assert pd.api.types.is_integer_dtype(test_ids["store_nbr"])
@@ -37,7 +43,9 @@ def test_store_sales_submission_order_follows_test_ids(tmp_path):
 
     assert list(submission.columns) == ["id", "sales"]
     assert submission["id"].tolist() == [3, 1, 2]
-    assert submission["sales"].tolist() == [5.0, 7.0, 9.0]
+    # Log-space points are inverted to raw sales: sales = expm1(point).
+    expected = [float(np.expm1(5.0)), float(np.expm1(7.0)), float(np.expm1(9.0))]
+    assert submission["sales"].tolist() == pytest.approx(expected)
 
     sample = pd.DataFrame({"id": test_ids["id"], "sales": 0.0})
     validate_submission(submission, sample)  # must not raise
@@ -45,7 +53,25 @@ def test_store_sales_submission_order_follows_test_ids(tmp_path):
     written = pd.read_csv(out)
     assert list(written.columns) == ["id", "sales"]
     assert written["id"].tolist() == [3, 1, 2]
-    assert written["sales"].tolist() == [5.0, 7.0, 9.0]
+    assert written["sales"].tolist() == pytest.approx(expected)
+
+
+def test_zero_log_point_writes_zero_sales(tmp_path: Path) -> None:
+    test_ids = pd.DataFrame(
+        {
+            "id": [7],
+            "date": pd.to_datetime(["2017-08-16"]),
+            "store_nbr": [1],
+            "family": ["AUTOMOTIVE"],
+        }
+    )
+    predictions = pd.DataFrame(
+        [{"series_id": "1|AUTOMOTIVE", "timestamp": "2017-08-16", "point": 0.0}]
+    )
+
+    submission = build_store_sales_submission(predictions, test_ids, tmp_path / "submission.csv")
+
+    assert submission["sales"].tolist() == [0.0]  # expm1(0) == 0
 
 
 def test_submission_missing_rows_rejected(tmp_path):
@@ -59,7 +85,8 @@ def test_submission_ignores_untested_prediction_rows(tmp_path):
     predictions = pd.concat([_predictions(), extra], ignore_index=True)
     submission = build_store_sales_submission(predictions, _test_ids(), tmp_path / "submission.csv")
     assert submission["id"].tolist() == [3, 1, 2]
-    assert submission["sales"].tolist() == [5.0, 7.0, 9.0]
+    expected = [float(np.expm1(5.0)), float(np.expm1(7.0)), float(np.expm1(9.0))]
+    assert submission["sales"].tolist() == pytest.approx(expected)
 
 
 def test_submission_reordering_rejected():

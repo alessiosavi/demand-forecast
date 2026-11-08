@@ -664,22 +664,33 @@ _OFFICIAL_POINTS = [
 
 
 def _dataset_config(directory: Path) -> DatasetConfig:
-    """The long/static roles the store-sales templates consume."""
+    """The long/static roles the store-sales templates consume (post-optimization)."""
     return DatasetConfig(
         source="long",
         path=directory / "long.parquet",
         id_columns=["store_nbr", "family"],
         timestamp_column="date",
-        target="sales",
+        target="log1p_sales",
         target_support="nonnegative",
-        known_dynamic=["onpromotion", "is_national_holiday"],
-        past_dynamic=["oil_price", "transactions"],
+        known_dynamic=[
+            "onpromotion",
+            "is_national_holiday",
+            "is_day_15",
+            "is_month_end",
+            "oil_price",
+        ],
+        past_dynamic=["transactions", "sales_lag7", "sales_lag28", "sales_roll7", "sales_roll28"],
         static_path=directory / "static.parquet",
         static_categorical=["store_nbr", "family", "city", "state", "type", "cluster"],
         freq="D",
         missing_target="zero",
         duplicates="error",
     )
+
+
+_LOGGED_TRUTH = {
+    key: [math.log1p(value) for value in values] for key, values in _MIRROR_TRUTH.items()
+}
 
 
 def _write_prepared_tree(config: RunnerConfig) -> None:
@@ -691,16 +702,24 @@ def _write_prepared_tree(config: RunnerConfig) -> None:
     for index, day in enumerate(_DAYS):
         for (store_nbr, family), values in _HISTORY.items():
             observed = index < 2
+            history = values[index] if observed else float("nan")
+            prior = values[index - 1] if observed and index >= 1 else float("nan")
             long_rows.append(
                 {
                     "store_nbr": store_nbr,
                     "family": family,
                     "date": day,
-                    "sales": values[index] if observed else float("nan"),
+                    "log1p_sales": math.log1p(history) if observed else float("nan"),
                     "onpromotion": int(day.day % 2 == 0),
                     "is_national_holiday": 0,
-                    "oil_price": 40.0 + index if observed else float("nan"),
+                    "is_day_15": 0,
+                    "is_month_end": 0,
+                    "oil_price": 40.0 + index,  # known: window included
                     "transactions": 100.0 * store_nbr if observed else float("nan"),
+                    "sales_lag7": prior,
+                    "sales_lag28": prior,
+                    "sales_roll7": prior,
+                    "sales_roll28": prior,
                 }
             )
     pd.DataFrame(long_rows).to_parquet(mirror / "long.parquet", index=False)
@@ -715,8 +734,13 @@ def _write_prepared_tree(config: RunnerConfig) -> None:
         }
     ).to_parquet(mirror / "static.parquet", index=False)
     truth_rows = [
-        {"store_nbr": store_nbr, "family": family, "date": _DAYS[2 + step], "sales": value}
-        for (store_nbr, family), values in _MIRROR_TRUTH.items()
+        {
+            "store_nbr": store_nbr,
+            "family": family,
+            "date": _DAYS[2 + step],
+            "log1p_sales": value,
+        }
+        for (store_nbr, family), values in _LOGGED_TRUTH.items()
         for step, value in enumerate(values)
     ]
     pd.DataFrame(truth_rows).to_parquet(mirror / "truth.parquet", index=False)
@@ -756,10 +780,10 @@ def _write_fetched_tree(config: RunnerConfig) -> None:
         json.dumps({"modes": ["zero_shot", "finetune"], "windows": ["mirror", "official"]}),
         encoding="utf-8",
     )
-    _mirror_points(_MIRROR_TRUTH).to_csv(
+    _mirror_points(_LOGGED_TRUTH).to_csv(
         root / "zero_shot" / "mirror" / "predictions.csv", index=False
     )
-    offset = {key: [value + 1.0 for value in values] for key, values in _MIRROR_TRUTH.items()}
+    offset = {key: [value + 1.0 for value in values] for key, values in _LOGGED_TRUTH.items()}
     _mirror_points(offset).to_csv(root / "finetune" / "mirror" / "predictions.csv", index=False)
     pd.DataFrame(_OFFICIAL_POINTS).to_csv(
         root / "finetune" / "official" / "predictions.csv", index=False
@@ -782,7 +806,9 @@ def test_score_stage_scores_assembles_submission_and_writes_report(tmp_path):
     assert all(math.isfinite(value) for value in scores.values())
     submission = pd.read_csv(config.submission_path)
     assert submission["id"].tolist() == [3, 1, 2]
-    assert submission["sales"].tolist() == [5.0, 7.0, 9.0]
+    # The fetched official points are log1p-space; the writer writes expm1 sales.
+    expected_sales = [math.expm1(5.0), math.expm1(7.0), math.expm1(9.0)]
+    assert submission["sales"].tolist() == pytest.approx(expected_sales)
     report = config.report_path.read_text(encoding="utf-8")
     assert "mirror (non-official)" in report
     assert "corpus_overlap: pending" in report

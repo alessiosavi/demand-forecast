@@ -5,6 +5,11 @@ order. Predictions arrive keyed by the loader's ``series_id`` (the ``"|"``-join
 of the configured id columns) and ``timestamp``; the writer joins them back
 onto the test ids on ``(store_nbr, family, date)``.
 
+Prediction points are log1p-space — the converter's pinned target transform —
+so the writer inverts them with ``expm1`` before writing the raw ``sales``
+column: ``expm1`` maps every finite point to a non-negative value, so the
+unchanged validator still holds.
+
 Join keys are normalized to pandas' string dtype on both sides: splitting
 ``series_id`` yields strings while ``test_ids.store_nbr`` and
 ``truth.store_nbr`` are integer columns, so ``"1"`` must be made to match ``1``.
@@ -82,10 +87,13 @@ def build_store_sales_submission(
 ) -> pd.DataFrame:
     """Join predictions onto the sample order and write ``id,sales`` to ``out``.
 
-    Every test id must receive exactly one prediction; unmatched ids raise
-    instead of writing a partial file. Prediction rows without a test id are
-    ignored, because the loaded panel may carry series absent from ``test.csv``.
-    The returned frame is the written submission, in ``test_ids`` order.
+    Prediction points are log1p-space (the converter's target transform), so
+    they are inverted with ``expm1`` before the raw ``sales`` column is
+    written. Every test id must receive exactly one prediction; unmatched ids
+    raise instead of writing a partial file. Prediction rows without a test id
+    are ignored, because the loaded panel may carry series absent from
+    ``test.csv``. The returned frame is the written submission, in ``test_ids``
+    order.
     """
     keys = _prediction_keys(predictions, name="predictions")
     test = _catalog_keys(test_ids, ["id"], name="test_ids")
@@ -93,7 +101,7 @@ def build_store_sales_submission(
     unmatched = int(merged["point"].isna().sum())
     if unmatched:
         raise ValueError(f"predictions missing or NaN for {unmatched} of {len(test)} test ids")
-    submission = merged.rename(columns={"point": "sales"})[["id", "sales"]]
+    submission = merged.assign(sales=np.expm1(merged["point"]))[["id", "sales"]]
     if len(submission) != len(test_ids) or submission["id"].tolist() != test_ids["id"].tolist():
         raise ValueError("submission row count or id order differs from test_ids")
     submission.to_csv(out, index=False)

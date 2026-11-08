@@ -5,36 +5,56 @@ raw CSVs, verifies their pinned column contracts, and writes two prepared
 variants under ``out_dir``:
 
 - ``official`` — every observed ``(store_nbr, family)`` series on its daily
-  grid through the last test day, with ``sales`` NaN from the test period on.
-- ``mirror`` — the same panel with ``sales`` NaN from the mirror cutoff (the
+  grid through the last test day, with the target ``log1p_sales`` NaN from the
+  test period on.
+- ``mirror`` — the same panel with the target NaN from the mirror cutoff (the
   first of the last ``horizon`` train days) on; those cut targets are split
-  out to ``truth.parquet`` and never enter the panel's targets.
+  out to ``truth.parquet`` (log-space as well) and never enter the panel's
+  targets.
+
+The target is the pinned ``log1p`` transform of raw sales: observed rows carry
+``log1p_sales = log1p(sales)``, while missing sale rows inside the history keep
+the ``missing_target == "zero"`` policy in raw space first (their log1p then
+reads zero, exactly mirroring the historical raw-target policy) and window
+rows are NaN. Mirror truth is log-space too, so scoring the mirror window with
+plain ``rmse`` equals the historical RMSLE on raw sales.
 
 Covariate availability is pinned per variant: the known covariates
-(``onpromotion``, ``is_national_holiday``) extend into the forecast window,
-from ``test.csv`` and the holiday calendar respectively, while the
-past-dynamic covariates (``oil_price``, ``transactions``) stop at the
-variant's origin. Past-dynamic values at or after the origin would extend
-each series' loaded history past the origin, and the trainer would then
-publish a bundle whose earliest permissible origin outruns the window origin
-the kernel workload forecasts at. Missing sale rows inside the history carry
-the pinned ``missing_target == "zero"`` policy (the competition convention);
-official test rows carry NaN targets.
+(``onpromotion``, ``is_national_holiday``, the payday flags ``is_day_15`` and
+``is_month_end``, and ``oil_price``) extend into the forecast window, from
+``test.csv``, the holiday calendar, the calendar itself and ``oil.csv``
+respectively; ``oil_price`` is filled for every date the raw file covers —
+mirror and official windows included — and NaN exactly where it has no row.
+The past-dynamic covariates (``transactions`` and the raw-sales lag/rolling
+block) stop at the variant's origin: the block's lags are strict shifts of the
+panel's sales series and its rolls are trailing means of the one-day-shifted
+series (``min_periods=1``), so no value at date ``t`` ever sees same-day
+sales; missing history rows participate exactly as they participate in the
+target (as zero-filled sales). Past-dynamic values at or after the origin
+would extend each series' loaded history past the origin, and the trainer
+would then publish a bundle whose earliest permissible origin outruns the
+window origin the kernel workload forecasts at. The mirror variant therefore
+masks the block from the mirror cutoff and the official variant from the
+official test start, so no in-window sales information is carried anywhere in
+the prepared files. Official test rows carry NaN targets.
 """
 
 import json
 import shutil
+import tempfile
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+import numpy as np
 import pandas as pd  # type: ignore[import-untyped]  # repo venv carries no pandas stubs
 
 from demand_forecast.config import DatasetConfig
 from demand_forecast.data.frequency import to_offset
+from demand_forecast.kaggle import scoring
 from demand_forecast.kaggle.settings import build_settings, load_template, write_settings
 
-__all__ = ["PrepareReport", "SLUG", "prepare"]
+__all__ = ["PrepareReport", "SLUG", "prepare", "score_mirror"]
 
 SLUG = "store-sales-time-series-forecasting"
 
@@ -52,11 +72,12 @@ _OIL_COLUMNS = ("date", "dcoilwtico")
 _TRANSACTIONS_COLUMNS = ("date", "store_nbr", "transactions")
 _HOLIDAY_COLUMNS = ("date", "type", "locale", "locale_name", "description", "transferred")
 
-_KNOWN_DYNAMIC = ["onpromotion", "is_national_holiday"]
-_PAST_DYNAMIC = ["oil_price", "transactions"]
+_TARGET = "log1p_sales"
+_KNOWN_DYNAMIC = ["onpromotion", "is_national_holiday", "is_day_15", "is_month_end", "oil_price"]
+_PAST_DYNAMIC = ["transactions", "sales_lag7", "sales_lag28", "sales_roll7", "sales_roll28"]
 _STATIC_CATEGORICAL = ["store_nbr", "family", "city", "state", "type", "cluster"]
 _FREQ = "D"
-_LONG_COLUMNS = ["store_nbr", "family", "date", "sales", *_KNOWN_DYNAMIC, *_PAST_DYNAMIC]
+_LONG_COLUMNS = ["store_nbr", "family", "date", _TARGET, *_KNOWN_DYNAMIC, *_PAST_DYNAMIC]
 _NATIONAL_TYPES = ("Holiday", "Transfer", "Bridge", "Additional")
 
 
@@ -119,6 +140,38 @@ def _union_grid(first_dates: pd.DataFrame, dates: pd.DatetimeIndex) -> pd.DataFr
     return grid.loc[grid["date"] >= grid["first_date"], ["store_nbr", "family", "date"]]
 
 
+def _payday_flags(dates: pd.Series) -> dict[str, pd.Series]:
+    """The pinned known payday flags for every date: the 15th and month ends."""
+    day = dates.dt.day
+    return {
+        "is_day_15": (day == 15).astype("int64"),
+        "is_month_end": (day == dates.dt.days_in_month).astype("int64"),
+    }
+
+
+def _sales_covariates(long: pd.DataFrame) -> pd.DataFrame:
+    """Add the raw-sales lag/rolling block, computed per series from the past only.
+
+    The block derives from the same sales series the target is built from, so
+    missing history rows participate exactly like the target does (they carry
+    the zero-fill policy by the time this runs). Lags are strict shifts; rolls
+    are trailing means of the one-day-shifted series with ``min_periods=1``,
+    so a value at date ``t`` never sees same-day sales and a series' first day
+    leaves the rolls NaN.
+    """
+    frame = long.sort_values(["store_nbr", "family", "date"], kind="stable").reset_index(drop=True)
+    keys = [frame["store_nbr"], frame["family"]]
+    sales = frame["sales"]
+    frame["sales_lag7"] = sales.groupby(keys, sort=False).shift(7)
+    frame["sales_lag28"] = sales.groupby(keys, sort=False).shift(28)
+    prior = sales.groupby(keys, sort=False).shift(1)
+    for window, column in ((7, "sales_roll7"), (28, "sales_roll28")):
+        frame[column] = prior.groupby(keys, sort=False).transform(
+            lambda values, window=window: values.rolling(window, min_periods=1).mean()
+        )
+    return frame
+
+
 def _clip_at_origin(
     frame: pd.DataFrame, origin: pd.Timestamp, *, mask_target: bool
 ) -> pd.DataFrame:
@@ -128,7 +181,7 @@ def _clip_at_origin(
     for column in _PAST_DYNAMIC:
         clipped[column] = clipped[column].mask(after)
     if mask_target:
-        clipped["sales"] = clipped["sales"].mask(after)
+        clipped[_TARGET] = clipped[_TARGET].mask(after)
     return clipped
 
 
@@ -154,7 +207,7 @@ def _dataset_config(directory: Path) -> DatasetConfig:
         path=directory / "long.parquet",
         id_columns=["store_nbr", "family"],
         timestamp_column="date",
-        target="sales",
+        target=_TARGET,
         target_support="nonnegative",
         known_dynamic=list(_KNOWN_DYNAMIC),
         past_dynamic=list(_PAST_DYNAMIC),
@@ -249,11 +302,12 @@ def prepare(raw_dir: Path, out_dir: Path, *, horizon: int = 16) -> PrepareReport
         how="left",
         validate="many_to_one",
     )
-    long = (
-        long[_LONG_COLUMNS]
-        .sort_values(["store_nbr", "family", "date"], kind="stable")
-        .reset_index(drop=True)
-    )
+
+    long = _sales_covariates(long)
+    long[_TARGET] = np.log1p(long["sales"])
+    for name, column in _payday_flags(long["date"]).items():
+        long[name] = column
+    long = long[_LONG_COLUMNS].reset_index(drop=True)
 
     official_dir = out_dir / "official"
     mirror_dir = out_dir / "mirror"
@@ -264,8 +318,8 @@ def prepare(raw_dir: Path, out_dir: Path, *, horizon: int = 16) -> PrepareReport
     mirror = _clip_at_origin(long, mirror_cutoff, mask_target=True)
     truth = (
         long.loc[
-            (long["date"] >= mirror_cutoff) & long["sales"].notna(),
-            ["store_nbr", "family", "date", "sales"],
+            (long["date"] >= mirror_cutoff) & long[_TARGET].notna(),
+            ["store_nbr", "family", "date", _TARGET],
         ]
         .sort_values(["store_nbr", "family", "date"], kind="stable")
         .reset_index(drop=True)
@@ -297,6 +351,7 @@ def prepare(raw_dir: Path, out_dir: Path, *, horizon: int = 16) -> PrepareReport
             "missing_target": "zero",
             "negative_sales": negative,
             "zero_filled_rows": zero_filled,
+            "target_transform": "log1p",
         },
     )
     for directory in (official_dir, mirror_dir):
@@ -309,3 +364,31 @@ def prepare(raw_dir: Path, out_dir: Path, *, horizon: int = 16) -> PrepareReport
             write_settings(settings, directory / f"settings-{mode.replace('_', '-')}.yaml")
         _write_report(report, directory)
     return report
+
+
+def score_mirror(
+    prepared_mirror_dir: Path, prediction_frames: dict[str, pd.DataFrame]
+) -> dict[str, float]:
+    """Score the store-sales mirror window in log space (RMSLE-equivalent).
+
+    The prepared mirror tree stores its labels as ``log1p_sales`` while the
+    generic scorer contracts on a raw ``sales`` label column, so this wrapper
+    stages a throwaway mirror directory — the prepared settings and report
+    plus the truth table with its label column renamed — and scores it with
+    the plain ``rmse`` metric. The settings carry the prepared panel's
+    absolute path, so the original ``long.parquet`` is read in place, never
+    copied or modified. Log-space RMSE is exactly RMSLE on raw sales, keeping
+    new mirror scores comparable with the historical raw-target runs; the
+    generic scorer stays untouched.
+    """
+    mirror = Path(prepared_mirror_dir)
+    with tempfile.TemporaryDirectory() as tmp:
+        staged = Path(tmp) / "mirror"
+        staged.mkdir()
+        for name in ("settings-finetune.yaml", "prepare.json"):
+            shutil.copyfile(mirror / name, staged / name)
+        truth = pd.read_parquet(mirror / "truth.parquet")
+        if _TARGET not in truth.columns:
+            raise ValueError(f"truth.parquet: missing label column {_TARGET!r}")
+        truth.rename(columns={_TARGET: "sales"}).to_parquet(staged / "truth.parquet", index=False)
+        return scoring.score_mirror(staged, prediction_frames, metric_name="rmse")
