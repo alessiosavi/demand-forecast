@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Classical `fev baseline --model` arms: `auto_ets`, `auto_theta`, and `median3`
+  (cell-wise median quantiles alongside the unchanged default `seasonal_naive`),
+  with seasonal-naive fallback and resume by task/model pair in `summaries.csv`.
+
 - **Pretraining Phase C (2026-11-01)** — opt-in EC2 runbook, self-contained
   bootstrap user data, setup/parity and dataset warm-up script, fail-closed boot
   deadline unit, and cost guard with reserved sessions and AWS stop/cleanup schedules.
