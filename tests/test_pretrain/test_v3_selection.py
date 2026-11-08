@@ -2,6 +2,7 @@
 
 import json
 from contextlib import closing
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -94,9 +95,59 @@ def test_frozen_stratified_pairs_policy_identity_and_window(selection_cfg, monke
 
 
 class LastValue(torch.nn.Module):
+    def __init__(self, n_quantiles=3):
+        super().__init__()
+        self.n_quantiles = n_quantiles
+
     def predict(self, batch):
         value = batch.target[:, -1] * batch.scale + batch.loc
-        return value[:, None, None].expand(-1, batch.labels.shape[1], 3)
+        return value[:, None, None].expand(-1, batch.labels.shape[1], self.n_quantiles)
+
+
+def test_shipped_v3_validation_disables_external_without_full_horizon(tmp_path, monkeypatch):
+    from tests.helpers.corpus_fixture import write_corpus_fixture
+    from tests.test_pretrain.test_validate import _external_fixture
+
+    cfg = PretrainConfig.from_yaml(
+        Path(__file__).resolve().parents[2] / "configs/pretrain-v3-corpus2.yaml"
+    )
+    cfg.corpus.root = tmp_path / "corpus"
+    for kind, (_, held_out) in cfg.corpus.selections().items():
+        for index in held_out:
+            if kind in ("tsmixup", "kernel_synth"):
+                write_corpus_fixture(
+                    cfg.corpus.root, kind=kind, index=index, n_series=2, lengths=(370, 370)
+                )
+            else:
+                directory = cfg.corpus.root / "training_corpus" / kind
+                directory.mkdir(parents=True, exist_ok=True)
+                _shard(
+                    tmp_path,
+                    [_row(i, target=(10 + np.arange(370) ** 1.1 + i).tolist()) for i in range(2)],
+                ).rename(directory / f"train-{index:05d}-of-{index + 1:05d}.parquet")
+    _external_fixture(cfg.corpus.root)
+    refs = corpus_manifest(cfg.corpus.root)
+    encoder = StaticEncoder().fit(shard_panel([]), [])
+    enabled = cfg.model_copy(deep=True)
+    enabled.corpus.external_validation = "monash_nn5_weekly"
+    assert enabled.recipe == "v3" and enabled.forecast.horizon == 288
+    with pytest.raises(ValueError, match="full horizon"):
+        validate.ValidationSet.build(enabled, refs, encoder)
+
+    monkeypatch.setattr(
+        validate, "external_pairs", lambda *a, **k: pytest.fail("external diagnostic was loaded")
+    )
+    validation = validate.ValidationSet.build(cfg, refs, encoder)
+    assert cfg.corpus.external_validation is None
+    assert validation.external is None and validation.v3_sources["external"] is None
+    result = validation.evaluate(LastValue(len(cfg.forecast.quantiles)), device="cpu")
+    assert {k: v for k, v in result.items() if k.startswith("ext_sql")} == {
+        "ext_sql_calendar_on": None,
+        "ext_sql_naive_calendar_on": None,
+    }
+    assert result["n_excluded_external"] is None
+    assert np.isfinite(result["val_sql"])
+    assert set(result["selection_sources"]) == {"chronos_real", "gifteval_pretrain"}
 
 
 def test_macro_cell_periods_and_nonfinite_cell_fails(selection_cfg):

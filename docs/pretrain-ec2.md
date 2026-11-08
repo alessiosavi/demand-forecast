@@ -944,6 +944,9 @@ if it is gone, re-warm from the pinned Hub inputs, rerun section 4's environment
 lock, dataset-byte/fingerprint gates and section 5's corpus verification. Never
 infer cache availability from the old volume ID.
 
+The shipped v3 config disables the external calendar on/off diagnostic at H=288
+with `corpus.external_validation: null` because weekly NN5 has no 288-step window.
+
 Allow about $1 for the probe session; $7–10 for the pilot quarter; $20–25 for the
 remaining 58k steps, about $25–35 for training in all. These are planning ranges,
 not measurements. Zero-shot rows cost about $5; composite rows cost $15–20 for
@@ -994,9 +997,9 @@ and batch 96 on the actual corpus. Keep the probe near ten GPU minutes for the
 Record actual elapsed time rather than treating that target as a guarantee.
 
 The probe's `eval_s` measures the real evaluation path: raw **and** EMA weights,
-synthetic holdouts, real frequency/horizon selection cells, external calendars
-on/off, and the raw snapshot write. `checkpoint_s` separately measures latest
-checkpoint serialization. Reject nonfinite losses, nonfinite selection cells or
+synthetic holdouts, real frequency/horizon selection cells, and the raw snapshot
+write. `checkpoint_s` separately measures latest checkpoint serialization.
+Reject nonfinite losses, nonfinite selection cells or
 missing horizon/source coverage; inspect exposure counters and H=288 memory
 against the 18 GB ceiling before spending on training. Reprobe a smaller batch
 if required; freeze the final config/identity before the pilot. Source/horizon

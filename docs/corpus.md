@@ -136,6 +136,8 @@ V3 external diagnostics are explicitly labelled `ext_sql_calendar_on` and
 are distinct from historical v2 `ext_sql` / `ext_sql_naive` model results. Neither
 external measurement selects the step or weight type. The 81 shifted fev checks
 at 20k/40k/60k/end remain operator-run diagnostics for round 5.
+The shipped v3 config sets `corpus.external_validation: null` at H=288 because
+weekly NN5 has no 288-step window, so its calendar on/off diagnostic is unavailable.
 
 ## Contents and exclusions
 
