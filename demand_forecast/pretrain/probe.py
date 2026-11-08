@@ -269,6 +269,8 @@ def task_probe(
             encoder,
             batch_size=512,
             scale_floor_frac=forecast.scale_floor_frac,
+            calendar_schema=forecast.calendar_schema,
+            target_lags=forecast.target_lags,
         )
         prep_s = time.perf_counter() - started
         _reset_peak(device)

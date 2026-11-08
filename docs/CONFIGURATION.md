@@ -35,7 +35,9 @@ Use the linked README, Settings schema and frozen protocol for current commands 
 The long-lag table is `5T: 2016`, `10T: 1008`, `15T: 672`, `30T: 336`,
 `H: 168`, `D: 364`, `W: 52`, `M: 24`, `Q: 8` (equivalent aliases and
 calendar anchors are accepted). Other frequencies use the task's `m`.
-These knobs apply consistently to task training, validation and bundle inference.
+These knobs apply consistently to task training, validation, bundle inference,
+the latency script and task probes. Pretraining configs reject non-default
+values until the v3 batch adapter supports them.
 Defaults preserve existing tensors, identities and serialized bundle config
 layouts; non-default settings enter the run identity and the bundle's `forecast`.
 Named schema metadata is stored in `model_spec`; old bundles load unnamed schemas

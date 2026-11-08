@@ -89,6 +89,8 @@ def main(argv: list[str] | None = None) -> None:
         cfg.horizon,
         cfg.max_context,
         bundle.encoder,
+        calendar_schema=cfg.calendar_schema,
+        target_lags=cfg.target_lags,
     )
     model = bundle.model.eval()
     with torch.inference_mode():

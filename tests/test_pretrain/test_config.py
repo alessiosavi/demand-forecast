@@ -18,15 +18,34 @@ ROOT = Path(__file__).resolve().parents[2]
 SHIPPED_CONFIG = ROOT / "configs/pretrain-v2-first-try.yaml"
 
 
-def test_corpus2_identity_and_serialized_config_remain_legacy():
+@pytest.mark.parametrize(
+    "name,identity",
+    [
+        (
+            "pretrain-v2-corpus2.yaml",
+            "00129853f6e85e9dcadaa049ae4838654a05ca013393580a7574ce90ffd0993c",
+        ),
+        (
+            "pretrain-v2-first-try.yaml",
+            "fc42f50dd4090e47067e68da9ce8d37146559f31bc415f5afe1f295b8772fe4c",
+        ),
+    ],
+)
+def test_shipped_v2_identity_and_serialized_config_remain_legacy(name, identity):
     from demand_forecast.pretrain.config import PretrainConfig, pretrain_identity
 
-    cfg = PretrainConfig.from_yaml(ROOT / "configs/pretrain-v2-corpus2.yaml")
-    # Measured before recipe-v3 changes; package version 2.0.0, no shard digests.
-    assert pretrain_identity(cfg, "2.0.0", {}) == (
-        "00129853f6e85e9dcadaa049ae4838654a05ca013393580a7574ce90ffd0993c"
+    cfg = PretrainConfig.from_yaml(ROOT / "configs" / name)
+    # Measured before this fix; package version 2.0.0, no shard digests.
+    assert pretrain_identity(cfg, "2.0.0", {}) == identity
+    payload = cfg.model_dump(mode="json")
+    assert not {"recipe", "period_policy", "grid_policy"} & payload.keys()
+    assert not {"calendar_schema", "target_lags"} & payload["forecast"].keys()
+    explicit = PretrainConfig.model_validate(
+        payload
+        | {"forecast": payload["forecast"] | {"calendar_schema": "legacy", "target_lags": "none"}}
     )
-    assert not {"recipe", "period_policy", "grid_policy"} & cfg.model_dump(mode="json").keys()
+    assert explicit.model_dump(mode="json") == payload
+    assert pretrain_identity(explicit, "2.0.0", {}) == identity
 
 
 @pytest.mark.parametrize(
@@ -292,3 +311,32 @@ def test_pretrain_rejects_task_only_scale_floor():
     raw["forecast"]["scale_floor_frac"] = 0.1
     with pytest.raises(ValidationError, match="only supported for task training"):
         PretrainConfig.model_validate(raw)
+
+
+@pytest.mark.parametrize("recipe", ["v2", "v3"])
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"calendar_schema": "canonical"},
+        {"target_lags": "cycle"},
+        {"calendar_schema": "canonical", "target_lags": "cycle"},
+    ],
+)
+def test_pretrain_rejects_task_only_input_schema(tmp_path, recipe, options):
+    from demand_forecast.pretrain.config import PretrainConfig
+
+    raw = yaml.safe_load(SHIPPED_CONFIG.read_text()) | {"recipe": recipe}
+    raw["forecast"].update(options)
+    path = tmp_path / "unsupported-schema.yaml"
+    path.write_text(yaml.safe_dump(raw))
+    for payload in (raw, raw | {"forecast": ForecastConfig(**raw["forecast"])}):
+        with pytest.raises(ValidationError) as exc:
+            PretrainConfig.model_validate(payload)
+        for name in options:
+            assert any(
+                error["loc"] == ("forecast", name)
+                and "only supported for task training" in error["msg"]
+                for error in exc.value.errors()
+            )
+    with pytest.raises(ValidationError, match="only supported for task training"):
+        PretrainConfig.from_yaml(path)
