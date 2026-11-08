@@ -706,3 +706,36 @@ def test_cli_shipped_zero_shot_yaml_resolves(tmp_path, monkeypatch):
     assert result.exit_code == 0, result.output
     assert captured[0].training.zero_shot and captured[0].training.init_from == str(source)
     assert captured[0].model.d_model == 320
+
+
+@pytest.mark.parametrize("zero_shot", [False, True])
+def test_fev_plan_reports_resolved_schedule_without_loading_data(tmp_path, monkeypatch, zero_shot):
+    import csv
+    import io
+
+    import yaml
+
+    from demand_forecast.bench.specs import FevTaskSpec
+    from tests.helpers.settings import tiny_settings
+
+    def forbidden(*args):
+        pytest.fail("plan loaded dataset rows")
+
+    monkeypatch.setattr(FevTaskSpec, "to_task", forbidden)
+    settings = tiny_settings(base_steps=3000)
+    settings.training.min_steps = 1000
+    settings.training.warmup_frac = 0.1
+    settings.training.eval_every = 200
+    settings.training.eval_at_start = True
+    settings.training.zero_shot = zero_shot
+    config = tmp_path / "config.yaml"
+    config.write_text(yaml.safe_dump(settings.model_dump(mode="json")))
+    result = runner.invoke(app, ["fev", "plan", "--tasks", "ETT_1H", "--config", str(config)])
+    assert result.exit_code == 0, result.output
+    row = next(csv.DictReader(io.StringIO(result.output)))
+    assert row["task"] == "ETT_1H"
+    assert row["step_budget_estimate"] == row["max_steps"] == ("0" if zero_shot else "1000")
+    assert row["warmup_steps"] == ("0" if zero_shot else "100")
+    assert row["eval_every"] == ("0" if zero_shot else "200")
+    assert row["n_evaluations"] == ("0" if zero_shot else "6")
+    assert row["early_stop_reachable"] == ("False" if zero_shot else "True")

@@ -327,26 +327,40 @@ def fev_plan(
     import yaml
 
     from demand_forecast.bench.specs import load_task_specs
-    from demand_forecast.core.training import resolve_budget
+    from demand_forecast.core.training import evaluation_count, resolve_budget, resolve_warmup
 
     settings = _training_settings(config, None)
     snapshot = yaml.safe_load(
         files("demand_forecast.bench").joinpath("tasks/schema_fev100.yaml").read_text()
     )["configs"]
-    typer.echo("task,items,median_length,step_budget_estimate")
+    typer.echo(
+        "task,items,median_length,step_budget_estimate,max_steps,warmup_steps,"
+        "eval_every,n_evaluations,early_stop_reachable"
+    )
     for spec in load_task_specs(tasks):
         if spec.dataset_config not in snapshot:
             raise typer.BadParameter(f"No schema snapshot for {spec.name}")
         info = snapshot[spec.dataset_config]
-        steps, _ = resolve_budget(
+        steps, eval_every = resolve_budget(
             settings.training.base_steps,
             info["items"] * len(spec.targets),
             settings.training.eval_every,
             settings.training.max_steps_cap,
+            settings.training.min_steps,
         )
         if settings.training.zero_shot:
             steps = 0
-        typer.echo(f"{spec.name},{info['items']},{info['median_length']},{steps}")
+            eval_every = 0
+        warmup = (
+            resolve_warmup(steps, settings.training.warmup_steps, settings.training.warmup_frac)
+            if steps
+            else 0
+        )
+        n_evals = evaluation_count(steps, eval_every, settings.training.eval_at_start)
+        typer.echo(
+            f"{spec.name},{info['items']},{info['median_length']},{steps},{steps},"
+            f"{warmup},{eval_every},{n_evals},{n_evals > settings.training.patience}"
+        )
 
 
 @fev_app.command("run")

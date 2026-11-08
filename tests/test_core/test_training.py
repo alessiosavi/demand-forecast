@@ -1807,3 +1807,322 @@ def test_eval_at_start_skipped_on_resume_exception_plan_and_no_origins(
     else:
         saved = torch.load(tmp_path / "latest.pt", weights_only=False)
         assert len(saved["history"]) == saved["step"] and not saved["initial_eval_done"]
+
+
+@pytest.mark.parametrize(
+    "min_steps,cap,expected",
+    [
+        (1000, None, (1000, 200)),
+        (1000, 600, (600, 120)),
+        (5000, None, (3000, 200)),
+        (100, None, (177, 35)),
+    ],
+)
+def test_resolve_budget_configurable_floor(min_steps, cap, expected):
+    assert resolve_budget(3000, 118, 200, cap, min_steps) == expected
+    assert resolve_budget(3000, 10000, 200, cap, min_steps)[0] <= 12000
+    with pytest.raises(ValueError, match="min_steps"):
+        resolve_budget(3000, 1, 200, min_steps=0)
+
+
+class ScalarModel(torch.nn.Module):
+    """One trainable float plus a live non-float buffer for averaging checks."""
+
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.tensor(0.0))
+        self.register_buffer("fallback_level", torch.tensor(0.0))
+        self.register_buffer("count", torch.tensor(0))
+
+
+def scripted_fit(
+    tmp_path,
+    panel,
+    plan,
+    encoder,
+    cfg,
+    scores,
+    *,
+    resume=False,
+    stop_after=None,
+    eval_at_start=False,
+    **kwargs,
+):
+    trainer = Trainer(ScalarModel(), cfg, cpu, RUN_ID, SEED)
+    evaluated = {}
+
+    def backward(batch, quantiles):
+        # Explicit live states 1, 2, ...; AdamW has no gradients to change them.
+        with torch.no_grad():
+            trainer.model.weight.fill_(trainer.step + 1)
+            trainer.model.count.fill_(trainer.step + 1)
+        return 0.0
+
+    trainer._backward_batch = backward
+
+    def evaluate(model, *args):
+        evaluated[trainer.step] = deepcopy(model.state_dict())
+        return {"SQL": scores[trainer.step]}
+
+    result = trainer.fit(
+        panel,
+        plan,
+        ForecastConfig(horizon=4),
+        encoder,
+        checkpoint_dir=tmp_path,
+        evaluate_fn=evaluate,
+        stop_after=stop_after,
+        resume=resume,
+        eval_at_start=eval_at_start,
+        **kwargs,
+    )
+    return trainer, result, evaluated
+
+
+@pytest.mark.parametrize(
+    "curve,best_step,smoothed",
+    [
+        ([1.0, 0.70, 0.95, 0.80, 0.78], 5, [0.85, 2.65 / 3, 2.45 / 3, 2.53 / 3, 0.79]),
+        ([1.0, 0.70, 0.95, 0.80, 1.0], 3, [0.85, 2.65 / 3, 2.45 / 3, 2.75 / 3, 0.9]),
+    ],
+)
+def test_smoothed_selects_expected_state(
+    tmp_path, panel_long, plan_long, encoder_long, curve, best_step, smoothed
+):
+    cfg = TrainConfig(base_steps=5, selection="smoothed", patience=20, amp=False)
+    trainer, result, states = scripted_fit(
+        tmp_path, panel_long, plan_long, encoder_long, cfg, dict(enumerate(curve, start=1))
+    )
+    assert result.best_step == best_step  # raw minimum is the second evaluation
+    assert result.best_score == pytest.approx(smoothed[best_step - 1])
+    assert_state_equal(trainer.model.state_dict(), states[best_step])
+    assert [r["selection_score"] for r in result.history] == pytest.approx(smoothed)
+
+
+@pytest.mark.parametrize(
+    "mode,expected", [("ema", [0.0, 1.0, 2.5, 5.25]), ("tail", [0.0, 2.0, 3.0, 6.0])]
+)
+def test_weight_average_hand_computation(mode, expected):
+    from demand_forecast.core.training import _WeightAverage
+
+    model = ScalarModel()
+    cfg = TrainConfig(weight_average=mode, ema_decay=0.5, average_last_k=2)
+    average = _WeightAverage(cfg, model.state_dict())
+    assert average.weights(model.state_dict())["weight"].item() == expected[0]
+    for step, value in enumerate([2.0, 4.0, 8.0], start=1):
+        with torch.no_grad():
+            model.weight.fill_(value)
+            model.count.fill_(step)
+        average.update(model.state_dict())
+        average.sample(model.state_dict(), step)
+        weights = average.weights(model.state_dict())
+        assert weights["weight"].item() == expected[step]
+        assert weights["count"].item() == step
+        assert model.weight.item() == value
+
+
+@pytest.mark.parametrize(
+    "mode,expected",
+    [("ema", [0.5, 1.25, 2.125, 3.0625, 4.03125]), ("tail", [1.0, 1.5, 2.5, 3.5, 4.5])],
+)
+@pytest.mark.parametrize("exception", [False, True])
+def test_averaged_weights_are_evaluated_selected_and_returned(
+    tmp_path, panel_long, plan_long, encoder_long, mode, expected, exception
+):
+    cfg = TrainConfig(
+        base_steps=5, weight_average=mode, ema_decay=0.5, average_last_k=2, patience=20, amp=False
+    )
+    plan = replace(plan_long, exception=exception)
+    trainer, result, evaluated = scripted_fit(
+        tmp_path,
+        panel_long,
+        plan,
+        encoder_long,
+        cfg,
+        {step: float(6 - step) for step in range(1, 6)},
+    )
+    if exception:
+        assert evaluated == {}
+    else:
+        assert [state["weight"].item() for state in evaluated.values()] == expected
+    assert result.best_step == 5
+    assert result.best_state["weight"].item() == expected[-1]
+    assert trainer.model.weight.item() == expected[-1]
+    assert trainer.model.count.item() == 5
+    # Checkpoint retains the raw optimizer/model pair; the bundle uses best_state.
+    saved = torch.load(tmp_path / "latest.pt", weights_only=False)
+    assert saved["model"]["weight"].item() == 5.0
+
+
+@pytest.mark.parametrize("mode", ["none", "ema", "tail"])
+@pytest.mark.parametrize("selection", ["best", "smoothed"])
+@pytest.mark.parametrize("stop_after", [1, 3, 4])
+def test_hygiene_resume_exact(
+    tmp_path, panel_long, plan_long, encoder_long, mode, selection, stop_after
+):
+    cfg = TrainConfig(
+        base_steps=10,
+        selection=selection,
+        weight_average=mode,
+        ema_decay=0.5,
+        average_last_k=2,
+        patience=20,
+        amp=False,
+    )
+    scores = dict(zip(range(0, 11, 2), [1.2, 1.0, 0.70, 0.95, 0.80, 1.0], strict=True))
+    full_trainer, full, _ = scripted_fit(
+        tmp_path / "full", panel_long, plan_long, encoder_long, cfg, scores, eval_at_start=True
+    )
+    _, stopped, _ = scripted_fit(
+        tmp_path / "resume",
+        panel_long,
+        plan_long,
+        encoder_long,
+        cfg,
+        scores,
+        eval_at_start=True,
+        stop_after=stop_after,
+    )
+    assert stopped.stop_reason == "interrupted"
+    saved = torch.load(tmp_path / "resume/latest.pt", weights_only=False)
+    if selection == "smoothed":
+        assert len(saved["selection_states"]) == min(2, 1 + stop_after // 2)
+    if mode != "none":
+        assert "weight_average" in saved
+    trainer, resumed, _ = scripted_fit(
+        tmp_path / "resume",
+        panel_long,
+        plan_long,
+        encoder_long,
+        cfg,
+        scores,
+        eval_at_start=True,
+        resume=True,
+    )
+    assert resumed.history == full.history
+    assert (resumed.best_step, resumed.best_score, resumed.stop_reason) == (
+        full.best_step,
+        full.best_score,
+        full.stop_reason,
+    )
+    assert_state_equal(resumed.best_state, full.best_state)
+    assert_state_equal(trainer.model.state_dict(), full_trainer.model.state_dict())
+
+
+@pytest.mark.parametrize("selection", ["best", "smoothed"])
+def test_select_min_gain_retains_step_zero_and_resumes(
+    tmp_path, panel_long, plan_long, encoder_long, selection
+):
+    cfg = TrainConfig(
+        base_steps=5, selection=selection, select_min_gain=0.1, patience=20, amp=False
+    )
+    scores = {step: 0.96 if step else 1.0 for step in range(6)}
+    _, stopped, _ = scripted_fit(
+        tmp_path,
+        panel_long,
+        plan_long,
+        encoder_long,
+        cfg,
+        scores,
+        eval_at_start=True,
+        stop_after=2,
+    )
+    assert stopped.best_step == 0
+    trainer, result, _ = scripted_fit(
+        tmp_path,
+        panel_long,
+        plan_long,
+        encoder_long,
+        cfg,
+        scores,
+        eval_at_start=True,
+        resume=True,
+    )
+    assert result.best_step == 0 and trainer.model.weight.item() == 0.0
+
+
+@pytest.mark.parametrize("mode,expected", [("ema", 2.125), ("tail", 2.5)])
+def test_refit_average_includes_partial_final_interval_and_resumes(
+    tmp_path, panel_long, plan_long, encoder_long, mode, expected
+):
+    # eval_every=2 on a 10-step schedule; refit stops at step 3.
+    cfg = TrainConfig(
+        base_steps=10, weight_average=mode, ema_decay=0.5, average_last_k=2, amp=False
+    )
+    plan = replace(plan_long, exception=True)
+    kwargs = {"step_limit": 3, "schedule_max_steps": 10}
+    _, stopped, _ = scripted_fit(
+        tmp_path, panel_long, plan, encoder_long, cfg, {}, stop_after=1, **kwargs
+    )
+    assert stopped.stop_reason == "interrupted"
+    trainer, result, _ = scripted_fit(
+        tmp_path, panel_long, plan, encoder_long, cfg, {}, resume=True, **kwargs
+    )
+    assert result.best_state["weight"].item() == expected
+    assert trainer.model.weight.item() == expected
+
+
+@pytest.mark.parametrize(
+    "curve,reason,steps,best_step",
+    [
+        ([1.0, 1.0, 1.0, 0.0, 0.0], "early_stop", 3, 1),
+        ([1.2, 0.8, 1.0, 0.0, 0.0], "early_stop", 3, 3),
+        ([1.0, 0.9, 0.8, 0.7, 0.6], "max_steps", 5, 5),
+    ],
+)
+def test_smoothed_patience_and_completed_resume(
+    tmp_path, panel_long, plan_long, encoder_long, curve, reason, steps, best_step
+):
+    cfg = TrainConfig(base_steps=5, selection="smoothed", patience=1, amp=False)
+    scores = dict(enumerate(curve, start=1))
+    _, first, _ = scripted_fit(tmp_path, panel_long, plan_long, encoder_long, cfg, scores)
+    assert (first.stop_reason, first.steps, first.best_step) == (reason, steps, best_step)
+    _, resumed, evaluated = scripted_fit(
+        tmp_path, panel_long, plan_long, encoder_long, cfg, scores, resume=True
+    )
+    assert evaluated == {} and first.history == resumed.history
+    assert_state_equal(first.best_state, resumed.best_state)
+
+
+@pytest.mark.parametrize("selection", ["best", "smoothed"])
+@pytest.mark.parametrize("score,best_step", [(0.96, 0), (0.9, 0), (0.89, 1)])
+def test_selection_margin_uses_strict_raw_step_zero_baseline(
+    tmp_path, panel_long, plan_long, encoder_long, selection, score, best_step
+):
+    cfg = TrainConfig(
+        base_steps=5, selection=selection, select_min_gain=0.1, patience=20, amp=False
+    )
+    scores = {step: score if step else 1.0 for step in range(6)}
+    trainer, result, _ = scripted_fit(
+        tmp_path, panel_long, plan_long, encoder_long, cfg, scores, eval_at_start=True
+    )
+    # With smoothing, evaluation 1 includes step 0; the first eligible plateau
+    # point is evaluation 2. The baseline remains the raw step-zero SQL of 1.0.
+    if score == 0.89 and selection == "smoothed":
+        best_step = 2
+    assert result.best_step == best_step
+    assert trainer.model.weight.item() == best_step
+
+
+@pytest.mark.parametrize("fraction,expected", [(None, 100), (0.0, 0), (0.5, 2), (1.0, 5)])
+def test_warmup_fraction_rounds_resolved_budget(
+    tmp_path, panel_long, plan_long, encoder_long, fraction, expected
+):
+    cfg = TrainConfig(
+        base_steps=10,
+        min_steps=8,
+        max_steps_cap=5,
+        warmup_frac=fraction,
+        warmup_steps=100,
+        patience=20,
+        amp=False,
+    )
+    trainer, _, _ = scripted_fit(
+        tmp_path,
+        panel_long,
+        plan_long,
+        encoder_long,
+        cfg,
+        {step: float(6 - step) for step in range(1, 6)},
+    )
+    assert trainer.max_steps == 5 and trainer.warmup_steps == expected

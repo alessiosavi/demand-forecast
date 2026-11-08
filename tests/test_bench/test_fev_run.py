@@ -210,6 +210,14 @@ def test_identity_unchanged_with_new_fields_unset(tmp_path, config, expected):
             "init_from": None,
             "zero_shot": False,
             "eval_at_start": False,
+            "warmup_frac": None,
+            "min_steps": None,
+            "selection": "best",
+            "weight_average": "none",
+            "ema_decay": 0.99,
+            "average_last_k": 3,
+            "select_min_gain": 0.0,
+            "exception_policy": "final",
         }
     )
     task = spec.to_task()
