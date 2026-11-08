@@ -128,7 +128,7 @@ def _check_refit(settings: Settings) -> None:
         raise ValueError("zero_shot is incompatible with refit=full")
 
 
-def _initial_model(settings: Settings, spec: ModelSpec):
+def _initial_model(settings: Settings, spec: ModelSpec, panel: Panel):
     """Reproduce the task initialization, including transfer and frozen parameters."""
     torch.manual_seed(settings.seed)
     np.random.seed(settings.seed)
@@ -137,7 +137,9 @@ def _initial_model(settings: Settings, spec: ModelSpec):
     transfer = None
     if settings.training.init_from:
         source = load_bundle(settings.training.init_from, device="cpu")
-        transferred = init_from_pretrained(model, source)
+        transferred = init_from_pretrained(
+            model, source, target_panel=panel, target_forecast=settings.forecast
+        )
         transfer = {
             "pretrain_identity": source.manifest["pretrain_identity"],
             "model_sha256": source.manifest["sha256"]["model.pt"],
@@ -361,7 +363,7 @@ def train_panel(
         panel, encoder, settings.forecast, settings.model.d_model, settings.model.cat_emb_dim
     )
     backbone_kwargs = settings.model.backbone_kwargs()
-    model, transfer = _initial_model(settings, spec)
+    model, transfer = _initial_model(settings, spec, panel)
     scaler_period_resolved = _resolve_scaler_period(settings, panel)
     scaler_period = (
         scaler_period_resolved["period"]
@@ -488,7 +490,7 @@ def train_panel(
                 # Keep the selection encoder/spec so initial weights and vocabularies
                 # are identical. Newly observed fit ids use its unknown codes.
                 del model
-                model, _ = _initial_model(settings, spec)
+                model, _ = _initial_model(settings, spec, panel)
                 trainer = Trainer(model, cfg, device, identity, settings.seed)
                 refit_result = trainer.fit(
                     panel,

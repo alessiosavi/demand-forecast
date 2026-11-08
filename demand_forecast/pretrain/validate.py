@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
@@ -21,10 +21,104 @@ from demand_forecast.pretrain.corpus import (
     CORPUS_REPO,
     CORPUS_ROLES,
     PRETRAIN_FREQ,
+    ShardPanelGroup,
     ShardRef,
     read_shard,
+    read_shard_v3,
     shard_panel,
+    shard_panels,
 )
+from demand_forecast.pretrain.periods import pretrain_period
+from demand_forecast.pretrain.sampler import V3BatchBuilder
+
+
+@dataclass
+class V3Pairs:
+    """Fixed selected rows with their real grids and per-cell scaling periods."""
+
+    groups: list[ShardPanelGroup]
+    items: np.ndarray
+
+
+def holdout_pairs_v3(shards, cfg: PretrainConfig) -> V3Pairs:
+    """Keep the legacy pair quota/seed while preserving each selected row's grid."""
+    selected = []
+    for shard in shards:
+        loaded = read_shard_v3(shard.path, kind=shard.kind, grid_policy=cfg.grid_policy)
+        eligible = [r for r in loaded.records if r.series.length >= cfg.forecast.horizon + 8]
+        indices = np.random.default_rng(cfg.seed).choice(
+            len(eligible), size=min(cfg.corpus.val_pairs_per_kind, len(eligible)), replace=False
+        )
+        for index in indices:
+            selected.append(replace(eligible[index], row_index=len(selected)))
+    return V3Pairs(
+        shard_panels(selected, period_policy=cfg.period_policy),
+        np.array(
+            [(r.row_index, r.series.length - cfg.forecast.horizon) for r in selected],
+            dtype=np.int64,
+        ).reshape(-1, 2),
+    )
+
+
+def evaluate_pairs_v3(model, source: V3Pairs, *, scale_floor_frac=0.0, **kwargs) -> dict:
+    """Use the training adapter and pool SQL cells with each row's own period."""
+    horizon, quantiles = kwargs["horizon"], kwargs["quantiles"]
+    batch_size = kwargs["batch_size"]
+    builder = V3BatchBuilder(
+        source.groups,
+        horizon,
+        kwargs["max_context"],
+        kwargs["encoder"],
+        scale_floor_frac=scale_floor_frac,
+    )
+    rows = {
+        index: (series, group.panel.seasonal_period)
+        for group in source.groups
+        for index, series in zip(group.row_indices, group.panel.series, strict=True)
+    }
+    labels = np.full((len(source.items), horizon), np.nan)
+    predictions = np.empty((*labels.shape, len(quantiles)))
+    scales = np.empty(len(labels))
+    last = np.full(len(labels), np.nan)
+    was_training = model.training
+    model.eval()
+    try:
+        with torch.no_grad():
+            for start in range(0, len(labels), batch_size):
+                batch = builder.build(source.items[start : start + batch_size]).to(kwargs["device"])
+                predictions[start : start + batch.size] = model.predict(batch).cpu().numpy()
+        for row, (index, origin) in enumerate(source.items):
+            series, period = rows[int(index)]
+            past = series.target[:origin]
+            future = series.target[origin : origin + horizon]
+            labels[row, : len(future)] = future
+            scales[row] = metrics.seasonal_error_per_item([past], period)[0]
+            observed = past[~np.isnan(past)]
+            if observed.size:
+                last[row] = observed[-1]
+
+        def scaled_errors(pred):
+            with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+                values = metrics.quantile_loss(labels, pred, quantiles) / scales[:, None, None]
+            return np.where(np.isfinite(values), values, np.nan)
+
+        errors = scaled_errors(predictions)
+        naive = scaled_errors(np.broadcast_to(last[:, None, None], predictions.shape))
+
+        def score(errors):
+            counts = np.isfinite(errors).sum(axis=(0, 1))
+            means = np.full(len(quantiles), np.nan)
+            np.divide(np.nansum(errors, axis=(0, 1)), counts, out=means, where=counts > 0)
+            return float(np.mean(means))
+
+        return {
+            "SQL": score(errors),
+            "naive_sql": score(naive),
+            "n_items": len(labels),
+            "n_excluded": int((~np.isfinite(errors).any(axis=(1, 2))).sum()),
+        }
+    finally:
+        model.train(was_training)
 
 
 def holdout_pairs(
@@ -159,6 +253,8 @@ class ValidationSet:
     quantiles: tuple[float, ...]
     batch_size: int = 128
     diagnostics: dict[str, tuple[Panel, np.ndarray] | None] = field(default_factory=dict)
+    v3_sources: dict[str, V3Pairs | None] | None = None
+    scale_floor_frac: float = 0.0
 
     @classmethod
     def build(
@@ -166,12 +262,17 @@ class ValidationSet:
     ) -> ValidationSet:
         """Select local hold-outs by kind/index and require configured external data."""
         sets = {}
+        v3_sources = {} if cfg.recipe == "v3" else None
         for kind, (_, held_out) in cfg.corpus.selections().items():
             wanted = set(held_out)
             selected = sorted(
                 (ref for ref in refs if ref.kind == kind and ref.index in wanted),
                 key=lambda ref: ref.index,
             )
+            if v3_sources is not None:
+                v3_sources[kind] = holdout_pairs_v3(selected, cfg) if selected else None
+                sets[kind] = None
+                continue
             chunks = [
                 holdout_pairs(
                     ref,
@@ -196,6 +297,20 @@ class ValidationSet:
             if not directory.is_dir():
                 raise FileNotFoundError(f"external validation directory not found: {directory}")
             external = external_pairs(config_name, cfg.corpus.root, horizon=cfg.forecast.horizon)
+        if v3_sources is not None:
+            v3_sources["external"] = None
+            if external is not None:
+                panel, origins = external
+                panel = replace(
+                    panel,
+                    seasonal_period=pretrain_period(panel.freq)
+                    if cfg.period_policy == "frequency"
+                    else 1,
+                )
+                v3_sources["external"] = V3Pairs(
+                    [ShardPanelGroup(panel, tuple(range(len(panel))), True)],
+                    np.column_stack((np.arange(len(origins)), origins)),
+                )
         return cls(
             tsmixup=sets.pop("tsmixup", None),
             kernel_synth=sets.pop("kernel_synth", None),
@@ -206,6 +321,8 @@ class ValidationSet:
             max_context=cfg.forecast.max_context,
             quantiles=tuple(cfg.forecast.quantiles),
             batch_size=cfg.training.val_batch_size,
+            v3_sources=v3_sources,
+            scale_floor_frac=cfg.forecast.scale_floor_frac,
         )
 
     def evaluate(self, model: ForecastModel, *, device: torch.device | str) -> dict:
@@ -228,16 +345,14 @@ class ValidationSet:
             "external": self.external,
             **self.diagnostics,
         }
+        if self.v3_sources is not None:
+            sources = self.v3_sources
         for kind, source in sources.items():
             if kind in self.diagnostics:
                 result[f"val_sql_{kind}"] = result[f"n_excluded_{kind}"] = None
             if source is None:
                 continue
-            panel, origins = source
-            scores = evaluate_pairs(
-                model,
-                panel,
-                enumerate(origins),
+            options = dict(
                 horizon=self.horizon,
                 max_context=self.max_context,
                 encoder=self.encoder,
@@ -245,6 +360,13 @@ class ValidationSet:
                 batch_size=self.batch_size,
                 device=device,
             )
+            if self.v3_sources is not None:
+                scores = evaluate_pairs_v3(
+                    model, source, scale_floor_frac=self.scale_floor_frac, **options
+                )
+            else:
+                panel, origins = source
+                scores = evaluate_pairs(model, panel, enumerate(origins), **options)
             result[f"n_excluded_{kind}"] = scores["n_excluded"]
             if kind == "external":
                 result["ext_sql"] = scores["SQL"]

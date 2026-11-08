@@ -32,9 +32,35 @@ M → 12, Q → 4, Y → 1. Equivalent tick durations share periods; begin/end a
 calendar anchors are preserved. Unspecified offsets and unsupported multipliers
 use period 1. Benchmark frequency conventions are unchanged.
 
-These are reader/config foundations; training and validation still use the legacy
-reader. Calendar schema/transfer, horizon/resume state, selection, and integration
-arrive in later rounds. This is not yet a runnable v3 training recipe.
+Round 2b connects this reader to training and validation. Each homogeneous group
+uses the canonical 16-value calendar schema plus `lag_period` and `lag_long`,
+followed by their masks. Encoder inputs start with target and observed; decoder
+inputs contain calendar and lag values/masks. Group batches are left-padded to
+the common context length and restored to the requested original row order.
+Synthetic and fallback rows have zero calendar values and false calendar masks;
+period-one lags are masked, while their weekly long lag remains 52. Lag values
+use only positions before the origin, in the target's normalization frame.
+
+The v3 model specification is fixed independently of any synthetic panel. All
+calendar/lag projection columns (values and masks) start at zero. Telemetry and
+the bundle manifest record cumulative encoder/decoder `feature_exposure` counts
+for every named slot, including zero-exposure slots; counts include every batch
+cell whose input mask is true, through the final training step, and resume with
+the checkpoint. Schema names and the target-lag policy enter only v3 identities.
+
+Transfer dispatches on the source specification. Named v3 sources copy matching
+calendar/lag value and mask weights by feature name into the task's own layout,
+including legacy frequency calendars and optional cycle lags. Mask offsets use
+the task's full covariate count; task-specific dynamic columns start at zero.
+The transfer API requires the destination panel and forecast layout and checks
+schema metadata before changing weights. Legacy v2 sources retain their original
+target/observed-only transfer. Backbone, head and static-bias handling are shared.
+
+`configs/pretrain-v3-corpus2.yaml` enables the adapter. Validation uses the same
+adapter and per-frequency periods for normalization and SQL, but synthetic
+holdouts still select checkpoints and real holdouts remain diagnostics. Fixed
+horizon sampling and selection match v2 for now; round 3 adds horizon sampling
+and its resume state, and round 4 adds real-holdout selection, EMA and snapshots.
 
 ## Contents and exclusions
 

@@ -478,3 +478,46 @@ def test_multitarget_task_probe_reaches_inference(tmp_path, monkeypatch):
     assert len(seen) == 1 and seen[0].shape == (4, spec.horizon, 9)
     assert np.isfinite(seen[0]).all()
     assert reports[spec.name]["infer_s"] > 0
+
+
+@pytest.mark.parametrize(
+    "recipe,policy,expected", [("v2", "legacy_one", 1), ("v3", "frequency", 7)]
+)
+def test_task_probe_resolves_pretraining_scaler_for_training_and_validation(
+    tmp_path, monkeypatch, recipe, policy, expected
+):
+    from dataclasses import replace
+
+    from demand_forecast.core import evaluation, training
+    from demand_forecast.pretrain import probe
+    from tests.helpers.fev_fixture import write_fev_fixture
+    from tests.helpers.fev_spec import fixture_spec
+    from tests.helpers.settings import tiny_settings
+
+    parquet = write_fev_fixture(tmp_path / "data", freq="D", length=80)
+    settings = tiny_settings(base_steps=2, d_model=8)
+    settings.forecast.scaler_period = "pretraining"
+    settings.training.init_from = tmp_path / "source"
+    settings.training.init_from.mkdir()
+    (settings.training.init_from / "manifest.json").write_text(
+        json.dumps({"config": {"recipe": recipe, "period_policy": policy}})
+    )
+    fit, prepare = training.Trainer.fit, evaluation.prepare_validation
+    seen = []
+
+    def observe_fit(self, *args, **kwargs):
+        seen.append(("fit", kwargs["scaler_period"]))
+        assert kwargs["scaler_period"] == expected
+        return fit(self, *args, **kwargs)
+
+    def observe_prepare(*args, **kwargs):
+        seen.append(("validation", kwargs["scaler_period"]))
+        assert kwargs["scaler_period"] == expected
+        return prepare(*args, **kwargs)
+
+    monkeypatch.setattr(training.Trainer, "fit", observe_fit)
+    monkeypatch.setattr(evaluation, "prepare_validation", observe_prepare)
+    # The explicit task period deliberately differs from both source policies.
+    spec = replace(fixture_spec(parquet), seasonality=2)
+    probe.task_probe([spec], settings, steps=2, out=tmp_path / "out")
+    assert seen == [("fit", expected), ("validation", expected)]

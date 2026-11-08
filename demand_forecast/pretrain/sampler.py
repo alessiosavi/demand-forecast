@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from fractions import Fraction
 from math import lcm
 from pathlib import Path
@@ -13,12 +13,13 @@ from typing import Any
 from weakref import finalize
 
 import numpy as np
+import torch
 
 from demand_forecast.data.encoders import StaticEncoder
 from demand_forecast.data.panel import Series
 from demand_forecast.data.sampler import Batch, BatchBuilder, _positive
 from demand_forecast.pretrain import corpus
-from demand_forecast.pretrain.corpus import ShardRef
+from demand_forecast.pretrain.corpus import ShardPanelGroup, ShardRecords, ShardRef
 
 Kind = str
 KIND_CODE = {"tsmixup": 0, "kernel_synth": 1, "chronos_real": 2, "gifteval_pretrain": 3}
@@ -283,6 +284,134 @@ class ShardStream(Iterator[Batch]):
         self._draws = np.empty((0, 2), dtype=np.int64)
 
 
+class V3BatchBuilder:
+    """Build homogeneous grids, then pad and scatter back to requested row order.
+
+    Items address original shard rows, even when a group has noncontiguous rows.
+    All groups share the canonical input layout; no Batch layout change is needed.
+    """
+
+    def __init__(
+        self,
+        groups: Sequence[ShardPanelGroup],
+        horizon,
+        max_context,
+        encoder,
+        *,
+        scale_floor_frac=0.0,
+    ):
+        self.builders = [
+            (
+                group,
+                BatchBuilder(
+                    group.panel,
+                    horizon,
+                    max_context,
+                    encoder,
+                    calendar=group.calendar_available,
+                    calendar_schema="canonical",
+                    target_lags="cycle",
+                    scale_floor_frac=scale_floor_frac,
+                ),
+            )
+            for group in groups
+        ]
+        self._routes = {}
+        self._row_indices = [torch.tensor(group.row_indices) for group, _ in self.builders]
+        for group_index, (group, _) in enumerate(self.builders):
+            for local_index, row_index in enumerate(group.row_indices):
+                if row_index in self._routes:
+                    raise ValueError("v3 rows must address exactly one panel group")
+                self._routes[row_index] = (group_index, local_index)
+
+    def build(self, items) -> Batch:
+        items = np.asarray(items, dtype=np.int64).reshape(-1, 2)
+        chunks, positions = [], []
+        selected_groups = {}
+        for row, (index, origin) in enumerate(items):
+            if int(index) not in self._routes:
+                raise ValueError("v3 items must address exactly one panel group")
+            group_index, local_index = self._routes[int(index)]
+            selected, pairs = selected_groups.setdefault(group_index, ([], []))
+            selected.append(row)
+            pairs.append((local_index, int(origin)))
+        for group_index, (selected, pairs) in selected_groups.items():
+            group, builder = self.builders[group_index]
+            chunk = builder.build(pairs)
+            chunk.series_index = self._row_indices[group_index][chunk.series_index]
+            chunks.append(chunk)
+            positions.extend(selected)
+        if not chunks:
+            raise ValueError("v3 batch requires at least one item")
+        length = max(chunk.target.shape[1] for chunk in chunks)
+        order = torch.tensor(np.argsort(positions))
+        context_fields = {"target", "observed", "padding", "enc_cov", "enc_cov_mask"}
+
+        def combine(name, values):
+            if name in context_fields:
+                padded = []
+                for value in values:
+                    buffer = value.new_zeros((value.shape[0], length, *value.shape[2:]))
+                    if value.shape[1]:
+                        buffer[:, -value.shape[1] :] = value
+                    padded.append(buffer)
+                values = padded
+            return torch.cat(values)[order]
+
+        return Batch(
+            **{
+                field.name: (
+                    {
+                        name: combine(name, [chunk.cat[name] for chunk in chunks])
+                        for name in chunks[0].cat
+                    }
+                    if field.name == "cat"
+                    else combine(field.name, [getattr(chunk, field.name) for chunk in chunks])
+                )
+                for field in fields(Batch)
+            }
+        )
+
+
+class V3ShardStream(ShardStream):
+    """Reuse the legacy schedule/state with a real-grid, named-input adapter."""
+
+    def __init__(self, *args, period_policy, grid_policy, scale_floor_frac, **kwargs):
+        self.period_policy = period_policy
+        self.grid_policy = grid_policy
+        self.scale_floor_frac = scale_floor_frac
+        super().__init__(*args, **kwargs)
+
+    def _read(self, path: Path) -> ShardRecords:
+        records = corpus.read_shard_v3(path, kind=self.kind, grid_policy=self.grid_policy)
+        self.shard_loads += 1
+        return records
+
+    def _load_shard(self) -> None:
+        ref = self.refs[int(self._order[self.shard_cursor])]
+        if self._future is None:
+            loaded = self._read(ref.path)
+        else:
+            future, self._future = self._future, None
+            loaded = future.result()
+        self._builder = V3BatchBuilder(
+            corpus.shard_panels(loaded.records, period_policy=self.period_policy),
+            self.horizon,
+            self.max_context,
+            self.encoder,
+            scale_floor_frac=self.scale_floor_frac,
+        )
+        lengths = np.array([record.series.length for record in loaded.records], dtype=np.int64)
+        indices = np.flatnonzero(lengths > self.min_context)
+        self._rng = np.random.default_rng(
+            (self.seed, KIND_CODE[self.kind], self.pass_index, ref.index)
+        )
+        origins = self._rng.integers(self.min_context, lengths[indices])
+        draws = np.column_stack((indices, origins))
+        self._draws = draws[self._rng.permutation(len(draws))]
+        self._prefetch_next()
+
+
 class CorpusSampler:
     """Mix independent shard streams on an exact, zero-based batch schedule.
 
@@ -311,6 +440,10 @@ class CorpusSampler:
         holdout: Sequence[ShardRef] = (),
         sources: dict[str, Sequence[ShardRef]] | None = None,
         weights: dict[str, float] | None = None,
+        recipe: str = "v2",
+        period_policy: str = "legacy_one",
+        grid_policy: str = "legacy_weekly",
+        scale_floor_frac: float = 0.0,
     ) -> None:
         _positive(kernel_synth_every + 1, "kernel_synth_every + 1")
         primary = {(ref.kind, ref.index) for ref in tsmixup}
@@ -353,9 +486,19 @@ class CorpusSampler:
             sources if sources is not None else {"tsmixup": tsmixup, "kernel_synth": kernel_synth}
         )
         self.streams = {}
+        stream_type = ShardStream
+        if recipe == "v3":
+            stream_type = V3ShardStream
+            kwargs.update(
+                period_policy=period_policy,
+                grid_policy=grid_policy,
+                scale_floor_frac=scale_floor_frac,
+            )
+        elif recipe != "v2":
+            raise ValueError("recipe must be v2 or v3")
         try:
             for kind, refs in refs_by_kind.items():
-                self.streams[kind] = ShardStream(refs, kind, **kwargs)
+                self.streams[kind] = stream_type(refs, kind, **kwargs)
         except BaseException:
             for stream in self.streams.values():
                 stream.close()

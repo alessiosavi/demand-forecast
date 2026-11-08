@@ -34,13 +34,15 @@ class Frame:
     scale_floored: bool = False
 
 
-def metric_scale_weight(frame: Frame, past: np.ndarray, m_task: int) -> tuple[float, bool]:
+def metric_scale_weight(
+    frame: Frame, past: np.ndarray, m_task: int, *, m_frame: int | None = None
+) -> tuple[float, bool]:
     """Return the context-only frame/metric scale ratio and its clipping flag.
 
     Undefined or zero metric scales exclude the sample, independently of frame
     eligibility. Use the effective frame scale, including either scale floor.
     """
-    task_scale = seasonal_error(past, m_task)
+    task_scale = frame.scale_raw if m_frame == m_task else seasonal_error(past, m_task)
     if not np.isfinite(task_scale) or task_scale <= 0:
         return 0.0, False
     with np.errstate(over="ignore"):

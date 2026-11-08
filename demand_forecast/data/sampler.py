@@ -416,7 +416,7 @@ class BatchBuilder:
             self.floored_target_samples += int(frame.scale_floored)
             if self.loss_weight == "metric_scale":
                 weight, clipped = metric_scale_weight(
-                    frame, series.target[:origin], panel.seasonal_period
+                    frame, series.target[:origin], panel.seasonal_period, m_frame=self.scaler_period
                 )
                 arrays["loss_weight"][row] = weight
                 self.loss_weight_clipped += int(clipped)
