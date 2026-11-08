@@ -64,7 +64,21 @@ def test_identity_ignores_unset_quick_fields_and_changes_when_set(field):
     assert dumped["training"]["val_items_max"] is None
     expected = settings.model_dump(mode="json")
     del expected["training"]["max_steps_cap"], expected["training"]["val_items_max"]
-    for key in ("init_from", "zero_shot", "eval_at_start", "trainable", "series_embedding"):
+    for key in (
+        "init_from",
+        "zero_shot",
+        "eval_at_start",
+        "trainable",
+        "series_embedding",
+        "warmup_frac",
+        "min_steps",
+        "selection",
+        "weight_average",
+        "ema_decay",
+        "average_last_k",
+        "select_min_gain",
+        "exception_policy",
+    ):
         del expected["training"][key]
     del expected["forecast"]["scale_floor_frac"]
     assert _identity_settings(settings) == expected
@@ -525,3 +539,78 @@ def test_train_panel_init_from_transfers_then_trains(
     )
     assert report["transfer"]["pretrain_identity"] == source.manifest["pretrain_identity"]
     assert "zero_shot" not in load_bundle(directory).manifest
+
+
+@pytest.mark.parametrize("stop_after", [None, 2])
+def test_exception_pretrained_ships_initial_weights_and_skips_refit(
+    tmp_path, panel29, origin29, tiny_pretrained_bundle_dir, monkeypatch, stop_after
+):
+    from copy import deepcopy
+
+    import torch
+
+    from demand_forecast.core.training import Trainer
+
+    settings = tiny_settings(base_steps=4)
+    settings.training.init_from = str(tiny_pretrained_bundle_dir)
+    settings.training.min_train_history = 1000
+    settings.training.exception_policy = "pretrained"
+    settings.training.refit = "full"
+    fit, initials = Trainer.fit, []
+
+    def capture(self, panel, plan, *args, **kwargs):
+        assert plan.exception and kwargs["keep_initial"]
+        assert "step_limit" not in kwargs  # no refit invocation
+        initials.append(deepcopy(self.model.state_dict()))
+        return fit(self, panel, plan, *args, **kwargs)
+
+    monkeypatch.setattr(Trainer, "fit", capture)
+    if stop_after:
+        with pytest.raises(InterruptedRun):
+            train_panel(
+                panel29,
+                origin29,
+                settings,
+                tmp_path,
+                dataset_fingerprint="fp",
+                stop_after=stop_after,
+            )
+    bundle_path = train_panel(
+        panel29,
+        origin29,
+        settings,
+        tmp_path,
+        dataset_fingerprint="fp",
+        resume=stop_after is not None,
+    )
+    bundle = load_bundle(bundle_path)
+    report = json.loads((tmp_path / "run.json").read_text())
+    checkpoint = torch.load(tmp_path / "checkpoints/latest.pt", weights_only=False)
+    assert report["exception_policy_applied"] == "pretrained"
+    assert report["fit_result"]["best_step"] == 0
+    assert report["fit_result"]["steps"] == 4
+    assert report["refit"]["performed"] is False
+    assert report["refit"]["reason"] == "no_inner_validation"
+    assert report["n_evaluations"] == 0 and report["early_stop_reachable"] is False
+    for key, value in bundle.model.state_dict().items():
+        assert torch.equal(value, checkpoint["best_state"][key])
+        if key != "fallback_level":
+            assert torch.equal(value, initials[0][key]), key
+    assert not (tmp_path / "checkpoints/refit").exists()
+
+
+def test_exception_pretrained_without_source_uses_final(tmp_path, tiny_panel_and_settings):
+    import torch
+
+    panel, origin, settings = tiny_panel_and_settings
+    settings.training.min_train_history = 1000
+    settings.training.exception_policy = "pretrained"
+    path = train_panel(panel, origin, settings, tmp_path, dataset_fingerprint="fp")
+    report = json.loads((tmp_path / "run.json").read_text())
+    assert report["exception_policy_applied"] == "final"
+    assert report["fit_result"]["best_step"] == report["fit_result"]["steps"] == 2
+    saved = torch.load(tmp_path / "checkpoints/latest.pt", weights_only=False)
+    assert all(
+        torch.equal(value, saved["model"][key])
+        for key, value in load_bundle(path).model.state_dict().items()
+    )

@@ -183,6 +183,7 @@ def task_probe(
     from demand_forecast.core.bundle import Bundle
     from demand_forecast.core.evaluation import evaluate_prepared, prepare_validation
     from demand_forecast.core.training import (
+        TRAIN_CONFIG_EXCLUDE,
         NonFiniteTraining,
         TrainConfig,
         resolve_budget,
@@ -232,20 +233,7 @@ def task_probe(
 
         # Keep Trainer's actual split and sampler, but suppress model selection
         # during the bounded timing run. Validation is measured exactly once below.
-        train_cfg = TrainConfig(
-            **settings.training.model_dump(
-                exclude={
-                    "refit",
-                    "min_train_history",
-                    "val_items_max",
-                    "init_from",
-                    "zero_shot",
-                    "eval_at_start",
-                    "trainable",
-                    "series_embedding",
-                }
-            )
-        )
+        train_cfg = TrainConfig(**settings.training.model_dump(exclude=TRAIN_CONFIG_EXCLUDE))
         train_cfg.batch_size = 128
         train_cfg.base_steps = train_cfg.max_steps_cap = steps
         trainer = _ProbeTrainer(model, train_cfg, device, f"probe-{spec.name}", settings.seed)

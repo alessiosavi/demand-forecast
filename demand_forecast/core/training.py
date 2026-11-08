@@ -9,10 +9,12 @@ import math
 import os
 import random
 import time
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+from typing import Literal
 from zipfile import ZipFile
 
 import numpy as np
@@ -79,6 +81,22 @@ class NonFiniteTraining(RuntimeError):  # noqa: N818 - public training failure s
     """Consecutive non-finite losses stopped training with a terminal checkpoint."""
 
 
+# Settings controls consumed by the run protocol rather than the trainer.
+TRAIN_CONFIG_EXCLUDE = frozenset(
+    {
+        "refit",
+        "min_train_history",
+        "val_items_max",
+        "init_from",
+        "zero_shot",
+        "eval_at_start",
+        "trainable",
+        "series_embedding",
+        "exception_policy",
+    }
+)
+
+
 @dataclass
 class TrainConfig:
     base_steps: int = 3000
@@ -93,6 +111,13 @@ class TrainConfig:
     amp: bool = True
     checkpoint_every: int = 200
     max_steps_cap: int | None = None
+    warmup_frac: float | None = None
+    min_steps: int | None = None
+    selection: Literal["best", "smoothed"] = "best"
+    weight_average: Literal["none", "ema", "tail"] = "none"
+    ema_decay: float = 0.99
+    average_last_k: int = 3
+    select_min_gain: float = 0.0
 
 
 @dataclass
@@ -110,17 +135,95 @@ class FitResult:
 
 
 def resolve_budget(
-    base_steps: int, n_series: int, eval_every: int, max_steps_cap: int | None = None
+    base_steps: int,
+    n_series: int,
+    eval_every: int,
+    max_steps_cap: int | None = None,
+    min_steps: int | None = None,
 ) -> tuple[int, int]:
     """Scale and clip steps, optionally cap them, then resolve evaluation frequency."""
     if base_steps < 1 or n_series < 0 or eval_every < 1:
         raise ValueError("base_steps and eval_every must be positive; n_series must be nonnegative")
     if max_steps_cap is not None and max_steps_cap < 1:
         raise ValueError("max_steps_cap must be positive")
-    max_steps = int(np.clip(base_steps * n_series / 2000, min(500, base_steps), 4 * base_steps))
+    if min_steps is not None and min_steps < 1:
+        raise ValueError("min_steps must be positive")
+    floor = min(500 if min_steps is None else min_steps, base_steps)
+    max_steps = int(np.clip(base_steps * n_series / 2000, floor, 4 * base_steps))
     if max_steps_cap is not None:
         max_steps = min(max_steps, max_steps_cap)
     return max_steps, min(eval_every, max(max_steps // 5, 1))
+
+
+def resolve_warmup(max_steps: int, warmup_steps: int, warmup_frac: float | None) -> int:
+    """Retain absolute warmup unless a fraction of the schedule is requested."""
+    return warmup_steps if warmup_frac is None else round(warmup_frac * max_steps)
+
+
+def evaluation_count(max_steps: int, eval_every: int, eval_at_start: bool = False) -> int:
+    """Count planned evaluations, including the final partial interval."""
+    return math.ceil(max_steps / eval_every) + int(eval_at_start) if max_steps else 0
+
+
+def _cpu_state(state: dict) -> dict:
+    return {key: value.detach().cpu().clone() for key, value in state.items()}
+
+
+class _WeightAverage:
+    """A device-local EMA or CPU tail ring, separate from the live optimizer."""
+
+    def __init__(self, cfg: TrainConfig, state: dict):
+        self.mode, self.decay, self.k = cfg.weight_average, cfg.ema_decay, cfg.average_last_k
+        self.device = next(iter(state.values())).device
+        self.shadow = (
+            {
+                key: value.detach().clone()
+                for key, value in state.items()
+                if value.is_floating_point()
+            }
+            if self.mode == "ema"
+            else None
+        )
+        self.tail: list[dict] = []
+        self.last_step: int | None = None
+
+    def update(self, state: dict) -> None:
+        if self.mode == "ema":
+            for key, value in state.items():
+                if value.is_floating_point():
+                    self.shadow[key].mul_(self.decay).add_(value.detach(), alpha=1 - self.decay)
+
+    def sample(self, state: dict, step: int) -> None:
+        if self.mode == "tail" and self.last_step != step:
+            self.tail.append(_cpu_state(state))
+            self.tail = self.tail[-self.k :]
+            self.last_step = step
+
+    def weights(self, state: dict) -> dict:
+        if self.mode == "none":
+            return state
+        averaged = {}
+        for key, value in state.items():
+            if not value.is_floating_point():
+                averaged[key] = value.detach().cpu().clone()
+            elif self.mode == "ema":
+                averaged[key] = self.shadow[key]
+            elif self.tail:
+                total = self.tail[0][key].clone()
+                for snapshot in self.tail[1:]:
+                    total.add_(snapshot[key])
+                averaged[key] = total.div_(len(self.tail))
+            else:
+                averaged[key] = value.detach().cpu().clone()
+        return averaged
+
+    def state_dict(self) -> dict:
+        return {"shadow": self.shadow, "tail": self.tail, "last_step": self.last_step}
+
+    def load_state_dict(self, state: dict) -> None:
+        self.shadow, self.tail, self.last_step = state["shadow"], state["tail"], state["last_step"]
+        if self.shadow is not None:
+            self.shadow = {key: value.to(self.device) for key, value in self.shadow.items()}
 
 
 def lr_factor(step: int, *, max_steps: int, warmup_steps: int) -> float:
@@ -280,6 +383,7 @@ class Trainer:
         *,
         step_limit: int | None = None,
         schedule_max_steps: int | None = None,
+        keep_initial: bool = False,
     ) -> FitResult:
         """Fit the permitted split, or continue its checkpoint without reseeding.
 
@@ -311,6 +415,16 @@ class Trainer:
             raise ValueError("batch_size, checkpoint_every and patience must be positive")
         if self.cfg.warmup_steps < 0:
             raise ValueError("warmup_steps must be nonnegative")
+        if self.cfg.warmup_frac is not None and not 0 <= self.cfg.warmup_frac <= 1:
+            raise ValueError("warmup_frac must be between 0 and 1")
+        if self.cfg.selection not in {"best", "smoothed"}:
+            raise ValueError("unknown selection")
+        if self.cfg.weight_average not in {"none", "ema", "tail"}:
+            raise ValueError("unknown weight_average")
+        if not 0 <= self.cfg.ema_decay < 1 or self.cfg.average_last_k < 1:
+            raise ValueError("ema_decay must be in [0, 1); average_last_k must be positive")
+        if not 0 <= self.cfg.select_min_gain < 1:
+            raise ValueError("select_min_gain must be in [0, 1)")
         if checkpoint_dir is None and (stop_after is not None or resume or eval_at_start):
             checkpoint_dir = Path("checkpoints")
             logger.info("checkpoint_dir not supplied; using %s", checkpoint_dir)
@@ -319,14 +433,22 @@ class Trainer:
         self.plan = plan
         horizon, max_context = forecast_cfg.horizon, forecast_cfg.max_context
         self.max_steps, self.eval_every = resolve_budget(
-            self.cfg.base_steps, len(plan.fit_ids), self.cfg.eval_every, self.cfg.max_steps_cap
+            self.cfg.base_steps,
+            len(plan.fit_ids),
+            self.cfg.eval_every,
+            self.cfg.max_steps_cap,
+            self.cfg.min_steps,
         )
         if schedule_max_steps is not None:
             self.max_steps = schedule_max_steps
+            if self.cfg.weight_average == "tail":
+                self.eval_every = min(self.cfg.eval_every, max(self.max_steps // 5, 1))
         self.step_limit = self.max_steps if step_limit is None else step_limit
         if not 1 <= self.step_limit <= self.max_steps:
             raise ValueError("step_limit must be between 1 and max_steps")
-        self.warmup_steps = self.cfg.warmup_steps
+        self.warmup_steps = resolve_warmup(
+            self.max_steps, self.cfg.warmup_steps, self.cfg.warmup_frac
+        )
         fit_ids = set(plan.fit_ids)
         fit_indices = [i for i, series in enumerate(panel.series) if series.series_id in fit_ids]
         origins = build_origins(panel, horizon, forecast_cfg.min_context, upto=plan.train_upto)
@@ -355,6 +477,10 @@ class Trainer:
         self.history: list[dict] = []
         self.best_score: float | None = None
         self.best_state = deepcopy(self.model.state_dict())
+        self.average = _WeightAverage(self.cfg, self.model.state_dict())
+        self.selection_states: list[dict] = []
+        self.selection_left_score: float | None = None
+        self.initial_score: float | None = None
         self.timings, self.telemetry = _empty_timings(), []
         self._last_eval_step, self._last_eval_train_s = 0, 0.0
         if resume and checkpoint_path is not None and checkpoint_path.exists():
@@ -377,6 +503,9 @@ class Trainer:
             or self.consecutive_nonfinite >= NONFINITE_STOP_AFTER
         ):
             return self._result("nonfinite_losses")
+        if self.cfg.selection == "smoothed" and self.terminal_reason in {"early_stop", "max_steps"}:
+            self.model.load_state_dict(self.best_state)
+            return self._result(self.terminal_reason)
         if not len(origins):
             return self._result("no_training_data")
 
@@ -410,21 +539,22 @@ class Trainer:
             and not self.initial_eval_done
         ):
             eval_started = time.perf_counter()
-            if prepared is not None:
-                metrics = _evaluate_with_backoff(self.model, prepared, forecast_cfg.quantiles)
-            else:
-                metrics = evaluate_fn(
-                    self.model,
-                    panel,
-                    plan.val_items,
-                    plan.val_origin,
-                    horizon,
-                    max_context,
-                    encoder,
-                    forecast_cfg.quantiles,
-                )
-            self.history.append({"step": 0, **metrics})
-            self._select_best(float(metrics["SQL"]))
+            with self._evaluation_weights():
+                if prepared is not None:
+                    metrics = _evaluate_with_backoff(self.model, prepared, forecast_cfg.quantiles)
+                else:
+                    metrics = evaluate_fn(
+                        self.model,
+                        panel,
+                        plan.val_items,
+                        plan.val_origin,
+                        horizon,
+                        max_context,
+                        encoder,
+                        forecast_cfg.quantiles,
+                    )
+                self.history.append({"step": 0, **metrics})
+                self._select_best(float(metrics["SQL"]))
             self.initial_eval_done = True
             self.model.train()
             if self.device.type == "cuda":
@@ -449,8 +579,10 @@ class Trainer:
         self.model.train()
         session_steps = 0
         floored_before = self.sampler.builder.floored_target_samples
-        while self.step < self.step_limit and (
-            plan.exception or self.patience_counter < self.cfg.patience
+        while (
+            self.step < self.step_limit
+            and self.terminal_reason is None
+            and (plan.exception or self.patience_counter < self.cfg.patience)
         ):
             if self.sampler.position == len(self.sampler):
                 self.sampler.set_epoch(self.sampler.epoch + 1)
@@ -464,12 +596,13 @@ class Trainer:
                     self.scaler.step(self.optimizer)
                     scale_before = self.scaler.get_scale() if self.scaler.is_enabled() else None
                     self.scaler.update()
-                    if (
-                        scale_before is not None
-                        and self.scaler.get_scale() < scale_before
-                        and self.timings["scaler_skips"] is not None
-                    ):
+                    skipped_update = (
+                        scale_before is not None and self.scaler.get_scale() < scale_before
+                    )
+                    if skipped_update and self.timings["scaler_skips"] is not None:
                         self.timings["scaler_skips"] += 1
+                    if not skipped_update and self.cfg.weight_average == "ema":
+                        self.average.update(self.model.state_dict())
                 self.scheduler.step()
                 self.step += 1
                 session_steps += 1
@@ -497,27 +630,33 @@ class Trainer:
                         logger.info("checkpoint_dir not supplied; using %s", checkpoint_dir)
                     self.checkpoint(checkpoint_path)
                     return self._result("nonfinite_losses")
+                if plan.exception and (
+                    self.step % self.eval_every == 0 or self.step == self.step_limit
+                ):
+                    # Refit has no validation, but uses the same tail sampling cadence.
+                    self.average.sample(self.model.state_dict(), self.step)
                 if not plan.exception and (
                     self.step % self.eval_every == 0 or self.step == self.max_steps
                 ):
                     eval_started = time.perf_counter()
-                    if prepared is not None:
-                        metrics = _evaluate_with_backoff(
-                            self.model, prepared, forecast_cfg.quantiles
-                        )
-                    else:
-                        metrics = evaluate_fn(
-                            self.model,
-                            panel,
-                            plan.val_items,
-                            plan.val_origin,
-                            horizon,
-                            max_context,
-                            encoder,
-                            forecast_cfg.quantiles,
-                        )
-                    record.update(metrics)
-                    self._select_best(float(metrics["SQL"]))
+                    with self._evaluation_weights():
+                        if prepared is not None:
+                            metrics = _evaluate_with_backoff(
+                                self.model, prepared, forecast_cfg.quantiles
+                            )
+                        else:
+                            metrics = evaluate_fn(
+                                self.model,
+                                panel,
+                                plan.val_items,
+                                plan.val_origin,
+                                horizon,
+                                max_context,
+                                encoder,
+                                forecast_cfg.quantiles,
+                            )
+                        record.update(metrics)
+                        self._select_best(float(metrics["SQL"]))
                     self.model.train()
                     if self.device.type == "cuda":
                         # Include any asynchronous best-state copies in evaluation
@@ -563,8 +702,14 @@ class Trainer:
                     not plan.exception and self.patience_counter >= self.cfg.patience
                 )
                 interrupted = stop_after is not None and session_steps >= stop_after
-                if plan.exception and (finished or interrupted):
-                    self.best_state = deepcopy(self.model.state_dict())
+                if finished and not plan.exception and self.cfg.selection == "smoothed":
+                    # Fix the stopping boundary before the final edge can reset patience.
+                    self.terminal_reason = (
+                        "early_stop" if self.patience_counter >= self.cfg.patience else "max_steps"
+                    )
+                    self._finish_selection()
+                if plan.exception and (finished or interrupted) and not keep_initial:
+                    self.best_state = deepcopy(self.average.weights(self.model.state_dict()))
                     self.best_step = self.step
                 if checkpoint_path is not None and (
                     self.step % self.cfg.checkpoint_every == 0 or finished or interrupted
@@ -581,20 +726,73 @@ class Trainer:
             if plan.exception
             else ("early_stop" if self.patience_counter >= self.cfg.patience else "max_steps")
         )
-        if not plan.exception:
+        if not plan.exception and self.cfg.selection == "smoothed":
+            reason = self.terminal_reason or reason
+        if not plan.exception or keep_initial or self.cfg.weight_average != "none":
             self.model.load_state_dict(self.best_state)
         return self._result(reason)
 
     def _select_best(self, score: float) -> None:
+        if self.step == 0:
+            self.initial_score = score
+        if self.cfg.selection == "smoothed":
+            if len(self.selection_states) == 2:
+                self.selection_left_score = self.selection_states.pop(0)["score"]
+            self.selection_states.append(
+                {"step": self.step, "score": score, "state": _cpu_state(self.model.state_dict())}
+            )
+            if len(self.selection_states) == 2:
+                values = [entry["score"] for entry in self.selection_states]
+                if self.selection_left_score is not None:
+                    values.insert(0, self.selection_left_score)
+                self._select_smoothed(self.selection_states[0], sum(values) / len(values))
+        else:
+            self._consider_state(score, self.step, self.model.state_dict())
+
+    def _finish_selection(self) -> None:
+        if self.selection_states:
+            values = [entry["score"] for entry in self.selection_states]
+            self._select_smoothed(self.selection_states[-1], sum(values) / len(values))
+
+    def _select_smoothed(self, entry: dict, score: float) -> None:
+        self._consider_state(score, entry["step"], entry["state"])
+        # Raw SQL remains available; expose the actual selection criterion too.
+        record = next(
+            record for record in reversed(self.history) if record["step"] == entry["step"]
+        )
+        record["selection_score"] = score
+
+    def _consider_state(self, score: float, step: int, state: dict) -> None:
         """Keep every absolute improvement, but reset patience only past tolerance."""
+        eligible = not (
+            step > 0
+            and self.cfg.select_min_gain > 0
+            and self.initial_score is not None
+            and not score < self.initial_score * (1 - self.cfg.select_min_gain)
+        )
         previous = self.best_score
-        improved = math.isfinite(score) and (
-            previous is None or score < previous * (1 - self.cfg.rel_tol)
+        improved = (
+            eligible
+            and math.isfinite(score)
+            and (previous is None or score < previous * (1 - self.cfg.rel_tol))
         )
         self.patience_counter = 0 if improved else self.patience_counter + 1
-        if math.isfinite(score) and (previous is None or score < previous):
-            self.best_score, self.best_step = score, self.step
-            self.best_state = deepcopy(self.model.state_dict())
+        if eligible and math.isfinite(score) and (previous is None or score < previous):
+            self.best_score, self.best_step = score, step
+            self.best_state = deepcopy(state)
+
+    @contextmanager
+    def _evaluation_weights(self):
+        if self.cfg.weight_average == "none":
+            yield
+            return
+        live = _cpu_state(self.model.state_dict())
+        self.average.sample(live, self.step)
+        self.model.load_state_dict(self.average.weights(live))
+        try:
+            yield
+        finally:
+            self.model.load_state_dict(live)
 
     def _result(self, reason: str) -> FitResult:
         best_state = deepcopy(self.best_state)
@@ -677,6 +875,13 @@ class Trainer:
             "last_eval_step": self._last_eval_step,
             "last_eval_train_s": self._last_eval_train_s,
         }
+        if self.cfg.weight_average != "none":
+            state["weight_average"] = self.average.state_dict()
+        if self.cfg.selection == "smoothed":
+            state["selection_states"] = self.selection_states
+            state["selection_left_score"] = self.selection_left_score
+        if self.initial_score is not None:
+            state["initial_score"] = self.initial_score
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         with NamedTemporaryFile(dir=path.parent, prefix=f".{path.name}-", delete=False) as file:
@@ -732,6 +937,16 @@ class Trainer:
         self.consecutive_nonfinite = state.get("consecutive_nonfinite", 0)
         self.initial_eval_done = state.get("initial_eval_done", False)
         self.terminal_reason = state.get("terminal_reason")
+        if "weight_average" in state:
+            self.average.load_state_dict(state["weight_average"])
+        self.selection_states = state.get("selection_states", [])
+        self.selection_left_score = state.get("selection_left_score")
+        self.initial_score = state.get("initial_score")
+        if self.initial_score is None and self.initial_eval_done:
+            self.initial_score = next(
+                (entry["SQL"] for entry in self.history if entry["step"] == 0 and "SQL" in entry),
+                None,
+            )
         self.timings.update(state.get("timings", {}))
         with ZipFile(path) as archive:
             root = archive.namelist()[0].split("/")[0]

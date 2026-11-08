@@ -21,13 +21,16 @@ from demand_forecast.config import Settings
 from demand_forecast.core.bundle import load_bundle, load_bundle_manifest, save_bundle
 from demand_forecast.core.training import (
     NONFINITE_STOP_AFTER,
+    TRAIN_CONFIG_EXCLUDE,
     InterruptedRun,
     NonFiniteTraining,
     TrainConfig,
     Trainer,
     _empty_timings,
     _set_fallback_level,
+    evaluation_count,
     resolve_budget,
+    resolve_warmup,
 )
 from demand_forecast.core.transfer import init_from_pretrained
 from demand_forecast.core.validation import plan_inner_validation, subsample_validation
@@ -52,7 +55,18 @@ def _identity_settings(settings: Settings) -> dict:
     for key in ("zero_shot", "eval_at_start"):
         if training[key] is False:
             training.pop(key)
-    for key, default in (("trainable", "all"), ("series_embedding", True)):
+    for key, default in (
+        ("trainable", "all"),
+        ("series_embedding", True),
+        ("warmup_frac", None),
+        ("min_steps", None),
+        ("selection", "best"),
+        ("weight_average", "none"),
+        ("ema_decay", 0.99),
+        ("average_last_k", 3),
+        ("select_min_gain", 0.0),
+        ("exception_policy", "final"),
+    ):
         if training[key] == default:
             training.pop(key)
     if payload["forecast"]["scale_floor_frac"] == 0.0:
@@ -256,7 +270,10 @@ def train_panel(
                 limit = state.get("step_limit", state["max_steps"])
                 unfinished_phase |= state["step"] < limit and (
                     existing_checkpoint == refit_checkpoint
-                    or state["patience_counter"] < settings.training.patience
+                    or (
+                        state.get("terminal_reason") not in {"early_stop", "max_steps"}
+                        and state["patience_counter"] < settings.training.patience
+                    )
                 )
             del state
         if selection_path.exists():
@@ -295,6 +312,7 @@ def train_panel(
         len(plan.fit_ids),
         settings.training.eval_every,
         settings.training.max_steps_cap,
+        settings.training.min_steps,
     )
     logger.info(
         "training budget: task=%s items=%d max_steps=%d",
@@ -330,6 +348,11 @@ def train_panel(
     }
     training_cutoff = plan.train_upto
     validation_history = []
+    keep_initial = (
+        plan.exception
+        and settings.training.exception_policy == "pretrained"
+        and settings.training.init_from is not None
+    )
     if settings.training.zero_shot:
         fit_ids = set(plan.fit_ids)
         fit_indices = [i for i, series in enumerate(panel.series) if series.series_id in fit_ids]
@@ -364,20 +387,7 @@ def train_panel(
             },
         )
     else:
-        cfg = TrainConfig(
-            **settings.training.model_dump(
-                exclude={
-                    "refit",
-                    "min_train_history",
-                    "val_items_max",
-                    "init_from",
-                    "zero_shot",
-                    "eval_at_start",
-                    "trainable",
-                    "series_embedding",
-                }
-            )
-        )
+        cfg = TrainConfig(**settings.training.model_dump(exclude=TRAIN_CONFIG_EXCLUDE))
         fit_started = time.perf_counter()
         selection_steps_this_call = 0
         if selection is None:
@@ -391,6 +401,7 @@ def train_panel(
                 resume=resume,
                 stop_after=stop_after,
                 eval_at_start=settings.training.eval_at_start,
+                keep_initial=keep_initial,
             )
             _check_fit_result(result, checkpoint)
             selection_steps_this_call = result.steps - resumed_from_step
@@ -477,6 +488,27 @@ def train_panel(
         "resumed_from_step": resumed_from_step,
         "device": str(device),
         "resolved_budget": resolved_budget,
+        "resolved_warmup_steps": (
+            resolve_warmup(
+                resolved_budget["max_steps"],
+                settings.training.warmup_steps,
+                settings.training.warmup_frac,
+            )
+            if not settings.training.zero_shot
+            else 0
+        ),
+        "n_evaluations": (
+            evaluation_count(
+                resolved_budget["max_steps"],
+                resolved_budget["eval_every"],
+                settings.training.eval_at_start,
+            )
+            if not plan.exception and fit_result["stop_reason"] != "no_training_data"
+            else 0
+        ),
+        "exception_policy_applied": ("pretrained" if keep_initial else "final")
+        if plan.exception
+        else None,
         "n_fit_ids": len(plan.fit_ids),
         "n_val_items": n_val_items,
         "val_items_max": settings.training.val_items_max,
@@ -505,6 +537,7 @@ def train_panel(
             "cumulative": timings,
         },
     }
+    report["early_stop_reachable"] = report["n_evaluations"] > settings.training.patience
     if transfer is not None:
         report["transfer"] = transfer
     report = _finite_json(report)

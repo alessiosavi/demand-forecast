@@ -103,6 +103,8 @@ class TrainingConfig(BaseModel):
     learning_rate: float = Field(1e-3, gt=0, allow_inf_nan=False)
     weight_decay: float = Field(1e-2, ge=0, allow_inf_nan=False)
     warmup_steps: int = Field(100, ge=0)
+    warmup_frac: float | None = Field(None, ge=0, le=1, allow_inf_nan=False)
+    min_steps: int | None = Field(None, ge=1)
     grad_clip: float = Field(1.0, gt=0, allow_inf_nan=False)
     eval_every: int = Field(200, ge=1)
     patience: int = Field(5, ge=1)
@@ -118,6 +120,12 @@ class TrainingConfig(BaseModel):
     eval_at_start: bool = False
     trainable: Literal["all", "heads_only"] = "all"
     series_embedding: bool = True
+    selection: Literal["best", "smoothed"] = "best"
+    weight_average: Literal["none", "ema", "tail"] = "none"
+    ema_decay: float = Field(0.99, ge=0, lt=1, allow_inf_nan=False)
+    average_last_k: int = Field(3, ge=1)
+    select_min_gain: float = Field(0.0, ge=0, lt=1, allow_inf_nan=False)
+    exception_policy: Literal["final", "pretrained"] = "final"
 
     @model_validator(mode="after")
     def validate_refit(self):

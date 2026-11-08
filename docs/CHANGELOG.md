@@ -18,6 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   real-grid shard reader with crop-aware starts, homogeneous panels, row maps and
   fallback counts; pretraining-only frequency periods with anchored alias support.
 
+- Optional fine-tune hygiene controls for proportional warmup, a configurable
+  budget floor, smoothed checkpoint selection, EMA/tail weight averaging,
+  step-zero selection margins, and a pretrained short-history exception policy.
+  Defaults preserve existing identities and training behavior. Averaging and
+  smoothed selection resume exactly; `fev plan` and `run.json` report resolved
+  schedules and whether the evaluation budget can reach early stopping.
+
 - **Pretraining Phase C (2026-11-01)** — opt-in EC2 runbook, self-contained
   bootstrap user data, setup/parity and dataset warm-up script, fail-closed boot
   deadline unit, and cost guard with reserved sessions and AWS stop/cleanup schedules.

@@ -35,6 +35,56 @@ Use the linked README, Settings schema and frozen protocol for current commands 
 | `forecast.scale_floor_frac` | `0.0` | A fraction in `[0, 1)`. When positive, eligible target scales are at least this fraction times the mean absolute observed value in the sample's cropped context, in addition to `1e-6`. Training, validation and inference share the transform. Zero/undefined seasonal scales retain their existing eligibility and fallback behavior. |
 | CLI `fev run --policy` | `first_window` | `per_window` trains/selects a separate model on each window's own available past, using the same settings; optional refit applies to each window. |
 
+### Optional fine-tune hygiene
+
+These training controls are disabled by default. Each field is omitted from the
+canonical run identity when it equals its own default; every non-default value
+changes the identity, including averaging parameters when averaging is disabled.
+Existing default identities and the single-state bundle format are preserved.
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `training.warmup_frac` | `null` | Optional finite fraction in `[0, 1]`. Overrides `warmup_steps` with `round(warmup_frac * max_steps)` after the budget floor and cap. Uses Python rounding, including ties to even. Refit uses the selection run's `schedule_max_steps`, rather than its shorter selected step limit. |
+| `training.min_steps` | `null` | Optional integer at least 1. Replaces the default 500-step floor: `clip(base_steps * n_fit_ids / 2000, min(min_steps, base_steps), 4 * base_steps)`. The existing `max_steps_cap` still applies after clipping. |
+| `training.selection` | `best` | `best` keeps the lowest inner SQL as before. `smoothed` selects by the mean SQL of each evaluation and its available immediate neighbours. An interior score is finalized when its right neighbour arrives; the first and last edges use two points (one if only one evaluation exists). Patience and `rel_tol` use finalized smoothed scores. The restored weights belong to the selected evaluation. |
+| `training.weight_average` | `none` | `ema` averages floating state tensors after each successful optimizer update, starting from the initialized state. Non-finite losses and AMP-skipped updates leave the shadow unchanged. `tail` averages the last `average_last_k` raw evaluation states, including step 0 when evaluated. Both modes evaluate and select only averaged weights and copy non-float buffers from the live model. |
+| `training.ema_decay` | `0.99` | Finite EMA decay in `[0, 1)`, used only by `weight_average: ema`. |
+| `training.average_last_k` | `3` | Positive integer window for `weight_average: tail`. Early evaluations use the states available so far. |
+| `training.select_min_gain` | `0.0` | Finite fraction in `[0, 1)`. With `eval_at_start`, a later checkpoint's selection score (smoothed when enabled) must be strictly below `(1 - select_min_gain) * raw_step_0_SQL` to replace step 0. Without a step-0 evaluation the margin has no effect. |
+| `training.exception_policy` | `final` | For short histories with no inner validation, `pretrained` ships the transferred step-0 weights when `init_from` is set, while still completing/checkpointing the fixed-budget training run. Refit is skipped. Without `init_from`, this uses the final state. `exception_policy_applied` records `pretrained` or `final` for exception runs and `null` otherwise. |
+
+With `select_min_gain > 0`, checkpoints that do not clear the margin also
+increment patience. If later checkpoints never clear it, training can early-stop
+with step 0 still selected.
+
+The live weights and optimizer remain paired during averaging; the EMA shadow
+stays on the model's device, while tail and smoothing snapshots live on CPU.
+Checkpoints retain the EMA shadow or tail snapshots, the last two evaluated states needed by
+smoothed selection, and the step-0 score. Interruptions do not finalize a pending
+right edge or insert an extra tail snapshot. Resuming produces the same selection
+and averaged weights. Old checkpoints without these optional keys remain usable
+with the default controls. CPU memory for exact tail averaging grows with `k`
+state snapshots; smoothing retains at most two additional evaluated states.
+
+With averaging enabled, a full-history refit samples tail states at the resolved
+evaluation cadence without running validation. Its last snapshot is at
+`step_limit`, including a partial final interval; it returns the averaged state.
+At an early stop, smoothing fixes the stopping boundary before scoring the final
+available edge; an edge improvement can change the shipped state without
+reopening training. Raw `SQL` remains in `validation_history`; smoothed runs also
+record the finalized `selection_score`.
+
+`fev plan` appends `max_steps`, `warmup_steps`, `eval_every`, `n_evaluations`, and
+`early_stop_reachable` to its current columns, using metadata without loading
+dataset rows. `n_evaluations` counts scheduled evaluations (including a partial
+final interval and optional step 0), before early stopping. `early_stop_reachable`
+is the diagnostic `n_evaluations > patience`, not a prediction of whether stopping
+will occur. The task's eventual short-history exception is unknown to this
+metadata-only estimate. `run.json` records `resolved_warmup_steps`, the scheduled
+`n_evaluations`, and `early_stop_reachable` for selection; no-validation, no-data,
+and zero-shot runs report zero evaluations. Actual evaluations remain in
+`validation_history`. These reporting fields do not enter the identity.
+
 Refit is skipped when selection chooses step zero (`best_step_zero`) or there
 is no inner validation (`no_inner_validation`, since that path already trains
 on all permitted history). `zero_shot: true` with `refit: full` is rejected.

@@ -121,6 +121,40 @@ def test_refit_skips_zero_step_and_exception_with_reason(
         )
 
 
+@pytest.mark.parametrize("refit", ["none", "full"])
+def test_smoothed_terminal_selection_is_completed_by_both_resume_paths(
+    tmp_path, protocol_case, monkeypatch, refit
+):
+    from demand_forecast.bench.run import _completed_training
+    from demand_forecast.core import run
+
+    panel, origin, settings = protocol_case
+    settings.training.selection = "smoothed"
+    settings.training.patience = 1
+    settings.training.refit = refit
+    scores = iter([1.2, 0.8, 1.0])
+    monkeypatch.setattr(training, "evaluate_prepared", lambda *a, **k: {"SQL": next(scores)})
+    _, report = _run(protocol_case, tmp_path)
+    state = torch.load(tmp_path / "checkpoints/latest.pt", weights_only=False)
+    assert state["terminal_reason"] == report["fit_result"]["stop_reason"] == "early_stop"
+    assert state["step"] == 3 < state["max_steps"]
+    # Finalizing the right edge improves selection and resets patience after stopping.
+    assert state["patience_counter"] == 0 < settings.training.patience
+    assert _completed_training(tmp_path, report["run_identity"], origin, settings)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("completed training must reuse the bundle")
+
+    monkeypatch.setattr(run, "_initial_model", forbidden)
+    monkeypatch.setattr(Trainer, "fit", forbidden)
+    before = {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
+    assert (
+        train_panel(panel, origin, settings, tmp_path, dataset_fingerprint="fp", resume=True)
+        == tmp_path / "bundle"
+    )
+    assert before == {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
+
+
 @pytest.mark.parametrize("stop_after", [6, 7])
 def test_refit_interruption_resumes_refit_without_selection(
     tmp_path, protocol_case, monkeypatch, stop_after
@@ -282,6 +316,14 @@ def test_scale_floor_counts_training_and_prediction_samples(tmp_path, protocol_c
         ("training", "trainable", "heads_only"),
         ("training", "series_embedding", False),
         ("training", "refit", "full"),
+        ("training", "warmup_frac", 0.1),
+        ("training", "min_steps", 1000),
+        ("training", "selection", "smoothed"),
+        ("training", "weight_average", "ema"),
+        ("training", "ema_decay", 0.9),
+        ("training", "average_last_k", 2),
+        ("training", "select_min_gain", 0.05),
+        ("training", "exception_policy", "pretrained"),
         ("forecast", "scale_floor_frac", 0.1),
     ],
 )
@@ -298,6 +340,74 @@ def test_protocol_nondefault_changes_identity(section, field, value):
 def test_scale_floor_rejects_invalid_fractions(value):
     with pytest.raises(ValueError, match="scale_floor_frac"):
         ForecastConfig(horizon=4, scale_floor_frac=value)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("warmup_frac", None),
+        ("min_steps", None),
+        ("selection", "best"),
+        ("weight_average", "none"),
+        ("ema_decay", 0.99),
+        ("average_last_k", 3),
+        ("select_min_gain", 0.0),
+        ("exception_policy", "final"),
+    ],
+)
+def test_hygiene_defaults_are_omitted_from_identity(field, value):
+    settings = tiny_settings()
+    before = _identity_settings(settings)
+    setattr(settings.training, field, value)
+    assert field not in _identity_settings(settings)["training"]
+    assert _identity_settings(settings) == before
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"warmup_frac": -0.1},
+        {"warmup_frac": 1.1},
+        {"warmup_frac": float("nan")},
+        {"min_steps": 0},
+        {"selection": "median"},
+        {"weight_average": "swa"},
+        {"ema_decay": 1.0},
+        {"ema_decay": -0.1},
+        {"average_last_k": 0},
+        {"select_min_gain": -0.1},
+        {"select_min_gain": 1.0},
+        {"exception_policy": "best"},
+    ],
+)
+def test_hygiene_config_rejects_invalid_values(values):
+    with pytest.raises(ValueError):
+        TrainingConfig(**values)
+
+
+@pytest.mark.parametrize("average", ["none", "ema", "tail"])
+def test_fractional_warmup_is_reused_by_refit(tmp_path, protocol_case, monkeypatch, average):
+    settings = protocol_case[2]
+    settings.training.refit = "full"
+    settings.training.warmup_frac = 0.5
+    settings.training.weight_average = average
+    _select_step(monkeypatch, 3)
+    calls = []
+    fit = Trainer.fit
+
+    def capture(self, *args, **kwargs):
+        result = fit(self, *args, **kwargs)
+        calls.append((self, result))
+        return result
+
+    monkeypatch.setattr(Trainer, "fit", capture)
+    bundle, report = _run(protocol_case, tmp_path)
+    assert [c[0].warmup_steps for c in calls] == [3, 3]
+    assert report["resolved_warmup_steps"] == 3
+    assert report["n_evaluations"] == 6
+    assert report["early_stop_reachable"] is True
+    _, result = calls[-1]
+    _assert_weights_equal(bundle.model.state_dict(), result.best_state)
 
 
 @pytest.mark.parametrize("stop_after", [2, 6, 7])
@@ -373,3 +483,55 @@ def test_scale_floor_validation_uses_same_frame_as_training(protocol_case):
     assert torch.equal(prepared.batches[0].scale, training_batch.scale)
     assert torch.equal(prepared.batches[0].target, training_batch.target)
     assert (training_batch.scale > 100).all()
+
+
+@pytest.mark.parametrize("mode", ["ema", "tail"])
+@pytest.mark.parametrize("refit", ["none", "full"])
+def test_averaged_model_resume_exact(tmp_path, protocol_case, monkeypatch, mode, refit):
+    settings = protocol_case[2]
+    settings.training.weight_average = mode
+    settings.training.selection = "smoothed"
+    settings.training.ema_decay = 0.5
+    settings.training.average_last_k = 2
+    settings.training.eval_at_start = True
+    settings.training.refit = refit
+    # Force a positive selected step for refit, retaining the actual smoothed code.
+    original = Trainer._select_best
+
+    def select(self, score):
+        return original(self, float(10 - self.step))
+
+    monkeypatch.setattr(Trainer, "_select_best", select)
+    expected, before = _run(protocol_case, tmp_path / "whole")
+    # Pause in selection, or in the refit after selection completed.
+    with pytest.raises(InterruptedRun):
+        _run(protocol_case, tmp_path / "parts", stop_after=2 if refit == "none" else 8)
+    resumed, report = _run(protocol_case, tmp_path / "parts", resume=True)
+    _assert_weights_equal(expected.model.state_dict(), resumed.model.state_dict())
+    assert report["fit_result"] == before["fit_result"]
+    assert report["validation_history"] == before["validation_history"]
+
+
+@pytest.mark.parametrize("mode", ["none", "ema", "tail"])
+def test_completed_smoothed_early_stop_refit_reuses_bundle(
+    tmp_path, protocol_case, monkeypatch, mode
+):
+    settings = protocol_case[2]
+    settings.training.selection = "smoothed"
+    settings.training.patience = 1
+    settings.training.refit = "full"
+    settings.training.weight_average = mode
+    original = Trainer._select_best
+
+    def select(self, score):
+        original(self, {1: 1.2, 2: 0.8, 3: 1.0}[self.step])
+
+    monkeypatch.setattr(Trainer, "_select_best", select)
+    _, report = _run(protocol_case, tmp_path)
+    assert report["fit_result"]["steps"] == report["fit_result"]["best_step"] == 3
+    assert report["fit_result"]["stop_reason"] == "early_stop"
+    assert report["refit"]["steps"] == 3
+    before = {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
+    monkeypatch.setattr(Trainer, "fit", lambda *a, **k: pytest.fail("completed run retrained"))
+    _run(protocol_case, tmp_path, resume=True)
+    assert before == {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
