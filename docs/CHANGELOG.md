@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Classical `fev baseline --model` arms: `auto_ets`, `auto_theta`, and `median3`
+  (cell-wise median quantiles alongside the unchanged default `seasonal_naive`),
+  with seasonal-naive fallback and resume by task/model pair in `summaries.csv`.
+
 - Optional fine-tune hygiene controls for proportional warmup, a configurable
   budget floor, smoothed checkpoint selection, EMA/tail weight averaging,
   step-zero selection margins, and a pretrained short-history exception policy.
