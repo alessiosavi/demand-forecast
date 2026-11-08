@@ -168,6 +168,19 @@ masks. These are linear projections of the concatenated channels, not separate
 categorical embeddings for dynamic columns. Dynamic inputs must be numeric;
 categories need indicator encoding.
 
+`forecast.calendar_schema: canonical` reserves 16 named sine/cosine slots in
+the order `tod, hour, dow, dom, doy, woy, month, quarter`; unavailable fields have
+zero values and false masks. Sub-daily grids include seconds since local midnight
+(`tod`), and quarterly grids include `quarter`. The default `legacy` retains
+frequency-specific layouts. `forecast.target_lags: cycle` inserts `lag_period`
+and `lag_long` after calendar values and before task covariates in both encoder
+and decoder, with masks after all values. Lags read full history, including
+positions before the context crop, and use the sample's target location and
+scale. Only target positions strictly before the origin are available: decoder
+step `h` can use lag `k` only when `h < k`. Period-one slots are masked;
+`target_lags: none` preserves the existing inputs. Bundles retain optional named
+calendar/lag schemas for subsequent transfer by name.
+
 `V2Backbone` applies static FiLM conditioning to encoder and decoder inputs,
 pre-norm attention/feedforward layers, and gated static enrichment of encoder
 memory. `hidden_continuous_size` sets the hidden width of that enrichment

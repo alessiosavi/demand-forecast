@@ -482,6 +482,8 @@ class Trainer:
             seed=self.seed,
             label_upto=plan.train_upto,
             scale_floor_frac=forecast_cfg.scale_floor_frac,
+            calendar_schema=forecast_cfg.calendar_schema,
+            target_lags=forecast_cfg.target_lags,
             scaler_period=scaler_period,
             loss_weight=self.cfg.loss_weight,
         )
@@ -541,6 +543,8 @@ class Trainer:
                 max_context,
                 encoder,
                 scale_floor_frac=forecast_cfg.scale_floor_frac,
+                calendar_schema=forecast_cfg.calendar_schema,
+                target_lags=forecast_cfg.target_lags,
                 scaler_period=scaler_period,
             )
             build_s = time.perf_counter() - prepare_started

@@ -417,6 +417,44 @@ def test_task_probe_honours_validation_scale_floor(tmp_path, monkeypatch):
     np.testing.assert_allclose(np.concatenate(scales), expected)
 
 
+@pytest.mark.parametrize(
+    "calendar_schema,target_lags",
+    [("canonical", "none"), ("legacy", "cycle"), ("canonical", "cycle")],
+)
+def test_task_probe_honours_input_schema(tmp_path, monkeypatch, calendar_schema, target_lags):
+    from demand_forecast.core import evaluation
+    from demand_forecast.pretrain.probe import task_probe
+    from tests.helpers.fev_fixture import write_fev_fixture
+    from tests.helpers.fev_spec import fixture_spec
+    from tests.helpers.settings import tiny_settings
+
+    parquet = write_fev_fixture(tmp_path / "data", length=80)
+    settings = tiny_settings(base_steps=2, d_model=8)
+    settings.forecast.calendar_schema = calendar_schema
+    settings.forecast.target_lags = target_lags
+    prepare = evaluation.prepare_validation
+    batches = []
+
+    def observe_prepare(*args, **kwargs):
+        prepared = prepare(*args, **kwargs)
+        batches.extend(prepared.batches)
+        return prepared
+
+    monkeypatch.setattr(evaluation, "prepare_validation", observe_prepare)
+    reports = task_probe([fixture_spec(parquet)], settings, steps=2, out=tmp_path / "out")
+    assert reports["fixture"]["infer_s"] > 0
+    assert len(batches) == 1
+    calendar_slots = 16 if calendar_schema == "canonical" else 4
+    lag_slots = 2 if target_lags == "cycle" else 0
+    batch = batches[0]
+    assert batch.enc_cov.shape[-1] == calendar_slots + lag_slots + 2
+    assert batch.dec_cov.shape[-1] == calendar_slots + lag_slots + 1
+    if target_lags == "cycle":
+        assert batch.dec_cov_mask[..., calendar_slots + 1].all()  # Weekly long lag: 52.
+    if calendar_schema == "canonical":
+        assert not batch.dec_cov_mask[..., :10].any()  # Only week/month are available.
+
+
 def test_multitarget_task_probe_reaches_inference(tmp_path, monkeypatch):
     from demand_forecast.inference.predictor import Predictor
     from demand_forecast.pretrain.probe import task_probe

@@ -73,6 +73,9 @@ def _identity_settings(settings: Settings) -> dict:
             training.pop(key)
     if payload["forecast"]["scale_floor_frac"] == 0.0:
         payload["forecast"].pop("scale_floor_frac")
+    for name, default in (("calendar_schema", "legacy"), ("target_lags", "none")):
+        if payload["forecast"].get(name, default) == default:
+            payload["forecast"].pop(name, None)
     if payload["forecast"]["scaler_period"] == "task":
         payload["forecast"].pop("scaler_period")
     if settings.training.init_from is not None:

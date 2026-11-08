@@ -148,6 +148,8 @@ class Predictor:
             cfg.max_context,
             self.bundle.encoder,
             scale_floor_frac=cfg.scale_floor_frac,
+            calendar_schema=cfg.calendar_schema,
+            target_lags=cfg.target_lags,
             scaler_period=(
                 None if self.bundle.scaler_period == "task" else self.bundle.scaler_period
             ),

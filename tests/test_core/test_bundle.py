@@ -167,7 +167,9 @@ def test_bundle_metadata_configs_state_and_weights_only_load(
     assert config["backbone_kwargs"] == asdict(tiny_v2_trained.backbone.cfg)
     assert config["forecast"] == forecast29.model_dump(mode="json")
     assert config["dataset"] == dataset.model_dump(mode="json")
-    assert config["model_spec"] == json.loads(json.dumps(asdict(tiny_v2_trained.spec)))
+    assert config["model_spec"] == json.loads(
+        json.dumps({k: v for k, v in asdict(tiny_v2_trained.spec).items() if v is not None})
+    )
     assert json.loads((directory / "encoder.json").read_text()) == encoder29.to_json()
     metadata = json.loads((directory / "panel.json").read_text())
     assert metadata == {
@@ -466,6 +468,73 @@ def test_bundle_version_and_off_grid_origin_are_refused(bundle_dir, panel29, ori
     path.write_text(json.dumps(manifest))
     with pytest.raises(ValueError, match="Unsupported bundle version"):
         load_bundle(bundle_dir)
+
+
+@pytest.mark.parametrize("calendar_schema", ["legacy", "canonical"])
+@pytest.mark.parametrize("target_lags", ["none", "cycle"])
+def test_bundle_named_schema_roundtrip_and_inference(
+    tmp_path, panel29, encoder29, cutoff29, origin29, calendar_schema, target_lags
+):
+    cfg = ForecastConfig(
+        horizon=13, max_context=8, calendar_schema=calendar_schema, target_lags=target_lags
+    )
+    spec = ModelSpec.from_panel(panel29, encoder29, cfg, 16, 4)
+    model = build_v2(spec).eval()
+    batch = make_batch(
+        panel29,
+        [(i, 29) for i in range(3)],
+        13,
+        8,
+        encoder29,
+        calendar_schema=calendar_schema,
+        target_lags=target_lags,
+    )
+    save_bundle(
+        tmp_path,
+        model=model,
+        family="v2",
+        backbone_kwargs=asdict(model.backbone.cfg),
+        forecast_cfg=cfg,
+        dataset_cfg=None,
+        encoder=encoder29,
+        panel=panel29,
+        training_cutoff=cutoff29,
+        earliest_origin=origin29,
+        manifest={},
+    )
+    config = json.loads((tmp_path / "config.json").read_text())
+    assert ("calendar_schema" in config["model_spec"]) == (calendar_schema == "canonical")
+    assert ("lag_schema" in config["model_spec"]) == (target_lags == "cycle")
+    assert config["forecast"].get("calendar_schema", "legacy") == calendar_schema
+    assert config["forecast"].get("target_lags", "none") == target_lags
+    loaded = load_bundle(tmp_path)
+    assert loaded.model.spec == spec and loaded.forecast_cfg == cfg
+    with torch.no_grad():
+        expected = model.predict(batch).numpy()
+    _, actual = Predictor(loaded).forecast_arrays(panel29, origin29)
+    np.testing.assert_array_equal(actual, expected)
+
+
+@pytest.mark.parametrize("explicit_nulls", [False, True])
+def test_old_bundle_loads_unnamed_schemas(bundle_dir, explicit_nulls):
+    path = bundle_dir / "config.json"
+    config = json.loads(path.read_text())
+    assert "calendar_schema" not in config["forecast"] and "target_lags" not in config["forecast"]
+    for name in ("calendar_schema", "lag_schema"):
+        assert name not in config["model_spec"]
+        if explicit_nulls:
+            config["model_spec"][name] = None
+    path.write_text(json.dumps(config))
+    manifest_path = bundle_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["sha256"]["config.json"] = hashlib.sha256(path.read_bytes()).hexdigest()
+    manifest_path.write_text(json.dumps(manifest))
+    loaded = load_bundle(bundle_dir)
+    assert loaded.model.spec.calendar_schema is None and loaded.model.spec.lag_schema is None
+    assert (
+        loaded.forecast_cfg.calendar_schema == "legacy"
+        and loaded.forecast_cfg.target_lags == "none"
+    )
 
 
 def test_predictor_diagnostics_match_arrays(bundle_dir, panel29, origin29):

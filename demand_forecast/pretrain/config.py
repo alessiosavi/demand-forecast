@@ -152,6 +152,28 @@ class _PretrainForecastConfig(ForecastConfig):
             raise ValueError("scale_floor_frac is only supported for task training")
         return value
 
+    @field_validator("calendar_schema")
+    @classmethod
+    def reject_calendar_schema(cls, value: str) -> str:
+        """Keep legacy pretraining batches until the v3 adapter supports named schemas."""
+        if value != "legacy":
+            raise ValueError(
+                "non-default calendar_schema is only supported for task training; "
+                "pretraining requires 'legacy'"
+            )
+        return value
+
+    @field_validator("target_lags")
+    @classmethod
+    def reject_target_lags(cls, value: str) -> str:
+        """Keep pretraining lag-free until the v3 adapter supports target lags."""
+        if value != "none":
+            raise ValueError(
+                "non-default target_lags is only supported for task training; "
+                "pretraining requires 'none'"
+            )
+        return value
+
 
 class PretrainConfig(BaseModel):
     """Standalone pretraining configuration; loading never accesses corpus files."""
