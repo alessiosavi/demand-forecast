@@ -59,7 +59,7 @@ target/observed-only transfer. Backbone, head and static-bias handling are share
 Round 3 adds `horizon_policy: fev_set`: each training batch draws uniformly from
 the pinned horizons `{5, 8, 12, 13, 14, 24, 28, 39, 48, 52, 60, 61, 96, 144,
 168, 288}` that fit its active frequency group. Every origin is at least
-`max(8, m + 1)` positions into the series and has a full future grid window;
+`max(forecast.min_context, m + 1)` positions (8 in shipped configs) into the series and has a full future grid window;
 missing labels remain masked. A source with no geometrically usable windows
 raises after a full shard pass. Undefined scales and missing labels do not remove
 windows; their actual eligible-label exposure is recorded.
@@ -85,11 +85,57 @@ by source, frequency/period/calendar group and horizon, with batch/pair counts,
 eligible-label counts and total label cells; `horizon_histogram` counts batches.
 Both resume cumulatively, as does named `feature_exposure` telemetry.
 
-`configs/pretrain-v3-corpus2.yaml` enables horizon sampling. Validation uses the same
-adapter and per-frequency periods for normalization and SQL, but synthetic
-holdouts still select checkpoints at the configured maximum horizon and real
-holdouts remain diagnostics. Round 4 adds stratified real-holdout selection,
-EMA and snapshots.
+`configs/pretrain-v3-corpus2.yaml` enables horizon sampling and round-4 real-holdout
+selection. `corpus.selection_shards` selects `chronos_real: [9]` and
+`gifteval_pretrain: [14]`, both excluded from training. If omitted in a v3 config,
+selection uses the configured real-source holdouts; missing real holdouts fail
+construction. Synthetic holdouts and `monash_nn5_weekly` remain diagnostics.
+
+Validation freezes up to `min(4096, corpus.val_pairs_per_kind)` pairs **total per
+real source**, using the v3 adapter with canonical calendars, cycle lags and each
+cell's conventional period for both frame normalization and SQL denominators.
+Cells are the available frequency/period/calendar groups from `shard_panels`
+crossed with feasible pinned fev horizons (the configured horizon in fixed mode).
+Sorted cells receive capacity-capped round-robin quotas; each samples series
+without replacement using the configured seed, reserving the final full horizon.
+Origins obey the training minimum above. A series can occur at several horizons.
+Pair tuples and membership are frozen once at construction; only sampled histories
+are retained, shared across horizons. A quota too small to cover every cell fails.
+The construction/aggregation policy hash enters the v3 identity alongside the
+input and sampler policies. Changing seed, config or shard digests also changes it.
+
+Selection SQL is the equal-source mean of each source's equal-cell mean, rather
+than a pooled sample average. Every predetermined cell must have finite SQL;
+otherwise that candidate evaluation is invalid, with failing cells recorded.
+`selection_sources` reports source and cell SQL, naive SQL, periods, horizons,
+pair counts and exclusions in every evaluation. `evaluations` in
+`checkpoints/progress.json` and the bundle manifest retains this evidence,
+including both raw and EMA results when enabled. Synthetic `val_sql_tsmixup` /
+`val_sql_kernel_synth` and pooled real-source diagnostics never select weights.
+
+`training.ema_decay` defaults to `null` (off); the v3 YAML uses `0.999`. The
+shadow updates only after successful optimizer steps. Every evaluation compares
+raw and EMA real-holdout SQL, preferring raw on ties, and records
+`selected_weights`; the run records `best_weights`. The full shadow, selected
+state, sampler and cumulative exposure counters resume exactly. No task-side
+averaging controls enter pretraining identities. The default EMA/snapshot controls
+are omitted from config serialization and identity; v2 payloads remain unchanged.
+
+With `training.keep_eval_snapshots: true` (default false), each evaluation writes
+raw model-only weights to `checkpoints/step-<n>.pt`, including the final step.
+`eval_snapshots` lists step, relative path and weight type in progress and manifest.
+The shipped 78k-step run writes 16 snapshots, approximately 49 MB each. Use
+`pretrain export --run-dir RUN --step N --out BUNDLE` to export one; omit `--step`
+for latest raw weights, or use `--weights ema` for the latest checkpoint's shadow.
+Export reconstructs a loadable bundle from saved metadata without corpus files,
+including after an interruption. Earlier EMA states are not retained separately.
+
+V3 external diagnostics are explicitly labelled `ext_sql_calendar_on` and
+`ext_sql_naive_calendar_on`. A separately measured `ext_sql_calendar_off` /
+`ext_sql_naive_calendar_off` disables calendars in the same v3 lag adapter; these
+are distinct from historical v2 `ext_sql` / `ext_sql_naive` model results. Neither
+external measurement selects the step or weight type. The 81 shifted fev checks
+at 20k/40k/60k/end remain operator-run diagnostics for round 5.
 
 ## Contents and exclusions
 
@@ -289,11 +335,12 @@ explicit legacy shard/hold-out lists must agree. An explicit
 `kernel_synth_every` is accepted only for a matching two-kind weight ratio (or
 zero for TSMixup alone); weighted mode still uses round-robin ordering.
 
-Only the arithmetic mean of the TSMixup and KernelSynth hold-out SQL scores
-selects a model. Supply both legacy hold-out kinds for a finite selection score;
+Under recipe v2, only the arithmetic mean of the TSMixup and KernelSynth hold-out
+SQL scores selects a model. Supply both legacy hold-out kinds for a finite selection score;
 a missing score still makes the selection mean NaN, as before. New-kind scores
 appear as `val_sql_chronos_real` / `val_sql_gifteval_pretrain` diagnostics.
-The local `monash_nn5_weekly` external diagnostic is unchanged.
+The v2 local `monash_nn5_weekly` external diagnostic is unchanged. Recipe v3 uses
+the real-cell selection and separately labelled diagnostics described above.
 
 ## Audit
 

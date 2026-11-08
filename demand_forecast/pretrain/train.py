@@ -72,6 +72,36 @@ def _cpu_state(model) -> dict:
     return {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
 
 
+class _PretrainEMA:
+    """Device-local shadow mirroring the fine-tune EMA without task controls."""
+
+    def __init__(self, model, decay: float):
+        self.decay = decay
+        self.shadow = {key: value.detach().clone() for key, value in model.state_dict().items()}
+
+    @torch.no_grad()
+    def update(self, model):
+        for key, value in model.state_dict().items():
+            if value.is_floating_point():
+                self.shadow[key].mul_(self.decay).add_(value.detach(), alpha=1 - self.decay)
+            else:
+                self.shadow[key].copy_(value)
+
+    def restore(self, state, device):
+        self.shadow = {key: value.to(device).clone() for key, value in state.items()}
+
+
+def _atomic_model_save(state: dict, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with NamedTemporaryFile(dir=path.parent, prefix=f".{path.name}-", delete=False) as stream:
+        temporary = Path(stream.name)
+    try:
+        torch.save(state, temporary)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def _validate_controls(cfg: PretrainConfig) -> None:
     for name in ("max_steps", "batch_size", "eval_every", "checkpoint_every", "val_batch_size"):
         if getattr(cfg.training, name) < 1:
@@ -190,6 +220,13 @@ class _PretrainLoop:
             self.step = self.best_step = self.consecutive_nonfinite = 0
             self.best_score = None
             self.best_state = _cpu_state(self.model)
+            self.ema = (
+                _PretrainEMA(self.model, cfg.training.ema_decay)
+                if cfg.training.ema_decay is not None
+                else None
+            )
+            self.best_weights = "raw"
+            self.eval_snapshots: list[dict] = []
             self.history: list[dict] = []
             self.timings = dict(
                 train_s=0.0,
@@ -277,8 +314,11 @@ class _PretrainLoop:
             self.scaler.step(self.optimizer)
             scale_before = self.scaler.get_scale() if self.scaler.is_enabled() else None
             self.scaler.update()
-            if scale_before is not None and self.scaler.get_scale() < scale_before:
+            skipped = scale_before is not None and self.scaler.get_scale() < scale_before
+            if skipped:
                 self.timings["scaler_skips"] += 1
+            elif self.ema is not None:
+                self.ema.update(self.model)
         self.scheduler.step()
         self.step += 1
         self.consecutive_nonfinite = 0 if finite else self.consecutive_nonfinite + 1
@@ -294,6 +334,33 @@ class _PretrainLoop:
         _sync(self.device)
         started = time.perf_counter()
         scores = self.validation.evaluate(self.model, device=self.device)
+        choice = "raw"
+        candidate = None
+        if self.ema is not None:
+            raw_state = _cpu_state(self.model)
+            try:
+                self.model.load_state_dict(self.ema.shadow)
+                ema_scores = self.validation.evaluate(self.model, device=self.device)
+                raw_score, ema_score = scores["val_sql"], ema_scores["val_sql"]
+                if (
+                    ema_score is not None
+                    and math.isfinite(ema_score)
+                    and (raw_score is None or not math.isfinite(raw_score) or ema_score < raw_score)
+                ):
+                    choice = "ema"
+                    candidate = _cpu_state(self.model)
+            finally:
+                self.model.load_state_dict(raw_state)
+            raw_scores = scores
+            scores = dict(ema_scores if choice == "ema" else raw_scores)
+            scores.update(
+                raw=raw_scores,
+                ema=ema_scores,
+                val_sql_raw=raw_scores["val_sql"],
+                val_sql_ema=ema_scores["val_sql"],
+            )
+        if self.cfg.recipe == "v3":
+            scores["selected_weights"] = choice
         self.history[-1].update(scores)
         score = scores["val_sql"]
         if (
@@ -302,9 +369,30 @@ class _PretrainLoop:
             and (self.best_score is None or score < self.best_score)
         ):
             self.best_score, self.best_step = score, self.step
-            self.best_state = _cpu_state(self.model)
+            self.best_state = candidate if candidate is not None else _cpu_state(self.model)
+            self.best_weights = choice
         _sync(self.device)
         self.timings["eval_s"] += time.perf_counter() - started
+
+    def snapshot(self, directory: Path) -> None:
+        """Keep raw model-only evaluation weights for later averaging/export."""
+        path = Path(directory) / "checkpoints" / f"step-{self.step}.pt"
+        _atomic_model_save(_cpu_state(self.model), path)
+        record = {"step": self.step, "path": f"checkpoints/{path.name}", "weights": "raw"}
+        if record not in self.eval_snapshots:
+            self.eval_snapshots.append(record)
+
+    def evaluation_metadata(self) -> dict:
+        from demand_forecast.pretrain.config import selection_pair_policy_hash
+
+        if self.cfg.recipe != "v3":
+            return {}
+        return {
+            "best_weights": self.best_weights,
+            "selection_pair_policy": selection_pair_policy_hash(),
+            "evaluations": [row for row in self.history if "val_sql" in row],
+            "eval_snapshots": self.eval_snapshots,
+        }
 
     def sample_peak(self) -> None:
         self.timings["peak_rss_bytes"] = max(self.timings["peak_rss_bytes"], _peak_rss())
@@ -344,6 +432,16 @@ class _PretrainLoop:
                 )
             },
         }
+        if self.cfg.recipe == "v3":
+            state.update(
+                ema_shadow=self.ema.shadow if self.ema is not None else None,
+                best_weights=self.best_weights,
+                eval_snapshots=self.eval_snapshots,
+                export_metadata={
+                    "config": self.cfg.model_dump(mode="json"),
+                    "encoder": self.encoder.to_json(),
+                },
+            )
         path.parent.mkdir(parents=True, exist_ok=True)
         with NamedTemporaryFile(dir=path.parent, prefix=f".{path.name}-", delete=False) as stream:
             temporary = Path(stream.name)
@@ -367,6 +465,7 @@ class _PretrainLoop:
                 "stop_reason": stop_reason,
                 "best_step": self.best_step,
                 "best_score": self.best_score,
+                **self.evaluation_metadata(),
                 "timings": self.timings,
                 "device": str(self.device),
                 "amp_dtype": str(self.amp_dtype).removeprefix("torch.") if self.amp else None,
@@ -385,6 +484,11 @@ class _PretrainLoop:
         self.optimizer.load_state_dict(state["optimizer"])
         self.scheduler.load_state_dict(state["scheduler"])
         self.scaler.load_state_dict(state["scaler"])
+        if self.cfg.recipe == "v3":
+            if self.ema is not None:
+                self.ema.restore(state["ema_shadow"], self.device)
+            self.best_weights = state["best_weights"]
+            self.eval_snapshots = state["eval_snapshots"]
         sampler = state["sampler_state"]
         self.sampler.load_state(sampler_state_from_dict(sampler))
         for key in (
@@ -436,6 +540,8 @@ def pretrain(
             finished = loop.step == cfg.training.max_steps
             if loop.step % cfg.training.eval_every == 0 or finished:
                 loop.evaluate()
+                if cfg.training.keep_eval_snapshots:
+                    loop.snapshot(out_dir)
             interrupted = not finished and stop_after is not None and session_steps >= stop_after
             if interrupted:
                 loop.checkpoint(checkpoint, "interrupted")
@@ -466,6 +572,14 @@ def pretrain(
                 "ext_sql_naive": record.get("ext_sql_naive"),
                 "n_items": len(loop.validation.external[1]),
             }
+            if cfg.recipe == "v3":
+                external = {
+                    "name": cfg.corpus.external_validation,
+                    "n_items": len(loop.validation.external[1]),
+                }
+                external.update(
+                    {key: value for key, value in record.items() if key.startswith("ext_sql")}
+                )
         save_bundle(
             out_dir / "bundle",
             model=loop.model,
@@ -486,6 +600,7 @@ def pretrain(
                     "config": cfg.model_dump(mode="json"),
                     "shards": loop.shards,
                     "external_diagnostic": external,
+                    **loop.evaluation_metadata(),
                     **(
                         {
                             key: loop.timings[key]
@@ -515,6 +630,65 @@ def pretrain(
         return result
     finally:
         loop.sampler.close()
+
+
+def export_pretrain(
+    run_dir: Path, out: Path, *, step: int | None = None, weights: str = "raw"
+) -> None:
+    """Export raw snapshots or the latest raw/EMA state without corpus access."""
+    from demand_forecast.data.encoders import StaticEncoder
+    from demand_forecast.pretrain.corpus import PRETRAIN_START, shard_panel
+
+    if weights not in ("raw", "ema"):
+        raise ValueError("weights must be raw or ema")
+    run_dir = Path(run_dir)
+    checkpoint = torch.load(
+        run_dir / "checkpoints/latest.pt", map_location="cpu", weights_only=False
+    )
+    metadata = checkpoint.get("export_metadata")
+    if metadata is None:
+        raise ValueError("export requires a recipe-v3 round-4 checkpoint")
+    cfg = PretrainConfig.model_validate(metadata["config"])
+    if weights == "ema":
+        if step is not None and step != checkpoint["step"]:
+            raise ValueError("EMA export is available only at the latest checkpoint step")
+        state = checkpoint["ema_shadow"]
+        if state is None:
+            raise ValueError("checkpoint has no EMA shadow")
+        exported_step = checkpoint["step"]
+    elif step is None:
+        state, exported_step = checkpoint["model"], checkpoint["step"]
+    else:
+        record = next((r for r in checkpoint["eval_snapshots"] if r["step"] == step), None)
+        if record is None:
+            raise ValueError(f"no evaluation snapshot at step {step}")
+        state = torch.load(run_dir / record["path"], map_location="cpu", weights_only=True)
+        exported_step = step
+    panel = shard_panel([])
+    encoder = StaticEncoder.from_json(metadata["encoder"])
+    spec = ModelSpec.from_panel(
+        panel, encoder, cfg.forecast, cfg.model.d_model, cfg.model.cat_emb_dim
+    )
+    model = build_model("v2", spec, cfg.model.backbone_kwargs())
+    model.load_state_dict(state)
+    save_bundle(
+        out,
+        model=model,
+        family="v2",
+        backbone_kwargs=cfg.model.backbone_kwargs(),
+        forecast_cfg=cfg.forecast,
+        dataset_cfg=None,
+        encoder=encoder,
+        panel=panel,
+        training_cutoff=PRETRAIN_START,
+        earliest_origin=PRETRAIN_START,
+        manifest={
+            "pretrain_identity": checkpoint["identity"],
+            "exported_step": exported_step,
+            "exported_weights": weights,
+            "config": cfg.model_dump(mode="json"),
+        },
+    )
 
 
 def pretrain_duration(cfg: PretrainConfig, probe: dict) -> dict:

@@ -279,6 +279,13 @@ def test_v3_train_resume_weights_optimizer_telemetry_and_artifacts(tmp_path, tin
                 lengths=(340, 350),
                 seed=index,
             )
+    # Round 4 selects only real holdouts; keep this sampler integration offline.
+    real = tiny_pretrain_cfg.corpus.root / "training_corpus/chronos_real"
+    real.mkdir()
+    for index in (0, 1):
+        _shard(tmp_path, [_row(0, target=(np.arange(350, dtype=float) ** 2).tolist())]).rename(
+            real / f"train-{index:05d}-of-00002.parquet"
+        )
     write_manifest(
         corpus_manifest(tiny_pretrain_cfg.corpus.root),
         tiny_pretrain_cfg.corpus.root / "manifest.json",
@@ -290,6 +297,15 @@ def test_v3_train_resume_weights_optimizer_telemetry_and_artifacts(tmp_path, tin
         "grid_policy": "source",
         "shard_visit_quota": {"tsmixup": 10, "kernel_synth": 7},
     }
+    raw["corpus"] = dict(
+        root=tiny_pretrain_cfg.corpus.root,
+        external_validation=None,
+        val_pairs_per_kind=32,
+        sources={
+            kind: dict(shards=[0], holdout=[1], weight=1)
+            for kind in ("tsmixup", "kernel_synth", "chronos_real")
+        },
+    )
     raw["forecast"]["horizon"] = 288
     raw["training"].update(max_steps=12, val_batch_size=4)
     cfg = PretrainConfig.model_validate(raw)
