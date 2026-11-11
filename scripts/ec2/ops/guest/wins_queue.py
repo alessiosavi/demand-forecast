@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run a resumable manifest in three light lanes, draining before each heavy job."""
+"""Run a resumable manifest in light lanes, draining before each heavy job."""
 
 import json
 import os
@@ -36,7 +36,8 @@ def load_manifest(path: Path) -> list[dict]:
     return items
 
 
-def run_item(item: dict, state: Path) -> bool:
+def run_item(item: dict, state: Path) -> tuple[int, bool]:
+    """Return the exit code and whether a failed command can be retried."""
     name, argv = item["name"], item["argv"]
     marker = state / f"{name}.json"
     # Let fev --resume validate its artifacts/inputs even after a prior success.
@@ -45,21 +46,26 @@ def run_item(item: dict, state: Path) -> bool:
     with (state / f"{name}.log").open("a") as log:
         log.write(f"\nCOMMAND {shlex.join(argv)}\n")
         log.flush()
+        retryable = True
         try:
             rc = subprocess.run(argv, stdout=log, stderr=subprocess.STDOUT, check=False).returncode
         except OSError as exc:
             log.write(f"{exc}\n")
             rc = 127
+            retryable = False
     temporary = marker.with_suffix(".json.tmp")
     temporary.write_text(json.dumps(dict(argv=argv, exit=rc)) + "\n")
     temporary.replace(marker)
     print(f"WINS_EXIT {name} exit={rc}", flush=True)
-    return rc == 0
+    return rc, retryable
 
 
 def run(stage: str, manifest: Path) -> int:
     if not re.fullmatch(r"[a-zA-Z0-9_-]+", stage):
         raise ValueError("Invalid stage")
+    lanes = int(os.environ.get("WINS_LANES", "3"))
+    if not 1 <= lanes <= 8:
+        raise ValueError("WINS_LANES must be an integer from 1 to 8")
     items = load_manifest(manifest)
     root = Path(os.environ.get("WINS_STATE_DIR") or str(Path(os.environ["OPS"]) / "wins"))
     state = root / stage
@@ -73,7 +79,7 @@ def run(stage: str, manifest: Path) -> int:
         except BlockingIOError as exc:
             raise ValueError(f"Another queue is already running under {root}") from exc
         results = []
-        with ThreadPoolExecutor(max_workers=3) as pool:
+        with ThreadPoolExecutor(max_workers=lanes) as pool:
             pending = []
             for item in items:
                 if item["lane"] == "heavy":
@@ -83,9 +89,15 @@ def run(stage: str, manifest: Path) -> int:
                 else:
                     pending.append(pool.submit(run_item, item, state))
             results.extend(job.result() for job in pending)
-        ok = sum(results)
+        if os.environ.get("WINS_RETRY_FAILED", "1") != "0":
+            for index, item in enumerate(items):
+                rc, retryable = results[index]
+                if rc != 0 and retryable:
+                    print(f"WINS_RETRY {item['name']}", flush=True)
+                    results[index] = run_item(item, state)
+        ok = sum(rc == 0 for rc, _ in results)
         print(f"WINS_DONE ok={ok} failed={len(results) - ok}", flush=True)
-        return 0 if all(results) else 1
+        return 0 if ok == len(results) else 1
 
 
 if __name__ == "__main__":

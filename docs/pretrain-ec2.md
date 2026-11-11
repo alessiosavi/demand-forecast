@@ -1159,9 +1159,15 @@ guard settle --txn "$TXN" --stopped-at "$CONFIRMED_STOP_UTC" --evidence "$STOP_E
 bash "$LOCAL_CODE/scripts/ec2/ops/session.sh" status
 ```
 
-The wins queue exits zero only when every item succeeds; a non-zero queue exit
-means at least one item failed. Results are still copied back and the session is
-stopped. Rerun to retry failed items; each invocation lets `fev --resume` validate
+On the guest, `WINS_LANES` sets the number of concurrent light lanes (integer
+1–8, default 3); heavy items still run alone. After the whole manifest finishes,
+failed items retry once, one at a time in manifest order, with nothing else
+running. Launch errors (exit 127 from `OSError`) are not retried. Set
+`WINS_RETRY_FAILED=0` on the guest to disable retries. Each retry prints
+`WINS_RETRY <name>`; logs keep both attempts, while markers and the last
+`WINS_EXIT` reflect the final attempt. `WINS_DONE` and the queue exit describe
+the final state: zero only when every item succeeds. Results are still copied
+back and the session is stopped. Each invocation lets `fev --resume` validate
 and resume its own output artifacts.
 
 Section 16's chain checks the ledger after stop/reconcile and exits nonzero for

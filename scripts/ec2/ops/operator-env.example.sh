@@ -36,6 +36,11 @@ export PULL='[{"remote_dir":"/home/ubuntu/fev/runs/wins","local_dir":"/absolute/
 export EXPECTED_EXIT=0 SKIP_SETUP=0
 # wins-guest.sh uses $OPS/wins/<stage> for logs/status; optional WINS_STATE_DIR
 # overrides $OPS/wins. Manifest cmd is an argv array or a shell-quoted argv string.
+# On the guest, WINS_LANES sets concurrent light lanes (1–8, default 3); heavy
+# items still run alone. Failed items retry once alone, in manifest order, after
+# all first attempts; launch errors (exit 127 from OSError) are not retried.
+# Set WINS_RETRY_FAILED=0 on the guest to disable retries. Logs keep both attempts;
+# markers, WINS_EXIT, WINS_DONE and queue exit reflect the final attempt/state.
 # fev run/tune receive --resume automatically. A non-zero queue exit means at least
-# one item failed; results are still copied back. Rerun to retry failed items.
+# one item still failed; results are still copied back.
 # Each invocation lets fev validate and resume its own output artifacts.

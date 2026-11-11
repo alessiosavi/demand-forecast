@@ -689,11 +689,12 @@ def test_wins_true_false_summary_and_resume(tmp_path, commands, expected_rc, sum
     assert result.stdout.splitlines()[-1] == f"WINS_DONE {summary}"
     resumed = run_wins(tmp_path, items)
     assert resumed.returncode == expected_rc
-    assert resumed.stdout.count("WINS_START") == len(commands)
+    assert resumed.stdout.count("WINS_START") == len(commands) + commands.count("false")
     assert len(list((tmp_path / "ops/wins/synthetic").glob("*.log"))) == len(items)
 
 
-def test_wins_lane_concurrency_and_heavy_barrier(tmp_path):
+@pytest.fixture
+def wins_probe(tmp_path):
     probe = tmp_path / "probe.py"
     probe.write_text("""import fcntl, json, subprocess, sys, time
 from pathlib import Path
@@ -704,34 +705,121 @@ def record(kind):
         stream.write(json.dumps([kind, sys.argv[2]]) + "\\n")
 record("start")
 time.sleep(0.2)
-rc = subprocess.run([sys.argv[3]]).returncode
+rc = subprocess.run(sys.argv[3:]).returncode
 record("end")
 sys.exit(rc)
 """)
     events = tmp_path / "events.jsonl"
+    return [sys.executable, str(probe), str(events)], events
+
+
+@pytest.mark.parametrize("light_lanes", [None, 1, 8])
+def test_wins_lane_concurrency_and_heavy_barrier(tmp_path, monkeypatch, wins_probe, light_lanes):
+    if light_lanes is None:
+        monkeypatch.delenv("WINS_LANES", raising=False)
+    else:
+        monkeypatch.setenv("WINS_LANES", str(light_lanes))
+    probe, events = wins_probe
     lanes = ["light"] * 4 + ["heavy"] + ["light"] * 3
     items = [
         dict(
             name=f"item{i}",
             lane=lane,
-            cmd=[sys.executable, str(probe), str(events), f"item{i}", "true" if i % 2 else "false"],
+            cmd=[*probe, f"item{i}", "true" if i % 2 else "false"],
         )
         for i, lane in enumerate(lanes)
     ]
     result = run_wins(tmp_path, items)
     assert result.returncode == 1, result.stderr
     active, maximum = set(), 0
+    started, retries = set(), []
     for event, name in map(json.loads, events.read_text().splitlines()):
         if event == "start":
+            if name in started:
+                assert len(started) == len(items)
+                assert not active
+                retries.append(name)
+            started.add(name)
             active.add(name)
         else:
             active.remove(name)
         maximum = max(maximum, len(active))
-        assert len(active) <= 3
+        assert len(active) <= (light_lanes or 3)
+        if retries:
+            assert len(active) <= 1
         if "item4" in active:
             assert active == {"item4"}
-    assert not active and maximum == 3
+    assert not active and maximum == min(light_lanes or 3, 4)
+    assert retries == ["item0", "item2", "item4", "item6"]
+    assert [line for line in result.stdout.splitlines() if line.startswith("WINS_RETRY")] == [
+        f"WINS_RETRY {name}" for name in retries
+    ]
     assert result.stdout.splitlines()[-1] == "WINS_DONE ok=4 failed=4"
+
+
+@pytest.mark.parametrize("light_lanes", ["0", "x", "9"])
+def test_wins_invalid_lanes_start_nothing(tmp_path, monkeypatch, wins_probe, light_lanes):
+    monkeypatch.setenv("WINS_LANES", light_lanes)
+    probe, events = wins_probe
+    result = run_wins(tmp_path, [dict(name="item", lane="light", cmd=[*probe, "item", "true"])])
+    assert result.returncode == 2
+    assert "WINS_ERROR" in result.stderr
+    assert "WINS_START" not in result.stdout
+    assert not events.exists()
+
+
+def test_wins_retry_recovers_and_keeps_both_attempts(tmp_path):
+    flag = tmp_path / "first-attempt"
+    command = [
+        sys.executable,
+        "-c",
+        "from pathlib import Path; import sys; p = Path(sys.argv[1]); "
+        "existed = p.exists(); p.touch(); sys.exit(0 if existed else 1)",
+        str(flag),
+    ]
+    result = run_wins(tmp_path, [dict(name="item", lane="light", cmd=command)])
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [
+        "WINS_START item lane=light",
+        "WINS_EXIT item exit=1",
+        "WINS_RETRY item",
+        "WINS_START item lane=light",
+        "WINS_EXIT item exit=0",
+        "WINS_DONE ok=1 failed=0",
+    ]
+    state = tmp_path / "ops/wins/synthetic"
+    assert json.loads((state / "item.json").read_text()) == dict(argv=command, exit=0)
+    assert (
+        sum(line.startswith("COMMAND ") for line in (state / "item.log").read_text().splitlines())
+        == 2
+    )
+
+
+@pytest.mark.parametrize(
+    "command, retry_failed, attempts, expected_exit",
+    [
+        (["false"], "1", 2, 1),
+        (["false"], "0", 1, 1),
+        (["/nonexistent/wins-test-command"], "1", 1, 127),
+        ([sys.executable, "-c", "raise SystemExit(127)"], "1", 2, 127),
+    ],
+)
+def test_wins_retry_attempt_limit(
+    tmp_path, monkeypatch, command, retry_failed, attempts, expected_exit
+):
+    monkeypatch.setenv("WINS_RETRY_FAILED", retry_failed)
+    result = run_wins(tmp_path, [dict(name="item", lane="light", cmd=command)])
+    assert result.returncode == 1, result.stderr
+    assert result.stdout.count("WINS_START") == attempts
+    assert result.stdout.count("WINS_RETRY") == attempts - 1
+    assert result.stdout.count(f"WINS_EXIT item exit={expected_exit}") == attempts
+    assert result.stdout.splitlines()[-1] == "WINS_DONE ok=0 failed=1"
+    state = tmp_path / "ops/wins/synthetic"
+    assert json.loads((state / "item.json").read_text())["exit"] == expected_exit
+    assert (
+        sum(line.startswith("COMMAND ") for line in (state / "item.log").read_text().splitlines())
+        == attempts
+    )
 
 
 def test_wins_resume_reaches_cli_even_after_previous_success(tmp_path, monkeypatch):
