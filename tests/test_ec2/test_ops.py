@@ -396,6 +396,25 @@ def test_stop_reconciles_when_no_usable_ssh_key(operator):
     result = operator.run("session.sh", "stop")
     assert result.returncode == 2
     assert operator.guard_operations() == ["stop", "reconcile"]
+    assert "SSH shutdown fallback skipped: missing connection record" in result.stderr
+    assert not operator.calls("ssh")
+
+
+def test_stop_reports_incomplete_connection_record(operator, monkeypatch, capsys):
+    monkeypatch.syspath_prepend(str(OPS))
+    import session_control
+
+    for name in ("PYTHON", "LOCAL_CODE", "LEDGER"):
+        monkeypatch.setenv(name, operator.env[name])
+    monkeypatch.setattr(
+        session_control, "execute", lambda *args, **kwargs: "key\thost\tknown\tdeadline\n"
+    )
+    monkeypatch.setattr(session_control, "guard", lambda *args, **kwargs: None)
+    assert session_control.stop() == 2
+    assert (
+        "SSH shutdown fallback skipped: connection record has 4 fields; expected 7"
+        in capsys.readouterr().err
+    )
 
 
 def test_stop_reconciles_with_errexit_in_operator_env(operator):
@@ -519,6 +538,46 @@ def test_chain_failures_always_stop_and_reconcile(operator, failure):
         assert len(dispatches) == 1
 
 
+def test_chain_guest_failure_still_copies_results_and_stops(operator):
+    result = operator.chain(wait_codes=[0, 1])
+    assert result.returncode == 1, result.stderr
+    assert any("ubuntu@192.0.2.10:/results/" in call for call in operator.calls("rsync"))
+    assert operator.guard_operations()[-2:] == ["stop", "reconcile"]
+    assert json.loads(operator.ledger_path.read_text())["sessions"][0]["status"] == "closed"
+
+
+@pytest.mark.parametrize("initial_sha", [None, "b" * 40, "a" * 40])
+def test_chain_checkout_env_sha_is_idempotent(operator, initial_sha):
+    guest_code = operator.tmp / "guest code"
+    (guest_code / ".git").mkdir(parents=True)
+    guest_env = operator.tmp / "guest env.sh"
+    original = "export OTHER=retained"
+    if initial_sha:
+        original += f" FEV_SHA={initial_sha}"
+    original += "\n"
+    guest_env.write_text(original)
+    operator.env.update(GUEST_CODE=str(guest_code), GUEST_ENV=str(guest_env), FEV_SHA="a" * 40)
+    operator.executable(
+        operator.bin / "git",
+        '#!/bin/bash\nif [[ $1 == rev-parse ]]; then printf "%s\\n" "$SHA"; fi\nexit 0\n',
+    )
+    for _ in range(2):
+        result = operator.chain()
+        assert result.returncode == 0, result.stderr
+        checkout = [call[-1] for call in operator.calls("ssh") if "git checkout" in call[-1]][-1]
+        result = subprocess.run(
+            ["/bin/bash", "-c", checkout],
+            env=operator.env,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        assert result.returncode == 0, result.stderr
+    contents = guest_env.read_text()
+    assert contents.startswith(original)
+    assert contents.count("FEV_SHA=" + "a" * 40) == 1
+
+
 def test_chain_skip_setup_is_explicit(operator):
     operator.env["SKIP_SETUP"] = "1"
     result = operator.chain()
@@ -617,7 +676,11 @@ def run_wins(tmp_path, items):
 
 @pytest.mark.parametrize(
     "commands, expected_rc, summary",
-    [(["true", "false", "true"], 0, "ok=2 failed=1"), (["false", "false"], 1, "ok=0 failed=2")],
+    [
+        (["true", "true"], 0, "ok=2 failed=0"),
+        (["true", "false", "true"], 1, "ok=2 failed=1"),
+        (["false", "false"], 1, "ok=0 failed=2"),
+    ],
 )
 def test_wins_true_false_summary_and_resume(tmp_path, commands, expected_rc, summary):
     items = [dict(name=f"item{i}", lane="light", cmd=cmd) for i, cmd in enumerate(commands)]
@@ -656,7 +719,7 @@ sys.exit(rc)
         for i, lane in enumerate(lanes)
     ]
     result = run_wins(tmp_path, items)
-    assert result.returncode == 0, result.stderr
+    assert result.returncode == 1, result.stderr
     active, maximum = set(), 0
     for event, name in map(json.loads, events.read_text().splitlines()):
         if event == "start":
@@ -972,7 +1035,8 @@ def test_queue_lock_excludes_other_stages(tmp_path):
         assert "WINS_START" not in result.stdout
 
 
-def test_real_guard_interrupt_during_copy_advances_to_cleanup(operator):
+@pytest.mark.parametrize("unresolved_stop", [False, True])
+def test_real_guard_interrupt_during_copy_advances_to_cleanup(operator, unresolved_stop):
     prepare_real_chain(operator, stall_rsync=True)
     operator.env["COPY_TIMEOUT_SECONDS"] = "60"
     child = subprocess.Popen(
@@ -991,14 +1055,20 @@ def test_real_guard_interrupt_during_copy_advances_to_cleanup(operator):
             assert child.poll() is None
             assert time.monotonic() < end
             time.sleep(0.02)
+        if unresolved_stop:
+            operator.state(instance_state="stopped", stop_reason="")
         child.send_signal(signal.SIGINT)
         _out, err = child.communicate(timeout=10)
     finally:
         if child.poll() is None:
             child.kill()
             child.wait()
-    assert child.returncode != 0, err
+    assert child.returncode == (2 if unresolved_stop else 130), err
     assert "Copy-back interrupted" in err
+    if unresolved_stop:
+        assert "Earlier failure exit=130 superseded by stop exit=2" in err
+    else:
+        assert "superseded by stop" not in err
     data = json.loads(operator.ledger_path.read_text())
     assert len([t for t in data["transactions"] if t["command"] == "stop"]) == 1
     assert len([t for t in data["transactions"] if t["command"] == "reconcile"]) == 1

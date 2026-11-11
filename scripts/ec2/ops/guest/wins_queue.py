@@ -85,7 +85,7 @@ def run(stage: str, manifest: Path) -> int:
             results.extend(job.result() for job in pending)
         ok = sum(results)
         print(f"WINS_DONE ok={ok} failed={len(results) - ok}", flush=True)
-        return 0 if ok else 1
+        return 0 if all(results) else 1
 
 
 if __name__ == "__main__":

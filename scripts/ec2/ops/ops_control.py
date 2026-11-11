@@ -45,30 +45,6 @@ def host(fallback: bool = False) -> None:
     print("\t".join(fields))
 
 
-def stop_evidence(label: str, txn: str, at: str, rc: str, failed: str) -> None:
-    if not re.fullmatch(r"[a-zA-Z0-9_-]+", label):
-        raise ValueError("Invalid session label")
-    path = Path(os.environ["EXPERIMENT"]) / "ops" / f"stop.{label}.json"
-    evidence = dict(
-        label=label,
-        txn=txn,
-        shutdown_at=at,
-        shutdown_ssh_exit=int(rc),
-        first_failed_ssh_at=failed or None,
-        note="SSH unreachability is evidence for operator review, not proof of an EC2 stop",
-    )
-    # Keep the first observed failure across repeated stop attempts.
-    if path.exists():
-        previous = json.loads(path.read_text())
-        if previous.get("first_failed_ssh_at"):
-            evidence["first_failed_ssh_at"] = previous["first_failed_ssh_at"]
-    path.write_text(json.dumps(evidence, indent=2) + "\n")
-    print(
-        f"SSH stop evidence: {path}; after login, reconcile and settle estimated times with evidence",
-        file=sys.stderr,
-    )
-
-
 def command(script: str, *args: str, seconds=None) -> None:
     if seconds is None:
         operation = args[0] if args else ""
@@ -225,7 +201,9 @@ git fetch -q origin {quote(sha)}
 git checkout -q --detach {quote(sha)}
 test "$(git rev-parse HEAD)" = {quote(sha)}
 test -z "$(git status --porcelain)"
-printf '\\nexport FEV_SHA=%s\\n' {quote(sha)} >> {quote(guest_env)}
+if ! (unset FEV_SHA; source {quote(guest_env)}; test "${{FEV_SHA:-}}" = {quote(sha)}); then
+    printf '\\nexport FEV_SHA=%s\\n' {quote(sha)} >> {quote(guest_env)}
+fi
 """
         work("remote.sh", "ssh", checkout)
         for name, destination in (
@@ -315,7 +293,15 @@ printf '\\nexport FEV_SHA=%s\\n' {quote(sha)} >> {quote(guest_env)}
                 try:
                     owned_session(ledger(), owned)
                     if owned and any(s["txn_id"] in owned for s in unresolved(ledger())):
-                        rc = stop(owned) or rc
+                        stop_rc = stop(owned)
+                        if stop_rc:
+                            # Unresolved stops take precedence because the instance may still cost money.
+                            if rc:
+                                print(
+                                    f"Earlier failure exit={rc} superseded by stop exit={stop_rc}",
+                                    file=sys.stderr,
+                                )
+                            rc = stop_rc
                 except (OSError, ValueError, subprocess.SubprocessError) as exc:
                     print(f"Stop/reconcile requires attention: {exc}", file=sys.stderr)
                     rc = rc or 2
@@ -331,8 +317,6 @@ def main() -> int:
     elif action == "status":
         data, _end = json.JSONDecoder().raw_decode(sys.stdin.read().lstrip())
         print(json.dumps(data, indent=2))
-    elif action == "stop-evidence":
-        stop_evidence(*args)
     elif action == "transfer-manifest":
         size, path = args
         if not re.fullmatch(r"[0-9]+", size.strip()):

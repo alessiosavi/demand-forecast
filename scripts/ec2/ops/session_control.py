@@ -256,6 +256,13 @@ def _stop(owned):
     phase("reconcile")
     data = ledger()
     # A successful guard exit can leave pending discovery or estimated stop times.
+    if (rc or unresolved(data)) and (not connection or len(connection) != 7):
+        reason = (
+            f"connection record has {len(connection)} fields; expected 7"
+            if connection
+            else "missing connection record"
+        )
+        print(f"SSH shutdown fallback skipped: {reason}", file=sys.stderr)
     if (rc or unresolved(data)) and connection and len(connection) == 7:
         key, address, known, _deadline, label, _instance, txn = connection
         if owned is None or txn in owned:

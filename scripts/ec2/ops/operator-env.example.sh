@@ -36,5 +36,6 @@ export PULL='[{"remote_dir":"/home/ubuntu/fev/runs/wins","local_dir":"/absolute/
 export EXPECTED_EXIT=0 SKIP_SETUP=0
 # wins-guest.sh uses $OPS/wins/<stage> for logs/status; optional WINS_STATE_DIR
 # overrides $OPS/wins. Manifest cmd is an argv array or a shell-quoted argv string.
-# fev run/tune receive --resume automatically. Failed items retry on the next run;
-# each invocation lets fev validate and resume its own output artifacts.
+# fev run/tune receive --resume automatically. A non-zero queue exit means at least
+# one item failed; results are still copied back. Rerun to retry failed items.
+# Each invocation lets fev validate and resume its own output artifacts.

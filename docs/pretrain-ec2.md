@@ -1159,6 +1159,11 @@ guard settle --txn "$TXN" --stopped-at "$CONFIRMED_STOP_UTC" --evidence "$STOP_E
 bash "$LOCAL_CODE/scripts/ec2/ops/session.sh" status
 ```
 
+The wins queue exits zero only when every item succeeds; a non-zero queue exit
+means at least one item failed. Results are still copied back and the session is
+stopped. Rerun to retry failed items; each invocation lets `fev --resume` validate
+and resume its own output artifacts.
+
 Section 16's chain checks the ledger after stop/reconcile and exits nonzero for
 open/pending sessions, unconfirmed stops, or estimated stop times, even when the
 guard returned zero. It prints the ledger-specific settle command with explicit
