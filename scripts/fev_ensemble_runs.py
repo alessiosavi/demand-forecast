@@ -7,8 +7,10 @@ import ast
 import hashlib
 import json
 import sys
+import zlib
 from dataclasses import fields
 from pathlib import Path
+from zipfile import BadZipFile
 
 import numpy as np
 import pandas as pd
@@ -195,6 +197,8 @@ def main(argv: list[str] | None = None) -> int:
         SyntaxError,
         RuntimeError,
         EOFError,
+        BadZipFile,
+        zlib.error,
     ) as exc:
         print(f"Ensemble refused: {exc}", file=sys.stderr)
         return 2

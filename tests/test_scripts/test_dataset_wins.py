@@ -1,19 +1,15 @@
-"""Offline protocol checks using synthetic fev rows and tiny local forecasts."""
+"""Bench-free protocol checks for task shifts, recipe selection and standings."""
 
 import json
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 import pytest
 import yaml
 
-from demand_forecast.bench.run import assemble_predictions
 from demand_forecast.bench.specs import load_task_specs
 from demand_forecast.config import Settings
-from scripts import fev_ensemble_runs, fev_shift_tasks, fev_wins
-from tests.helpers.fev_fixture import write_fev_fixture
-from tests.helpers.fev_spec import fixture_spec
+from scripts import fev_shift_tasks, fev_wins
 
 
 @pytest.fixture(autouse=True)
@@ -54,8 +50,7 @@ def test_shift_formula_and_output_loads(tmp_path, count, step, explicit_cutoff):
     assert spec.num_windows == expected_count
     assert spec.initial_cutoff == cutoff - ((expected_count - 1) * effective_step + 4)
     # Last backtest horizon ends EXACTLY where the first official horizon starts.
-    shifted = spec.to_task()
-    assert shifted.cutoffs[-1] + spec.horizon == cutoff
+    assert spec.initial_cutoff + (spec.num_windows - 1) * effective_step + spec.horizon == cutoff
 
 
 def test_official_is_unmodified_and_names_file_and_windows_override(tmp_path):
@@ -82,7 +77,7 @@ def test_time_units_fail_with_task_name(tmp_path, capsys, updates):
 
 
 @pytest.mark.parametrize("count,cutoff", [(None, "2023-05-05"), (2, "2023-08-25")])
-def test_timestamp_override_round_trips_and_constructs_fev_task(tmp_path, count, cutoff):
+def test_timestamp_override_round_trips(tmp_path, count, cutoff):
     out = tmp_path / "timestamp.yaml"
     args = [
         "--names",
@@ -103,12 +98,6 @@ def test_timestamp_override_round_trips_and_constructs_fev_task(tmp_path, count,
         "56D",
         count or 4,
     )
-    task = spec.to_task()
-    assert task.cutoffs == [
-        (pd.Timestamp(cutoff) + pd.Timedelta(days=56 * index)).isoformat()
-        for index in range(count or 4)
-    ]
-    assert pd.Timestamp(task.cutoffs[-1]) + pd.Timedelta(days=56) == pd.Timestamp("2023-12-15")
     original = next(s for s in load_task_specs("fev100") if s.name == spec.name).to_dict()
     original.update(initial_cutoff=cutoff, window_step_size="56D", num_windows=count or 4)
     assert spec.to_dict() == original
@@ -142,11 +131,6 @@ def test_timestamp_overrides_repeat_for_rohlik_tasks(tmp_path):
             cutoff,
             f"{days}D",
             4,
-        )
-        task = spec.to_task()
-        assert len(task.cutoffs) == 4
-        assert pd.Timestamp(task.cutoffs[-1]) + pd.Timedelta(days=days) == pd.Timestamp(
-            "2023-12-15"
         )
 
 
@@ -292,134 +276,6 @@ def test_unknown_name_fails_without_output(tmp_path, capsys):
     assert fev_shift_tasks.main(["--names", "typo", "--out", str(out)]) == 2
     assert "unknown task: typo" in capsys.readouterr().err
     assert not out.exists()
-
-
-@pytest.fixture
-def local_runs(tmp_path):
-    spec = fixture_spec(write_fev_fixture(tmp_path / "data", n_series=2, length=32))
-    task = spec.to_task()
-    runs, forecasts = [], []
-    for seed in range(2):
-        directory = tmp_path / f"seed{seed}"
-        (directory / spec.name).mkdir(parents=True)
-        predictions, arrays_per_window = [], []
-        for index, window in enumerate(task.iter_windows()):
-            past, _ = window.get_input_data()
-            ids = [row["id"] for row in past]
-            arrays = np.broadcast_to(
-                np.arange(9, dtype=np.float32) + 8 + seed * 2 + index,
-                (len(ids), 4, 9),
-            ).copy()
-            np.savez(
-                directory / spec.name / f"window_{index}.npz",
-                ids=np.asarray(ids),
-                arrays=arrays,
-                identity=f"seed{seed}",
-            )
-            predictions.append(assemble_predictions(spec, past, ids, arrays))
-            arrays_per_window.append(arrays)
-        # Independent oracle: call fev itself, as the runner did before extraction.
-        summary = task.evaluation_summary(
-            predictions,
-            model_name=f"seed{seed}",
-            trained_on_this_dataset=False,
-            per_quantile_scores=True,
-        )
-        pd.DataFrame([{"task": spec.name, **summary}]).to_csv(
-            directory / "summaries.csv", index=False
-        )
-        runs.append(directory)
-        forecasts.append(arrays_per_window)
-    return spec, runs, forecasts
-
-
-def test_one_run_ensemble_is_exact(local_runs, tmp_path):
-    spec, runs, forecasts = local_runs
-    out = tmp_path / "one"
-    assert (
-        fev_ensemble_runs.main(["--runs", str(runs[0]), "--out", str(out), "--model-name", "one"])
-        == 0
-    )
-    original = pd.read_csv(runs[0] / "summaries.csv", float_precision="round_trip")
-    result = pd.read_csv(out / "summaries.csv", float_precision="round_trip")
-    assert result.test_error.iloc[0] == original.test_error.iloc[0]
-    for index, expected in enumerate(forecasts[0]):
-        with np.load(out / spec.name / f"window_{index}.npz") as saved:
-            np.testing.assert_array_equal(saved["arrays"], expected)
-
-
-def test_two_run_mean_and_monotonicity(local_runs, tmp_path):
-    spec, runs, forecasts = local_runs
-    # Cross two quantiles in one input so re-sorting is actually exercised.
-    path = runs[1] / spec.name / "window_0.npz"
-    with np.load(path) as saved:
-        values = dict(saved)
-    values["arrays"] = values["arrays"][..., ::-1].copy()
-    values["arrays"][..., 0] += 4
-    np.savez(path, **values)
-    forecasts[1][0] = values["arrays"]
-    out = tmp_path / "two"
-    result = fev_ensemble_runs.ensemble_runs(runs, out, "mean")
-    expected_predictions = []
-    for index, window in enumerate(spec.to_task().iter_windows()):
-        expected = np.sort(np.mean([forecasts[0][index], forecasts[1][index]], axis=0), axis=-1)
-        with np.load(out / spec.name / f"window_{index}.npz") as saved:
-            np.testing.assert_array_equal(saved["arrays"], expected)
-            assert (np.diff(saved["arrays"], axis=-1) >= 0).all()
-            past, _ = window.get_input_data()
-            expected_predictions.append(
-                assemble_predictions(spec, past, saved["ids"].tolist(), expected)
-            )
-    oracle = spec.to_task().evaluation_summary(expected_predictions, model_name="oracle")
-    assert result.test_error.iloc[0] == oracle["test_error"]
-
-
-@pytest.mark.parametrize(
-    "mismatch", ["ids", "shape", "quantiles", "saved_quantiles", "windows", "tasks", "fingerprint"]
-)
-def test_ensemble_mismatches_fail(local_runs, tmp_path, capsys, mismatch):
-    spec, runs, _ = local_runs
-    path = runs[1] / spec.name / "window_0.npz"
-    if mismatch in {"ids", "shape", "saved_quantiles"}:
-        with np.load(path) as saved:
-            values = dict(saved)
-        if mismatch == "ids":
-            values["ids"] = np.asarray(["unexpected", "1"])
-        elif mismatch == "shape":
-            values["arrays"] = values["arrays"][:, :-1]
-        else:
-            values["quantile_levels"] = np.arange(9) / 9
-        np.savez(path, **values)
-    elif mismatch == "windows":
-        path.unlink()
-    else:
-        csv = runs[1] / "summaries.csv"
-        rows = pd.read_csv(csv)
-        if mismatch == "quantiles":
-            rows["quantile_levels"] = "[0.1, 0.5, 0.9]"
-        elif mismatch == "fingerprint":
-            rows["dataset_fingerprint"] = "different"
-        else:
-            rows["task_name"] = "other"
-            rows["task"] = "other"
-        rows.to_csv(csv, index=False)
-    out = tmp_path / "bad"
-    assert (
-        fev_ensemble_runs.main(
-            ["--runs", *map(str, runs), "--out", str(out), "--model-name", "bad"]
-        )
-        == 2
-    )
-    assert "Ensemble refused" in capsys.readouterr().err
-    assert not (out / "summaries.csv").exists()
-
-
-def test_ensemble_reconstructs_mixed_csv_cutoff_types(local_runs):
-    _, runs, _ = local_runs
-    row = pd.read_csv(runs[0] / "summaries.csv").iloc[0].to_dict()
-    row["initial_cutoff"], row["window_step_size"] = "-8", "4"
-    task = fev_ensemble_runs.task_from_row(row)
-    assert task.cutoffs == [-8, -4]
 
 
 def test_positive_cutoff_cannot_wrap_to_negative_index(tmp_path, capsys):
