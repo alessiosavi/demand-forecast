@@ -1152,7 +1152,7 @@ bash "$LOCAL_CODE/scripts/ec2/ops/session.sh" start "$LABEL" "$MINUTES" 24
 # This opens a session only. Use remote.sh push/dispatch/wait/pull, then stop;
 # run-guest-job.sh starts its own session and must not be called on this one.
 
-# After expired-token shutdown, inspect ops/stop.<label>.json and AWS evidence.
+# After an expired-token stop fallback, inspect ops/stop.<label>.json and AWS evidence.
 aws sso login --profile "$AWS_PROFILE"
 guard reconcile
 guard settle --txn "$TXN" --stopped-at "$CONFIRMED_STOP_UTC" --evidence "$STOP_EVIDENCE"
@@ -1174,6 +1174,15 @@ Section 16's chain checks the ledger after stop/reconcile and exits nonzero for
 open/pending sessions, unconfirmed stops, or estimated stop times, even when the
 guard returned zero. It prints the ledger-specific settle command with explicit
 evidence placeholders. A failed SSH probe alone does not establish a stop time.
+If stop/reconcile remains unresolved, the pinned SSH fallback brings the guest
+deadline forward through `sudo /usr/local/sbin/arm-deadline.sh set <UTC>`.
+It requests the first minute boundary at least 60 seconds ahead of the operator's
+current UTC time, so the guest stop can take up to about two minutes.
+`ops/stop.<label>.json` retains the requested deadline, helper reply and SSH
+evidence. Exit 0 with `DEADLINE_SET` confirms only that a guest stop is scheduled;
+it does not confirm an EC2 stop or resolve the ledger. Helper failures (including
+exit 3 with `DEADLINE_NOT_READY` before the boot unit runs) are recorded and
+reported on stderr. The chain still exits nonzero while the ledger is unresolved.
 Current public IPv4 tcp/22 ingress is checked before each start and refreshed on
 SSH transport failure while credentials work; existing rules are retained and
 additions are recorded in `ops/sg-changes.log`. Dispatch is never retried.
@@ -1183,7 +1192,7 @@ Checkout, push, dispatch and copy-back have overall command timeouts (defaults
 `CHECKOUT_TIMEOUT_SECONDS`, `PUSH_TIMEOUT_SECONDS`, `DISPATCH_TIMEOUT_SECONDS`,
 `COPY_TIMEOUT_SECONDS` and `COPY_BUDGET_SECONDS` as needed. Interrupting copy-back
 advances to cleanup. Cleanup has its own `STOP_TIMEOUT_SECONDS` budget (480
-seconds), with bounded guard calls and SSH shutdown. These limits supplement
+seconds), with bounded guard calls and the SSH stop fallback. These limits supplement
 the existing guest deadline and AWS stop schedule. After capacity retry, the
 original label's `ops/session.<label>.json` identifies the actual transaction;
 `ops/outer-job.<original-label>.txt` retains the job polling path.

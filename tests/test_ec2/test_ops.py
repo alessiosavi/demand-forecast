@@ -159,14 +159,15 @@ if name == "ssh":
     if state.get("ssh_failures", 0):
         state["ssh_failures"] -= 1
         finish(255)
+    if cmd.startswith("sudo /usr/local/sbin/arm-deadline.sh set "):
+        state["stop_fallback"] = True
+        print(state.get("helper_reply", "DEADLINE_SET") + " " + shlex.split(cmd)[-1])
+        finish(state.get("helper_rc", 0))
     if any("arm-deadline.sh" in a for a in args):
         print("DEADLINE_SET " + args[-1])
         finish()
-    if "sudo shutdown -h now" in cmd:
-        state["shutdown"] = True
-        finish(state.get("shutdown_rc", 255))
-    if cmd == "true" and state.get("shutdown"):
-        finish(255)
+    if cmd == "true" and state.get("stop_fallback"):
+        finish(state.get("probe_rc", 255))
     if "wait-job.sh" in cmd:
         codes = state.get("wait_codes", [])
         finish(codes.pop(0) if codes else 0)
@@ -375,19 +376,69 @@ def test_remote_refuses_unpinned_host(operator):
 
 
 @pytest.mark.parametrize("reconcile_rc", [0, 2])
-def test_stop_shutdown_backstop_and_reconcile(operator, reconcile_rc):
+def test_stop_deadline_backstop_and_reconcile(operator, reconcile_rc):
     operator.state(stop_rc=2, reconcile_rc=reconcile_rc)
     result = operator.run("session.sh", "stop")
     assert result.returncode == 2
     assert operator.guard_operations() == ["stop", "reconcile"]
     calls = operator.calls("ssh")
-    assert calls[0][-1] == "sudo shutdown -h now"
+    assert calls[0][-1].startswith("sudo /usr/local/sbin/arm-deadline.sh set ")
     assert calls[1][-1] == "true"
     assert "StrictHostKeyChecking=yes" in calls[0]
     evidence = json.loads((operator.experiment / "ops/stop.test.json").read_text())
-    assert evidence["shutdown_ssh_exit"] == 255
+    assert evidence["shutdown_ssh_exit"] == 0
+    assert evidence["deadline_reply"] == "DEADLINE_SET " + evidence["requested_deadline"]
     assert evidence["first_failed_ssh_at"].endswith("Z")
     datetime.strptime(evidence["first_failed_ssh_at"], "%Y-%m-%dT%H:%M:%SZ")
+
+
+@pytest.mark.parametrize(
+    "now, expected",
+    [
+        ("2026-11-11T12:30:00Z", "2026-11-11T12:31:00Z"),
+        ("2026-11-11T12:30:00.001Z", "2026-11-11T12:32:00Z"),
+        ("2026-11-11T23:59:59.999Z", "2026-11-12T00:01:00Z"),
+    ],
+)
+def test_stop_fallback_uses_earliest_safe_helper_deadline(operator, monkeypatch, now, expected):
+    monkeypatch.syspath_prepend(str(OPS))
+    import session_control
+
+    for name, value in operator.env.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("GUEST_USER", "ubuntu")
+    current = datetime.fromisoformat(now.replace("Z", "+00:00")).timestamp()
+    monkeypatch.setattr(session_control.time, "time", lambda: current)
+    operator.state(stop_rc=2, probe_rc=0)
+
+    assert session_control.stop() == 2
+    command = operator.calls("ssh")[0][-1]
+    assert shlex.split(command) == ["sudo", "/usr/local/sbin/arm-deadline.sh", "set", expected]
+    assert "shutdown" not in command
+    requested = datetime.strptime(expected, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    assert 60 <= requested.timestamp() - current < 120
+    evidence = json.loads((operator.experiment / "ops/stop.test.json").read_text())
+    assert evidence["requested_deadline"] == expected
+    assert evidence["deadline_reply"] == "DEADLINE_SET " + expected
+    assert evidence["shutdown_ssh_exit"] == 0
+    assert evidence["first_failed_ssh_at"] is None
+    assert json.loads(operator.ledger_path.read_text())["sessions"][0]["status"] == "open"
+
+
+@pytest.mark.parametrize(
+    "helper_rc, helper_reply",
+    [(3, "DEADLINE_NOT_READY"), (1, "DEADLINE_MISMATCH"), (0, "UNEXPECTED_REPLY")],
+)
+def test_stop_reports_unconfirmed_helper_reply(operator, helper_rc, helper_reply):
+    operator.state(stop_rc=2, helper_rc=helper_rc, helper_reply=helper_reply)
+    result = operator.run("session.sh", "stop")
+    assert result.returncode == 2
+    evidence = json.loads((operator.experiment / "ops/stop.test.json").read_text())
+    assert evidence["shutdown_ssh_exit"] == helper_rc
+    assert evidence["deadline_reply"] == helper_reply + " " + evidence["requested_deadline"]
+    assert evidence["deadline_reply"] in result.stderr
+    assert f"exit={helper_rc}" in result.stderr
+    assert json.loads(operator.ledger_path.read_text())["sessions"][0]["status"] == "open"
 
 
 def test_stop_reconciles_when_no_usable_ssh_key(operator):
@@ -396,7 +447,7 @@ def test_stop_reconciles_when_no_usable_ssh_key(operator):
     result = operator.run("session.sh", "stop")
     assert result.returncode == 2
     assert operator.guard_operations() == ["stop", "reconcile"]
-    assert "SSH shutdown fallback skipped: missing connection record" in result.stderr
+    assert "SSH stop fallback skipped: missing connection record" in result.stderr
     assert not operator.calls("ssh")
 
 
@@ -412,7 +463,7 @@ def test_stop_reports_incomplete_connection_record(operator, monkeypatch, capsys
     monkeypatch.setattr(session_control, "guard", lambda *args, **kwargs: None)
     assert session_control.stop() == 2
     assert (
-        "SSH shutdown fallback skipped: connection record has 4 fields; expected 7"
+        "SSH stop fallback skipped: connection record has 4 fields; expected 7"
         in capsys.readouterr().err
     )
 
@@ -965,7 +1016,9 @@ def test_real_guard_estimated_stop_cannot_report_success(operator):
     assert "'--ledger'" not in result.stderr  # shlex emits a copyable command
     assert "settle --txn " + data["sessions"][0]["txn_id"] in result.stderr
     assert "--stopped-at '<confirmed-stop-UTC>'" in result.stderr
-    assert any(c[-1] == "sudo shutdown -h now" for c in operator.calls("ssh"))
+    assert any(
+        c[-1].startswith("sudo /usr/local/sbin/arm-deadline.sh set ") for c in operator.calls("ssh")
+    )
     assert len([t for t in data["transactions"] if t["command"] == "stop"]) == 1
     assert len([t for t in data["transactions"] if t["command"] == "reconcile"]) == 1
 
@@ -978,7 +1031,9 @@ def test_real_guard_empty_discovery_retains_pending_and_falls_back(operator):
     assert result.returncode == 2, result.stderr
     assert json.loads(operator.ledger_path.read_text())["sessions"][0]["status"] == "open"
     assert "Stop unconfirmed" in result.stderr
-    assert any(c[-1] == "sudo shutdown -h now" for c in operator.calls("ssh"))
+    assert any(
+        c[-1].startswith("sudo /usr/local/sbin/arm-deadline.sh set ") for c in operator.calls("ssh")
+    )
 
 
 def prepare_real_chain(operator, **state):
@@ -1163,10 +1218,14 @@ def test_real_guard_interrupt_during_copy_advances_to_cleanup(operator, unresolv
     assert data["sessions"][0]["status"] == "closed", err
 
 
-def test_real_guard_stalled_shutdown_is_bounded_and_unresolved(operator):
+def test_real_guard_stalled_stop_fallback_is_bounded_and_unresolved(operator):
     use_real_guard(operator)
     assert operator.run("session.sh", "start", "shutdown", "60", "0").returncode == 0
-    operator.state(instance_state="stopped", stall_contains="sudo shutdown", stop_reason="")
+    operator.state(
+        instance_state="stopped",
+        stall_contains="sudo /usr/local/sbin/arm-deadline.sh",
+        stop_reason="",
+    )
     operator.env.update(SSH_TIMEOUT_SECONDS="0.2", STOP_TIMEOUT_SECONDS="6")
     before = time.monotonic()
     result = operator.run("session.sh", "stop")

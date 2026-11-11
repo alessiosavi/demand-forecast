@@ -262,11 +262,11 @@ def _stop(owned):
             if connection
             else "missing connection record"
         )
-        print(f"SSH shutdown fallback skipped: {reason}", file=sys.stderr)
+        print(f"SSH stop fallback skipped: {reason}", file=sys.stderr)
     if (rc or unresolved(data)) and connection and len(connection) == 7:
         key, address, known, _deadline, label, _instance, txn = connection
         if owned is None or txn in owned:
-            print("Stop unresolved; attempting bounded SSH shutdown", file=sys.stderr)
+            print("Stop unresolved; attempting bounded SSH stop fallback", file=sys.stderr)
             ssh = [
                 "ssh",
                 "-i",
@@ -282,6 +282,7 @@ def _stop(owned):
                 f"{os.environ['GUEST_USER']}@{address}",
             ]
             at, failed, shutdown_rc = utc(), "", 124
+            deadline_reply = ""
             try:
                 # Refresh also remains inside the cleanup budget.
                 execute(
@@ -290,12 +291,29 @@ def _stop(owned):
                 )
             except (OSError, ValueError, subprocess.SubprocessError) as exc:
                 print(f"Ingress refresh unavailable; trying pinned host: {exc}", file=sys.stderr)
+            requested_deadline = datetime.fromtimestamp(
+                math.ceil((time.time() + 60) / 60) * 60, timezone.utc
+            ).strftime("%Y-%m-%dT%H:%M:%SZ")
             try:
                 reply = run_process(
-                    ssh + ["sudo shutdown -h now"],
+                    ssh + [f"sudo /usr/local/sbin/arm-deadline.sh set {requested_deadline}"],
                     min(limit("SSH_TIMEOUT_SECONDS", 30), max(0.01, (end - time.monotonic()) / 2)),
+                    text=True,
+                    stdout=subprocess.PIPE,
                 )
                 shutdown_rc = reply.returncode
+                deadline_reply = (reply.stdout or "").strip()
+                if shutdown_rc == 0 and deadline_reply.startswith("DEADLINE_SET "):
+                    print(
+                        f"Guest stop scheduled: {deadline_reply}; EC2 stop unconfirmed",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(
+                        f"SSH stop fallback unconfirmed (exit={shutdown_rc}): "
+                        + (deadline_reply or "no helper reply"),
+                        file=sys.stderr,
+                    )
                 probe_at = utc()
                 probe = run_process(ssh + ["true"], min(15, max(0.01, end - time.monotonic())))
                 if probe.returncode:
@@ -303,12 +321,14 @@ def _stop(owned):
             except subprocess.TimeoutExpired:
                 pass
             except OSError as exc:
-                print(f"SSH shutdown failed: {exc}", file=sys.stderr)
+                print(f"SSH stop fallback failed: {exc}", file=sys.stderr)
             evidence = dict(
                 label=label,
                 txn=txn,
                 shutdown_at=at,
                 shutdown_ssh_exit=shutdown_rc,
+                requested_deadline=requested_deadline,
+                deadline_reply=deadline_reply,
                 first_failed_ssh_at=failed or None,
                 note="SSH loss is not confirmation of an EC2 stop",
             )

@@ -23,6 +23,8 @@ export SETUP_TIMEOUT_SECONDS=2400 COPY_MARGIN_SECONDS=120
 export CHECKOUT_TIMEOUT_SECONDS=180 PUSH_TIMEOUT_SECONDS=180
 export DISPATCH_TIMEOUT_SECONDS=60 COPY_TIMEOUT_SECONDS=180 COPY_BUDGET_SECONDS=240
 export SSH_TIMEOUT_SECONDS=120 GUARD_TIMEOUT_SECONDS=180 STOP_TIMEOUT_SECONDS=480
+# SSH stop fallback brings the guest deadline forward through arm-deadline.sh;
+# allow up to about two minutes. DEADLINE_SET means scheduled, not a confirmed EC2 stop.
 export START_TIMEOUT_SECONDS=1200 START_RETRIES=24
 # Optional: latest reservation deadline in UTC; retries shorten the session.
 # export LATEST_DEADLINE=2026-11-12T02:00:00Z
