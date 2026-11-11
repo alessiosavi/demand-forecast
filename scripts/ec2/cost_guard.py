@@ -800,7 +800,13 @@ class Guard:
             raise GuardError("minutes must be positive")
         if any(s["label"] == args.label for s in self.ledger["sessions"]):
             raise GuardError("session labels cannot be reused")
-        deadline = self.now() + timedelta(minutes=args.minutes)
+        now = self.now()
+        deadline = now + timedelta(minutes=args.minutes)
+        if latest := getattr(args, "latest_deadline", None):
+            deadline = min(deadline, instant(latest))
+        minutes = (deadline - now).total_seconds() / 60
+        if minutes <= 0:
+            raise GuardError("latest deadline has already passed")
         if deadline + timedelta(minutes=20) >= instant(self.config["cleanup_by"]):
             raise GuardError("session backstop must precede cleanup-by")
         # Reuse the experiment client token: a hidden successful launch returns the
@@ -832,7 +838,7 @@ class Guard:
             "label": args.label,
             "txn_id": self.txn["id"],
             "status": "pending",
-            "reservation_usd": reservation_usd(args.minutes, self.rate),
+            "reservation_usd": reservation_usd(minutes, self.rate),
             "settled_cost_usd": None,
             "instance_id": self.ledger.get("instance_id"),
             "public_ip": None,
@@ -1525,6 +1531,7 @@ def parser():
         command = commands.add_parser(name)
         command.add_argument("--label", type=label, required=True)
         command.add_argument("--minutes", type=finite, required=True)
+        command.add_argument("--latest-deadline", help="optional absolute UTC reservation cutoff")
         if name == "start":
             command.add_argument("--consume-hold", type=label)
         else:
