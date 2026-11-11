@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Dataset-wins task shifting, saved-forecast ensembling, backtest arm selection, leak-aware standings, and the pre-registered hygiene recipe.
+
 - Recipe-v3 round 5: CPU config-to-bundle/export-to-fine-tune integration,
   per-horizon/source timing and eligible-window exposure, measured raw/EMA
   validation plus snapshot costs, weighted duration estimates in progress/logs,
