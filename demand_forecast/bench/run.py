@@ -133,6 +133,11 @@ def prediction_diagnostics(saved) -> dict | None:
     return {key: saved[key].item() if key in saved else None for key in DIAGNOSTIC_DTYPES}
 
 
+def score_predictions(task, predictions, **kwargs) -> dict:
+    """Score forecasts with the runner's official fev/per-quantile evaluation."""
+    return task.evaluation_summary(predictions, per_quantile_scores=True, **kwargs)
+
+
 def _save_predictions(
     path: Path, ids: list[str], arrays: np.ndarray, identity: str, diagnostics: dict
 ) -> None:
@@ -549,7 +554,8 @@ def _run_fev_tasks(
         devices = {d["device"] for d in diagnostics_per_window if d is not None}
         summary = {
             "task": spec.name,
-            **task.evaluation_summary(
+            **score_predictions(
+                task,
                 predictions,
                 model_name=model_name,
                 trained_on_this_dataset=False,
@@ -575,7 +581,6 @@ def _run_fev_tasks(
                     "scaler_skips": cumulative.get("scaler_skips"),
                     "sessions": cumulative.get("sessions"),
                 },
-                per_quantile_scores=True,
             ),
         }
         summaries = summaries.loc[
