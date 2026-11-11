@@ -964,8 +964,9 @@ after this quota change; omit it so the run builds its live estimate instead.
 
 Allow about $1 for the probe session; $7–10 for the pilot quarter; $20–25 for the
 remaining 58k steps, about $25–35 for training in all. These are planning ranges,
-not measurements. Zero-shot rows cost about $5; composite rows cost $15–20 for
-only the groups whose backtest arms change. Reserve and reconcile each session
+not measurements. The 81 zero-shot backtests took a measured **18 minutes**;
+composite rows cost $15–20 for only the groups whose backtest arms change.
+Reserve and reconcile each session
 in the existing guard ledger; do not launch concurrent GPU work during probing.
 
 On the operator, retain `P2_SHA` (full merged SHA), `PRETRAIN_CONFIG`, `LABEL`,
@@ -1066,7 +1067,7 @@ import os
 from pathlib import Path
 import yaml
 cfg = yaml.safe_load(Path('configs/fev-v2-pretrained-zero-shot.yaml').read_text())
-cfg['forecast'].update(calendar_schema='canonical', target_lags='cycle')
+cfg['forecast'].update(calendar_schema='canonical', target_lags='cycle', scaler_period='pretraining')
 Path(os.environ['OPS'], 'v3-zero-shot.yaml').write_text(yaml.safe_dump(cfg))
 PYCFG
 SNAPSHOT_ID=$(python - "$SNAPSHOT/manifest.json" <<'PYID'
@@ -1114,3 +1115,64 @@ Pre-register these gates in the ledger before the GPU starts (verbatim plan text
 - Adoption gate for the full run: zero-shot standing on the 100 tasks against corpus-v2 (0.219); the new bundle becomes the
   base model only below a 0.97 ratio of geometric SQL on the backtests, group by group; composite rows are re-run only for
   groups that pass. Nothing is chosen on real test windows.
+
+## 16. Operator chain and the dataset-wins study
+
+[Dataset-wins study](dataset-wins.md)
+
+```bash
+cp scripts/ec2/ops/operator-env.example.sh /absolute/path/outside/repo/operator-env.sh
+${EDITOR:-vi} /absolute/path/outside/repo/operator-env.sh
+export OPERATOR_ENV=/absolute/path/outside/repo/operator-env.sh
+source "$OPERATOR_ENV"
+# First provision, guest env.sh, and Colab inputs: sections 2–4.
+# LABEL must be unique; SHA must be an approved full commit already on origin.
+# GUEST_ARGS, PUSH and PULL are JSON arrays; see operator-env.example.sh.
+bash "$LOCAL_CODE/scripts/ec2/ops/session.sh" status
+bash "$LOCAL_CODE/scripts/ec2/ops/run-guest-job.sh"
+cat "$EXPERIMENT/ops/outer-job.$LABEL.txt"
+bash "$LOCAL_CODE/scripts/ec2/ops/session.sh" status
+
+# Poll an existing session's saved job. Do not start a new session here.
+# Recover JOB from ops/outer-job.<original-label>.txt; after an ambiguous
+# dispatch reply, inspect guest host-logs before polling. Never redispatch it.
+bash "$LOCAL_CODE/scripts/ec2/ops/session.sh" host
+bash "$LOCAL_CODE/scripts/ec2/ops/remote.sh" wait "$JOB" "$EXPECTED_EXIT" "$DEADLINE_EPOCH"
+bash "$LOCAL_CODE/scripts/ec2/ops/remote.sh" pull "$REMOTE_DIR" "$LOCAL_DIR" --exclude '*.npz'
+bash "$LOCAL_CODE/scripts/ec2/ops/session.sh" stop
+
+# Start a new session only after the previous one is fully stopped and settled.
+# Use a fresh label. Each capacity retry gets a suffix (-r2, -r3, ...).
+# CloudTrail must confirm a rejected capacity request before automatic retry;
+# other failures or ambiguous evidence stop the chain. 24 means up to 25 attempts.
+export LABEL='<new-unique-label>'
+# Optional UTC cutoff caps the next reservation, including after retry delays:
+export LATEST_DEADLINE='2026-11-12T02:00:00Z'  # replace with your actual cutoff
+bash "$LOCAL_CODE/scripts/ec2/ops/session.sh" start "$LABEL" "$MINUTES" 24
+# This opens a session only. Use remote.sh push/dispatch/wait/pull, then stop;
+# run-guest-job.sh starts its own session and must not be called on this one.
+
+# After expired-token shutdown, inspect ops/stop.<label>.json and AWS evidence.
+aws sso login --profile "$AWS_PROFILE"
+guard reconcile
+guard settle --txn "$TXN" --stopped-at "$CONFIRMED_STOP_UTC" --evidence "$STOP_EVIDENCE"
+bash "$LOCAL_CODE/scripts/ec2/ops/session.sh" status
+```
+
+Section 16's chain checks the ledger after stop/reconcile and exits nonzero for
+open/pending sessions, unconfirmed stops, or estimated stop times, even when the
+guard returned zero. It prints the ledger-specific settle command with explicit
+evidence placeholders. A failed SSH probe alone does not establish a stop time.
+Current public IPv4 tcp/22 ingress is checked before each start and refreshed on
+SSH transport failure while credentials work; existing rules are retained and
+additions are recorded in `ops/sg-changes.log`. Dispatch is never retried.
+
+Checkout, push, dispatch and copy-back have overall command timeouts (defaults
+180/180/60/180 seconds); copy-back has a shared 240-second budget. Configure
+`CHECKOUT_TIMEOUT_SECONDS`, `PUSH_TIMEOUT_SECONDS`, `DISPATCH_TIMEOUT_SECONDS`,
+`COPY_TIMEOUT_SECONDS` and `COPY_BUDGET_SECONDS` as needed. Interrupting copy-back
+advances to cleanup. Cleanup has its own `STOP_TIMEOUT_SECONDS` budget (480
+seconds), with bounded guard calls and SSH shutdown. These limits supplement
+the existing guest deadline and AWS stop schedule. After capacity retry, the
+original label's `ops/session.<label>.json` identifies the actual transaction;
+`ops/outer-job.<original-label>.txt` retains the job polling path.
