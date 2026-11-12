@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -10,7 +11,7 @@ import pandas as pd
 import yaml
 
 from demand_forecast.bench.run import _save_summaries
-from demand_forecast.bench.specs import load_task_specs
+from demand_forecast.bench.specs import fev_bench_tasks, load_task_specs
 
 
 def merge_runs(root: Path, names: list[str], allow_partial: bool = False) -> Path:
@@ -21,10 +22,19 @@ def merge_runs(root: Path, names: list[str], allow_partial: bool = False) -> Pat
         raise ValueError(f"output already exists and is non-empty or unsafe: {out}")
     if not names or len(set(names)) != len(names):
         raise ValueError("task selection must be non-empty and unique")
+    for name in names:
+        if (
+            not name
+            or Path(name).is_absolute()
+            or any(part in ("", ".", "..") for part in name.split("/"))
+            or "\\" in name
+            or name.split("/")[0] == "merged"
+        ):
+            raise ValueError(f"unsafe task name: {name!r}")
+    if any(a != b and b.startswith(a + "/") for a in names for b in names):
+        raise ValueError("task names overlap as artifact directories")
     frames, present = [], []
     for name in names:
-        if name in (".", "..", "merged") or Path(name).name != name or not name:
-            raise ValueError(f"unsafe task name: {name!r}")
         path = root / name / "summaries.csv"
         if not path.exists():
             if allow_partial:
@@ -49,7 +59,9 @@ def merge_runs(root: Path, names: list[str], allow_partial: bool = False) -> Pat
     out.mkdir(parents=True, exist_ok=True)
     # Publish summary last: readers never observe a completed CSV before its links.
     for name in present:
-        (out / name).symlink_to(Path("..") / name / name, target_is_directory=True)
+        link = out / name
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(os.path.relpath(root / name / name, link.parent), target_is_directory=True)
     _save_summaries(combined, out / "summaries.csv")
     return out
 
@@ -66,7 +78,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--allow-partial", action="store_true")
     args = parser.parse_args(argv)
     try:
-        specs = load_task_specs(args.tasks, args.profiles)
+        specs = (
+            fev_bench_tasks(args.tasks)
+            if Path(args.tasks).suffix in (".yaml", ".yml")
+            else load_task_specs(args.tasks, args.profiles)
+        )
         out = merge_runs(args.run_root, [spec.name for spec in specs], args.allow_partial)
     except (OSError, ValueError, yaml.YAMLError) as exc:
         print(f"Merge refused: {exc}", file=sys.stderr)

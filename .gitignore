@@ -147,6 +147,7 @@ plotly/
 *.db
 *.png
 *.txt
+!requirements-yardsticks.txt
 metafeatures*.csv
 predictions.csv
 metrics.json

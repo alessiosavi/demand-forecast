@@ -66,7 +66,7 @@ where = ["."]
 include = ["demand_forecast*"]
 
 [tool.setuptools.package-data]
-demand_forecast = ["bench/tasks/*.yaml", "bench/tasks/*.PROVENANCE.md"]
+demand_forecast = ["bench/tasks/*.yaml", "bench/tasks/*.PROVENANCE.md", "bench/yardsticks/LICENSE-APACHE-2.0"]
 
 [tool.mypy]
 python_version = "3.10"

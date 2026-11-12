@@ -28,6 +28,17 @@ and exposes the number of workers (default 1). It retains the upstream
 It also preserves fractional interval levels for custom quantiles and fills
 missing input values only in the target column.
 
+`demand_forecast/bench/yardsticks/adapters.py` adapts the Chronos-2 and Timestral
+evaluation scripts of fev at commit `9cf943c388e5cfaf352175ea3c69e408b197d997`
+(`models/chronos-2`, `models/timestral`):
+https://github.com/autogluon/fev/tree/9cf943c388e5cfaf352175ea3c69e408b197d997/models
+
+The port keeps the published settings, covariate roles, categorical handling and
+Timestral batching, and moves the history, covariate and cross-series switches
+into a shared runner. The same Apache-2.0 text ships beside the module as
+`demand_forecast/bench/yardsticks/LICENSE-APACHE-2.0`. The models themselves are
+not redistributed; their weights keep their own licences.
+
 `demand_forecast/bench/tasks/fev_bench_weekly.yaml` contains seven unmodified
 entries from fev's `benchmarks/fev_bench/tasks.yaml` at tag `v0.10.0`:
 https://github.com/autogluon/fev/blob/v0.10.0/benchmarks/fev_bench/tasks.yaml
