@@ -100,7 +100,7 @@ def audit_report(run_dir: Path, specs, model_name: str) -> tuple[str, list[str]]
             lines.append(
                 f"- {name}: SQL={recomputed.get('SQL')}; {recomputed['num_forecasts']} item-target-window forecasts; weights={options.weights_revision}"
             )
-        except (OSError, ValueError, KeyError, TypeError) as exc:
+        except (AttributeError, OSError, ValueError, KeyError, TypeError) as exc:
             issues.append(f"{name}: {exc}")
     lines += [
         "",

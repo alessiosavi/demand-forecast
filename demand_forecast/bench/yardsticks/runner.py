@@ -191,7 +191,7 @@ def _summary_matches(row, expected):
         elif isinstance(value, bool):
             matches = str(actual).lower() == str(value).lower()
         elif isinstance(value, (int, float)):
-            matches = actual == value
+            matches = pd.to_numeric(actual, errors="coerce") == value
         else:
             matches = actual == str(value)
         if not matches:

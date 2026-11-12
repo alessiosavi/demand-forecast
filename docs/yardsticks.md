@@ -80,11 +80,20 @@ Each task has `run.json` and `window_N.npz`: item IDs, target names, quantiles,
 original-unit predictions `(items, targets, horizon, quantiles)`, identity and
 time. Item and target order is fev's order. Failures, including fail-fast errors,
 are recorded in `failures.json`; successful retries clear them. `--keep-going`
-returns exit 1 if any selected task remains incomplete. Use `fev_report.py
---model-name LABEL` to verify identities, file hashes, coverage and recomputed
-fev scores. Yardstick audits do not require synthetic training/bundle artifacts
-or a baseline. `fev_wins.py standing` accepts these summaries directly. Isolated
-per-task runs can be joined with `fev_merge_runs.py`, including names with `/`.
+returns exit 1 if any selected task remains incomplete. Audit a yardstick run
+with the task YAML it was run with: pass `--tasks` and the same `--names`
+selection (comma-separated names or `@file`) to `fev_report.py`. For example:
+
+```bash
+python scripts/fev_report.py --run-dir results/chronos2 --model-name chronos2 \
+  --tasks shifted.yaml --names @names.txt --out results/chronos2/report.md
+```
+
+Omit `--names` when the run includes every task in the YAML. The report verifies
+identities, file hashes, coverage and recomputed fev scores. Yardstick audits do
+not require synthetic training/bundle artifacts or a baseline.
+`fev_wins.py standing` accepts these summaries directly. Isolated per-task runs
+can be joined with `fev_merge_runs.py`, including names with `/`.
 
 One output directory holds one yardstick configuration. Resume checks weights,
 all switches, package versions, task definition, dataset fingerprint and window

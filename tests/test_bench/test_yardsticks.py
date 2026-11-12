@@ -130,6 +130,119 @@ def test_runner_same_fev_inputs_multitarget_audit_and_resume(scenario):
     assert len(fake.calls) == 2
 
 
+@pytest.mark.parametrize("quantiles", [[i / 10 for i in range(1, 10)], [0.1, 0.9]])
+def test_single_target_scored_and_audited_with_fev_validation(scenario, quantiles):
+    from demand_forecast.bench.yardsticks.runner import fev_predictions
+    from scripts.fev_report import build_report
+
+    tasks, options, out = scenario
+    task = fev.Task(**{**tasks[0].to_dict(), "target": "target", "quantile_levels": quantiles})
+    frame = run_yardstick([task], options, out, adapter_factory=lambda _: FakeAdapter())
+    row = frame.iloc[0]
+    assert row.num_forecasts == 6
+    assert np.isfinite(row[["SQL", "MASE", "WQL", "WAPE"]].astype(float)).all()
+    assert {key for key in frame if key.startswith("SQL[")} == {f"SQL[{q}]" for q in quantiles}
+    with np.load(out / task.task_name / "window_0.npz", allow_pickle=False) as saved:
+        levels = saved["quantiles"].tolist()
+        assert levels == sorted(set(quantiles) | {0.5})
+        assert saved["arrays"].shape == (3, 1, 4, len(levels))
+        predictions = fev_predictions(saved["arrays"], levels, ["target"])
+        assert isinstance(predictions, dict) and set(predictions) == {"target"}
+        cleaned = task.clean_and_validate_predictions(predictions)
+        past, _ = task.get_window(0).get_input_data()
+        for i, forecast in enumerate(cleaned["target"]):
+            np.testing.assert_allclose(forecast["predictions"], past[i]["target"][-1] + 0.5)
+    report, issues = build_report(out, [task], model_name=options.model_name)
+    assert issues == []
+    assert "Complete:" in report
+
+
+@pytest.mark.parametrize(
+    "actual,expected,matches",
+    [
+        ("-13", -13, True),
+        ("-13.0", -13, True),
+        ("4e0", 4, True),
+        ("0.25", 0.25, True),
+        ("not-a-number", 4, False),
+        ("2022-06-26T00:00:00", 4, False),
+        ("4W-SUN", 4, False),
+        ("5", 4, False),
+        ("NaN", 4, False),
+        (np.nan, 4, False),
+        (None, 4, False),
+        (np.nan, np.nan, False),
+        ("TRUE", True, True),
+        ("false", False, True),
+        ("1", True, False),
+        (np.nan, None, True),
+        (None, None, True),
+        ("None", None, False),
+    ],
+)
+def test_summary_numeric_conversion_preserves_bool_and_none(actual, expected, matches):
+    from demand_forecast.bench.yardsticks.runner import _summary_matches
+
+    assert bool(_summary_matches({"value": actual}, {"value": expected})) is matches
+
+
+def test_resume_mixed_timestamp_and_integer_cutoffs_preserves_evidence(
+    scenario, tmp_path, monkeypatch, capsys
+):
+    from demand_forecast.bench.yardsticks import runner
+    from scripts.fev_yardstick import main
+
+    tasks, options, out = scenario
+    definition = tasks[0].to_dict()
+    task_file = tmp_path / "mixed.yaml"
+    task_file.write_text(
+        yaml.safe_dump(
+            {
+                "tasks": [
+                    {
+                        **definition,
+                        "task_name": "timestamp",
+                        "initial_cutoff": "2022-06-26",
+                        "window_step_size": "4W-SUN",
+                    },
+                    {**definition, "task_name": "integer"},
+                ]
+            }
+        )
+    )
+    tasks = load_tasks(task_file)
+    frame = run_yardstick(tasks, options, out, adapter_factory=lambda _: FakeAdapter())
+    assert frame.loc[frame.task == "integer", "initial_cutoff"].iloc[0] == "-8"
+    assert frame.loc[frame.task == "integer", "window_step_size"].iloc[0] == "4"
+    before = {p: p.read_bytes() for p in out.rglob("*") if p.is_file()}
+    capsys.readouterr()
+    monkeypatch.setattr(runner, "_adapter", lambda *args: pytest.fail("resume loaded model"))
+    assert (
+        main(
+            [
+                "--model",
+                "chronos2",
+                "--weights",
+                options.weights,
+                "--tasks",
+                str(task_file),
+                "--out-dir",
+                str(out),
+                "--model-name",
+                options.model_name,
+                "--device",
+                "cpu",
+                "--resume",
+            ]
+        )
+        == 0
+    )
+    output = capsys.readouterr().out
+    assert "Skipping completed task timestamp" in output
+    assert "Skipping completed task integer" in output
+    assert before == {p: p.read_bytes() for p in out.rglob("*") if p.is_file()}
+
+
 @pytest.mark.parametrize("model", ["chronos2", "timestral"])
 def test_context_and_covariates_applied_before_adapter(scenario, model):
     tasks, options, out = scenario
@@ -413,3 +526,108 @@ def test_report_all_failed_native_tasks_is_incomplete_not_exception(scenario, tm
     (out / "summaries.csv").unlink()
     assert main(args) == 1
     assert "Incomplete" in report.read_text()
+
+
+@pytest.mark.parametrize(
+    "missing", ["configuration_identity", "run_identity", "dataset_fingerprint", "model_name"]
+)
+def test_report_damaged_summary_is_incomplete(scenario, tmp_path, missing):
+    from scripts.fev_report import build_report, main
+
+    tasks, options, out = scenario
+    frame = run_yardstick(tasks, options, out, adapter_factory=lambda _: FakeAdapter())
+    frame.drop(columns=missing).to_csv(out / "summaries.csv", index=False)
+    report, issues = build_report(out, tasks, model_name=options.model_name)
+    assert "Incomplete" in report
+    assert any(missing in issue for issue in issues)
+    destination = tmp_path / "damaged.md"
+    assert (
+        main(
+            [
+                "--run-dir",
+                str(out),
+                "--tasks",
+                str(tmp_path / "tasks.yaml"),
+                "--model-name",
+                options.model_name,
+                "--out",
+                str(destination),
+            ]
+        )
+        == 1
+    )
+    assert "Incomplete" in destination.read_text() and missing in destination.read_text()
+
+
+@pytest.mark.parametrize("selection", ["csv", "file"])
+def test_report_names_audits_only_selected_yaml_tasks(scenario, tmp_path, selection):
+    from scripts.fev_report import main
+
+    tasks, options, out = scenario
+    definitions = [
+        tasks[0].to_dict(),
+        {**tasks[0].to_dict(), "task_name": "second"},
+        {**tasks[0].to_dict(), "task_name": "unselected"},
+    ]
+    task_file = tmp_path / "tasks.yaml"
+    task_file.write_text(yaml.safe_dump({"tasks": definitions}))
+    selected = load_tasks(task_file, ["synthetic/new", "second"])
+    run_yardstick(selected, options, out, adapter_factory=lambda _: FakeAdapter())
+    # A merged run can be detected from its summary without a root manifest.
+    (out / "yardstick.json").unlink()
+    destination = tmp_path / "subset.md"
+    args = [
+        "--run-dir",
+        str(out),
+        "--tasks",
+        str(task_file),
+        "--model-name",
+        options.model_name,
+        "--out",
+        str(destination),
+    ]
+    assert main(args) == 1
+    assert "unselected: expected exactly one model row" in destination.read_text()
+    names = "synthetic/new,second"
+    if selection == "file":
+        names_file = tmp_path / "names.txt"
+        names_file.write_text("synthetic/new\nsecond\n")
+        names = f"@{names_file}"
+    assert main([*args, "--names", names]) == 0
+    report = destination.read_text()
+    assert "Complete:" in report and "unselected" not in report
+    assert "- synthetic/new:" in report and "- second:" in report
+
+
+@pytest.mark.parametrize(
+    "selector", ["missing.yaml", "first,second", "unreadable.yaml", "malformed.yaml"]
+)
+def test_report_unreadable_yardstick_tasks_exits_cleanly(scenario, tmp_path, capsys, selector):
+    from scripts.fev_report import main
+
+    tasks, options, out = scenario
+    run_yardstick(tasks, options, out, adapter_factory=lambda _: FakeAdapter())
+    task_file = tmp_path / selector
+    if selector == "unreadable.yaml":
+        task_file.mkdir()
+    elif selector == "malformed.yaml":
+        task_file.write_text("tasks: [")
+    destination = tmp_path / "invalid.md"
+    assert (
+        main(
+            [
+                "--run-dir",
+                str(out),
+                "--tasks",
+                str(task_file),
+                "--model-name",
+                options.model_name,
+                "--out",
+                str(destination),
+            ]
+        )
+        == 2
+    )
+    error = capsys.readouterr().err
+    assert "--tasks" in error and "YAML" in error and str(task_file) in error
+    assert "Traceback" not in error and not destination.exists()

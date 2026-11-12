@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import os
+import sys
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
@@ -254,7 +255,7 @@ def build_report(
         issues.append("summaries.csv: missing")
         frame = pd.DataFrame(columns=["task", "model_name"])
     if (run_dir / "yardstick.json").exists() or (
-        "yardstick_protocol" in frame
+        {"model_name", "yardstick_protocol"} <= set(frame.columns)
         and frame.loc[frame.model_name == model_name, "yardstick_protocol"].notna().any()
     ):
         from demand_forecast.bench.yardsticks.audit import audit_report
@@ -529,7 +530,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--tasks",
         default="weekly",
-        help="weekly, heldout, comma-separated weekly names, or task YAML",
+        help=(
+            "weekly, heldout, comma-separated weekly names, or task YAML; "
+            "audit a yardstick run with the task YAML it was run with"
+        ),
+    )
+    parser.add_argument(
+        "--names", help="yardstick tasks to audit: comma-separated task names or @file"
     )
     parser.add_argument("--profiles", type=Path)
     parser.add_argument("--baseline", default="seasonal_naive")
@@ -546,12 +553,23 @@ def main(argv: list[str] | None = None) -> int:
     path = args.run_dir / "summaries.csv"
     frame = pd.read_csv(path) if path.exists() else pd.DataFrame()
     if (args.run_dir / "yardstick.json").exists() or (
-        "yardstick_protocol" in frame
+        {"model_name", "yardstick_protocol"} <= set(frame.columns)
         and frame.loc[frame.model_name == args.model_name, "yardstick_protocol"].notna().any()
     ):
-        from demand_forecast.bench.yardsticks import load_tasks
+        import yaml
 
-        specs = load_tasks(Path(str(fev_bench_tasks_path(args.tasks))))
+        from demand_forecast.bench.yardsticks import load_tasks
+        from demand_forecast.bench.yardsticks.runner import read_names
+
+        try:
+            specs = load_tasks(Path(str(fev_bench_tasks_path(args.tasks))), read_names(args.names))
+        except (OSError, ValueError, yaml.YAMLError) as exc:
+            print(
+                f"Yardstick audit failed for --tasks {args.tasks!r}: {exc}\n"
+                "Use the task YAML the run was made with and --names for the selected task names.",
+                file=sys.stderr,
+            )
+            return 2
     else:
         specs = load_task_specs(args.tasks, args.profiles)
     report, issues = build_report(args.run_dir, specs, args.baseline, args.model_name)
