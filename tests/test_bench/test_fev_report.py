@@ -313,6 +313,17 @@ def test_report_reordered_npz_ids_still_align(report_run):
     assert table(before, "Doubled, unscaled pinball") == table(after, "Doubled, unscaled pinball")
 
 
+def test_report_missing_model_name_with_yardstick_protocol_is_incomplete(report_run):
+    _, out, _, _ = report_run
+    path = out / "summaries.csv"
+    frame = pd.read_csv(path).drop(columns="model_name").assign(yardstick_protocol=1)
+    frame.to_csv(path, index=False)
+    process, report = invoke_report(report_run)
+    assert process.returncode == 1, process.stdout + process.stderr
+    assert "Incomplete" in report and "missing task/model_name columns" in report
+    assert "Traceback" not in process.stderr
+
+
 def test_report_missing_task_fails_and_allow_partial_succeeds(report_run):
     _, out, _, _ = report_run
     shutil.rmtree(out / "second")

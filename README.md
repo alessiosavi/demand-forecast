@@ -114,6 +114,10 @@ working directory.
 
 ## fev evaluation
 
+External pretrained Chronos-2 and Timestral runs use a separate environment and
+[`scripts/fev_yardstick.py`](scripts/fev_yardstick.py). See the [host installation,
+published settings, ablations and audit commands](docs/yardsticks.md).
+
 Task definitions can be read without the benchmark dependencies. Running the
 benchmark commands requires the optional extra:
 

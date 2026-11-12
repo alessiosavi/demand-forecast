@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import os
+import sys
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
@@ -13,7 +14,12 @@ import numpy as np
 import pandas as pd
 
 from demand_forecast.bench.run import prediction_diagnostics, predictions_for_fev
-from demand_forecast.bench.specs import FevTaskSpec, dataset_fingerprint, load_task_specs
+from demand_forecast.bench.specs import (
+    FevTaskSpec,
+    dataset_fingerprint,
+    fev_bench_tasks_path,
+    load_task_specs,
+)
 from demand_forecast.metrics import quantile_loss, seasonal_error_per_item, summarize
 
 METRICS = ("SQL", "MASE", "WAPE", "WQL")
@@ -248,6 +254,13 @@ def build_report(
     else:
         issues.append("summaries.csv: missing")
         frame = pd.DataFrame(columns=["task", "model_name"])
+    if (run_dir / "yardstick.json").exists() or (
+        {"model_name", "yardstick_protocol"} <= set(frame.columns)
+        and frame.loc[frame.model_name == model_name, "yardstick_protocol"].notna().any()
+    ):
+        from demand_forecast.bench.yardsticks.audit import audit_report
+
+        return audit_report(run_dir, specs, model_name)
     for spec in specs:
         task_dir = run_dir / spec.name
         model = _one_row(frame, spec.name, model_name, "model", issues)
@@ -517,7 +530,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--tasks",
         default="weekly",
-        help="weekly, heldout, comma-separated weekly names, or task YAML",
+        help=(
+            "weekly, heldout, comma-separated weekly names, or task YAML; "
+            "audit a yardstick run with the task YAML it was run with"
+        ),
+    )
+    parser.add_argument(
+        "--names", help="yardstick tasks to audit: comma-separated task names or @file"
     )
     parser.add_argument("--profiles", type=Path)
     parser.add_argument("--baseline", default="seasonal_naive")
@@ -531,9 +550,29 @@ def main(argv: list[str] | None = None) -> int:
         import fev  # noqa: F401
     except ImportError as exc:
         raise ImportError("install demand-forecast[bench]") from exc
-    report, issues = build_report(
-        args.run_dir, load_task_specs(args.tasks, args.profiles), args.baseline, args.model_name
-    )
+    path = args.run_dir / "summaries.csv"
+    frame = pd.read_csv(path) if path.exists() else pd.DataFrame()
+    if (args.run_dir / "yardstick.json").exists() or (
+        {"model_name", "yardstick_protocol"} <= set(frame.columns)
+        and frame.loc[frame.model_name == args.model_name, "yardstick_protocol"].notna().any()
+    ):
+        import yaml
+
+        from demand_forecast.bench.yardsticks import load_tasks
+        from demand_forecast.bench.yardsticks.runner import read_names
+
+        try:
+            specs = load_tasks(Path(str(fev_bench_tasks_path(args.tasks))), read_names(args.names))
+        except (OSError, ValueError, yaml.YAMLError) as exc:
+            print(
+                f"Yardstick audit failed for --tasks {args.tasks!r}: {exc}\n"
+                "Use the task YAML the run was made with and --names for the selected task names.",
+                file=sys.stderr,
+            )
+            return 2
+    else:
+        specs = load_task_specs(args.tasks, args.profiles)
+    report, issues = build_report(args.run_dir, specs, args.baseline, args.model_name)
     _write_report(args.out, report)
     print(f"{'Incomplete' if issues else 'Complete'} report saved to {args.out}", flush=True)
     return int(bool(issues) and not args.allow_partial)
