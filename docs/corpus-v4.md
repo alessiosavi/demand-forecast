@@ -213,8 +213,9 @@ an allowed match or an inconclusive allowed folder. Quarantined matches and
 inconclusive results remain reported without changing their manifest status.
 A clean quarantined folder is only a candidate for release by PR.
 
-Every run executes old controls and benchmark-derived as-is, scaled, cropped and
-hourly-parent/aggregated controls. The unrelated seasonal control must remain
+Each input/method/opportunity identity executes old controls and benchmark-derived
+as-is, scaled, cropped and hourly-parent/aggregated controls once. Completed
+controls are atomically checkpointed and reused across pool restarts. The unrelated seasonal control must remain
 negative. If no identifying benchmark series can support the plants, the run is
 invalid. Controls use the production matcher and the same information threshold.
 
@@ -225,19 +226,26 @@ no per-history SQLite BLOB or 1 GB BLOB limit. SQLite's page cache is 8 MiB and
 temporary tables stay on disk. A folder result is atomically checkpointed with the method,
 manifest, benchmark content/revision, search budget and its current Parquet
 hashes. On restart benchmark identity is rebuilt, all corpus hashes are reread,
-completed identical folders resume, and controls run again. Runtime failures are
+completed identical folders resume, and completed controls with the same
+benchmark/method/opportunity identity resume. A changed opportunity bound reruns
+controls at the new threshold. Runtime failures are
 retried, including quarantined folders. When missing data is repaired and the
 opportunity bound increases, an identical clean result remains valid under the
 stricter information threshold and can resume; a reduced bound or a non-clean
 result with a changed bound requires a new scan. Matching thresholds are unchanged. Incompletely
 restored published folders are moved back into isolated staging after surviving
-files are rehashed; missing files are fetched again. Wrong existing hashes
-remain errors. No within-folder
-progress claim is made. Changing code requires a method-version bump when its
+files are rehashed; missing files are fetched again. Wrong existing hashes remain errors. Within-folder work is checkpointed per
+Parquet row group, with original shard row numbers retained. Changing code requires a method-version bump when its
 search semantics change; changing inputs automatically invalidates cached results.
 
-The default process RSS budget is **32 GiB** on the 64 GB guest, leaving memory
-for the parent, benchmark loading, the operating system and uploads. Override
+The default fetch process RSS budget and total audit worker budget are **32 GiB**
+on the 64 GB guest, leaving memory for the parent, benchmark loading, the
+operating system and uploads. Audit `--workers` defaults to `os.cpu_count()`
+(or one if unavailable); each disposable worker receives exactly
+`memory_budget_bytes // workers`. The total excludes the supervisor and gcloud.
+Use an appropriate total on larger machines, for example 256 GiB / 90 workers
+(2.844 GiB each), or 512 GiB / 180 workers (2.844 GiB each). A very small quotient
+can fail the RSS check at import/startup; no silent worker reduction is made. Override
 it with `--memory-budget-gib` on fetch and audit (fractions are accepted).
 The job generator accepts the same option; the guest can override it with
 `CORPUS_MEMORY_BUDGET_GIB`. Measurement and audit folder workers have a 10 ms
@@ -288,9 +296,68 @@ More than one million hash postings per query remains an explicit unresolved
 limit before the old matcher expands them. Candidate caps, 4,096 phase coverage,
 10,000 evidence records, tolerances and the 512-point overlap are unchanged;
 dropped coverage is inconclusive. Calendar aggregation still needs full
-benchmark timestamps and can be expensive. Bounded index batches intentionally
-reread corpus rows; all-frequency/all-phase audit cost can dominate measurement.
-Real wall time depends on benchmark points, frequency pairs and candidate density.
+benchmark timestamps and can be expensive. Each unit decodes its row group once into SQLite metadata plus native-dtype flat
+numeric scratch outside `state`. Later passes map those values without Arrow
+redecoding or another numeric Parquet read. Frequency discovery still projects
+`freq`, and provenance hashing still reads compressed shards. A bounded group
+of original benchmark batches probes each chunk in the same pass; its size is
+`max(1, min(4, worker_budget // (4 * 512 * MAX_INDEX_POINTS)))`. The 512-byte/point
+planning allowance reserves index construction space; the actual RSS watchdog
+remains authoritative. At the example 16/90/180-core budgets the group size is four.
+Benchmark metadata is filtered before histories are mapped, and dates are only
+materialized for benchmark-to-corpus aggregation. Query hashes are reused across
+resident indices and between posting preflight and legacy candidate discovery;
+the legacy functions execute unchanged, with an isolated memoized hash table.
+The nine benchmark stride indices (strides 2–4 and all phases) are also cached
+within a resident batch rather than reconstructed for every missing-data query.
+No shared matcher globals are changed.
+
+Units write compact journals, summing consecutive negative-query counters and
+flushing at each positive query. Merge heads contain only keys/file offsets; only the
+selected payload is decoded. Parent memory and open files do not multiply by
+875 potentially large positive payloads. The reducer restores the original frequency,
+benchmark-batch, shard, row-group, row, channel, phase and chunk order. It applies
+the original 10,000-record cutoff at the original query, including that query's
+coverage/comparison counts. A unit also stops after 10,000 local matches: its
+traversal is a subsequence of the global traversal, so any omitted work must
+follow the global cutoff. After a unit reaches its local cap, speculative queries are limited to its
+current resident batch group. Other units still finish their own work before
+folder reduction. Largest groups are scheduled first using numeric leaf counts plus row overhead.
+Completion order and worker count cannot reorder
+evidence or turn resource losses into clean coverage. Unsupported pairs keep the
+same skipped reasons; no domain crosswalk, threshold or phase is removed.
+
+`state/audit-units` holds atomic completion markers and SHA256-bound journals;
+only in-flight units need retry after interruption. A new worker count can reuse
+complete units. Runtime failures retry. The guest sets `CORPUS_AUDIT_STATE_URI`:
+the supervisor uploads each completed journal and then its marker, serially,
+before counting the unit done, and publishes completed controls before launching
+the pool. Periodic snapshots exclude live unit/control/folder checkpoint paths, so a delayed
+snapshot cannot overwrite a newer completion marker; the final sync runs after
+the pool exits. This closes the ten-minute snapshot gap for completed work. Upload
+failure fails the folder/attempt. Ordinary local runs omit this environment
+variable and make no cloud calls. A restart still rebuilds benchmark identity and
+rehashes corpus files. Disposable numeric scratch is not uploaded; it is removed
+when workers finish or terminate and rebuilt only for units requiring work.
+
+A failed speculative worker is checked with the original-order folder scanner
+in `audit_serial.py`, under the same per-worker RSS quota and without rerunning
+controls. This preserves a match at the legacy cutoff when a malformed or
+oversized row would only have been visited after that cutoff. Genuine failures
+before the cutoff still fail; upload failures remain attempt failures. The
+compatibility pass can reread the folder and add serial time on this rare failure
+path. A successful result is durably checkpointed by folder. Progress marks
+`status: fallback` / `serial_fallback: true`; its scanned/decoded counters describe
+the primary pool and exclude compatibility rechecks.
+
+`state/audit-progress.json` is atomically rewritten about once per second while
+the pool runs, with schema version 1, `units_total`, `units_done`, `units_failed`,
+`values_scanned` (pool matcher input points, including repeated phases/batches),
+`native_values_decoded`, `elapsed_seconds`, nullable
+`estimated_remaining_seconds`, and per-folder total/done/failed/status. Elapsed
+is pool wall time for the current invocation; ETA extrapolates completed unit
+throughput and is provisional for heterogeneous groups. The ten-minute state
+sync exposes progress in the bucket; journals/markers have immediate durability.
 
 A folder failure is checkpointed in `fetch-summary.json`, with its name and
 error, while later folders continue to download, validate and publish. The
@@ -303,6 +370,107 @@ restarting cannot change their policy meaning. The generated job runs audit
 even after fetch fails and exits nonzero after both stages; final uploads still
 include every completed folder and both summaries.
 
+## Audit cost model and the six-hour target
+
+The independent checkpoint/scheduling unit is one Parquet row group. The supplied
+pinned survey gives **150 shards, 875 units, 121 folders, 7,491,306 rows** and
+22.6 GB of compressed data. Its `groups` arrays describe only 215 groups; summing
+them is not the corpus total. Recorded numeric leaves give 6,287,711,751 values;
+filling each of the 660 omitted groups with its shard's reported maximum gives
+a conservative upper bound of 12,066,492,230. Thus the available metadata bounds
+numeric values at **6.29–12.07 billion**. The largest fully described group has
+977,638,380 values (ERA5); this is a material scheduling tail. Actual footer
+values, benchmark batch counts, frequency distributions, missingness and
+candidate density must be measured on the guest; 100 datasets alone determines
+none of those batch counts.
+
+For a nonempty channel of length `n`, identity search uses
+`q(n) = 1 + max(0, ceil((n - 65536) / 65024))` queries, with the original overlap.
+For a comparable fixed ratio `r`, fine-to-coarse search uses both sum and mean
+for every phase `p=0..r-1`, with length `max(0, (n-p)//r)`. Apply `q` separately
+to every nonempty variant. Unsupported ratios/origins still record the original
+coverage event, after the unchanged identifying-parent gate. Benchmark-to-corpus
+variants expand the index batch count instead. Let `B(u,c,b)` be the original
+number of bounded 262,144-point/4,096-history benchmark batches for a unit's
+corpus/benchmark frequency pair. A unit costs:
+
+```
+T(u) = Arrow_decode(Vu) + numeric_spool_IO(ceil(B/G) passes)
+     + sum over frequency pairs/resident groups [parent_identification(Vu)
+                                                + corpus_aggregation(Vu, ratio)]
+     + sum over frequency pairs/batches/queries [alpha + beta * query_points
+                                                + candidate/stride work]
+     + sum over original batches [index_build + benchmark_aggregation]
+     + journal/checkpoint/upload overhead
+T(N) >= max(sum(T(u))/N, max(T(u))) + serial setup/controls/reduction
+```
+
+`G` is the resident batch group size; hashes and aggregation preparation are
+shared within that group. It saves up to `G-1` numeric spool reads/preparations
+per group, while one-time decoding removes all repeated numeric Parquet passes.
+It does not divide the number of index comparisons by `G`. Short rows incur a
+per-query cost (`alpha`), so dividing all values by 65,536 understates runtime.
+Fixed aggregation must also account for input reduction work: for ratio `r`,
+`sum over phases/methods r * max(0, (n-p)//r)` approaches `2*r*n` fine input
+values read/added, although aggregated output approaches only `2*n` points.
+Sum and mean retain their original arithmetic and are separate variants. This
+corpus-side work is shared across the `G` resident batches. Benchmark-side
+aggregation/index preparation repeats per row-group unit, a cost of finer
+parallelism that the simple query-rate table does not include. Sharing prepared
+benchmark indices across units is another semantics-preserving follow-up.
+Missingness can activate the original stride searches; positive/dense candidates
+can cost much more than negative probes.
+
+Using W4a6's measured **0.035 s / 65,536-point negative query**, ignoring short-row
+and candidate overhead, one full-corpus identity batch costs **0.940–1.804 CPU
+hours**. The following are conditional compute estimates for an effective
+value-weighted batch/phase multiplier `B_eff`, before new hash savings, serial
+setup and IO. They are not a measured forecast of fev100:
+
+| B_eff | Ideal 16 cores (h) | Ideal 90 cores (h) | Ideal 180 cores (h) | Largest-group floor (h) |
+| --- | --- | --- | --- | --- |
+| 10 | 0.59–1.13 | 0.10–0.20 | 0.05–0.10 | 1.46 |
+| 100 | 5.88–11.28 | 1.04–2.00 | 0.52–1.00 | 14.62 |
+| 1000 | 58.76–112.76 | 10.45–20.05 | 5.22–10.02 | 146.17 |
+
+Predicted wall time must be at least the larger of the relevant ideal estimate
+and its unit tail, adjusted by measured query throughput. Even **90 or 180 cores
+cannot meet six hours at B_eff=100** under that baseline tail. No unconditional
+six-hour or fourteen-hour promise is supportable without the benchmark batches.
+If the measured tail remains above six hours, the next step is to decode a large
+group once into a shared, verified numeric spool and distribute bounded row
+ranges or frequency/batch groups across workers; ordered journals already
+support the required deterministic merge. This must retain every phase, stride,
+comparison and coverage event. It adds durable spool ownership/validation and
+must be tested before deployment; increasing cores alone does not remove the tail.
+
+An offline seeded probe with four 262,144-point indices measured 65,536-point
+queries at 0.0442 s originally, 0.0229 s/index with two resident batches and
+0.0156 s/index with four (about 65% less per index). A 96-point missing-data
+query took 1.359 s originally, 0.855 s with cold caches and 0.00785 s with warm
+stride caches; outputs were equal. With all four stride caches populated, the
+process peak was 786,743,296 bytes (750 MiB); this does not measure decoder or
+full-machine peaks on C3D. At the four-batch rate, the conditional B_eff=100 model
+has ideal 16/90/180-core compute of 2.62–5.02 / 0.46–0.89 / 0.23–0.45 hours,
+but the largest-group floor remains **6.51 hours on all three shapes**, before
+setup, IO and short-row work. Thus the six-hour target is still not established.
+
+A critical limitation of that microbenchmark: its 65,536-point negative queries
+hit the unchanged posting budget (`unresolved_rows=1`); 336/4,096-point probes
+also dropped groups/offsets. The latter took about 0.0066/0.147 s per index,
+respectively. These rates describe the existing capped method, not a completed
+clean search, and show that query cost is nonlinear in length/candidate density.
+The audit retains every such coverage loss as inconclusive. Forecasting real
+completion and release validity requires actual batch, length, mask and cap
+measurements; do not treat a fast capped negative as clean coverage.
+
+Peak worker RSS is bounded by `total_budget//N` with the existing sampled
+watchdog, plus possible between-sample overshoot. Peak machine memory also
+includes the supervisor, benchmark loading, OS/page cache and one serialized
+uploader; it is not established by the CPU model. Numeric scratch can approach
+4–8 bytes per concurrently active native value (up to 50–97 GB for all bounded
+corpus values), plus metadata, separate from compressed corpus and benchmarks.
+
 ## Cloud guest job and release
 
 ```bash
@@ -310,6 +478,44 @@ python -m scripts.corpus_v4.make_corpus_job FULL_REPO_SHA \
   gs://YOUR_BUCKET/corpus-v4 job.sh
 bash -n job.sh
 ```
+
+To move the audit to a larger guest without native data refetch:
+
+```bash
+python -m scripts.corpus_v4.make_corpus_job FULL_REPO_SHA \
+  gs://YOUR_BUCKET/corpus-v4 audit-only.sh --audit-only \
+  --workers 90 --memory-budget-gib 256
+bash -n audit-only.sh
+```
+
+Restore the same `STATE_URI` first, including the complete revision-scoped
+`benchmark-cache/<FEV_DATASETS_REVISION>` produced by the original audit. Audit-only
+sets `HF_HUB_OFFLINE=1` and `HF_DATASETS_OFFLINE=1`: it fails if benchmark cache
+inputs are unavailable and never downloads data from the Hub. Installation and
+Git provisioning still use their normal package/code sources. Corpus bytes come
+only from the published prefix. Before scanning, `verify_published` checks the
+corpus identity and all folders against the manifest, and every receipt's full
+file list, size and SHA256/Git-blob hash against the checked-in pinned inventory
+(`scripts/corpus_v4/pinned_inventory.json`, recorded at the same revision as the
+existing release-inventory fixture). It verifies stats hashes and refuses extra,
+missing, symlinked, tampered or misplaced data. Receipt claims cannot hide a
+missing shard. The verifier has no Hub client/download operation.
+
+Every audit-only invocation has a **new audit attempt ID** and the new code SHA.
+It preserves the original source attempt status before replacing the public
+gate, and writes `state/audit-provenance.json` with the verified receipt
+fingerprint, source prefix, source code SHA and `fetch_attempt_id`. The original
+fetch attempt may have an incomplete status because its audit was still running;
+complete verified receipts establish fetch completeness. A source audit-only
+status retains its original `fetch_attempt_id` on another restart. Both the new
+`attempt-status.json` and the new `audit.json` carry this link, while their
+`attempt_id` values must agree with each other, not with the fetch attempt.
+The job explicitly validates that relationship, current SHA, valid/exit-0 audit
+and no failed folders before publishing a complete success. Verification failure
+leaves the new attempt incomplete and cannot republish a restored successful
+audit. Audit-only uploads audit/status/state; it does not republish corpus bytes.
+Do not run competing writers at one corpus prefix; the orchestrator must stop
+the old combined job before starting its audit-only replacement.
 
 The generated job installs the repository at the full SHA into an editable venv
 with the existing `bench` extra. The package requires Python >=3.10, so the

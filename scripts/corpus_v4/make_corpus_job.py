@@ -85,14 +85,62 @@ CORPUS_ENVIRONMENT
 """
 
 
-def render(repo_sha, corpus_prefix, *, memory_budget_gib=32):
+def render(repo_sha, corpus_prefix, *, memory_budget_gib=32, workers=None, audit_only=False):
     """Generate a bash job that preserves incomplete work and uploads failure evidence."""
     if not re.fullmatch(r"[0-9a-f]{40}", repo_sha):
         raise ValueError("repo SHA must be a full lowercase commit hash")
     if not re.fullmatch(r"gs://[a-z0-9][a-z0-9._-]+(?:/[A-Za-z0-9._/-]+)?", corpus_prefix):
         raise ValueError("corpus prefix must be a plain gs:// bucket path")
+    if workers is not None and (
+        not isinstance(workers, int) or isinstance(workers, bool) or workers < 1
+    ):
+        raise ValueError("workers must be a positive integer")
     memory_budget_arg(memory_budget_gib)
     memory_budget_gib = float(memory_budget_gib)
+    mode = "audit-only" if audit_only else "combined"
+    source_status = (
+        """
+# Keep the source identity before replacing the public attempt gate. Restarts
+# retain the original fetch identity, even after this prefix names an audit run.
+if [[ ! -f "$RUN_DIR/state/fetch-attempt-status.json" ]]; then
+    gcloud storage cp "$CORPUS_URI/attempt-status.json" "$RUN_DIR/state/fetch-attempt-status.json"
+fi
+"""
+        if audit_only
+        else ""
+    )
+    phase = (
+        r"""# Restore only published bytes; the verifier has no data Hub client.
+# Benchmark data must already be in the revision-scoped restored state cache.
+export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1
+gcloud storage rsync --recursive "$CORPUS_URI" "$CORPUS"
+python -m scripts.corpus_v4.verify_published "$CORPUS" \
+    --source-status "$RUN_DIR/state/fetch-attempt-status.json" --source-prefix "$CORPUS_URI" \
+    --provenance "$RUN_DIR/state/audit-provenance.json"
+FETCH_ATTEMPT_ID="$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["fetch_attempt_id"])' "$RUN_DIR/state/audit-provenance.json")"
+export CORPUS_FETCH_ATTEMPT_ID="$FETCH_ATTEMPT_ID"
+fetch_status=0
+"""
+        if audit_only
+        else r"""fetch_status=0
+python -m scripts.corpus_v4.fetch_native "$CORPUS" --state "$RUN_DIR/state" \
+    --memory-budget-gib "$MEMORY_BUDGET_GIB" || fetch_status=$?
+"""
+    )
+    audit_contract = (
+        r"""python - "$AUDIT/audit.json" "$ATTEMPT_ID" "$REPO_SHA" "$FETCH_ATTEMPT_ID" <<'CORPUS_AUDIT_CONTRACT'
+import json, sys
+with open(sys.argv[1]) as stream:
+    audit = json.load(stream)
+if (audit.get("attempt_id") != sys.argv[2] or audit.get("repo_sha") != sys.argv[3]
+        or audit.get("fetch_attempt_id") != sys.argv[4] or not audit.get("valid")
+        or audit.get("exit_code") != 0 or audit.get("failed_folders")):
+    raise RuntimeError("audit does not certify the current attempt and verified fetch")
+CORPUS_AUDIT_CONTRACT
+"""
+        if audit_only
+        else ""
+    )
     return f"""#!/usr/bin/env bash
 # Research-only use. Original source licences apply.
 # Full corpus and audit state are durable below RUN_DIR/state.
@@ -101,6 +149,8 @@ set -euo pipefail
 : "${{STATE_URI:?guest must export STATE_URI}}"
 REPO_SHA='{repo_sha}'
 CORPUS_URI='{corpus_prefix.rstrip("/")}'
+MODE='{mode}'
+FETCH_ATTEMPT_ID=''
 mkdir -p "$RUN_DIR/state"
 export HOME="${{HOME:-$RUN_DIR/home}}"
 export HF_HOME="$RUN_DIR/hf-cache"
@@ -112,11 +162,12 @@ AUDIT="$RUN_DIR/state/audit"
 SYNC_PID=''
 ATTEMPT_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 export CORPUS_ATTEMPT_ID="$ATTEMPT_ID" CORPUS_REPO_SHA="$REPO_SHA"
+export CORPUS_AUDIT_STATE_URI="$STATE_URI"
 write_status() {{
     local code="$1" complete=false
     if [[ "$code" == 0 ]]; then complete=true; fi
-    printf '{{"attempt_id":"%s","repo_sha":"%s","exit_code":%d,"complete":%s}}\\n' \
-      "$ATTEMPT_ID" "$REPO_SHA" "$code" "$complete" > "$RUN_DIR/state/attempt-status.json.tmp"
+    printf '{{"attempt_id":"%s","repo_sha":"%s","exit_code":%d,"complete":%s,"mode":"%s","fetch_attempt_id":"%s"}}\\n' \
+      "$ATTEMPT_ID" "$REPO_SHA" "$code" "$complete" "$MODE" "$FETCH_ATTEMPT_ID" > "$RUN_DIR/state/attempt-status.json.tmp"
     mv "$RUN_DIR/state/attempt-status.json.tmp" "$RUN_DIR/state/attempt-status.json"
 }}
 finish() {{
@@ -127,7 +178,7 @@ finish() {{
         kill "$SYNC_PID" 2>/dev/null
         wait "$SYNC_PID" 2>/dev/null
     fi
-    if [[ -d "$CORPUS" ]]; then
+    if [[ "$MODE" == combined && -d "$CORPUS" ]]; then
         gcloud storage rsync --recursive "$CORPUS" "$CORPUS_URI" || status=3
     fi
     if [[ -f "$AUDIT/audit.json" ]]; then
@@ -141,14 +192,18 @@ finish() {{
 trap finish EXIT
 trap 'exit 143' TERM
 trap 'exit 130' INT
-# Invalidate previous success before provisioning or fetching anything.
+{source_status}# Invalidate previous success before provisioning or fetching anything.
 rm -f "$AUDIT/audit.json"
 write_status -1
 gcloud storage cp "$RUN_DIR/state/attempt-status.json" "$CORPUS_URI/attempt-status.json"
 # The host restores state before invoking us. Upload every ten minutes as well.
 (
     while sleep 600; do
-        gcloud storage rsync --recursive "$RUN_DIR/state" "$STATE_URI" || true
+        # Only the ordered publisher writes live unit/control checkpoints.
+        # A delayed snapshot must not overwrite a newer completion marker.
+        gcloud storage rsync --recursive \\
+            --exclude='(^|/)audit-(units|folders)(/|$)|(^|/)audit-controls[.]json$' \\
+            "$RUN_DIR/state" "$STATE_URI" || true
     done
 ) >/dev/null 2>&1 &
 SYNC_PID=$!
@@ -163,19 +218,18 @@ test "$(git rev-parse HEAD)" = "$REPO_SHA"
 {ENVIRONMENT}\
 export HF_HUB_DISABLE_IMPLICIT_TOKEN=1
 MEMORY_BUDGET_GIB="${{CORPUS_MEMORY_BUDGET_GIB:-{memory_budget_gib:g}}}"
-fetch_status=0
-python -m scripts.corpus_v4.fetch_native "$CORPUS" --state "$RUN_DIR/state" \\
-    --memory-budget-gib "$MEMORY_BUDGET_GIB" || fetch_status=$?
-# Each complete folder has stats.json and a verified receipt.
+WORKERS="${{CORPUS_AUDIT_WORKERS:-{workers or 0}}}"
+if [[ "$WORKERS" == 0 ]]; then WORKERS="$(python -c 'import os; print(os.cpu_count() or 1)')"; fi
+{phase}# Each complete folder has stats.json and a verified receipt.
 # Audit it even when another folder failed to fetch/measure.
 audit_status=0
 python -m scripts.corpus_v4.audit_fev_overlap "$CORPUS" "$AUDIT" --state "$RUN_DIR/state" \\
-    --memory-budget-gib "$MEMORY_BUDGET_GIB" || audit_status=$?
+    --memory-budget-gib "$MEMORY_BUDGET_GIB" --workers "$WORKERS" || audit_status=$?
 if (( fetch_status != 0 || audit_status != 0 )); then
     echo "Corpus attempt failed: fetch=$fetch_status audit=$audit_status; see fetch-summary.json and audit.json" >&2
     exit 2
 fi
-"""
+{audit_contract}"""
 
 
 def main(argv=None):
@@ -185,8 +239,20 @@ def main(argv=None):
     parser.add_argument("corpus_prefix")
     parser.add_argument("out", type=Path, help="job.sh path")
     parser.add_argument("--memory-budget-gib", type=float, default=32)
+    parser.add_argument("--workers", type=int)
+    parser.add_argument(
+        "--audit-only",
+        action="store_true",
+        help="verify and audit the published prefix; no data fetch",
+    )
     args = parser.parse_args(argv)
-    source = render(args.repo_sha, args.corpus_prefix, memory_budget_gib=args.memory_budget_gib)
+    source = render(
+        args.repo_sha,
+        args.corpus_prefix,
+        memory_budget_gib=args.memory_budget_gib,
+        workers=args.workers,
+        audit_only=args.audit_only,
+    )
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(source)
     args.out.chmod(0o755)

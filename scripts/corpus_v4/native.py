@@ -185,7 +185,9 @@ def folder_frequencies(folder):
     return sorted(aliases)
 
 
-def iter_rows(folder, kind, *, memory_budget_bytes=DEFAULT_MEMORY_BUDGET_BYTES):
+def iter_rows(
+    folder, kind, *, memory_budget_bytes=DEFAULT_MEMORY_BUDGET_BYTES, shard=None, row_group=None
+):
     """Page-buffered native rows; numeric arrays are views, consumers chunk work.
 
     batch_size=1 alone still retains whole compressed column chunks. A positive
@@ -200,6 +202,8 @@ def iter_rows(folder, kind, *, memory_budget_bytes=DEFAULT_MEMORY_BUDGET_BYTES):
     if kind == "covariates":
         required.add("covariates")
     for path in parquet_paths(folder):
+        if shard is not None and path.name != shard:
+            continue
         parquet = pq.ParquetFile(path, buffer_size=READ_BUFFER_BYTES, pre_buffer=False)
         schema = parquet.schema_arrow
         if not required <= set(schema.names):
@@ -231,6 +235,9 @@ def iter_rows(folder, kind, *, memory_budget_bytes=DEFAULT_MEMORY_BUDGET_BYTES):
             number = 0
             for group in range(parquet.num_row_groups):
                 metadata = parquet.metadata.row_group(group)
+                if row_group is not None and group != row_group:
+                    number += metadata.num_rows
+                    continue
                 group_values = sum(
                     metadata.column(i).num_values for i in range(metadata.num_columns)
                 )

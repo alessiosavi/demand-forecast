@@ -83,7 +83,7 @@ import json, os, pathlib, shutil, sys
 name, args = pathlib.Path(sys.argv[0]).name, sys.argv[1:]
 with open(os.environ["CALL_LOG"], "a") as log:
     log.write(json.dumps({"name": name, "args": args, "home": os.environ.get("HOME"),
-                          "hf_home": os.environ.get("HF_HOME")}) + "\n")
+                          "hub_offline": os.environ.get("HF_HUB_OFFLINE"), "datasets_offline": os.environ.get("HF_DATASETS_OFFLINE"), "hf_home": os.environ.get("HF_HOME")}) + "\n")
 def make_venv(target, clear):
     if clear:
         shutil.rmtree(target, ignore_errors=True)
@@ -95,8 +95,13 @@ if name == "git":
     if "rev-parse" in args:
         print(os.environ.get("CHECKOUT_HEAD", "a" * 40) if args[0] == "-C" else "a" * 40)
 elif name == "gcloud":
-    pass
+    if args[:2] == ["storage", "cp"] and args[-1].endswith("fetch-attempt-status.json"):
+        pathlib.Path(args[-1]).write_text(json.dumps({"attempt_id": "fetch-123", "repo_sha": "b" * 40}))
 elif name == "sleep":
+    marker = pathlib.Path(os.environ["RUN_DIR"]) / "synced-once"
+    if os.environ.get("RAPID_SYNC") == "1" and not marker.exists():
+        marker.touch()
+        sys.exit(0)
     sys.exit(1)
 elif name == "uv":
     assert args[:5] == ["venv", "--clear", "--seed", "--system-site-packages", "--python"]
@@ -129,7 +134,18 @@ elif args == ["-m", "pip", "freeze"]:
 elif args[:2] == ["-m", "scripts.corpus_v4.fetch_native"]:
     sys.exit(int(os.environ.get("FETCH_EXIT", "0")))
 elif args[:2] == ["-m", "scripts.corpus_v4.audit_fev_overlap"]:
+    if os.environ.get("WRITE_AUDIT") == "1":
+        target = pathlib.Path(args[3])
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "audit.json").write_text(json.dumps({
+            "attempt_id": os.environ.get("WRONG_ATTEMPT", os.environ["CORPUS_ATTEMPT_ID"]),
+            "repo_sha": os.environ["CORPUS_REPO_SHA"], "valid": True, "exit_code": 0,
+            "failed_folders": [], "fetch_attempt_id": os.environ.get("CORPUS_FETCH_ATTEMPT_ID")}))
     sys.exit(int(os.environ.get("AUDIT_EXIT", "0")))
+elif args[:2] == ["-m", "scripts.corpus_v4.verify_published"]:
+    if os.environ.get("VERIFY_FAIL") == "1":
+        sys.exit(17)
+    pathlib.Path(args[args.index("--provenance")+1]).write_text(json.dumps({"fetch_attempt_id": "fetch-123"}))
 else:
     os.execv(sys.executable, [sys.executable, *args])
 """
@@ -378,3 +394,67 @@ def test_guest_audits_completed_folders_after_fetch_failure(
     assert len(phases) == 2
     assert all("--memory-budget-gib" in args for args in phases)
     assert not json.loads((guest / "state/attempt-status.json").read_text())["complete"]
+
+
+@pytest.mark.parametrize("failure", [None, "verification", "wrong-attempt", "missing-audit"])
+def test_audit_only_guest_attempt_contract(environment_guest, monkeypatch, failure):
+    guest, _, invoke = environment_guest
+    job = guest.parent / "job.sh"
+    job.write_text(render("a" * 40, "gs://fake-corpus/job", audit_only=True, workers=4))
+    if failure != "missing-audit":
+        monkeypatch.setenv("WRITE_AUDIT", "1")
+    if failure == "verification":
+        monkeypatch.setenv("VERIFY_FAIL", "1")
+    elif failure == "wrong-attempt":
+        monkeypatch.setenv("WRONG_ATTEMPT", "old-attempt")
+    result, calls = invoke()
+    status = json.loads((guest / "state/attempt-status.json").read_text())
+    phases = [c["args"][:2] for c in calls if c["name"] == "python"]
+    assert ["-m", "scripts.corpus_v4.fetch_native"] not in phases
+    assert ["-m", "scripts.corpus_v4.verify_published"] in phases
+    assert status["mode"] == "audit-only"
+    audit_calls = [
+        c for c in calls if c["args"][:2] == ["-m", "scripts.corpus_v4.audit_fev_overlap"]
+    ]
+    assert all(c["hub_offline"] == c["datasets_offline"] == "1" for c in audit_calls)
+    if failure:
+        assert result.returncode != 0
+        assert not status["complete"] and status["exit_code"] == result.returncode
+    else:
+        assert result.returncode == 0, result.stderr
+        report = json.loads((guest / "state/audit/audit.json").read_text())
+        assert status["complete"] and status["exit_code"] == 0
+        assert report["attempt_id"] == status["attempt_id"] != "fetch-123"
+        assert report["repo_sha"] == status["repo_sha"] == "a" * 40
+        assert report["fetch_attempt_id"] == status["fetch_attempt_id"] == "fetch-123"
+        first_id = status["attempt_id"]
+        result, _ = invoke()
+        assert result.returncode == 0, result.stderr
+        status = json.loads((guest / "state/attempt-status.json").read_text())
+        assert status["attempt_id"] != first_id
+        assert status["fetch_attempt_id"] == "fetch-123"
+
+
+def test_periodic_snapshot_cannot_overwrite_eager_checkpoints(environment_guest, monkeypatch):
+    monkeypatch.setenv("RAPID_SYNC", "1")
+    _, _, invoke = environment_guest
+    result, calls = invoke()
+    assert result.returncode == 0, result.stderr
+    snapshots = [
+        c["args"]
+        for c in calls
+        if c["name"] == "gcloud" and c["args"][:3] == ["storage", "rsync", "--recursive"]
+    ]
+    exclusions = [
+        arg.split("=", 1)[1] for args in snapshots for arg in args if arg.startswith("--exclude=")
+    ]
+    assert exclusions, "periodic snapshot races the eager journal/marker publisher"
+    for path in (
+        "audit-units/demo/000000.jsonl",
+        "audit-units/demo/000000.json",
+        "audit-controls.json",
+        "audit-folders/demo.json",
+    ):
+        assert any(re.search(pattern, path) for pattern in exclusions)
+    for path in ("audit-progress.json", "corpus/univariate/demo/receipt.json"):
+        assert not any(re.search(pattern, path) for pattern in exclusions)

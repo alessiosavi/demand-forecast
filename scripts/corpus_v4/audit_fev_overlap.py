@@ -9,7 +9,6 @@ import math
 import os
 import re
 import sqlite3
-import subprocess
 import sys
 from collections import Counter
 from dataclasses import dataclass
@@ -29,7 +28,6 @@ from scripts.corpus_v4.matching import (
     METHOD_VERSION,
     aggregate_fixed,
     chunks,
-    find_index_matches,
     find_matches,
     frequency,
     identifying_parent,
@@ -40,11 +38,8 @@ from scripts.corpus_v4.native import (
     MemoryBudget,
     atomic_json,
     digest,
-    folder_frequencies,
     folder_path,
-    iter_rows,
     memory_budget_arg,
-    start_memory_watchdog,
     value_chunks,
 )
 
@@ -181,17 +176,23 @@ class BenchmarkStore:
             raise ValueError("no benchmark series")
 
     def __iter__(self):
+        return self.iter_frequency()
+
+    def iter_frequency(self, alias=..., *, timestamps=True):
+        """Project metadata before mapping histories; identity searches need no dates."""
         for meta, start, length, timed in self.db.execute(
             "SELECT meta, start, length, timed FROM series"
         ):
             item = json.loads(meta)
+            if alias is not ... and item["freq"] != alias:
+                continue
             values = (
                 np.memmap(self.values_path, dtype="<f8", mode="r", offset=start, shape=(length,))
                 if length
                 else np.empty(0, dtype="<f8")
             )
             times = None
-            if timed:
+            if timed and timestamps:
                 stamps = (
                     np.memmap(
                         self.stamps_path, dtype="<i8", mode="r", offset=start, shape=(length,)
@@ -440,9 +441,9 @@ def _fingerprint(value):
 def _index_batches(store, benchmark_alias, corpus_alias, direction):
     """Bound combined benchmark indices so corpus reads scale with points, not row count."""
     arrays, metadata, events, size = [], [], [], 0
-    for bench in store:
-        if bench.freq != benchmark_alias:
-            continue
+    for bench in store.iter_frequency(
+        benchmark_alias, timestamps=direction == "benchmark_to_corpus"
+    ):
         variants = (
             _variants(
                 bench.values,
@@ -490,239 +491,16 @@ def _index_batches(store, benchmark_alias, corpus_alias, direction):
         yield arrays, metadata, events
 
 
-def _scan_folder(root, entry, store, opportunities, memory_budget_bytes):
-    path = folder_path(root, entry)
-    matches, coverage, searched, skipped = [], Counter(), {}, {}
-    reasons = set()
-    aggregation_seen = {}
-    kind = entry["folder"].split("/")[0]
-    budget = MemoryBudget(memory_budget_bytes)
-    aliases = folder_frequencies(path)
-    benchmark_groups = {}
-    for (encoded,) in store.db.execute("SELECT meta FROM series"):
-        meta = json.loads(encoded)
-        benchmark_groups.setdefault(meta["freq"], set()).add(meta["dataset"])
-    benchmark_aliases = sorted(benchmark_groups, key=lambda alias: alias or "")
-    for corpus_alias in aliases:
-        cf = frequency(corpus_alias)
-        for benchmark_alias in benchmark_aliases:
-            bf = frequency(benchmark_alias)
-            datasets = sorted(benchmark_groups[benchmark_alias])
-            pairs = [
-                dict(
-                    benchmark=name,
-                    benchmark_frequency=benchmark_alias,
-                    corpus_frequency=corpus_alias,
-                    domains="all pairs (conservative)",
-                )
-                for name in datasets
-            ]
-            if cf is None or bf is None:
-                failure = "unsupported frequency"
-            elif cf == bf:
-                failure = None
-                rule, direction = "F", "same_frequency"
-            elif _rank(cf) is None or _rank(bf) is None:
-                failure = "unsupported cross-frequency ordering"
-            else:
-                failure = None
-                rule = "L"
-                direction = (
-                    "corpus_to_benchmark" if _rank(cf) < _rank(bf) else "benchmark_to_corpus"
-                )
-            if failure:
-                for pair in pairs:
-                    skipped[json.dumps(pair, sort_keys=True)] = dict(**pair, reason=failure)
-                reasons.add(failure)
-                continue
-            for pair in pairs:
-                pair.update(rule=rule, direction=direction)
-                key = (pair["benchmark"], corpus_alias, benchmark_alias)
-                searched[key] = dict(**pair, comparisons=0, matched=0, aggregations=[])
-                aggregation_seen[key] = set()
-            for arrays, metadata, events in _index_batches(
-                store, benchmark_alias, corpus_alias, direction
-            ):
-                for event in events:
-                    if "unresolved" in event:
-                        reasons.add(event["unresolved"])
-                        for pair in pairs:
-                            skipped[json.dumps(pair, sort_keys=True)] = dict(
-                                **pair, reason=event["unresolved"]
-                            )
-                    else:
-                        coverage["uninformative_aggregation_parents"] += 1
-                if not arrays:
-                    continue
-                batch_counts, batch_transforms = Counter(), {}
-                for meta in metadata:
-                    name = meta["dataset"]
-                    batch_counts[name] += 1
-                    encoded = json.dumps(meta["aggregation"], sort_keys=True)
-                    batch_transforms.setdefault(name, set()).add(encoded)
-                index = old.Index(arrays, [f"benchmark-{i}" for i in range(len(arrays))])
-                budget.check(context=f"audit index {entry['folder']}")
-                for rec in iter_rows(path, kind, memory_budget_bytes=memory_budget_bytes):
-                    row = rec["row"]
-                    if row["freq"] != corpus_alias:
-                        continue
-                    channels = [("target", i, v) for i, v in enumerate(rec["target"])]
-                    channels += [("covariates", i, v) for i, v in enumerate(rec["covariates"])]
-                    for column, channel, values in channels:
-                        variants = (
-                            _variants(
-                                values,
-                                cf,
-                                bf,
-                                fine_alias=corpus_alias,
-                                coarse_alias=benchmark_alias,
-                            )
-                            if direction == "corpus_to_benchmark"
-                            else [(values, dict(method="identity"))]
-                        )
-                        for query, aggregation in variants:
-                            if query is None:
-                                if "unresolved" in aggregation:
-                                    reasons.add(aggregation["unresolved"])
-                                    for pair in pairs:
-                                        skipped[json.dumps(pair, sort_keys=True)] = dict(
-                                            **pair, reason=aggregation["unresolved"]
-                                        )
-                                else:
-                                    coverage["uninformative_aggregation_parents"] += 1
-                                continue
-                            for bx, xx in chunks(query):
-                                records, counters = find_index_matches(
-                                    xx,
-                                    index,
-                                    opportunities=opportunities,
-                                    calendar_dimensions=[m["calendar_sizes"] for m in metadata],
-                                )
-                                budget.check(context=f"audit query {entry['folder']}")
-                                coverage.update(counters)
-                                for name, count in batch_counts.items():
-                                    key = (name, corpus_alias, benchmark_alias)
-                                    searched[key]["comparisons"] += count
-                                    transforms = (
-                                        {json.dumps(aggregation, sort_keys=True)}
-                                        if direction == "corpus_to_benchmark"
-                                        else batch_transforms[name]
-                                    )
-                                    for encoded in sorted(transforms - aggregation_seen[key]):
-                                        searched[key]["aggregations"].append(encoded)
-                                        aggregation_seen[key].add(encoded)
-                                for record in records:
-                                    meta = metadata[record["index_series_index"]]
-                                    key = (meta["dataset"], corpus_alias, benchmark_alias)
-                                    searched[key]["matched"] += 1
-                                    base, offset = _segment_id(row["item_id"])
-                                    record.update(
-                                        rule=rule,
-                                        aggregation=(
-                                            aggregation
-                                            if direction == "corpus_to_benchmark"
-                                            else meta["aggregation"]
-                                        ),
-                                        corpus=dict(
-                                            item_id=row["item_id"],
-                                            base_id=base,
-                                            segment_offset=offset,
-                                            source=row["source"],
-                                            shard=rec["shard"],
-                                            row=rec["row_index"],
-                                            column=column,
-                                            channel=channel,
-                                            chunk_offset=bx,
-                                        ),
-                                        benchmark={
-                                            k: v
-                                            for k, v in meta.items()
-                                            if k not in {"aggregation", "calendar_sizes"}
-                                        },
-                                    )
-                                    matches.append(record)
-                                    if len(matches) >= 10000:
-                                        reasons.add("evidence record limit reached")
-                                        break
-                                if len(matches) >= 10000:
-                                    break
-                            if len(matches) >= 10000:
-                                break
-                        if len(matches) >= 10000:
-                            break
-                    if len(matches) >= 10000:
-                        break
-                if len(matches) >= 10000:
-                    break
-            if len(matches) >= 10000:
-                break
-        if len(matches) >= 10000:
-            break
-    if any(coverage[k] for k in ("unresolved_rows", "groups_dropped", "offsets_dropped")):
-        reasons.add("matcher candidate/resource cap dropped coverage")
-    rules = {m["rule"] for m in matches}
-    verdict = (
-        "rule_f_match"
-        if "F" in rules
-        else "rule_l_match"
-        if "L" in rules
-        else "inconclusive"
-        if reasons
-        else "clean"
-    )
-    return dict(
-        folder=entry["folder"],
-        status=entry["status"],
-        verdict=verdict,
-        reason=sorted(reasons),
-        matches=matches,
-        coverage=dict(coverage),
-        searched_pairs=list(searched.values()),
-        skipped_pairs=list(skipped.values()),
-        quarantine_action=(
-            "releasable by PR; metadata review still required"
-            if entry["status"] == "quarantined" and verdict == "clean"
-            else "no automatic change"
-        ),
-    )
-
-
-def _scan_in_subprocess(root, entry, store, opportunities, memory_budget_bytes):
-    request = dict(
-        root=str(root),
-        entry=entry,
-        store=str(store.path),
-        opportunities=opportunities,
-        memory_budget_bytes=memory_budget_bytes,
-    )
-    result = subprocess.run(
-        [sys.executable, "-m", "scripts.corpus_v4.audit_fev_overlap", "--scan-worker"],
-        input=json.dumps(request),
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode:
-        raise ValueError(f"audit worker exit {result.returncode}: {result.stderr.strip()}")
-    return json.loads(result.stdout)
-
-
 def _scan_worker():
     request = json.load(sys.stdin)
-    budget = request["memory_budget_bytes"]
-    start_memory_watchdog(budget)
-    store = BenchmarkStore.__new__(BenchmarkStore)
-    store.path = Path(request["store"])
-    store.values_path = store.path.with_suffix(".values")
-    store.stamps_path = store.path.with_suffix(".stamps")
-    store.db = sqlite3.connect(store.path)
-    store.db.execute("PRAGMA cache_size=-8192")
-    try:
-        result = _scan_folder(
-            request["root"], request["entry"], store, request["opportunities"], budget
-        )
-        print(json.dumps(result))
-    finally:
-        store.close()
+    if request.get("serial_fallback"):
+        from scripts.corpus_v4.audit_serial import serial_worker
+
+        serial_worker(request)
+    else:
+        from scripts.corpus_v4.audit_parallel import unit_worker
+
+        unit_worker(request)
 
 
 def run_audit(
@@ -734,9 +512,13 @@ def run_audit(
     state=None,
     control_runner=controls,
     memory_budget_bytes=DEFAULT_MEMORY_BUDGET_BYTES,
+    workers=None,
 ):
     """Restart by folder with hashes, benchmark identity, method and policy bound to state."""
     validate_manifest(manifest)
+    workers = (os.cpu_count() or 1) if workers is None else workers
+    if not isinstance(workers, int) or isinstance(workers, bool) or workers < 1:
+        raise ValueError("workers must be a positive integer")
     root, out = Path(root), Path(out)
     state = Path(state or Path(os.environ.get("RUN_DIR", out)) / "state")
     state.mkdir(parents=True, exist_ok=True)
@@ -823,71 +605,36 @@ def run_audit(
             opportunities=opportunities,
         )
         fingerprint = _fingerprint(dict(**identity, folders=identities))
-        checks = control_runner(store.samples, opportunities)
-        folders = []
-        for entry in manifest["folders"]:
-            key = _fingerprint(
-                dict(
-                    **identity,
-                    entry=entry,
-                    hashes=identities[entry["folder"]],
-                    memory_budget_bytes=memory_budget_bytes,
-                )
+        control_key = _fingerprint(
+            dict(
+                benchmark=store.fingerprint,
+                opportunities=opportunities,
+                method=METHOD_VERSION,
+                runner=f"{control_runner.__module__}.{control_runner.__qualname__}",
             )
-            stable_identity = {k: v for k, v in identity.items() if k != "opportunities"}
-            resume_key = _fingerprint(
-                dict(
-                    **stable_identity,
-                    entry=entry,
-                    hashes=identities[entry["folder"]],
-                    memory_budget_bytes=memory_budget_bytes,
-                )
-            )
-            saved = state / "audit-folders" / f"{entry['folder'].replace('/', '--')}.json"
-            report = None
-            if saved.exists():
-                previous = json.loads(saved.read_text())
-                # A clean scan at a lower information threshold stays clean when
-                # a repaired/missing folder increases the global opportunity bound.
-                compatible_clean = (
-                    previous.get("resume_fingerprint") == resume_key
-                    and previous.get("opportunities", 0) <= opportunities
-                    and previous["report"]["verdict"] == "clean"
-                )
-                if (previous.get("fingerprint") == key or compatible_clean) and not previous[
-                    "report"
-                ].get("error"):
-                    report = previous["report"]
-                    report["resumed"] = True
-            if report is None:
-                try:
-                    if entry["folder"] in folder_reasons:
-                        raise ValueError(folder_reasons[entry["folder"]])
-                    report = _scan_in_subprocess(
-                        root, entry, store, opportunities, memory_budget_bytes
-                    )
-                except (ValueError, OSError, OverflowError, MemoryError, sqlite3.Error) as exc:
-                    report = dict(
-                        error=f"{type(exc).__name__}: {exc}",
-                        folder=entry["folder"],
-                        status=entry["status"],
-                        verdict="inconclusive",
-                        reason=[str(exc)],
-                        matches=[],
-                        searched_pairs=[],
-                        skipped_pairs=[],
-                    )
-                report["resumed"] = False
-                atomic_json(
-                    saved,
-                    dict(
-                        fingerprint=key,
-                        resume_fingerprint=resume_key,
-                        opportunities=opportunities,
-                        report=report,
-                    ),
-                )
-            folders.append(report)
+        )
+        control_path = state / "audit-controls.json"
+        saved_controls = json.loads(control_path.read_text()) if control_path.exists() else {}
+        if saved_controls.get("fingerprint") == control_key:
+            checks = saved_controls["checks"]
+        else:
+            checks = control_runner(store.samples, opportunities)
+            atomic_json(control_path, dict(fingerprint=control_key, checks=checks))
+        from scripts.corpus_v4.audit_parallel import publish_checkpoints, scan_folders
+
+        publish_checkpoints(state, [control_path])
+
+        folders = scan_folders(
+            root,
+            state,
+            manifest,
+            store,
+            identity,
+            identities,
+            folder_reasons,
+            memory_budget_bytes,
+            workers,
+        )
         failed_folders = [
             f["folder"]
             for f in folders
@@ -915,6 +662,8 @@ def run_audit(
             failed_folders=failed_folders,
             memory_budget_bytes=memory_budget_bytes,
         )
+        if os.environ.get("CORPUS_FETCH_ATTEMPT_ID"):
+            result["fetch_attempt_id"] = os.environ["CORPUS_FETCH_ATTEMPT_ID"]
         atomic_json(out / "audit.json", result)
         return result, code
     finally:
@@ -929,6 +678,9 @@ def main(argv=None):
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     parser.add_argument("--state", type=Path)
     parser.add_argument(
+        "--workers", type=int, default=None, help="concurrent workers (default: cores)"
+    )
+    parser.add_argument(
         "--memory-budget-gib",
         type=memory_budget_arg,
         default=DEFAULT_MEMORY_BUDGET_BYTES,
@@ -941,6 +693,7 @@ def main(argv=None):
         read_manifest(args.manifest),
         state=args.state,
         memory_budget_bytes=args.memory_budget_gib,
+        workers=args.workers,
     )
     if report["failed_folders"]:
         print("failed audit folders: " + ", ".join(report["failed_folders"]))

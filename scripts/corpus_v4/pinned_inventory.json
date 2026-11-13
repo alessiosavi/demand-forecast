@@ -1,0 +1,984 @@
+{
+  "repo_id": "abel-lab/Simons-Pretrain",
+  "revision": "5f17ab8cfa3fa00a8e821599b631127ba250c342",
+  "files": [
+    {
+      "path": "covariates/aemo_solar_farm_nwp/train-00000.parquet",
+      "size": 1588153,
+      "hash": "c8dc024180a5cab0ddb979fa09296518e400fdd383930597e2057a9f1a49ae0e",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "covariates/aemo_wem_load_forecast/train-00000.parquet",
+      "size": 140427,
+      "hash": "1b5936d5e0d6c9895203d311dd8cc90feb6029a5ad575dae35852a9dfeda09ff",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "covariates/aemo_wind_farm_nwp/train-00000.parquet",
+      "size": 4271526,
+      "hash": "24dba241026acbf812eb99b4b1456d0403632bf6a2dc4249e4466825d71ecd77",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "covariates/asos_temperature_mos/train-00000.parquet",
+      "size": 1089644,
+      "hash": "207c48e4ec1be342f83f401ff7c7b898eaddfdadadba8aafc41dce3a957a6a22",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "covariates/battery_drive_cycles/train-00000.parquet",
+      "size": 1674303,
+      "hash": "52ddb96f0cf890c80a559165994cd48068540901fc3f0dfa363e2fad1a2717f9",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "covariates/bcb_focus_inflation/LICENSE.md",
+      "size": 457,
+      "hash": "32e0db25ef6d741312f7ff305395689ab9dd33e3",
+      "algorithm": "git-sha1"
+    },
+    {
+      "path": "covariates/bcb_focus_inflation/train-00000.parquet",
+      "size": 4845,
+      "hash": "3d02598642d78f35d8825324948eda60f9235bc50da78aa1602d60ab300bfa94",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "covariates/bts_airport_schedule/train-00000.parquet",
+      "size": 475614,
+      "hash": "d82cd776df80babc557ebe5e4f8b3f080b2f684c951ef96dc0d35a17288629ca",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "covariates/cams_europe_air_quality/train-00000.parquet",
+      "size": 4375197,
+      "hash": "504590f5c7f510f45b3cc07ec4ec2344e6baead61cb9b4f6a2052971ab391739",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "covariates/city_load_weather_forecast/train-00000.parquet",
+      "size": 2255845,
+      "hash": "5d11caffafd223fb5e54feaf3e6a691b1e752a6351fbffbef2ee7e808913efc2",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "covariates/covid_hub_admissions/train-00000.parquet",
+      "size": 168379,
+      "hash": "5d8ada9009689e531d61a0bf62dfbc626eeecb9903fe25a28397c705d000433b",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "covariates/cpc_monthly_outlook/train-00000.parquet",
+      "size": 813207,
+      "hash": "ca0eaa256216766cdefee35a8d8d98c8a040d5556530f3ac7d0ca32ea619e8cc",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "covariates/dk_wind_solar_dayahead/train-00000.parquet",
+      "size": 142480,
+      "hash": "0e10b39f2c52c7176e067897c2854928c2053455df4a1ee14779cb71ff8c75ae",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "covariates/eia930_ba_load_weather/train-00000.parquet",
+      "size": 51056139,
+      "hash": "30a991885ae9131569574a08afe16617550f10b9687c98760ac687973e5fe298",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "covariates/eia930_ba_solar_weather/train-00000.parquet",
+      "size": 26955160,
+      "hash": "7503ca8a01d84fd205688b91639b8a75595fb0ccd064f62fd267d0e5a0a25777",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "covariates/eia930_ba_wind_weather/train-00000.parquet",
+      "size": 25669974,
+      "hash": "8d7df8feacb89e4ff3c07d81117c4beec1aa550581a33b0fc16d8a27145cbebd",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "covariates/eia930_demand_da/train-00000.parquet",
+      "size": 8345874,
+      "hash": "4d952ba57af8cff5e39c825873c65b1318c126444c1b4fb271c3551ac9f2b9f6",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "covariates/eia930_subregion_load_weather/train-00000.parquet",
+      "size": 62104956,
+      "hash": "a7850fad84aba8e3af2470c09b7960aabd4ac18996e350bc01c55e87028d23bf",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "covariates/eirgrid_ireland_demand_wind/train-00000.parquet",
+      "size": 217842,
+      "hash": "a30fa3569aeb28b288abd9212c35f815ca066b5c851956329990700554355948",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "covariates/elia_load_dayahead/train-00000.parquet",
+      "size": 324927,
+      "hash": "ec86ed575724f463402006e0c0ebc6df9b4322d7074eb744163e539dcb6c13c2",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "covariates/elia_wind_solar_dayahead/train-00000.parquet",
+      "size": 2273732,
+      "hash": "496e7630a24064c94014e5efee3cfc145a009da9cce2df9893a30260a1c6b220",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "covariates/enso_forecast_plume/train-00000.parquet",
+      "size": 5220,
+      "hash": "7152b3ca55eccf01bb69ae4c91cd94f28eddd864ad84640b02f171286efbf899",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "covariates/eu_wind_farm_nwp/train-00000.parquet",
+      "size": 2346173,
+      "hash": "500dcbbe1e9bccb53d0eec5e26c0fc011a749ca28f8fab474cd673fbb4c3230b",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "covariates/eurostat_flash_hicp/train-00000.parquet",
+      "size": 77732,
+      "hash": "4b38c4b3968b07d98c2495be4116e948e7033bb03bb4b374ecd0d4d5ee25432c",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "covariates/fi_rail_timetable/train-00000.parquet",
+      "size": 559515,
+      "hash": "8d60d2d224abe0efe19cc31f43b428edac3dcc6ce20c6e6b4120864ec4eae1df",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "covariates/gb_gsp_solar_nwp/train-00000.parquet",
+      "size": 4428648,
+      "hash": "2a8dc737ac8dd5d4b262b511594bea8643eb188d0e2d454fa5ad083c2180f4d7",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "covariates/gb_unit_output_availability/train-00000.parquet",
+      "size": 973270,
+      "hash": "23f786e3edae819518327b136244844cc12fb018a97f62333b4e67db4a8cbf70",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "covariates/gb_wind_generation/train-00000.parquet",
+      "size": 20400,
+      "hash": "b85751e4c6c38ef2b0833efb76e2b2c7b6baa252d7c59cf47ab76427c94b7fd7",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "covariates/hai_setpoints/LICENSE.md",
+      "size": 449,
+      "hash": "1f315fb27b9ece3a89a00f5472232458f24bede5",
+      "algorithm": "git-sha1"
+    },
+    {
+      "path": "covariates/hai_setpoints/train-00000.parquet",
+      "size": 149676,
+      "hash": "d2a91298fe5eb70733621e55dafb99b73ff104a9f499505e79cee2e5d990ccc0",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "covariates/hotel_bookings_otb64/train-00000.parquet",
+      "size": 16089,
+      "hash": "815ee2fa2a5792da3b133d9ebe53c0666fca769cde9b3595eef4e2414bf363de",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "covariates/london_dtou_tariff/train-00000.parquet",
+      "size": 10706453,
+      "hash": "844297d3ebcf25cdd862bf4cf46f5580e94326a6c56afdf228d95c78cea27600",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "covariates/mbta_planned_disruptions/train-00000.parquet",
+      "size": 102305,
+      "hash": "a71f277739ea4a222012757a1ed9fc4e467a62521591b050464b349ac9c1fb91",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "covariates/mlb_attendance_schedule/train-00000.parquet",
+      "size": 46699,
+      "hash": "2b8da467e8416e07275322ec255734d4bb4bdadaeb5b65d30fcb7185a4e3b52a",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "covariates/neso_demand_dayahead/train-00000.parquet",
+      "size": 213418,
+      "hash": "672281921678113e38870274b5c0d5904577f3e729fdc2dfff717827993ebc89",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "covariates/nist_nzertf_house/train-00000.parquet",
+      "size": 16503,
+      "hash": "bed00065aa674452b6952f187968ad9f9b60bf80e8964bdc6589436c17a3beb1",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "covariates/noaa_tide_predictions/train-00000.parquet",
+      "size": 1833726,
+      "hash": "258e69ac3e225fcd8ab4123068e966fbcafae0f423559ddb35d695f9c077f616",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "covariates/nwm_streamflow_forecast/train-00000.parquet",
+      "size": 113383,
+      "hash": "4fc3e376c0c3fca4f88038d01c7ce98c3f66af716cd8cd22fb4008e0ef64fcc7",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "covariates/nyc_subway_events/LICENSE.md",
+      "size": 684,
+      "hash": "2ddde2482cc4de69dbcdfc5547b8f32bd32f011d",
+      "algorithm": "git-sha1"
+    },
+    {
+      "path": "covariates/nyc_subway_events/articles.csv",
+      "size": 1894,
+      "hash": "b6e2137608d4009c96675bd5ca417221c95a49f8",
+      "algorithm": "git-sha1"
+    },
+    {
+      "path": "covariates/nyc_subway_events/train-00000.parquet",
+      "size": 154782,
+      "hash": "3534d3f0e8b942c96514e61a7deca995279b666a53c694c237e8b3845fa16e18",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "covariates/nyc_taxi_permitted_events/train-00000.parquet",
+      "size": 1865820,
+      "hash": "2805d993b2d8bc0438210d03fe632f1d84f2023b3e2dc88c32622895dc68466c",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "covariates/nz_node_price_schedule/train-00000.parquet",
+      "size": 4419752,
+      "hash": "bda744d3ff08de6fb78bacf68acd47b40772f4fcddb32beec7c73256ae80cf4c",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "covariates/ons_brazil_load_forecast/train-00000.parquet",
+      "size": 977165,
+      "hash": "a7e218ba767db2933b320424e6a33cf5bc7fa0d57a7c6b40a5e5e404c9330026",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "covariates/ons_brazil_load_weather/train-00000.parquet",
+      "size": 4973867,
+      "hash": "76f7407fdf0fac90fd65e584411a18ac721f2f00da29185bf2c1608549eed020",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "covariates/panasonic_battery_drive_cycles/train-00000.parquet",
+      "size": 1943140,
+      "hash": "7f6d63eba1f1ce784f395c3d4a26d8219e81765f22592675dc41055ae449117d",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "covariates/pvdaq_site_solar_weather/train-00000.parquet",
+      "size": 2483110,
+      "hash": "d98dcc1419042911d52bb2f593ee5c05bb4350fe9085ee1d70f37926d767764a",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "covariates/rba_smp_forecasts/train-00000.parquet",
+      "size": 2816,
+      "hash": "ec14424291135610564d16d74cc27a5a2782de0fceac2567565771aa39475bff",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "covariates/rfc_river_forecasts/train-00000.parquet",
+      "size": 5323,
+      "hash": "cacab79569f550e8d41cfb36d2616f0fc3811fab1bdba05343bcb2e567090451",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "covariates/rsv_hub_admissions/train-00000.parquet",
+      "size": 4244,
+      "hash": "d055d499299d161911df6bf67d19089b9819b3237957f5b7e920b9d2da8e7a47",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "covariates/rte_france_load_j1/train-00000.parquet",
+      "size": 77387,
+      "hash": "e3aae47f83633198c60852e79d02ecbbb88c3cd0008a4baf9224ce3464bb104e",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "covariates/sbb_rail_delays/train-00000.parquet",
+      "size": 425005,
+      "hash": "aab2a9a31607499210452039d8bd3a15f738cbfaeaa0654358486a97e27d7673",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "covariates/seoul_metro_kbo/train-00000.parquet",
+      "size": 1724138,
+      "hash": "ace5f7155b51f287a3711d401e0271e281303b32bb50ff7fd2d0f0283a142aed",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "covariates/stofs_water_level_forecast/train-00000.parquet",
+      "size": 1188437,
+      "hash": "5b07884a451f2838e8d2f68be88c108b17f7a35a821febca772a58e40fbf36c1",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "covariates/surfrad_solar_hrrr/train-00000.parquet",
+      "size": 85893,
+      "hash": "a89a476b87632ec49e13204c63706a261679cdededc6353ccbf3299a59614c72",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "covariates/swpc_f107_45day/train-00000.parquet",
+      "size": 37579,
+      "hash": "d03e223b534196d6f0ba4c77ad53994c61e4c625b19deb8477373b79a7d3b907",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "covariates/swpc_kp_forecast/train-00000.parquet",
+      "size": 16466,
+      "hash": "ef44ebb36c4f779f195405fcab8a37bf1590df6d267e7af81bd342af324b30cf",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "covariates/tennessee_eastman_setpoints/train-00000.parquet",
+      "size": 773682,
+      "hash": "6e3f8a43f43e00287f673b0b7b3fab0e10971aaa0751bef4d668148354ba33e6",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "covariates/transit_scheduled_service/train-00000.parquet",
+      "size": 49754,
+      "hash": "3a9fc33a94cbcf8250a5007bc0a41a943cc31b874e09f7e2344562199756da41",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "covariates/uk_roadworks_traffic/train-00000.parquet",
+      "size": 549198,
+      "hash": "24f8e830b81364c7414d3acaef1a61f213a5c8b13ba8ec9330fe8d3d69eaf9d4",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "covariates/us_ba_load_mos/train-00000.parquet",
+      "size": 1743282,
+      "hash": "d99dc1c5ce5544d8121c5d1e0294c090df1c750caa80c54eda8d97874f1bfb96",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "covariates/wikipedia_sports_fixtures/LICENSE.md",
+      "size": 605,
+      "hash": "8483e4368b96b3b28de858c03fdea4883aa6812c",
+      "algorithm": "git-sha1"
+    },
+    {
+      "path": "covariates/wikipedia_sports_fixtures/articles.csv",
+      "size": 6359,
+      "hash": "8615ade24c158a915c28a75938e37dac9324cfc1",
+      "algorithm": "git-sha1"
+    },
+    {
+      "path": "covariates/wikipedia_sports_fixtures/train-00000.parquet",
+      "size": 56639,
+      "hash": "c10d227af78a00609f8f68dc02ca02bed7726b39ad224288583c2836efb02cf9",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "covariates/wikipedia_tv_episodes/LICENSE.md",
+      "size": 599,
+      "hash": "269caf5c60b2d6d46ca729da87ae01ee35c81f81",
+      "algorithm": "git-sha1"
+    },
+    {
+      "path": "covariates/wikipedia_tv_episodes/articles.csv",
+      "size": 6769,
+      "hash": "d3e8c40568242079b7fb00764544356e90e24693",
+      "algorithm": "git-sha1"
+    },
+    {
+      "path": "covariates/wikipedia_tv_episodes/train-00000.parquet",
+      "size": 58405,
+      "hash": "cf61b3becf010388c7dcdb173ec98242b0579bc6f35416f940680b6a5026f84c",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/ajile/train-00000.parquet",
+      "size": 209889115,
+      "hash": "9913800c7a3d4e3d9390958919600c2635961bbe8d4009893a884315b8e8e0f6",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/arpa-e-perform/train-00000.parquet",
+      "size": 205280,
+      "hash": "34335588905ec28f3ea9a62da2854b56664c165a99ef777a040fe48b14976c11",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/australian-electricity-demand/train-00000.parquet",
+      "size": 2604620,
+      "hash": "399da46563db2d2e877f7c5cc0fd6b32e6dee6c43fb4f3353216d95c7c1b65dd",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/azure-vm-traces-2017/train-00000.parquet",
+      "size": 503599921,
+      "hash": "92e8824912a1180db9344cf396afdd2281097e4f03505f9fe8abbc0b235a015b",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/azure-vm-traces-2017/train-00001.parquet",
+      "size": 502777483,
+      "hash": "9ab2f4bc82e144a920bcf5c42d0351623a26e76b9df0979f0211c7a3404522bf",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/azure-vm-traces-2017/train-00002.parquet",
+      "size": 503274833,
+      "hash": "e21f21bbf2aca0d9868ac3919aaa5606d9e0ece1b14f451bb9cdc6aedfc8a4c4",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/azure-vm-traces-2017/train-00003.parquet",
+      "size": 505329917,
+      "hash": "e2fede0e3a2f79fdf79377638caa579e11597e3647cc7fd4288d5c8e8ec48a02",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/batch-distillation/train-00000.parquet",
+      "size": 4922387,
+      "hash": "3042adc5826e8ab7f193f83e34e1e414bff5f4eac20b4239a5a0a7842dd9febe",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/bdg-2/LICENSE.md",
+      "size": 468,
+      "hash": "600f1b196d89afd1b83eabe989ff62abeca4535a",
+      "algorithm": "git-sha1"
+    },
+    {
+      "path": "univariate/bdg-2/train-00000.parquet",
+      "size": 15722316,
+      "hash": "b9afc6f75c6722b7e314ca74dbe2fd5d285ce915988f3e88ad301b195734017d",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/bidmc32hr/train-00000.parquet",
+      "size": 6986949,
+      "hash": "7e57531b61bd3325e9a1c090f983c230db3635b2e5bae1f1aaa5eb2e2554ee6f",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/borealis/train-00000.parquet",
+      "size": 265406,
+      "hash": "3fc0a2f97af5ac09a52c74f12253eeb2e24e641e665e9794c621417fefc53d79",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/borg-cluster-data-2011/train-00000.parquet",
+      "size": 471670638,
+      "hash": "ff27c0a17ef1aea13199a5eaa63b704f66bfe7c76128d8ca62dda6c4ab8e6825",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/borg-cluster-data-2011/train-00001.parquet",
+      "size": 469482131,
+      "hash": "8b62256b622f635395f2bfb65bc5f0b92fb6f2495bb37b1ca43faff0b4ecd078",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/camels-de/train-00000.parquet",
+      "size": 101480106,
+      "hash": "c97486915c2e00ac4fbf81a13af43b455bc595a5c31f6b83c888e63a42a96ac1",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/cdc-fluview-who-nrevss/train-00000.parquet",
+      "size": 64422,
+      "hash": "71934eb14fdeccf388b1279e87017cb76558d53ed89b1d24483b343d31c34c94",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/cesnet/train-00000.parquet",
+      "size": 400742372,
+      "hash": "d44699f73876c8f603521846777d0627d1e415b22181699f1c96485226e55e95",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/eia930/train-00000.parquet",
+      "size": 19822634,
+      "hash": "e93c5c769f68b887d192e6d09417b79d7b960d2f145a8e7d41943c3e05e84c0d",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/eigenworms/train-00000.parquet",
+      "size": 51752132,
+      "hash": "aa618dd15f4ecf0e345aba00eca1454de11298d3b37044f04a4dc07dc6358ae1",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/elecdemand/train-00000.parquet",
+      "size": 74071,
+      "hash": "5db6e41c78781f782be496172b8d861eb7ac0a1c19a6ec93314f84df301c3c39",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/era5/train-00000.parquet",
+      "size": 3330917409,
+      "hash": "cfb229f9f62b72f8145bf6614f3db6233cf2682ba046a2fe8f81271743a01dba",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/era5/train-00001.parquet",
+      "size": 266544529,
+      "hash": "42eb98d9db16069de85d306914b884dc9d1bc49089c994fea9af7ce6ea205dcf",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/era5/train-00002.parquet",
+      "size": 296318405,
+      "hash": "b3220354317ecf90b2ee5de299d51ff4778f5e22d3bfd76f2039afb13ecdae3a",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/era5/train-00003.parquet",
+      "size": 296096248,
+      "hash": "19acd08b87618516da369e33a01adcb442b3ca63d6577446128a11d35f6023b5",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/era5/train-00004.parquet",
+      "size": 296181948,
+      "hash": "b91f73c3cc938025733a487416d273a35354b29820e881557daa246fe78e8872",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/era5/train-00005.parquet",
+      "size": 296091691,
+      "hash": "a1c0d50568d0146cf8cb5ae43802655b28330f1d6398a2010ca9082a5b5474af",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/era5/train-00006.parquet",
+      "size": 296122757,
+      "hash": "a4697d6404847963b7ce0f5632eceb46ccd4fb9c1bb3bb95bad0346fe5d9c4f2",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/era5/train-00007.parquet",
+      "size": 295404058,
+      "hash": "409f9c574bf33d18bc887c458625e531b92c76afc2d2829d8d4eb22bb8ae9d98",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/era5/train-00008.parquet",
+      "size": 295520147,
+      "hash": "4644c0aeeaae030c7dedd162b2da5f37883a86409b86f434321946d942430ed5",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/era5/train-00009.parquet",
+      "size": 296187194,
+      "hash": "ae31cebe623101e7116620256c56fda4075ead1883a3f41a35013bf1cab8b600",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/era5/train-00010.parquet",
+      "size": 296567665,
+      "hash": "4752837a496ea0bcc383f64646f5dc9c42a303de14dbe4fc34799336d657f708",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/era5/train-00011.parquet",
+      "size": 295525319,
+      "hash": "ec0e537bc54e843d393910f6299b73a4221d99cf0d6553609184b0d564ead390",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/era5/train-00012.parquet",
+      "size": 295499838,
+      "hash": "c14f640b8ce7d6bc6de31bc38cdfdd0f9d591712421a34782e224d32d4a54e85",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/factorynet-aursad/train-00000.parquet",
+      "size": 644100262,
+      "hash": "cf573f84183ac79cac2bd17cc4b36c3d7d84250d567d7b17f7ccf83740655d4c",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/factorynet-cnc/train-00000.parquet",
+      "size": 660543,
+      "hash": "41f6c85eaec423dabe61b49498f520ffa8090dd985441b38b6853c16770ee401",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/freshretailnet/train-00000.parquet",
+      "size": 3167534,
+      "hash": "d401eb5f3b6b19c3ddb3e6b71eb6128937e2c3aeb5948e80d90cb744f3b679d6",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/gpm-mergir/train-00000.parquet",
+      "size": 502991505,
+      "hash": "e20abfce25534a990bbef070468a999888964d7c2322c23a89a73601532e078c",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/gpm-mergir/train-00001.parquet",
+      "size": 502970575,
+      "hash": "df093332c5b9cfb6729f3a2d01f1d551178c1948a5b52dac8fa00b3e4a51d02b",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/gpm-mergir/train-00002.parquet",
+      "size": 502959327,
+      "hash": "b5c5001e5ec38a10be7902065e99ddec4dcfcd2173ab45aee23564a118be33e9",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/ideal-hourly/train-00000.parquet",
+      "size": 2807602,
+      "hash": "2dcd77936b828cba1b6d3df39cc50dc27bbe25641553cca22f3d238b2249117a",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/ideal/train-00000.parquet",
+      "size": 2339527,
+      "hash": "5dd696e1cba2543cb2dda72a3f3ff86f174fe747aedae7e6c53d13048d7cc596",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/lcl/train-00000.parquet",
+      "size": 8059362,
+      "hash": "20311c848c852f32da2fe19dd366bd74289451bff85297620c4b7d8ddd61b1ff",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/london-smart-meters/train-00000.parquet",
+      "size": 143965217,
+      "hash": "0a9fb515ced30dd72ae1576e0931e0ed3a92b65c73b3dac52710bda3b4c422b2",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/m100-ipmi/train-00000.parquet",
+      "size": 720211655,
+      "hash": "b06b6011a8c2df82ed84433f1d3e3ff1fe3848742d43ca47f7646bc41e68ad7c",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/metro-traffic/train-00000.parquet",
+      "size": 70761,
+      "hash": "46c0845b098b8aa4073ed9b287e4d0d64e4ad848d5c7bd197ac667f23b2f0901",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/museval-austin-water/train-00000.parquet",
+      "size": 2875,
+      "hash": "04e9739530821786c01e671b3d8d7bea859f704c5f97e77e01895c57affa0ad8",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/museval-beijing-embassy/train-00000.parquet",
+      "size": 44078,
+      "hash": "6b345ac899aff48eb30fd509c481d790749dd520e993970eb52c976ca6c11a06",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/museval-causalrivers/train-00000.parquet",
+      "size": 1320678,
+      "hash": "f47adf41cfb4a8bc0e158309cef7b8ac07c7db8668387ba82785398781bf3e5c",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/museval-cgm/LICENSE.md",
+      "size": 455,
+      "hash": "ef4c8daacddf34fda81bd060323d2fd8c4ab8b50",
+      "algorithm": "git-sha1"
+    },
+    {
+      "path": "univariate/museval-cgm/train-00000.parquet",
+      "size": 4277,
+      "hash": "985e35a705e8cb03ac6717668cd6ef860db99ca9fdebe28944eac94a8d8f650f",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/museval-mn-interstate/train-00000.parquet",
+      "size": 21320,
+      "hash": "b3f78299b81214cc87462fd5d6babfe18304260ca73ac439a0afe78f0578545e",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/museval-mta-ridership/train-00000.parquet",
+      "size": 6252,
+      "hash": "1daa73d20c5f4ddc519fa9da517d99af4620e8f934e38d6161b2430584466631",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/museval-traffic-pems/train-00000.parquet",
+      "size": 49461,
+      "hash": "b794df37f60dd89f847819ea5a5fe8e4e196962159050c91135672e75d860ea4",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/national-illness/train-00000.parquet",
+      "size": 26822,
+      "hash": "b70b12efb296808b5a5da3fdcea0410e20481ddc43d36bb894a6c385b3f12845",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/nhanes-pax80/train-00000.parquet",
+      "size": 128134366,
+      "hash": "68cb9d0e0fa036435f59202029a5e35faab2856d1e7220e744112b4a1770dc94",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/nmt-eeg/LICENSE.md",
+      "size": 453,
+      "hash": "ffdf9bf1a5297e2760abdd96b7f9f602c0920e7d",
+      "algorithm": "git-sha1"
+    },
+    {
+      "path": "univariate/nmt-eeg/train-00000.parquet",
+      "size": 202635219,
+      "hash": "7bf8220b248db6cd515808e88fbe01996a735bb142f8653e8d32daa4d21462ef",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/ntu-fi-humanid-csi-amplitude/train-00000.parquet",
+      "size": 313066190,
+      "hash": "7fce20ca60832d0ff92f53d02f8fe00e3c05cfaca8b194d6d3288bb364e21813",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/nyc-taxi/train-00000.parquet",
+      "size": 24671897,
+      "hash": "700830b3c1b9b83376f179aa3bcfbb1c1c5b3c9d878fbd89e4c8522942d94845",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/pedestrian-counts/train-00000.parquet",
+      "size": 2891142,
+      "hash": "4f28e72e6fb825bd8d99153ac7daed3abe86c73511ffddf572527597d78386c8",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/pems-bay/train-00000.parquet",
+      "size": 16707138,
+      "hash": "828db5caa46127d2ed654e812dd08c64b39d9b788539747e19bc81c9613e2e93",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/pems-districts/train-00000.parquet",
+      "size": 52994459,
+      "hash": "d43e3e352659933cd62eab46e24668ac6dfea28340c6b19504c38c09aac42c4c",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/project-tycho/train-00000.parquet",
+      "size": 546692,
+      "hash": "ad83134f57b9ad32ed7dddec63e4704ee1f246a2e66d22e30347854c1c4e3c7d",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/residential-load-power/train-00000.parquet",
+      "size": 727415901,
+      "hash": "72430e22b2b79214effc41c5e9a98a7904134e422b0d6cee41536f62a7a347fd",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/residential-pv-power/train-00000.parquet",
+      "size": 317165154,
+      "hash": "8097d16b542805ab3017dad2e6068d5c7c55cd4f8921843fea2bb3765bb96c9c",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/smart/train-00000.parquet",
+      "size": 272274,
+      "hash": "4b0fca0b3222c02b85bf0a185083f3a702a8df75a5901f1df47ab98bc56ecc80",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/solar-power/train-00000.parquet",
+      "size": 715843,
+      "hash": "e63bf8939fb189ed0cb399d5007e882826cd998e244870782a99abd5d4d7bceb",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/subseasonal-precip/train-00000.parquet",
+      "size": 14495999,
+      "hash": "0c29c87be734624c350673ae978d80e24404108bfdeee8beceff193bbffd3d77",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/subseasonal/train-00000.parquet",
+      "size": 106447200,
+      "hash": "f8b023ba281fdca0469fae3e0ae3c49654de540561b31734cbb0c70d26060604",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/telecomts-real/LICENSE.md",
+      "size": 1313,
+      "hash": "63514622139e80d65ae9365468020d2a315c152f",
+      "algorithm": "git-sha1"
+    },
+    {
+      "path": "univariate/telecomts-real/train-00000.parquet",
+      "size": 18441433,
+      "hash": "7a3b0ef3bf0bd2c345732be2b49c66f5c9c9c9c1fd3c46b822ef4217e5d7c988",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/traffic/train-00000.parquet",
+      "size": 11376213,
+      "hash": "c184840803c85f966ab24010914ad8727f4e9386b7d50c25688700d9e1ffc8c8",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/umass-sundance/train-00000.parquet",
+      "size": 3966126,
+      "hash": "c4c30c06f3fe0b17777632778f3d72b6af52be61d1743051bd0dff55af5193d5",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/urbangpt-chicago-taxi/train-00000.parquet",
+      "size": 662401,
+      "hash": "f283c796184de6c856d40fc6a945045e47c4a10a0e7fa82d5df18eb63425f01b",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/urbangpt-nyc-crime/train-00000.parquet",
+      "size": 169428,
+      "hash": "20b207772e5dc048d7380a3c73430ab70f552d5e28200800c45f13b4b87f5ed6",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/ushcn-daily/train-00000.parquet",
+      "size": 67609621,
+      "hash": "4b0bc76cd4780a1a2d9859144514e1dfd47e72a2392ebb9ae687ad38bcd4b8f1",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/wiki-daily-100k/train-00000.parquet",
+      "size": 151966055,
+      "hash": "0bb868fcf16dd0023eb47c5665230a984e0407765241bfd765af133ce50952dd",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/wiki-daily-100k/train-00001.parquet",
+      "size": 98176109,
+      "hash": "3eeb767b398ffc3fa4e258b1a68e76711182d180b5f91959c309d41a5336ccec",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/wiki-rolling-nips/train-00000.parquet",
+      "size": 11806662,
+      "hash": "41838c18aaa2818a8bfa06464412f7e0c177af61a9e64aa2385b75d62cde3583",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/wikipedia/train-00000.parquet",
+      "size": 213796753,
+      "hash": "8a795dec6fb4122f06a056120e208379737ae81e64b29d548ede2f0b14db813b",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/wind-farms/train-00000.parquet",
+      "size": 40439203,
+      "hash": "8ccfaa39f6bc93c90e0d1bf632911ae3488efcfc6119fdea979913b1e500d18a",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/wind-power/train-00000.parquet",
+      "size": 3148912,
+      "hash": "bb5ce82f174d04672c91f387fddf61c600ca336960bc824b898e007abb17cbf3",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/worldtrace/LICENSE.md",
+      "size": 445,
+      "hash": "9fbd9fd3c177b555bd67d5c38212c532cc1a14f9",
+      "algorithm": "git-sha1"
+    },
+    {
+      "path": "univariate/worldtrace/train-00000.parquet",
+      "size": 550852592,
+      "hash": "07aa7e464a29ce961bcd1d5cb480882e5c35d6a28d3bd09778ff7ba85f1cc9dd",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/worldtrace/train-00001.parquet",
+      "size": 551115199,
+      "hash": "e4d83de566eef810258dac736d2ff9faf233d7228436b4070c55347ae5b8de99",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/worldtrace/train-00002.parquet",
+      "size": 552686777,
+      "hash": "76e5981d45da8feb59b8c147019c1f68dae07ee4faca1f66907da2ec57c9347f",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/worldtrace/train-00003.parquet",
+      "size": 549946057,
+      "hash": "7a0995c71abfaa49c9c7d11aeddfe4f8932e6e8dc9df9143cfcc2a1142592295",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/worldtrace/train-00004.parquet",
+      "size": 550476255,
+      "hash": "38cd900b4bb38276643a67c0e04c96ba4c08df6e245343ce0a2118d6431be83a",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/worldtrace/train-00005.parquet",
+      "size": 549828220,
+      "hash": "9b80eb36a9c1acac8e0caf9480ea7d4d855d16fdc6a932d18f6fc13825c2fe49",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/worldtrace/train-00006.parquet",
+      "size": 553906291,
+      "hash": "e52968b255915871a79fb238930eee18bdad05001cc71b4360b153d09df8f020",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/worldtrace/train-00007.parquet",
+      "size": 548502325,
+      "hash": "47fc54981c1c299d3f48e9e5f32c1f17c1411fdeb3a93f70fabff3d12a8f5126",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/worldtrace/train-00008.parquet",
+      "size": 553477321,
+      "hash": "e60cbb2447a85f4ec32e57652f225fb799875620e20f4e45fc3622a751062706",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/worldtrace/train-00009.parquet",
+      "size": 552174135,
+      "hash": "662ed32657b979c1cf355434d64f8835399722a20adc6a02be4bf810936a72ae",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/worldtrace/train-00010.parquet",
+      "size": 550730417,
+      "hash": "e9790130f9dd2071d467222d2219e0efd75256dedff01ac493e9951c475c793a",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/worms/train-00000.parquet",
+      "size": 447732,
+      "hash": "02ed957a8872d0ead764597dda2f237df384c0842f4af2c204d68d30d0c61ee9",
+      "algorithm": "sha256"
+    },
+    {
+      "path": "univariate/zhou2016/train-00000.parquet",
+      "size": 98173181,
+      "hash": "14a0778ff4656f41e53077b928da9c93913e9916ac047003900df331e03af348",
+      "algorithm": "sha256"
+    }
+  ]
+}
