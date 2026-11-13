@@ -160,6 +160,28 @@ def test_ragged_schema_refused(tmp_path):
         measure_folder(tmp_path, "univariate")
 
 
+def test_zero_width_covariate_channels_fail_alignment(tmp_path):
+    path = native(tmp_path / "train-000.parquet", cov=True)
+    table = pq.read_table(path)
+    row = table.to_pylist()[0]
+    row["covariates"] = [[], []]
+    pq.write_table(pa.Table.from_pylist([row], schema=table.schema), path)
+    with pytest.raises(ValueError, match="covariates must be aligned"):
+        measure_folder(tmp_path, "covariates")
+
+
+def test_empty_covariate_list_means_zero_channels(tmp_path):
+    path = native(tmp_path / "train-000.parquet", cov=True)
+    table = pq.read_table(path)
+    row = table.to_pylist()[0]
+    row["covariates"] = []
+    pq.write_table(pa.Table.from_pylist([row], schema=table.schema), path)
+    stats = measure_folder(tmp_path, "covariates")
+    assert stats["covariate_channel_counts"] == {"0": 1}
+    assert stats["covariate_values"] == 0
+    assert stats["observed_target_values"] == 64
+
+
 def test_target_string_schema_refused(tmp_path):
     path = native(tmp_path / "train-000.parquet")
     row = pq.read_table(path).to_pylist()[0]

@@ -16,6 +16,91 @@ def signal(n=320, seed=23):
     return rng.normal(30, 8, n) + np.sin(np.arange(n) / 7) * 5
 
 
+@pytest.fixture
+def benchmark_loader(monkeypatch):
+    from demand_forecast.bench.specs import FevDatasetTask
+    from scripts.corpus_v4 import audit_fev_overlap as audit
+
+    def configure(rows):
+        dataset = pytest.importorskip("datasets").Dataset.from_list(rows)
+        tasks = [FevDatasetTask(f"bench-{i}", "offline") for i in range(100)]
+        monkeypatch.setattr(audit, "fev_bench_tasks", lambda selector: tasks)
+        monkeypatch.setattr(
+            audit,
+            "load_task_dataset",
+            lambda task, cache: dataset if task == tasks[0] else dataset.select([]),
+        )
+        return audit
+
+    return configure
+
+
+def test_frequency_none_is_unsupported():
+    from scripts.corpus_v4.matching import frequency
+
+    assert frequency(None) is None
+
+
+@pytest.mark.parametrize("length", [0, 1])
+def test_short_benchmark_row_borrows_uniform_dataset_alias(tmp_path, benchmark_loader, length):
+    import pandas as pd
+
+    audit = benchmark_loader(
+        [
+            dict(
+                id="short",
+                timestamp=pd.date_range("2000", periods=length, freq="h"),
+                target=signal(length),
+            ),
+            dict(
+                id="long",
+                timestamp=pd.date_range("2000", periods=160, freq="h"),
+                target=signal(160),
+            ),
+        ]
+    )
+    series = list(audit.load_benchmarks(tmp_path / "cache"))
+    assert [(item.item_id, item.freq) for item in series] == [("short", "h"), ("long", "h")]
+    assert len(series[0].values) == length
+
+
+@pytest.mark.parametrize("known_aliases", [[], ["h", "D"]], ids=["all_unknown", "mixed"])
+def test_unknown_benchmark_frequency_is_reported_in_coverage(
+    tmp_path, benchmark_loader, known_aliases
+):
+    import pandas as pd
+
+    rows = [dict(id="short", timestamp=pd.date_range("2000", periods=1, freq="h"), target=[1.0])]
+    rows += [
+        dict(id=alias, timestamp=pd.date_range("2000", periods=160, freq=alias), target=signal(160))
+        for alias in known_aliases
+    ]
+    audit = benchmark_loader(rows)
+    native(tmp_path / "corpus/univariate/demo/train-000.parquet", target=signal(seed=2).tolist())
+    report, code = run_audit(
+        tmp_path / "corpus",
+        tmp_path / "out",
+        manifest(),
+        state=tmp_path / "state",
+        control_runner=lambda *a: {"ok": True},
+    )
+    assert code == 2
+    assert report["benchmark_coverage"]["unknown_frequency_rows"] == [
+        dict(dataset="bench-0", item_id="short", column="target", length=1)
+    ]
+    folder = report["folders"][0]
+    assert folder["verdict"] == "inconclusive"
+    assert any(
+        pair["benchmark"] == "bench-0"
+        and pair["benchmark_frequency"] is None
+        and pair["reason"] == "unsupported frequency"
+        for pair in folder["skipped_pairs"]
+    )
+    assert json.loads((tmp_path / "out/audit.json").read_text()) == report
+    series = list(audit.load_benchmarks(tmp_path / "cache"))
+    assert series[0].freq is None
+
+
 def test_float32_scaled_cropped_inside_multivariate_segment(tmp_path):
     import pyarrow as pa
     import pyarrow.parquet as pq
@@ -117,6 +202,36 @@ def test_resume_revalidates_inputs_and_reruns_controls(tmp_path):
     assert first["input_fingerprint"] != third["input_fingerprint"]
 
 
+def test_benchmark_cache_and_checkpoints_are_scoped_by_revision(tmp_path, monkeypatch):
+    from scripts.corpus_v4 import audit_fev_overlap as audit
+
+    native(tmp_path / "corpus/univariate/demo/train-000.parquet", target=signal(seed=2).tolist())
+    caches = []
+
+    def benchmarks(cache):
+        caches.append(cache)
+        return [BenchmarkSeries("bench", "b", "target", "h", signal())]
+
+    monkeypatch.setattr(audit, "load_benchmarks", benchmarks)
+    state = tmp_path / "state"
+    args = (tmp_path / "corpus", tmp_path / "out", manifest())
+    kwargs = dict(state=state, control_runner=lambda *a: {"ok": True})
+    first, _ = run_audit(*args, **kwargs)
+    second, _ = run_audit(*args, **kwargs)
+    assert second["folders"][0]["resumed"]
+    original_revision = audit.FEV_DATASETS_REVISION
+    monkeypatch.setattr(audit, "FEV_DATASETS_REVISION", "another-revision")
+    third, _ = run_audit(*args, **kwargs)
+    assert caches == [
+        state / "benchmark-cache" / original_revision,
+        state / "benchmark-cache" / original_revision,
+        state / "benchmark-cache" / "another-revision",
+    ]
+    assert third["benchmark_revision"] == "another-revision"
+    assert not third["folders"][0]["resumed"]
+    assert first["input_fingerprint"] != third["input_fingerprint"]
+
+
 def test_aggregation_does_not_invent_observed_values():
     x = np.arange(96, dtype=float)
     x[2] = np.nan
@@ -171,13 +286,32 @@ def test_matching_gap_at_chunk_boundary_and_benchmark_crop():
     assert found
 
 
-def test_same_resolution_frequency_aliases():
+@pytest.mark.parametrize(
+    "alias,canonical",
+    [
+        ("H", "60min"),
+        ("1H", "h"),
+        ("15T", "15min"),
+        ("3M", "3ME"),
+        ("A", "YE"),
+        ("2A-JUN", "2YE-JUN"),
+        ("2Q-FEB", "2QE-FEB"),
+        ("2Y-MAR", "2YE-MAR"),
+        ("D", "24h"),
+        ("W-MON", "W-SUN"),
+        ("MS", "ME"),
+    ],
+)
+def test_same_resolution_frequency_aliases(alias, canonical):
     from scripts.corpus_v4.matching import frequency
 
-    assert frequency("H") == frequency("60min")
-    assert frequency("D") == frequency("24h")
-    assert frequency("W-MON") == frequency("W-SUN")
-    assert frequency("MS") == frequency("ME")
+    assert frequency(alias) is not None
+    assert frequency(alias) == frequency(canonical)
+
+
+def test_business_days_are_not_daily():
+    from scripts.corpus_v4.matching import frequency
+
     assert frequency("B") != frequency("D")
 
 

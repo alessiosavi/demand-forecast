@@ -48,7 +48,7 @@ class BenchmarkSeries:
     dataset: str
     item_id: str
     column: str
-    freq: str
+    freq: str | None
     values: np.ndarray
     timestamps: object = None
     domain: str = "unknown"
@@ -64,9 +64,17 @@ def load_benchmarks(cache):
         columns = seq_columns(dataset)
         if not set(task.targets) <= set(columns):
             raise ValueError(f"benchmark target missing: {task.name}")
+        # A short row cannot infer its frequency; borrow only a uniform dataset alias.
+        aliases = {
+            _timestamp_frequency(row[task.timestamp_column], task.freq)[0]
+            for row in dataset.select_columns([task.timestamp_column])
+        }
+        aliases.discard(None)
+        fallback = next(iter(aliases)) if len(aliases) == 1 else None
         for row in dataset:
             alias, stamps = _timestamp_frequency(row[task.timestamp_column], task.freq)
-            if frequency(alias) is None:
+            alias = alias or fallback
+            if alias is not None and frequency(alias) is None:
                 raise ValueError(f"unknown benchmark frequency: {task.name}")
             for column in columns:
                 values = np.asarray(row[column], np.float64)
@@ -88,11 +96,21 @@ class BenchmarkStore:
         self.db.execute("CREATE TABLE series (meta TEXT, vals BLOB, stamps BLOB)")
         h, self.points, self.count = hashlib.sha256(), 0, 0
         self.samples = []
+        self.coverage = dict(unknown_frequency_rows=[])
         sampled = set()
         for item in series:
             values = np.asarray(item.values, dtype="<f8")
             if values.ndim != 1 or len(values) > MAX_ROW_VALUES:
                 raise ValueError("benchmark series exceeds memory guard or invalid shape")
+            if item.freq is None:
+                self.coverage["unknown_frequency_rows"].append(
+                    dict(
+                        dataset=item.dataset,
+                        item_id=item.item_id,
+                        column=item.column,
+                        length=len(values),
+                    )
+                )
             meta = dict(
                 dataset=item.dataset,
                 item_id=item.item_id,
@@ -347,7 +365,8 @@ def _scan_folder(root, entry, store, opportunities):
     kind = entry["folder"].split("/")[0]
     aliases = sorted({r["row"]["freq"] for r in iter_rows(path, kind)})
     benchmark_aliases = sorted(
-        {json.loads(row[0])["freq"] for row in store.db.execute("SELECT meta FROM series")}
+        {json.loads(row[0])["freq"] for row in store.db.execute("SELECT meta FROM series")},
+        key=lambda alias: alias or "",
     )
     for corpus_alias in aliases:
         cf = frequency(corpus_alias)
@@ -537,7 +556,12 @@ def run_audit(root, out, manifest, benchmarks=None, *, state=None, control_runne
     state = Path(state or Path(os.environ.get("RUN_DIR", out)) / "state")
     state.mkdir(parents=True, exist_ok=True)
     out.mkdir(parents=True, exist_ok=True)
-    source = benchmarks if benchmarks is not None else load_benchmarks(state / "benchmark-cache")
+    # Offline datasets loading selects the newest cached config, ignoring revision.
+    source = (
+        benchmarks
+        if benchmarks is not None
+        else load_benchmarks(state / "benchmark-cache" / FEV_DATASETS_REVISION)
+    )
     store = BenchmarkStore(state / "benchmark.sqlite", source)
     try:
         import pyarrow.parquet as pq
@@ -640,6 +664,7 @@ def run_audit(root, out, manifest, benchmarks=None, *, state=None, control_runne
             benchmark_revision=FEV_DATASETS_REVISION,
             benchmark_series=store.count,
             benchmark_points=store.points,
+            benchmark_coverage=store.coverage,
             information_threshold=20 + math.log2(opportunities),
             controls=checks,
             input_errors=input_errors,

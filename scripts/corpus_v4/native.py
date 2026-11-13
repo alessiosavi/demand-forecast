@@ -104,7 +104,7 @@ def iter_rows(folder, kind):
                         raise ValueError("covariate target must have shape [T]")
                     target = target[None, :]
                     cov = np.asarray(row["covariates"], dtype=np.float64)
-                    if cov.size == 0:
+                    if cov.ndim == 1 and cov.size == 0:
                         cov = np.empty((0, target.shape[1]))
                 else:
                     cov = np.empty((0, target.shape[-1] if target.ndim else 0))

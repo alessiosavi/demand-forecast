@@ -9,19 +9,20 @@ import pandas as pd
 
 from demand_forecast.pretrain import audit_info
 from demand_forecast.pretrain import audit_match as old
+from demand_forecast.pretrain.audit import _offset
 
 CHUNK_POINTS = 65536
 OVERLAP = 512
 MAX_PHASES = 4096
-METHOD_VERSION = "corpus-v4-native-2"
+METHOD_VERSION = "corpus-v4-native-3"
 
 
 def frequency(alias):
     """Canonical exact offset; unlike v2, do not merge business days with daily data."""
-    aliases = {"H": "h", "T": "min", "M": "ME", "Q": "QE", "Y": "YE"}
-    value = aliases.get(alias, alias)
+    if alias is None:
+        return None
     try:
-        offset = pd.tseries.frequencies.to_offset(value)
+        offset = _offset(alias)
     except (TypeError, ValueError):
         return None
     if isinstance(offset, pd.offsets.Day):
