@@ -1,5 +1,6 @@
 """Synthetic operator integration: no credentials, guest, network or ML imports."""
 
+import ctypes
 import json
 import os
 import shlex
@@ -20,7 +21,7 @@ OPS = ROOT / "scripts/ec2/ops"
 # The real wrappers invoke executable stubs, including a fake guard interface.
 # Existing cost_guard tests cover its ledger/AWS implementation independently.
 STUB = r"""
-import json, os, shlex, signal, sys, time
+import ctypes, json, os, shlex, signal, sys, time
 from pathlib import Path
 name = Path(sys.argv[0]).name
 args = sys.argv[1:]
@@ -43,6 +44,18 @@ def stall():
     save()
     time.sleep(60)
 def alive(pid):
+    if sys.platform == "darwin":
+        # Inspect zombie state directly, including exiting libproc misses.
+        mib = (ctypes.c_int * 4)(1, 14, 1, pid)
+        data = ctypes.create_string_buffer(4096)
+        size = ctypes.c_size_t(len(data))
+        query = ctypes.CDLL(None, use_errno=True).sysctl
+        if query(mib, 4, data, ctypes.byref(size), None, 0):
+            raise OSError(ctypes.get_errno(), "process-state inspection failed")
+        if not size.value:
+            return False
+        # SDK extern_proc: four pointers, flags, then p_stat.
+        return data[4 * ctypes.sizeof(ctypes.c_void_p) + 4] != b"\x05"
     try:
         os.kill(pid, 0)
         if sys.platform == "linux":
@@ -261,6 +274,7 @@ class Operator:
             STUB_STATE=str(self.state_path),
             STUB_CALLS=str(self.calls_path),
             TEST_DEADLINE=self.deadline,
+            PYTHONPATH=str(OPS) + os.pathsep + self.env.get("PYTHONPATH", ""),
         )
         for name in ("aws", "ssh", "scp", "rsync", "sleep", "curl"):
             self.executable(self.bin / name, f"#!{sys.executable}\n" + STUB)
@@ -1110,19 +1124,52 @@ def running_real_chain(operator):
 
 
 def process_alive(pid):
-    # Darwin kill(pid, 0) succeeds for zombies. Give init a bounded opportunity
-    # to reap an orphan; a live leaked transport remains alive throughout.
-    end = time.monotonic() + (0.2 if sys.platform == "darwin" else 0)
-    while True:
-        try:
-            os.kill(pid, 0)
-            if sys.platform == "linux":
-                return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z"
-        except (ProcessLookupError, FileNotFoundError):
+    if sys.platform == "darwin":
+        mib = (ctypes.c_int * 4)(1, 14, 1, pid)
+        data = ctypes.create_string_buffer(4096)
+        size = ctypes.c_size_t(len(data))
+        query = ctypes.CDLL(None, use_errno=True).sysctl
+        if query(mib, 4, data, ctypes.byref(size), None, 0):
+            raise OSError(ctypes.get_errno(), "process-state inspection failed")
+        if not size.value:
             return False
-        if time.monotonic() >= end:
-            return True
-        time.sleep(0.005)
+        return data[4 * ctypes.sizeof(ctypes.c_void_p) + 4] != b"\x05"
+    try:
+        os.kill(pid, 0)
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z"
+    except (ProcessLookupError, FileNotFoundError):
+        return False
+
+
+def timeout_after_stall(operator, operation):
+    """Arm the real owner's deadline only after its transport has announced readiness."""
+    hook = operator.tmp / "timeout-hook"
+    hook.mkdir()
+    (hook / "sitecustomize.py").write_text("""import json, os, time
+from pathlib import Path
+import process_control as control
+original = control.PinnedOutput.wait
+def wait(output, seconds):
+    argv = output.child.args
+    target = json.loads(os.environ["TEST_TIMEOUT_OPERATION"])
+    if any([Path(str(arg)).name, *argv[i+1:i+len(target)]] == target
+           for i, arg in enumerate(argv)):
+        end = time.monotonic() + 120
+        while not json.loads(Path(os.environ["STUB_STATE"]).read_text()).get("stalled_pid"):
+            if control.exited(output.child):
+                return original(output, seconds)
+            if time.monotonic() >= end:
+                raise ValueError("Transport did not announce readiness")
+            output.read_ready(0.05)
+        # This is a real wait deadline; startup consumed none of its budget.
+        seconds = 0.05
+    return original(output, seconds)
+control.PinnedOutput.wait = wait
+if os.environ.get("EC2_CANCELLATION_GROUP_LOG"):
+    import cancellation_registry_hook
+""")
+    operator.env["PYTHONPATH"] = str(hook) + os.pathsep + operator.env["PYTHONPATH"]
+    operator.env["TEST_TIMEOUT_OPERATION"] = json.dumps(operation)
 
 
 def wait_for_stall(operator, child):
@@ -1151,16 +1198,16 @@ def test_real_guard_stalled_remote_reaches_single_cleanup(operator, state):
     # The nested transport timeout starts only once that leaf has been launched.
     # Healthy preparation retains the production budgets.
     prepare_real_chain(operator, **state)
-    name = (
-        "DISPATCH_TIMEOUT_SECONDS"
+    operation = (
+        ["remote.sh", "dispatch"]
         if state.get("stall_contains") == "dispatch-job.sh"
-        else "SSH_TIMEOUT_SECONDS"
+        else ["remote.sh", "ssh"]
         if state.get("stall_contains")
-        else "PUSH_TIMEOUT_SECONDS"
+        else ["remote.sh", "push"]
         if state.get("stall_scp")
-        else "COPY_TIMEOUT_SECONDS"
+        else ["remote.sh", "pull"]
     )
-    operator.env[name] = "10"
+    timeout_after_stall(operator, operation)
     with running_real_chain(operator) as child:
         wait_for_stall(operator, child)
         out, err = child.communicate(timeout=60)
@@ -1265,7 +1312,7 @@ def test_queue_lock_excludes_other_stages(tmp_path):
 
 @pytest.mark.parametrize("unresolved_stop", [False, True])
 def test_real_guard_interrupt_during_copy_advances_to_cleanup(operator, unresolved_stop):
-    prepare_real_chain(operator, stall_rsync=True, checkout_delay=0.75)
+    prepare_real_chain(operator, stall_rsync=True)
     with running_real_chain(operator) as child:
         # Wait for the fake transfer to enter its blocked operation, after its
         # durable state write. A call-log entry precedes that write and is not
@@ -1294,7 +1341,8 @@ def test_real_guard_cancel_reaps_suspended_supervisor_and_leaf(operator, copying
     # orphaning interleaving, independently of scheduler speed.
     state = dict(stall_rsync=True) if copying else dict(stall_contains="git checkout")
     prepare_real_chain(operator, suspend_supervisor=True, **state)
-    operator.env["COPY_TIMEOUT_SECONDS" if copying else "CHECKOUT_TIMEOUT_SECONDS"] = "10"
+    if cancel == "timeout":
+        timeout_after_stall(operator, ["remote.sh", "pull" if copying else "ssh"])
     with running_real_chain(operator) as child:
         stalled = wait_for_stall(operator, child)
         if cancel == "interrupt":

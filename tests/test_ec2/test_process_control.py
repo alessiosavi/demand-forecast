@@ -2,6 +2,7 @@
 
 import ctypes
 import importlib.util
+import inspect
 import os
 import selectors
 import signal
@@ -20,6 +21,21 @@ def control():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def test_healthy_command_has_no_process_control_stderr(control, capsys):
+    result = control.run_process(
+        ["/bin/echo", "hello"],
+        5,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert result.returncode == 0
+    assert result.stdout == "hello\n"
+    assert result.stderr == ""
+    assert capsys.readouterr().err == ""
 
 
 def test_drain_retries_unconfirmed_group_kill(control, monkeypatch):
@@ -87,6 +103,84 @@ def test_failed_term_preserves_timeout_after_group_death(control, monkeypatch):
     assert groups
     with pytest.raises(ProcessLookupError):
         killpg(groups[0], 0)
+
+
+@pytest.mark.parametrize("nested", [False, True], ids=["owner", "nested"])
+@pytest.mark.parametrize("failure", ["time limit", "interrupt"])
+def test_cancellation_reports_before_signal_and_nested_reap(
+    control, monkeypatch, capsys, nested, failure
+):
+    popen, killpg = subprocess.Popen, os.killpg
+    messages, children = [], []
+    lease = os.pipe()
+    os.set_blocking(lease[0], False)
+    info = os.fstat(lease[0])
+    if nested:
+        monkeypatch.setenv(control.SCOPE, f"{os.getpgrp()}:{lease[0]}:{info.st_dev}:{info.st_ino}")
+    else:
+        monkeypatch.delenv(control.SCOPE, raising=False)
+    previous = {sig: signal.signal(sig, control.interrupted) for sig in control.INTERRUPTS}
+
+    def fail_wait(*_args, **_kwargs):
+        if failure == "interrupt":
+            os.kill(os.getpid(), signal.SIGINT)
+            pytest.fail("Interrupt must leave the guarded wait")
+        raise subprocess.TimeoutExpired("command", 30)
+
+    def check_cancellation(group):
+        message = capsys.readouterr().err
+        assert failure in message.lower()
+        assert f"local process group {group}" in message
+        if failure == "interrupt":
+            assert str(signal.SIGINT.value) in message
+        messages.append(message)
+
+    def signal_group(group, sig):
+        if sig == signal.SIGTERM:
+            check_cancellation(group)
+        return killpg(group, sig)
+
+    def spawn(*args, **kwargs):
+        child = popen(*args, **kwargs)
+        children.append(child)
+        if nested:
+            terminate, wait = child.terminate, child.wait
+
+            def checked_terminate():
+                check_cancellation(os.getpgrp())
+                terminate()
+
+            def checked_wait(timeout=None):
+                if timeout is not None:
+                    raise subprocess.TimeoutExpired(child.args, timeout)
+                message = capsys.readouterr().err
+                assert f"Waiting to reap killed nested local process {child.pid}" in message
+                messages.append(message)
+                return wait()
+
+            child.communicate = fail_wait
+            child.terminate = checked_terminate
+            child.wait = checked_wait
+        return child
+
+    monkeypatch.setattr(control.subprocess, "Popen", spawn)
+    monkeypatch.setattr(control.os, "killpg", signal_group)
+    monkeypatch.setattr(control.PinnedOutput, "wait", fail_wait)
+    try:
+        expected = InterruptedError if failure == "interrupt" else subprocess.TimeoutExpired
+        with pytest.raises(expected):
+            control.run_process(["/bin/sleep", "60"], 30, stderr=subprocess.PIPE)
+        assert children[0].returncode is not None
+        assert "".join(messages).lower().count(failure) == 1
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+        for child in children:
+            if child.returncode is None:
+                child.kill()
+                popen.wait(child)
+        for fd in lease:
+            os.close(fd)
 
 
 def test_successful_shell_exit_still_drains_background_descendant(control):
@@ -302,9 +396,9 @@ def test_stale_scope_cannot_select_nested_path(control, monkeypatch):
     assert drained == [children[0].pid]
 
 
-@pytest.mark.parametrize("members", [["456(S)"], None], ids=["live", "unknown"])
+@pytest.mark.parametrize("case", ["live", "unknown", "refused", "observation-error"])
 def test_unconfirmed_drain_reports_periodically_and_does_not_reap(
-    control, monkeypatch, capsys, members
+    control, monkeypatch, capsys, case
 ):
     class Child:
         pid = 456
@@ -313,31 +407,52 @@ def test_unconfirmed_drain_reports_periodically_and_does_not_reap(
         def wait(self):
             pytest.fail("Unconfirmed death must retain the session")
 
-    elapsed, sleeps = 0, 0
+    elapsed = 0
+    ticks = iter([1, 4.9, 5, 6, 9.9, 10, 15])
+    messages = []
+    members = None if case == "unknown" else ["456(S)"]
 
     def sleep(_seconds):
-        nonlocal elapsed, sleeps
-        elapsed += 6
-        sleeps += 1
-        if sleeps == 4:
-            raise ProbeStopError()
+        nonlocal elapsed
+        message = capsys.readouterr().err
+        if elapsed in (0, 5, 10, 15):
+            assert message.count("Waiting for local process group 456") == 1
+            assert f"elapsed={elapsed:.1f}s" in message
+            messages.append(message)
+        else:
+            assert message == ""
+        try:
+            elapsed = next(ticks)
+        except StopIteration:
+            raise ProbeStopError() from None
 
-    def denied(*_args):
-        raise PermissionError("signal refused")
+    def signal_group(*_args):
+        if case == "refused":
+            raise PermissionError("signal refused")
 
-    monkeypatch.setattr(control, "exited", lambda _child: False, raising=False)
-    monkeypatch.setattr(control.os, "killpg", denied)
+    def observe(_child):
+        if case == "observation-error":
+            raise OSError("observation unavailable")
+        return False
+
+    monkeypatch.setattr(control, "exited", observe)
+    monkeypatch.setattr(control.os, "killpg", signal_group)
     monkeypatch.setattr(control, "group_members", lambda _group: members, raising=False)
     monkeypatch.setattr(control.time, "monotonic", lambda: elapsed)
     monkeypatch.setattr(control.time, "sleep", sleep)
     with pytest.raises(ProbeStopError):
         control.drain_group(Child())
-    err = capsys.readouterr().err
-    assert err.count("Waiting for local process group 456") == 3
-    assert "elapsed=6.0s" in err and "elapsed=18.0s" in err
+    err = "".join(messages)
+    assert err.count("Waiting for local process group 456") == 4
+    assert "elapsed=0.0s" in err and "elapsed=15.0s" in err
     assert "session retained" in err
-    assert ("456(S)" if members else "unknown (inspection failed)") in err
-    assert "signal refused" in err
+    assert (
+        "unknown (inspection failed)" if case in ("unknown", "observation-error") else "456(S)"
+    ) in err
+    if case == "refused":
+        assert "signal refused" in err
+    if case == "observation-error":
+        assert "observation unavailable" in err
 
 
 @pytest.mark.parametrize("text", [False, True])
@@ -368,7 +483,7 @@ def test_pinned_capture_drains_both_full_pipes(control, monkeypatch, text):
 
 
 @pytest.mark.parametrize("shell", [False, True], ids=["exec", "shell-substitution"])
-def test_live_lease_keeps_nested_transport_in_same_group(control, monkeypatch, shell):
+def test_live_lease_keeps_nested_transport_in_same_group(control, monkeypatch, capsys, shell):
     popen = subprocess.Popen
     children = []
 
@@ -399,9 +514,13 @@ print(os.getpgrp(), result.stdout.strip())
             sys.executable,
             script,
         ]
-    result = control.run_process(command, 10, stdout=subprocess.PIPE, text=True)
+    result = control.run_process(
+        command, 10, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+    )
     assert result.returncode == 0
     assert result.stdout.split() == [str(children[0].pid)] * 2
+    assert result.stderr == ""
+    assert capsys.readouterr().err == ""
 
 
 def test_owner_lease_requires_live_writer_and_matching_pipe(control, monkeypatch):
@@ -438,13 +557,25 @@ def test_membership_scan_requires_leader_and_valid_snapshot(
     control, monkeypatch, snapshot, expected
 ):
     def inspect(argv, **kwargs):
-        assert argv == ["ps", "-A", "-o", "pid=", "-o", "pgid=", "-o", "stat="]
+        assert argv == [
+            "ps",
+            "-A",
+            *(["-L"] if sys.platform == "linux" else []),
+            "-o",
+            "pid=",
+            "-o",
+            "pgid=",
+            "-o",
+            "stat=",
+        ]
         assert kwargs["timeout"] == 1
-        return subprocess.CompletedProcess(argv, 0, snapshot, "")
+        return subprocess.CompletedProcess(argv, 0, snapshot + f"\n{os.getpid()} 999999 S\n", "")
 
     monkeypatch.setattr(control.subprocess, "run", inspect)
     monkeypatch.setattr(control, "native_group_members", lambda _group: None, raising=False)
-    assert control.group_members(123) == expected
+    assert control.group_members(123) == (
+        None if sys.platform == "linux" and expected == [] else expected
+    )
 
 
 @pytest.mark.parametrize("capture", [False, True])
@@ -463,8 +594,12 @@ def test_signal_during_selector_wait_reaches_caller(control, monkeypatch, captur
             nonlocal armed
             if not armed:
                 armed = True
-                signal.setitimer(signal.ITIMER_REAL, 0.02)
-                return select(0.2)
+                # Model the selector's documented EINTR catch at the exact
+                # boundary; no timer or child-startup race is involved.
+                try:
+                    os.kill(os.getpid(), signal.SIGINT)
+                except InterruptedError:
+                    return []
             return select(seconds)
 
         result.select = wait
@@ -478,20 +613,17 @@ def test_signal_during_selector_wait_reaches_caller(control, monkeypatch, captur
         return child
 
     previous = {sig: signal.signal(sig, control.interrupted) for sig in control.INTERRUPTS}
-    alarm = signal.signal(signal.SIGALRM, lambda *_args: os.kill(os.getpid(), signal.SIGINT))
     monkeypatch.setattr(selectors, "DefaultSelector", selector)
     monkeypatch.setattr(control.subprocess, "Popen", spawn)
     try:
         with pytest.raises(InterruptedError):
             control.run_process(
                 [sys.executable, "-c", "import time; time.sleep(60)"],
-                0.3,
+                30,
                 stdout=subprocess.PIPE if capture else None,
             )
         assert armed
     finally:
-        signal.setitimer(signal.ITIMER_REAL, 0)
-        signal.signal(signal.SIGALRM, alarm)
         for sig, handler in previous.items():
             signal.signal(sig, handler)
 
@@ -533,6 +665,11 @@ def test_linux_membership_handles_comm_and_requires_complete_scan(
         entry = tmp_path / str(pid)
         entry.mkdir()
         (entry / "stat").write_text(f"{pid} (name with ) parentheses) {fields}\n")
+        (entry / f"task/{pid}").mkdir(parents=True)
+        (entry / f"task/{pid}/stat").write_text(f"{pid} (task) {fields}\n")
+    own = tmp_path / str(os.getpid())
+    own.mkdir()
+    (own / "stat").write_text(f"{os.getpid()} (self) R 1 999\n")
     monkeypatch.setattr(control.sys, "platform", "linux")
     monkeypatch.setattr(control, "Path", lambda _path: tmp_path)
     assert control.native_group_members(123) == expected
@@ -540,22 +677,30 @@ def test_linux_membership_handles_comm_and_requires_complete_scan(
 
 def test_drain_diagnostics_bypass_captured_child_stderr(control, monkeypatch, capsys):
     scan = control.group_members
-    started = time.monotonic()
+    scans = 0
+    messages = []
 
     def temporarily_unknown(group):
-        return None if time.monotonic() - started < 0.2 else scan(group)
+        nonlocal scans
+        scans += 1
+        return None if scans == 1 else scan(group)
+
+    def check_before_retry(_seconds):
+        message = capsys.readouterr().err
+        assert "Waiting for local process group" in message
+        assert "unknown (inspection failed)" in message
+        assert "session retained" in message
+        messages.append(message)
 
     monkeypatch.setattr(control, "group_members", temporarily_unknown)
-    monkeypatch.setattr(control, "DRAIN_DIAGNOSTIC_SECONDS", 0.02)
+    monkeypatch.setattr(control.time, "sleep", check_before_retry)
     result = control.run_process(
-        [sys.executable, "-c", "pass"], 2, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        [sys.executable, "-c", "pass"], 30, stdout=subprocess.PIPE, stderr=subprocess.PIPE
     )
     assert result.returncode == 0
     assert result.stderr == b""
-    err = capsys.readouterr().err
-    assert "Waiting for local process group" in err
-    assert "unknown (inspection failed)" in err
-    assert "session retained" in err
+    assert len(messages) == 1
+    assert capsys.readouterr().err == ""
 
 
 def test_auto_reaping_sigchld_is_rejected_before_spawn(control, monkeypatch):
@@ -585,34 +730,59 @@ def test_interrupt_deferral_stays_active_until_reap(control, monkeypatch, signum
     test_first_interrupt_during_drain_is_delivered_after_death(control, monkeypatch, signum, count)
 
 
-def test_lost_leader_identity_forbids_signals_and_inspection(control, monkeypatch, capsys):
+@pytest.mark.parametrize("reaped_elsewhere", [False, True])
+def test_lost_leader_identity_forbids_signals_and_inspection(
+    control, monkeypatch, capsys, reaped_elsewhere
+):
     class Child:
         pid = 456
-        returncode = 0  # Already reaped: never touch this group again.
+        returncode = None if reaped_elsewhere else 0
 
         def wait(self):
-            pytest.fail("Lost ownership must retain the session")
-
-    elapsed = 0
-
-    def sleep(_seconds):
-        nonlocal elapsed
-        elapsed += 6
-        if elapsed == 12:
-            raise ProbeStopError()
+            pytest.fail("Lost ownership cannot authorize reaping")
 
     def forbidden(*_args):
         pytest.fail("Cannot signal or inspect an unpinned group")
 
+    def lost(*_args):
+        raise ChildProcessError("another waiter reaped the leader")
+
+    def no_retry(_seconds):
+        pytest.fail("Lost leader identity is permanent; retry cannot recover it")
+
     monkeypatch.setattr(control.os, "killpg", forbidden)
     monkeypatch.setattr(control, "group_members", forbidden)
-    monkeypatch.setattr(control.time, "monotonic", lambda: elapsed)
-    monkeypatch.setattr(control.time, "sleep", sleep)
-    with pytest.raises(ProbeStopError):
+    monkeypatch.setattr(control, "observe_exit", lost)
+    monkeypatch.setattr(control.time, "sleep", no_retry)
+    with pytest.raises(subprocess.SubprocessError, match="leader identity unavailable"):
         control.drain_group(Child())
     err = capsys.readouterr().err
     assert "leader identity unavailable" in err
-    assert "session retained" in err
+    assert err.count("leader identity unavailable") == 1
+
+
+@pytest.mark.parametrize("own_visible", [False, True])
+@pytest.mark.parametrize("tasks_visible", [False, True])
+def test_linux_scan_checks_own_visibility_and_zombie_tasks(
+    control, monkeypatch, tmp_path, own_visible, tasks_visible
+):
+    leader = tmp_path / "123"
+    leader.mkdir()
+    (leader / "stat").write_text("123 (leader) Z 1 123\n")
+    if tasks_visible:
+        (leader / "task/123").mkdir(parents=True)
+        (leader / "task/124").mkdir()
+        (leader / "task/123/stat").write_text("123 (leader) Z 1 123\n")
+        (leader / "task/124/stat").write_text("124 (worker) S 1 123\n")
+    if own_visible:
+        own = tmp_path / str(os.getpid())
+        own.mkdir()
+        (own / "stat").write_text(f"{os.getpid()} (self) R 1 999\n")
+    monkeypatch.setattr(control.sys, "platform", "linux")
+    monkeypatch.setattr(control, "Path", lambda _path: tmp_path)
+    assert control.native_group_members(123) == (
+        ["124(S)"] if own_visible and tasks_visible else None
+    )
 
 
 def test_broken_diagnostic_pipe_cannot_release_session(control, monkeypatch):
@@ -643,3 +813,226 @@ def test_broken_diagnostic_pipe_cannot_release_session(control, monkeypatch):
     monkeypatch.setattr(control.sys, "stderr", ClosedPipe())
     with pytest.raises(ProbeStopError):
         control.drain_group(Child())
+
+
+@pytest.mark.parametrize(
+    "boundary", ["spawn", "raising-enter", "wait", "raising-exit", "drain", "reap", "restore"]
+)
+def test_repeated_transition_signals_use_one_dispatcher_and_deliver_after_reap(
+    control, monkeypatch, boundary
+):
+    popen, change_handler, drain = subprocess.Popen, signal.signal, control.drain_group
+    children, deliveries, swaps = [], [], []
+    fired = False
+    previous = {sig: signal.getsignal(sig) for sig in control.INTERRUPTS}
+
+    def handler(signum, _frame):
+        deliveries.append(signum)
+        assert children and children[0].returncode is not None, "Interrupt delivered before reap"
+        assert all(signal.getsignal(sig) is handler for sig in control.INTERRUPTS)
+        raise InterruptedError("operator wins")
+
+    def fire():
+        nonlocal fired
+        if not fired:
+            fired = True
+            for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGINT):
+                os.kill(os.getpid(), sig)
+
+    def spawn(*args, **kwargs):
+        child = popen(*args, **kwargs)
+        children.append(child)
+        wait = child.wait
+
+        def reap(*args, **kwargs):
+            if boundary == "reap":
+                fire()
+            return wait(*args, **kwargs)
+
+        child.wait = reap
+        if boundary == "spawn":
+            fire()
+        return child
+
+    def record_handler(sig, replacement):
+        swaps.append(sig)
+        return change_handler(sig, replacement)
+
+    def record_drain(child):
+        if boundary == "drain":
+            fire()
+        return drain(child)
+
+    lines, start = inspect.getsourcelines(control.InterruptDeferral.raising)
+    after_yield = start + next(i for i, line in enumerate(lines) if "yield" in line) + 2
+    exit_lines, exit_start = inspect.getsourcelines(control.deferred_interrupts)
+    restore_edge = exit_start + max(
+        i for i, line in enumerate(exit_lines) if "with blocked_interrupts():" in line
+    )
+
+    def trace(frame, event, _arg):
+        if frame.f_code.co_filename == control.__file__:
+            name = frame.f_code.co_name
+            if (
+                (boundary == "raising-enter" and name == "raising" and event == "call")
+                or (boundary == "wait" and name == "wait" and event == "call")
+                or (
+                    boundary == "raising-exit"
+                    and name == "raising"
+                    and event == "line"
+                    and frame.f_lineno >= after_yield
+                )
+                or (
+                    boundary == "restore"
+                    and name == "deferred_interrupts"
+                    and event == "line"
+                    and frame.f_lineno == restore_edge
+                )
+            ):
+                fire()
+        return trace
+
+    for sig in previous:
+        change_handler(sig, handler)
+    monkeypatch.setattr(control.subprocess, "Popen", spawn)
+    monkeypatch.setattr(control.signal, "signal", record_handler)
+    monkeypatch.setattr(control, "drain_group", record_drain)
+    try:
+        sys.settrace(trace)
+        with pytest.raises(InterruptedError, match="operator wins"):
+            control.run_process([sys.executable, "-c", "pass"], 30)
+        assert fired
+        assert deliveries == [signal.SIGINT]
+        assert all(swaps.count(sig) == 2 for sig in previous), swaps
+        assert children[0].returncode is not None
+    finally:
+        sys.settrace(None)
+        for sig, original in previous.items():
+            change_handler(sig, original)
+        for child in children:
+            if child.returncode is None:
+                child.kill()
+                child.wait()
+
+
+@pytest.mark.parametrize(
+    "failure", [subprocess.TimeoutExpired("deadline", 30), ValueError("failure")]
+)
+def test_interrupt_during_timeout_drain_wins_and_chains_timeout(control, monkeypatch, failure):
+    drain = control.drain_group
+    previous = {sig: signal.signal(sig, control.interrupted) for sig in control.INTERRUPTS}
+
+    def timeout(_output, _seconds):
+        raise failure
+
+    def interrupt_and_drain(child):
+        os.kill(os.getpid(), signal.SIGINT)
+        os.kill(os.getpid(), signal.SIGTERM)
+        drain(child)
+
+    monkeypatch.setattr(control.PinnedOutput, "wait", timeout)
+    monkeypatch.setattr(control, "drain_group", interrupt_and_drain)
+    try:
+        with pytest.raises(InterruptedError) as caught:
+            control.run_process([sys.executable, "-c", "pass"], 30)
+        assert caught.value.__cause__ is failure
+    finally:
+        for sig, original in previous.items():
+            signal.signal(sig, original)
+
+
+def test_spawn_interrupt_inside_callers_except_is_not_lost(control, monkeypatch):
+    popen = subprocess.Popen
+    previous = {sig: signal.signal(sig, control.interrupted) for sig in control.INTERRUPTS}
+
+    def spawn(*args, **kwargs):
+        child = popen(*args, **kwargs)
+        os.kill(os.getpid(), signal.SIGINT)
+        return child
+
+    monkeypatch.setattr(control.subprocess, "Popen", spawn)
+    try:
+        with pytest.raises(InterruptedError):
+            try:
+                raise ValueError("caller's existing exception")
+            except ValueError:
+                control.run_process([sys.executable, "-c", "pass"], 30)
+    finally:
+        for sig, original in previous.items():
+            signal.signal(sig, original)
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"preexec_fn": lambda: None},
+        {"start_new_session": False},
+        {"process_group": 0},
+        {"close_fds": False},
+        {"close_fds": None},
+        {"shell": True},
+        {"shell": "yes"},
+        {"executable": sys.executable},
+        {"user": os.getuid()},
+        {"group": os.getgid()},
+        {"extra_groups": []},
+    ],
+)
+def test_unsupported_ownership_options_are_rejected_before_spawn(control, monkeypatch, options):
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("Ownership-changing options must be rejected before Popen")
+
+    monkeypatch.setattr(control.subprocess, "Popen", forbidden)
+    with pytest.raises(ValueError, match=next(iter(options))):
+        control.run_process([sys.executable, "-c", "pass"], 30, **options)
+
+
+@pytest.mark.parametrize("text", [False, True])
+def test_timeout_keeps_callers_argv_and_captured_bytes(control, monkeypatch, text):
+    def timeout(output, seconds):
+        # This read is the readiness handshake: the child writes both pipes
+        # before the deadline is injected, independent of startup speed.
+        while not all(output.buffers.values()):
+            output.read_ready(1)
+        raise subprocess.TimeoutExpired(output.child.args, seconds)
+
+    monkeypatch.setattr(control.PinnedOutput, "wait", timeout)
+    argv = [
+        sys.executable,
+        "-c",
+        "import os,time; os.write(1,b'\\xffout\\n'); os.write(2,b'\\xfferr\\n'); time.sleep(60)",
+    ]
+    with pytest.raises(subprocess.TimeoutExpired) as caught:
+        control.run_process(argv, 30, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=text)
+    assert caught.value.cmd == argv
+    assert caught.value.stdout == b"\xffout\n"
+    assert caught.value.stderr == b"\xfferr\n"
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux zombie thread-group leader")
+def test_linux_zombie_leader_with_live_thread_is_live(control):
+    # pthread_exit kills only the main thread. The worker announces its TID;
+    # /proc then provides an explicit handshake for the leader's zombie state.
+    script = """
+import ctypes, os, threading
+def worker():
+    print(threading.get_native_id(), flush=True)
+    threading.Event().wait()
+threading.Thread(target=worker).start()
+ctypes.CDLL(None).pthread_exit(None)
+"""
+    child = subprocess.Popen(
+        [sys.executable, "-c", script], start_new_session=True, stdout=subprocess.PIPE, text=True
+    )
+    try:
+        tid = int(child.stdout.readline())
+        end = time.monotonic() + 30
+        while Path(f"/proc/{child.pid}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z":
+            assert time.monotonic() < end, "Leader never reached pthread_exit"
+            os.sched_yield()
+        members = control.native_group_members(child.pid)
+        assert members is not None and any(member.startswith(f"{tid}(") for member in members)
+    finally:
+        os.killpg(child.pid, signal.SIGKILL)
+        child.wait()
+        child.stdout.close()

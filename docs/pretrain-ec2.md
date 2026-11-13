@@ -1197,22 +1197,53 @@ Each local operation has one process group, shared by its nested supervisors
 and SSH/SCP/rsync transports. Cancellation kills and waits for that entire group
 before copy-back or stop/reconcile proceeds; a shell exiting is insufficient.
 If local process death cannot be confirmed, the chain waits with its session
-open. Every five seconds stderr identifies the local process group, the live
-member PIDs and states (or an unavailable inspection), and elapsed drain time.
+open. Healthy commands whose group is empty on the first inspection produce no
+`process_control` stderr; cancellation reports the time limit or interrupt and
+group immediately, and a killed nested child is reported before its final reap.
+The first unconfirmed drain reports the group, live member PIDs and states (or
+unavailable inspection), elapsed time and any signal refusal before waiting,
+then repeats every five seconds while death remains unconfirmed.
 Membership inspection uses libproc/sysctl on macOS and `/proc` on Linux, with
-`ps` as a fallback when native inspection is unavailable.
-SIGINT/SIGTERM are deferred during this barrier; repeated Ctrl-C does not release
+`ps` as a fallback when native inspection is unavailable (including Linux threads).
+Linux scans inspect the tasks of zombie thread-group leaders: a remaining live
+thread keeps the barrier closed. A native scan that cannot see the operator's
+own process or a visible zombie leader's task directory reports unknown.
+The Linux `ps` fallback can report live members but cannot certify emptiness
+after a failed native task scan. This assumes normal process visibility and
+same-credential descendants, as used by these SSH/SCP/rsync commands; restrictive
+Linux `hidepid` mounts and descendants changing credentials are unsupported.
+SIGINT/SIGTERM use one dispatcher throughout each command. It defers during
+setup and cleanup and can raise through I/O only inside the guarded wait; it
+switches back to deferral before raising. The first saved interrupt is delivered
+once, after draining and restoring the original handlers, and takes precedence
+over a timeout or failure (which is chained as its cause).
+Repeated Ctrl-C does not release
 the session. Inspect the reported group and terminate its live members by hand
 if necessary; restore process-inspection permission when membership is unknown.
 The original leader stays unreaped until no live member remains, reserving its
-group ID so cancellation cannot signal a subsequently recycled group. Nested
+group ID so cancellation cannot signal a subsequently recycled group. Exclusive
+child reaping and the default SIGCHLD disposition are required. If another waiter
+reaps the leader, ownership cannot recover: `LeaderIdentityLost` is reported once,
+no further group signal or inspection is allowed, and the caller proceeds to its
+remote cleanup with local death unconfirmed. Live or unknown membership with an
+intact leader still retains the barrier. Diagnostics are synchronous; they do
+not promise a heartbeat through a blocked syscall or stderr write, or a finite
+cleanup budget while group death remains unconfirmed. Nested
 supervisors must inherit a pipe lease held by the live outer owner; an old
-environment value alone cannot disable the barrier.
+environment value alone cannot disable the barrier. This protects against
+accidental stale environment values and recycled descriptors, not an adversary
+within the operator's own process tree. A process in the recorded group holding
+the exact named pipe with a live writer is nested by definition; it already
+controls its own environment and descriptors.
+Spawn options that change this ownership model (`preexec_fn`, `start_new_session`,
+`process_group`, `executable`, `user`, `group`, `extra_groups`, `shell=True` and
+`close_fds=False`) are rejected before spawning.
 The already-armed guest deadline still schedules guest shutdown independently
 of this local wait, and the AWS stop schedule remains at deadline + 20 minutes
 with the delivery conditions described above. Neither confirms local transport
-death, unblocks the operator, or proves an EC2 stop; the session stays open until
-local death is confirmed and the normal stop/reconcile path can run. Local
+death, unblocks the operator, or proves an EC2 stop; the normal stop/reconcile
+path runs after local death is confirmed, or after a diagnosed loss of leader
+identity. Local
 daemonization/`setsid` (including SSH ControlPersist) can escape the group and is
 outside this cancellation guarantee.
 Cleanup has its own `STOP_TIMEOUT_SECONDS` budget (480

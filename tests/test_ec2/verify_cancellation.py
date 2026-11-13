@@ -92,8 +92,24 @@ def process_snapshot():
                 fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
             except FileNotFoundError:
                 continue
-            if fields[0] != "Z":
-                result[int(entry.name)] = (int(fields[1]), fields[19])
+            live = fields[0] != "Z"
+            if not live:
+                try:
+                    tasks = list((entry / "task").iterdir())
+                    live = not tasks  # An empty task list is also unknown.
+                    for task in tasks:
+                        try:
+                            live |= (task / "stat").read_text().rsplit(")", 1)[1].split()[0] != "Z"
+                        except FileNotFoundError:
+                            continue
+                except FileNotFoundError:
+                    try:
+                        (entry / "stat").read_text()
+                    except FileNotFoundError:
+                        continue
+                    live = True  # A visible leader with unavailable tasks is unknown.
+            if live:
+                result[int(entry.name)] = (int(fields[1]), fields[19], int(fields[2]))
     elif sys.platform == "darwin":
         lib = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
         lib.proc_pidinfo.argtypes = [
@@ -116,29 +132,35 @@ def process_snapshot():
             info = (ctypes.c_uint32 * 34)()  # 136-byte proc_bsdinfo, flavor 3.
             if lib.proc_pidinfo(pid, 3, 0, info, ctypes.sizeof(info)) == ctypes.sizeof(info):
                 if info[1] != 5:
-                    result[pid] = (info[4], tuple(info[30:34]))
+                    result[pid] = (info[4], tuple(info[30:34]), info[25])
     else:
         raise RuntimeError("Leftover inspection requires Linux /proc or Darwin libproc")
     return result
 
 
 class ProcessTracker:
-    def __init__(self):
+    def __init__(self, group_log):
         self.known = {os.getpid(): process_snapshot()[os.getpid()][1]}
         self.stop = threading.Event()
         self.errors = []
         self.thread = threading.Thread(target=self.watch, daemon=True)
+        self.group_log = group_log
 
     def scan(self):
         snapshot = process_snapshot()
+        # Groups are recorded synchronously by the spawning test process.
+        # A surviving orphan remains in its group even if its original
+        # ancestry vanishes entirely between periodic snapshots.
+        groups = {int(row) for row in self.group_log.read_text().splitlines() if row.isdigit()}
         parents = {
             pid
             for pid, identity in self.known.items()
             if snapshot.get(pid, (None, None))[1] == identity
         }
+        parents.update(pid for pid, (_ppid, _identity, pgid) in snapshot.items() if pgid in groups)
         while True:
             added = {
-                pid for pid, (ppid, _identity) in snapshot.items() if ppid in parents
+                pid for pid, (ppid, _identity, _pgid) in snapshot.items() if ppid in parents
             } - parents
             if not added:
                 break
@@ -254,7 +276,24 @@ def main():
     if args.worker:
         return stress_worker(out, args.rounds, args.cases.split(","))
     out.mkdir(parents=True, exist_ok=False)
-    tracker = ProcessTracker()
+    group_log = out / "owned-groups.txt"
+    group_log.touch()
+    hook = out / "registry-hook"
+    hook.mkdir()
+    (hook / "sitecustomize.py").write_text("import cancellation_registry_hook\n")
+    (hook / "cancellation_registry_hook.py").write_text("""import os, subprocess
+original = subprocess.Popen.__init__
+def spawn(child, *args, **kwargs):
+    original(child, *args, **kwargs)
+    if kwargs.get("start_new_session"):
+        with open(os.environ["EC2_CANCELLATION_GROUP_LOG"], "a") as stream:
+            stream.write(str(child.pid) + "\\n")
+subprocess.Popen.__init__ = spawn
+""")
+    previous = {key: os.environ.get(key) for key in ("PYTHONPATH", "EC2_CANCELLATION_GROUP_LOG")}
+    os.environ["PYTHONPATH"] = str(hook) + os.pathsep + os.environ.get("PYTHONPATH", "")
+    os.environ["EC2_CANCELLATION_GROUP_LOG"] = str(group_log)
+    tracker = ProcessTracker(group_log)
     tracker.thread.start()
     result = {"python": sys.executable, "root": str(ROOT), "stages": {}}
 
@@ -311,6 +350,12 @@ def main():
         tracker.thread.join()
         result["leftover_pids"] = tracker.scan()
         result["inspection_errors"] = tracker.errors
+        result["registered_groups"] = len(set(group_log.read_text().splitlines()))
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
         result["source_sha256"] = hashes
         result["sources_unchanged"] = all(
             hashlib.sha256((ROOT / path).read_bytes()).hexdigest() == digest

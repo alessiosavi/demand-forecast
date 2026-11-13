@@ -1,4 +1,4 @@
-"""Finite subprocess lifetimes, including descendants and interrupted callers."""
+"""Owned subprocess groups, including descendants and interrupted callers."""
 
 import ctypes
 import errno
@@ -15,6 +15,29 @@ from pathlib import Path
 SCOPE = "_EC2_OPS_PROCESS_GROUP"
 INTERRUPTS = {signal.SIGINT, signal.SIGTERM}
 DRAIN_DIAGNOSTIC_SECONDS = 5
+
+
+class LeaderIdentityLost(subprocess.SubprocessError):
+    """Exclusive ownership was lost; do not signal or inspect the recycled ID."""
+
+
+def diagnostic(message):
+    try:
+        print(message, file=sys.stderr, flush=True)
+    except (OSError, ValueError):
+        pass  # A closed diagnostic pipe must never release the death barrier.
+
+
+def diagnose_cancellation(group, error, pending):
+    if isinstance(error, subprocess.TimeoutExpired):
+        reason = f"Time limit ({error.timeout:g}s) reached"
+    elif pending is not None:
+        reason = f"Interrupt signal {pending}"
+    elif isinstance(error, (KeyboardInterrupt, InterruptedError)):
+        reason = "Command interrupted"
+    else:
+        reason = f"Command failed ({type(error).__name__})"
+    diagnostic(f"{reason}; terminating local process group {group}")
 
 
 def observe_exit(pid, block=False):
@@ -40,8 +63,11 @@ def observe_exit(pid, block=False):
 def exited(child):
     """Observe without wait/poll/communicate: the unreaped PID pins the PGID."""
     if child.returncode is not None:
-        raise RuntimeError("Process-group leader was reaped before its death barrier")
-    return observe_exit(child.pid)
+        raise LeaderIdentityLost("leader identity unavailable: leader was already reaped")
+    try:
+        return observe_exit(child.pid)
+    except ChildProcessError as exc:
+        raise LeaderIdentityLost(f"leader identity unavailable: {exc}") from exc
 
 
 def darwin_process_state(pid):
@@ -86,6 +112,7 @@ def native_group_members(group):
     live, leader_seen = [], False
     try:
         if sys.platform == "linux":
+            own_seen = False
             for entry in Path("/proc").iterdir():
                 if not entry.name.isdigit():
                     continue
@@ -95,10 +122,35 @@ def native_group_members(group):
                     fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
                 except FileNotFoundError:
                     continue  # Exited/reaped since the directory enumeration.
+                own_seen |= int(entry.name) == os.getpid()
                 if int(fields[2]) == group:
                     leader_seen |= int(entry.name) == group
                     if fields[0] != "Z":
                         live.append(f"{entry.name}({fields[0]})")
+                    else:
+                        # pthread_exit can leave a zombie leader with live
+                        # threads. The kernel cannot reap it until they exit.
+                        try:
+                            tasks = list((entry / "task").iterdir())
+                        except FileNotFoundError:
+                            # A missing task directory is not proof that every
+                            # thread exited while the leader is still visible.
+                            try:
+                                (entry / "stat").read_text()
+                            except FileNotFoundError:
+                                continue
+                            return None
+                        if not tasks:
+                            return None
+                        for task in tasks:
+                            try:
+                                state = (task / "stat").read_text().rsplit(")", 1)[1].split()[0]
+                            except FileNotFoundError:
+                                continue
+                            if state != "Z":
+                                live.append(f"{task.name}({state})")
+            if not own_seen:
+                return None
         elif sys.platform == "darwin":
             lib = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
             listpids = lib.proc_listpids
@@ -155,7 +207,17 @@ def group_members(group):
         return native
     try:
         result = subprocess.run(
-            ["ps", "-A", "-o", "pid=", "-o", "pgid=", "-o", "stat="],
+            [
+                "ps",
+                "-A",
+                *(["-L"] if sys.platform == "linux" else []),
+                "-o",
+                "pid=",
+                "-o",
+                "pgid=",
+                "-o",
+                "stat=",
+            ],
             capture_output=True,
             text=True,
             timeout=1,
@@ -164,7 +226,7 @@ def group_members(group):
         return None
     if result.returncode:
         return None
-    live, leader_seen = [], False
+    live, leader_seen, own_seen = [], False, False
     for line in result.stdout.splitlines():
         fields = line.split()
         if not fields:
@@ -172,24 +234,33 @@ def group_members(group):
         if len(fields) != 3 or not fields[0].isdigit() or not fields[1].isdigit():
             return None
         pid, pgid, state = fields
+        own_seen |= pid == str(os.getpid())
         if pgid == str(group):
             leader_seen |= pid == str(group)
             if not state.startswith("Z"):
                 live.append(f"{pid}({state})")
-    return live if leader_seen else None
+    # On Linux a failed native task scan cannot be repaired by ps omitting
+    # those same threads. Its fallback may identify live members, but only a
+    # complete /proc task scan can certify a zombie-only group.
+    if sys.platform == "linux" and not live:
+        return None
+    return live if leader_seen and (own_seen or sys.platform != "linux") else None
 
 
 def drain_group(child):
     """Keep the leader unreaped through the last signal and membership scan."""
     started = time.monotonic()
-    diagnostic_at = started + DRAIN_DIAGNOSTIC_SECONDS
+    diagnostic_at = started
     while True:
         refused = None
         try:
             exited(child)
+        except LeaderIdentityLost as exc:
+            diagnostic(f"Local process group {child.pid}: {exc}; continuing caller cleanup")
+            raise
         except (OSError, RuntimeError) as exc:
             # Lost ownership cannot authorize a signal OR a scan of that ID.
-            members, refused = None, f"leader identity unavailable: {exc}"
+            members, refused = None, f"leader observation failed: {exc}"
         else:
             try:
                 os.killpg(child.pid, signal.SIGKILL)
@@ -205,17 +276,11 @@ def drain_group(child):
         now = time.monotonic()
         if now >= diagnostic_at:
             detail = ", ".join(members) if members is not None else "unknown (inspection failed)"
-            try:
-                print(
-                    f"Waiting for local process group {child.pid}: live members={detail}; "
-                    f"elapsed={now - started:.1f}s; session retained"
-                    + (f"; {refused}" if refused else ""),
-                    file=sys.stderr,
-                    flush=True,
-                )
-            except (OSError, ValueError):
-                # A closed diagnostic pipe must never release the barrier.
-                pass
+            diagnostic(
+                f"Waiting for local process group {child.pid}: live members={detail}; "
+                f"elapsed={now - started:.1f}s; session retained"
+                + (f"; {refused}" if refused else "")
+            )
             diagnostic_at = now + DRAIN_DIAGNOSTIC_SECONDS
         time.sleep(0.05)
     # No group signal or inspection is permitted after this point.
@@ -223,7 +288,13 @@ def drain_group(child):
 
 
 def scope_fd():
-    """An inherited number is insufficient: require an open lease from the owner."""
+    """Reject accidental stale scope using group, pipe identity and a live writer.
+
+    This is a nesting convention within the operator's own process tree, not
+    authentication against that tree: a process controlling its environment
+    and descriptors already controls itself. A matching pipe in the recorded
+    group with a live writer is nested by definition.
+    """
     try:
         group, fd, device, inode = map(int, os.environ.get(SCOPE, "").split(":"))
         info = os.fstat(fd)
@@ -295,6 +366,16 @@ class PinnedOutput:
             )
         return data
 
+    def collect(self, seconds):
+        end = time.monotonic() + seconds
+        while self.selector.select(0):
+            if time.monotonic() >= end:
+                raise subprocess.TimeoutExpired(self.child.args, seconds)
+            self.read_ready(0)
+
+    def captured(self, stream):
+        return bytes(self.buffers[stream]) if stream is not None else None
+
     def __exit__(self, *_exc):
         self.selector.close()
         for stream in (self.child.stdin, self.child.stdout, self.child.stderr):
@@ -306,17 +387,33 @@ def run_process(argv, seconds, **kwargs):
     seconds = float(seconds)
     if not 0 < seconds < float("inf"):
         raise ValueError("Command timeout must be positive and finite")
+    for option in (
+        "preexec_fn",
+        "start_new_session",
+        "process_group",
+        "executable",
+        "user",
+        "group",
+        "extra_groups",
+    ):
+        if option in kwargs:
+            raise ValueError(f"{option} is incompatible with process-group ownership")
+    for option, unsupported in (("close_fds", False), ("shell", True)):
+        if option in kwargs and bool(kwargs[option]) == unsupported:
+            raise ValueError(f"{option}={unsupported} is incompatible with process-group ownership")
     if signal.getsignal(signal.SIGCHLD) != signal.SIG_DFL:
         raise ValueError("Process-group ownership requires the default SIGCHLD disposition")
-    # Deferral precedes Popen. Raising is enabled only inside the already
-    # established finally below, including delivery of a spawn-time interrupt.
+    child = lease = None
+    stdout = stderr = None
+    # One dispatcher owns the entire lifetime. Only the guarded I/O wait can
+    # raise its private carrier; every exit/drain edge remains deferred.
     with deferred_interrupts() as interrupts:
-        child = None
-        lease = None
         inherited = scope_fd()
         nested = inherited is not None
+        drain_attempted = False
         try:
-            env = dict(kwargs.pop("env", os.environ))
+            supplied_env = kwargs.pop("env", None)
+            env = dict(os.environ if supplied_env is None else supplied_env)
             if nested:
                 command = argv
                 env[SCOPE] = os.environ[SCOPE]
@@ -329,41 +426,16 @@ def run_process(argv, seconds, **kwargs):
                 env.pop(SCOPE, None)
             kwargs["pass_fds"] = tuple(set(kwargs.get("pass_fds", ())) | {fd})
             child = subprocess.Popen(command, start_new_session=not nested, env=env, **kwargs)
-            try:
-                if nested:
+            if nested:
+                try:
                     with interrupts.raising():
                         stdout, stderr = child.communicate(timeout=seconds)
-                else:
-                    with PinnedOutput(child) as output:
-                        try:
-                            with interrupts.raising():
-                                output.wait(seconds)
-                        except BaseException:
-                            try:
-                                exited(child)
-                                os.killpg(child.pid, signal.SIGTERM)
-                            except (OSError, RuntimeError):
-                                pass
-                            grace = time.monotonic() + 1
-                            while not exited(child) and time.monotonic() < grace:
-                                output.read_ready(0.01)
-                            raise
-                        finally:
-                            drain_group(child)
-                        # Once no live member remains, all owned writers are
-                        # gone. Collect buffered bytes without waiting on an
-                        # escaped/daemonized writer outside this operation.
-                        end = time.monotonic() + seconds
-                        while output.selector.select(0):
-                            if time.monotonic() >= end:
-                                raise subprocess.TimeoutExpired(argv, seconds)
-                            output.read_ready(0)
-                        stdout = output.output(child.stdout)
-                        stderr = output.output(child.stderr)
-            finally:
-                if nested:
-                    # Only the owner may signal the shared group. Nested
-                    # supervisors only reap their direct child while unwinding.
+                except BaseException as exc:
+                    if child.returncode is None:
+                        diagnose_cancellation(os.getpgrp(), exc, interrupts.pending)
+                    raise
+                finally:
+                    # Only the owner may signal the shared group.
                     if child.returncode is None:
                         try:
                             child.terminate()
@@ -373,19 +445,55 @@ def run_process(argv, seconds, **kwargs):
                             child.wait(timeout=1)
                         except subprocess.TimeoutExpired:
                             child.kill()
+                            diagnostic(f"Waiting to reap killed nested local process {child.pid}")
                             child.wait()
+            else:
+                with PinnedOutput(child) as output:
+                    completed = False
+                    try:
+                        try:
+                            with interrupts.raising():
+                                output.wait(seconds)
+                            completed = True
+                        except BaseException as exc:
+                            diagnose_cancellation(child.pid, exc, interrupts.pending)
+                            try:
+                                exited(child)
+                                os.killpg(child.pid, signal.SIGTERM)
+                                grace = time.monotonic() + 1
+                                while not exited(child) and time.monotonic() < grace:
+                                    output.read_ready(0.01)
+                            except (OSError, LeaderIdentityLost):
+                                pass  # The final drain diagnoses lost ownership.
+                            raise
+                        finally:
+                            drain_attempted = True
+                            drain_group(child)
+                            output.collect(seconds)
+                            if completed:
+                                stdout = output.output(child.stdout)
+                                stderr = output.output(child.stderr)
+                    except subprocess.TimeoutExpired as exc:
+                        exc.cmd = argv
+                        exc.output = output.captured(child.stdout)
+                        exc.stderr = output.captured(child.stderr)
+                        raise
+
         finally:
-            # Includes signals at pipe setup / context-entry transition edges.
-            if child is not None and not nested and child.returncode is None:
-                drain_group(child)
-            if child is not None:
-                for stream in (child.stdin, child.stdout, child.stderr):
-                    if stream:
-                        stream.close()
-            if lease:
-                for fd in lease:
-                    os.close(fd)
-        return subprocess.CompletedProcess(argv, child.returncode, stdout, stderr)
+            # Covers PinnedOutput setup and every other pre-wait transition.
+            # Never retry a failed drain: lost identity is permanent.
+            try:
+                if child is not None and not nested and not drain_attempted:
+                    drain_group(child)
+            finally:
+                if child is not None:
+                    for stream in (child.stdin, child.stdout, child.stderr):
+                        if stream:
+                            stream.close()
+                if lease:
+                    for fd in lease:
+                        os.close(fd)
+    return subprocess.CompletedProcess(argv, child.returncode, stdout, stderr)
 
 
 def interrupted(signum, _frame):
@@ -408,58 +516,55 @@ def blocked_interrupts():
 
 class InterruptDeferral:
     def __init__(self):
-        self.pending = []
+        self.pending = None
+        self.raising_enabled = False
         self.previous = {sig: signal.getsignal(sig) for sig in INTERRUPTS}
 
-    def defer(self, signum, _frame):
-        if not self.pending:
-            self.pending.append(signum)
+    def dispatch(self, signum, _frame):
+        if self.previous[signum] == signal.SIG_IGN:
+            return
+        if self.pending is None:
+            self.pending = signum
+        if self.raising_enabled:
+            # Switch BEFORE raising: even a signal in the context-manager's
+            # exit transition cannot interrupt the death barrier.
+            self.raising_enabled = False
+            raise ForwardedInterrupt()
 
     def restore(self):
         for sig, handler in self.previous.items():
             signal.signal(sig, handler)
 
-    def forward(self, signum, frame):
+    def deliver(self, error):
+        if self.pending is None:
+            return
+        signum, self.pending = self.pending, None
+        handler = self.previous[signum]
         try:
-            self.previous[signum](signum, frame)
-        except InterruptedError as exc:
-            # selectors swallow InterruptedError as a syscall EINTR. Carry
-            # the operator's exception through I/O, translating it only once
-            # we have left that boundary and entered the drain's finally.
-            raise ForwardedInterrupt(exc) from None
-
-    def deliver(self):
-        if self.pending and sys.exc_info()[0] is None:
-            signum = self.pending.pop(0)
-            self.pending.clear()
-            handler = self.previous[signum]
             if callable(handler):
                 handler(signum, None)
             elif handler == signal.SIG_DFL:
                 signal.raise_signal(signum)
+        except BaseException as interrupt:
+            # Explicit precedence, independent of a caller's active except.
+            # The carrier is private; only the caller's handler defines its API.
+            cause = None if isinstance(error, ForwardedInterrupt) else error
+            raise interrupt from cause
 
     @contextmanager
     def raising(self):
         try:
-            try:
-                with blocked_interrupts():
-                    for sig, handler in self.previous.items():
-                        signal.signal(sig, self.forward if callable(handler) else handler)
-                self.deliver()
-                yield
-            finally:
-                with blocked_interrupts():
-                    for sig in INTERRUPTS:
-                        signal.signal(sig, self.defer)
-        except ForwardedInterrupt as exc:
-            raise exc.interrupt from None
+            self.raising_enabled = True
+            if self.pending is not None:
+                self.raising_enabled = False
+                raise ForwardedInterrupt()
+            yield
+        finally:
+            self.raising_enabled = False
 
 
 class ForwardedInterrupt(BaseException):
-    """Escape I/O's EINTR handling without changing the caller's exception API."""
-
-    def __init__(self, interrupt):
-        self.interrupt = interrupt
+    """Escape selectors' EINTR handling; never delivered to the caller."""
 
 
 @contextmanager
@@ -467,13 +572,22 @@ def deferred_interrupts():
     with blocked_interrupts():
         interrupts = InterruptDeferral()
         for sig in INTERRUPTS:
-            signal.signal(sig, interrupts.defer)
+            signal.signal(sig, interrupts.dispatch)
+    error = None
     try:
         yield interrupts
+    except BaseException as exc:
+        error = exc
     finally:
-        with blocked_interrupts():
-            interrupts.restore()
-    interrupts.deliver()
+        interrupts.raising_enabled = False
+        try:
+            with blocked_interrupts():
+                interrupts.restore()
+        finally:
+            # Also runs on exceptional exits, only after the barrier and restore.
+            interrupts.deliver(error)
+    if error is not None and not isinstance(error, ForwardedInterrupt):
+        raise error
 
 
 @contextmanager
