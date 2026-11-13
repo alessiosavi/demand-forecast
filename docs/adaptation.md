@@ -271,6 +271,321 @@ and real fev SQL parity. No weights, cloud services or benchmark downloads are
 needed. Real cohort feasibility and model-training behavior require separate
 verification by the subsequent tasks.
 
+## Per-task Simons trainer (patch 0004)
+
+Apply the ordered patch series in `third_party/simons/` to the pinned upstream
+checkout. Run the trainer inside that prepared Simons tree:
+
+```bash
+python -m simons.training.adapt \
+  --bundle /path/to/adaptation-bundle \
+  --base /path/to/immutable-base-export \
+  --output /path/to/task-arm-seed \
+  --params head --lr-multiplier 0.02 --max-updates 500 --seed 11 \
+  --device cuda
+```
+
+The base must be a **local** directory with `config.json` and
+`model.safetensors`. The trainer never downloads weights or datasets. The recipe
+is specified by CLI flags; `--help` lists every flag. Registered arms are
+`head|all`, multipliers `0.02|0.10`, seeds `11|29`. Each new output starts from the
+same base with fresh NorMuon/AdamW state. Reusing an output resumes its own
+identity-checked state; use a separate output for every task/arm/seed. No job
+generation, outer-window scoring, seed selection or cross-task weight carryover
+is implemented here.
+
+`head` trains exactly `norm.weight`, `head.weight`, `head.bias`; all other
+parameters have gradients disabled. For the native stage-4 25M config these are
+384, 110,592 and 288 scalars: **111,264 trainable / 25,010,304 frozen**.
+`all` enables all 25,121,568 scalars, including learned covariate modules. Counts,
+names, trainable shapes and individual tensor sizes are computed from the actual
+base and saved in the receipt. A different architecture has different counts.
+Frozen tensors are passed to the upstream optimizer with no gradients, so its
+weight decay cannot alter them.
+
+The trainer accepts **bundle schema 2 only**, checking the manifest and both
+inner-file versions separately. Other versions fail with an explicit
+`schema_version must be 2` error; regenerate older bundles. It verifies the
+manifest fingerprint and every payload's hash/size before consuming data, and
+checks the native Parquet field names and float32 list types before sampling.
+The trainer receipt remains `adaptation.json` schema 1; that is a separate format.
+Source/version hashes and precise `training_input_sha256` values remain covered
+by bundle identity even when a source change rounds to identical float32 rows.
+
+Training reads only hash-verified native Parquet rows inside the bundle. Each
+update samples 32 effective grouped windows: uniformly choose an eligible item,
+then one of its eligible contiguous target blocks, then a valid origin.
+History is capped at 2,048 steps and the base's context, rounded down to its
+patch/far-pool layout. Every target channel needs at least 32 finite history
+points; the group needs at least one finite horizon label. No valid origins
+means a frozen fallback. Targets retain their groups of at most 32; known
+covariates use the bundle's native numeric/history-fitted categorical codes,
+with the upstream varying-column filter and 16-column cap. Past-only/static
+features never enter training. There is no synthetic mixing or augmentation.
+
+Windows are left-padded with missing history and right-padded to the base's
+native future length (512 in the registered checkpoint). The exact H future
+steps are supervised; every future target is hidden from the forward pass, and
+all covariates after H are missing. The loss reuses
+`training.network.covariate_forward` with native causal normalization, asinh
+units and nine quantiles 0.1–0.9. It averages pinball over **observed horizon
+cells and quantiles**, with history weight zero. The pointwise mask also handles
+H that is not divisible by the patch width; upstream's auxiliary loss has a
+patch-level mask. Up to four compatible grouped windows form a microbatch;
+gradients accumulate with their observed-cell weights to the effective batch.
+`--batch-size`, `--microbatch-size` and `--context` allow a bounded qualification
+recipe. The baseline's inference context/config remains intact.
+
+NorMuon/AdamW uses stage-4 base rates 0.002/0.0005, weight decay 0.0697 on hidden
+matrices, muP base width 704 and global gradient clip 1. The multiplier scales
+both base rates before upstream width/head scaling. Rewarm rises from 0.1 to 1
+for 50 updates, then decays linearly to zero at the last planned update. A run
+shorter than 50 updates consists only of the shortened rewarm. There is no
+pretraining warm-start rate doubling. Training forwards use float32 weights and
+inputs without autocast, with native float64 normalization. The upstream NorMuon
+optimizer still uses bf16 internally for the `all` arm; the `head` arm uses AdamW
+only. Loss and gradient checks precede the optimizer step, and a finite-weight
+check follows it before committing the update. Inner inference retains the
+scorer's upstream CUDA bf16 autocast (float32 on CPU). This differs from
+pretraining, which enables training bf16 autocast on supported CUDA hardware.
+Task-batch memory and update speed must be qualified on the GPU.
+
+Inner evaluation defaults to updates 0/50/100/250/500. `--eval-updates 0,2,4`
+changes the list; zero and the planned final update are always included, and
+checks beyond `--max-updates` are omitted. Both inner files use the scoring
+adapter's public `forecast_series` path, six raw-mode switches disabled,
+`shared_categories=False`, quantile sorting and interpolation to the bundle's
+requested levels. Actual scoring uses float64 `score_past` and `score_target`,
+SQL's historical seasonal absolute-error scale, finite-loss reduction over
+items/time per channel/quantile, mean over quantiles, then mean over channels.
+Per-group scores are diagnostics; they are never averaged to form task SQL.
+A wholly undefined channel invalidates the aggregate, matching fev. SQL is the
+registered metric; `SQL` and `{"name":"SQL","epsilon":...}` are supported.
+Other metrics/configurations are rejected explicitly before training.
+
+Model targets are restored as float32. Inner known covariates are restored as
+object arrays in the manifest's `known_future` column order before Simons applies
+its column cap and per-window conversion. This preserves booleans, numeric nulls,
+text nulls and literal strings such as `"None"`; it never substitutes the native
+training category codes. No-covariate blocks pass `None`. Scoring fields retain
+their float64 precision independently of model inputs and training material.
+Offline parity checks exercise both the default NumPy formatter and unformatted
+data, text nulls versus literal categories, NumPy boolean training values,
+float64 seasonal scales erased by float32, and reloaded selected exports.
+
+The registration overrides A5's earlier combined-gain draft: an adapted
+candidate needs **at least 2% gain on each inner window** relative to update 0.
+Choose the qualifying candidate with the smallest arithmetic mean of the two
+scores; ties keep the earliest update. Early stopping counts two consecutive
+checks without at least 0.5% mean-SQL gain over the last significant best mean.
+Smaller gains accumulate against that best until the threshold is reached.
+A zero baseline cannot qualify an adapted candidate by percentage gain.
+Any non-finite forecast, overall score, loss, gradient or updated weight selects
+the frozen base, even if an earlier candidate qualified. Selection is
+**per task**: items too short for the two inner windows contribute neither
+training material nor inner scores, and every item uses the task's single set
+of selected weights. Excluded IDs and their exact reasons remain in the receipt;
+the input bundle's `fallback` metadata does not override the trainer's task-wide
+selection. Some excluded items do not prevent adaptation. If all items are
+excluded, the trainer keeps the frozen base with reason `all_items_excluded`.
+Empty/unsampleable training also keeps the base, with reason `empty_training_set`.
+
+Outputs are `config.json`, `model.safetensors`, `adaptation.json` and
+`checkpoints/checkpoint-{slot-0,slot-1,final}.pt`. The config bytes are preserved
+from the base. A frozen decision copies both base files byte for byte; an
+adapted decision exports the best candidate, rather than the final iterate.
+Load either with `Simons.from_pretrained(output)`; for raw scoring apply the
+same six switches as `SimonsAdapter`. Published processing remains available
+in the preserved config for a separate system experiment.
+
+`adaptation.json` schema version 1 records:
+
+- `identity`: bundle fingerprint, base file hashes, full effective recipe, seed,
+  hashes of patched Simons Python sources, reproducibility settings and
+  Torch/NumPy/device/thread runtime;
+- `reproducibility`: effective `deterministic_algorithms`, seeded Torch CPU/all-CUDA
+  RNGs, stateless NumPy sampling and fixed bundle order, bitwise replay limits,
+  CUDA kernel limitation and effective `CUBLAS_WORKSPACE_CONFIG`; also included in
+  `identity` so settings participate in resume validation;
+- `precision`: float32 weights, disabled training autocast, native float64
+  normalization, CPU/CUDA inner-inference precision, and whether the optimizer's
+  internal bf16 path is active;
+- `inputs`: manifest hash, every payload hash/size, base hashes, task and phase;
+- `recipe`, `seed`, `parameters`, `sampling`, `objective`, `optimization`:
+  actual settings, parameter names/counts, sampling eligibility, peak group rates;
+- `evaluations`: ordered `{update, wall_seconds, windows}`; `wall_seconds` measures
+  each two-window evaluation separately. Each of the two windows has its
+  overall `score`, per-channel scores, per-item/block `groups` and any failure
+  `reason`; non-finite numeric results are JSON null;
+- `decision`: selected update, `adapted|frozen_base`, reason, stop/patience state;
+- `training_wall_seconds`: cumulative time inside training updates, including a
+  failed non-finite attempt, excluding evaluation and checkpoint/export overhead;
+  divide by `updates_run` for mean update cost when all attempts succeeded;
+- `peak_cuda_memory_bytes`: peak Torch allocated memory on the selected CUDA
+  device, reset before loading the base and retained as a maximum across resumed
+  segments; JSON null on non-CUDA devices. This is allocated tensor memory, not reserved
+  allocator memory or total device usage. CUDA synchronization brackets training
+  updates and evaluations so their wall times include completed device work;
+- `updates_run`, `wall_seconds`, `last_update`, `exposure`: successful committed
+  updates, measured loop wall time, last finite loss/unclipped gradient norm and
+  update `wall_seconds`, and observed history/horizon/known-covariate scalar exposures plus grouped-window
+  count. Horizon cells count once, not nine times for quantiles. Counters resume
+  transactionally and exclude replayed work after the last checkpoint; physical
+  replay work lost in a crash is not measurable from this receipt. Training and
+  evaluation timings follow the same committed-work accounting;
+- `excluded_items`, `ineligible_training_groups`, `export`: coverage and exact
+  selected-file hashes. Unique-corpus observed values describe the eligible
+  sampling corpus, not the distinct labels actually drawn.
+
+Every evaluation, every 50 updates or ten minutes, and every new runner nonce
+publishes a hashed/fsynced alternating checkpoint. Intervals are configurable
+with `--checkpoint-updates` and `--checkpoint-seconds`. Checkpoints include the
+optimizer, current model, best candidate, selection history, counters and RNG
+state. Sampling is stateless per (seed, update), independent of inner labels;
+changing inner targets can affect selection, never the gradients at a given
+update. Resume requires the same verified bundle/base/recipe/software/runtime.
+CPU tests verify that replayed updates, evaluation scores, export bytes and
+deterministic receipt fields match uninterrupted execution in the same runtime;
+measured times and peak memory naturally differ. CPU runs enable strict Torch
+deterministic algorithms. CUDA runs explicitly disable that mode, including an
+inherited setting: native `sliding_scale` uses `nanmedian` with indices, which
+has no deterministic CUDA implementation. The model forward path and scorer are
+unchanged. Torch seeds and saved CPU/CUDA RNG states, stateless per-update NumPy
+sampling, and bundle item/block/origin order remain reproducible. The cuBLAS
+workspace setting is retained but does not make other CUDA kernels deterministic.
+CUDA training, inner scores, selection decisions, adapted weights and export
+bytes are **not guaranteed bitwise reproducible**, even after resume on the same
+hardware/software stack; CPU-versus-CUDA numerical parity is not guaranteed
+either. Frozen fallback exports still copy the immutable base bytes exactly.
+No cross-version or cross-device numerical reproducibility is promised.
+
+If `$RUN_DIR/checkpoint-request` contains a new nonempty nonce, the next update
+boundary saves state before atomically writing `checkpoint-done` with that
+nonce. Without `RUN_DIR`, the output directory is used. A restart repairs a
+missing acknowledgment even when the save already committed. Completion is
+checkpointed before export publication, so an interrupted publication is
+repairable by rerunning the same command. Corrupt input hashes and identity
+mismatches fail closed; they are configuration/integrity errors, not coverage
+fallbacks.
+
+## Adaptation pilot guest job (AD5)
+
+Generate the job locally; generation reads the patch bundle and makes no cloud
+calls. Supply an immutable repository revision containing the bundle builder and
+yardstick runner, the pin in `third_party/simons/PINNED`, and the SHA-256 of the
+operator's **shifted development task YAML**. There is no default task file or
+implicit cohort. The job passes exactly one requested name to each bundle and
+scoring command, including names such as `fred_md_2025/macro`.
+
+```bash
+python scripts/gcp/jobs/make_adapt_job.py \
+  --name adapt-pilot-01 --repo-sha "$REPO_SHA" --upstream-pin "$SIMONS_PIN" \
+  --tasks-uri gs://BUCKET/pilot/shifted.yaml --tasks-sha256 "$TASKS_SHA256" \
+  --names epf_de ercot_1H fred_md_2025/macro rohlik_sales_1W hospital_admissions_1D \
+  --hub-weights abel-lab/Simons-25M --hub-revision "$HUB_REVISION_40_HEX" \
+  --params head all --lr-multipliers 0.02 0.10 --seeds 11 29 \
+  --max-updates 500 --processing both --output /tmp/adapt-pilot-01.sh
+```
+
+Alternatively use `--checkpoint-uri gs://BUCKET/export-prefix`, containing
+`config.json` and `model.safetensors`; it is mutually exclusive with the Hub
+source. Hub revisions must be full 40-character lowercase commit IDs. Defaults
+are the two parameter arms, rates 0.02/0.10, seeds 11/29, 500 updates and both
+outer processing modes. `--processing raw` or `published` runs only that mode.
+The registered inner selection and evaluation schedule remain trainer defaults;
+seeds are reported individually and are never selected by outer performance.
+
+The generated Bash job implements the `RUN_DIR` / `STATE_URI` guest contract in
+`docs/gcp.md`. One Python 3.12 environment, provisioned through uv when needed,
+uses stage-1 torch 2.8.0+cu128, CUDA 12.8 and `requirements-yardsticks.txt`. The
+guest verifies the repository revision, clones Simons at its upstream pin, checks
+and applies every embedded patch through `prepare.py`, and installs that tree
+editable alongside this repository. It verifies the dependency pins, CUDA, and
+both the imported Simons and trainer paths, then records pip freeze and runtime
+facts before downloading inputs or loading datasets.
+
+Each task builds one bundle, scores the frozen base once per requested mode,
+then runs the Cartesian product of arms, multipliers and seeds from that base.
+The trainer automatically resumes its own checkpoint slots. Only a selected
+adapted export is scored; a frozen decision writes a reuse receipt pointing to
+the already measured frozen score. Failures are recorded per fit/mode, remaining
+fits and tasks are attempted, and any failed bundle, fit or score makes the final
+exit nonzero. Failed or incomplete work is retried by rerunning the same job.
+
+Small evidence lives under `$RUN_DIR/state/adapt/<name>/`:
+
+```text
+inputs.json, tasks.yaml, checkpoint-sha256.json, environment.txt
+results.csv, completed.json
+tasks/<UTF-8-task-name-as-hex>/
+  bundle-manifest.json, bundle.log
+  frozen/<mode>/{status.json,run.json,summaries.csv,score.log}
+  fits/<params>-lr<multiplier>-seed<seed>/
+    fit.json, adaptation.json, train.log, checkpoints.json
+    <mode>/{status.json,run.json,summaries.csv,score.log}  # adapted selection
+    <mode>-reuse.json                                # frozen selection
+```
+
+`results.csv` has one row per task/arm/seed, including failed fits, with columns:
+`task`, `params`, `lr_multiplier`, `seed`, `status`, `selected`, `selected_update`,
+`decision_reason`, `inner_0_window_0`, `inner_0_window_1`,
+`inner_selected_window_0`, `inner_selected_window_1`, `outer_sql_raw`,
+`outer_sql_published`, `frozen_sql_raw`, `frozen_sql_published`,
+`trainable_parameters`, `training_seconds`, `inner_evaluation_seconds`,
+`outer_evaluation_seconds`, `peak_gpu_memory_bytes`, `error`.
+The outer columns describe the selected model, so frozen decisions equal the
+frozen control. Missing/failed/unrequested scores are empty. Training and inner
+evaluation seconds come from the trainer receipt; outer seconds sum the adapted
+scorer subprocess durations. Frozen reuse adds zero outer seconds. Each frozen
+scorer's duration is retained separately in its status receipt. Peak GPU memory
+is the trainer's peak allocated CUDA bytes, with the same limitations described
+above; it does not include the separate outer scorer process.
+
+Bundles, exports, trainer checkpoints, prediction arrays and dataset caches stay
+outside `state/`. Disposable work uses a fixed `/tmp/demand-forecast-adapt-<hash>`
+path determined by inputs and the artifact URI, preserving scorer checkpoint
+identities across replacement guest labels. Durable checkpoint generations and
+selected exports are uploaded as immutable hash-addressed objects under
+`${STATE_URI%/}-adapt-artifacts/<name>/blobs/<sha256>`, a sibling prefix in the
+same bucket, excluded from the runner's state restore. `checkpoints.json` and
+`fit.json` publish references only after uploads succeed. Restore downloads and
+verifies those referenced objects; lost bundles are rebuilt and their complete
+manifest hashes must match. Object lifecycle cleanup is an operator task.
+
+The supervisor forwards guest checkpoint-request nonces to the active trainer's
+private control directory. It acknowledges a matching nonce only after checkpoint
+uploads and atomic reference publication; normal trainer checkpoints are uploaded
+while training continues. This provides the last successfully uploaded generation
+on preemption, without assuming a final shutdown upload will finish.
+`completed.json` records the full inputs, payload hashes, base hashes, bundle
+versions/fingerprints, per-fit and per-score status, and hashes of the small state
+artifacts. A successful, fully verified completion exits before environment
+installation or downloads. A changed input identity or changed base/bundle content
+under the same name is refused. A damaged completion is rebuilt from independently
+verified evidence; finished fits and scores are reused.
+Every frozen and adapted score receipt binds its measurement to the SHA-256 hashes
+of the export's config and weights; missing or mismatched bindings restore the
+export and rerun scoring, and completion preflight verifies these bindings.
+If both base identity records are absent while task evidence survives, the job
+refuses reuse. A missing bundle manifest is recoverable only when a surviving
+completion hash or verified trainer receipt establishes its original exact hash;
+frozen scores alone cannot establish that bundle identity. Restore the original
+identity evidence or use a new name instead of rebinding surviving results.
+
+The job requires bundle `schema_version` to be the integer **2** and preserves
+the exact manifest bytes. It checks the manifest's task/phase and payload hashes
+before frozen scoring or fitting. The embedded trainer patch 0004 independently
+checks schema 2, the manifest fingerprint, both inner-file versions and the native
+training representation. The job records bundle schema 2 separately from
+`adaptation.json` schema 1 and its own completion schema 1. Unsupported bundles
+fail the task before any scoring or fitting; remaining tasks are attempted.
+The caller must provide the
+registered shifted development windows: a supplied YAML hash authenticates its
+bytes, not its cohort declaration. The job never substitutes official task YAML
+or opens another task's dataset to establish that declaration. Offline tests
+cannot establish CUDA determinism, real dataset coverage, GPU cost/throughput,
+package installation on the guest image, or live preemption durability.
+
 ## Known scoring question
 
 Should the scorer's handling of nullable text covariates change? This remains
