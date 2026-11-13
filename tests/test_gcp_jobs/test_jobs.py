@@ -1086,7 +1086,7 @@ def test_resumed_save_preserves_newest_slot_until_publish(upstream, tmp_path, mo
 
 
 @pytest.mark.parametrize("leg", ["stage3", "stage4", "stage4-long"])
-def test_resumed_leg_uses_public_corpus_layout(upstream, tmp_path, monkeypatch, leg):
+def test_resumed_leg_uses_public_corpus_layout(upstream, tmp_path, monkeypatch, leg, audit_receipt):
     from types import SimpleNamespace
 
     import yaml
@@ -1096,6 +1096,7 @@ def test_resumed_leg_uses_public_corpus_layout(upstream, tmp_path, monkeypatch, 
     corpus = tmp_path / "corpus"
     for name in ("univariate", "covariates"):
         (corpus / name / "dataset").mkdir(parents=True)
+    audit_receipt(corpus)
     args = SimpleNamespace(
         run_dir=tmp_path,
         root=upstream,
