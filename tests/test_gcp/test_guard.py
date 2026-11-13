@@ -120,6 +120,9 @@ if args[:3] == ['compute', 'instances', 'stop']:
             v.update(status='TERMINATED', lastStopTimestamp=datetime.now(timezone.utc).isoformat())
     end({})
 if args[:3] == ['compute', 'instances', 'delete']:
+    if state.get('forbid_runtime_evidence'):
+        ledger = json.loads(Path(os.environ['LEDGER']).read_text())
+        assert not ledger['sessions'][0].get('runtime_evidence')
     if state.get('require_runtime_evidence'):
         ledger = json.loads(Path(os.environ['LEDGER']).read_text())
         assert ledger['sessions'][0]['runtime_evidence']['stop'] == state['require_runtime_evidence']
@@ -142,6 +145,10 @@ if args[:3] == ['compute', 'disks', 'delete']:
 if args[:3] == ['compute', 'operations', 'list']:
     assert opt('--zones'), args
     target = opt('--filter')
+    response = state.get('operations_reads', []).pop(0) if state.get('operations_reads') else {}
+    if response.get('error'): end(error=response['error'])
+    if response.get('warning'): print(response['warning'], file=sys.stderr)
+    if 'operations' in response: end(response['operations'])
     if state.get('operations_error'): end(error='403 Permission denied')
     if state.get('operations_warning'): print(state['operations_warning'], file=sys.stderr)
     if 'operations_response' in state: end(state['operations_response'])
@@ -1753,8 +1760,16 @@ def test_contradictory_preemption_or_unknown_delete_history_keeps_money(cloud, p
     else:
         operations.append(dict(operations[0], name="unknown-op", operationType="setMetadata"))
     cloud.change(operations=operations)
-    assert cloud.run("close", "run-a", ok=False).returncode == 2
+    before = len(cloud.calls())
+    result = cloud.run("close", "run-a", ok=False)
+    assert result.returncode == 2
     assert cloud.read()["sessions"][0]["settled_cost_usd"] is None
+    if present == "instance":
+        assert "preemption history contradicts present instance" in result.stderr
+        assert not any(
+            call[:3] in (["compute", "instances", "stop"], ["compute", "instances", "delete"])
+            for call in cloud.calls()[before:]
+        )
 
 
 @pytest.mark.parametrize(
@@ -2312,9 +2327,10 @@ def test_real_guest_shutdown_history_settles_conservatively(
     assert all("user" not in op for op in saved["settlement_operations"])
 
 
-def test_ad2_completed_describe_path_unchanged(cloud, monkeypatch):
+@pytest.mark.parametrize("model", ["SPOT", "STANDARD", "FLEX_START"])
+def test_ad2_completed_describe_path_unchanged(cloud, monkeypatch, model):
     fixture = LIVE_GUEST_SHUTDOWNS[0]
-    guest_shutdown_history(cloud, fixture)
+    guest_shutdown_history(cloud, fixture, model=model)
     cloud.change(
         instances=[
             dict(
@@ -2328,6 +2344,7 @@ def test_ad2_completed_describe_path_unchanged(cloud, monkeypatch):
             )
         ]
     )
+    before = len(cloud.calls())
     close_in_process(cloud, monkeypatch, frozen=datetime.fromisoformat(fixture["closed_at"]))
     saved = cloud.read()["sessions"][0]
     assert saved["runtime_evidence"] == fixture["runtime_evidence"]
@@ -2337,6 +2354,11 @@ def test_ad2_completed_describe_path_unchanged(cloud, monkeypatch):
     )
     assert abs(Decimal(saved["settled_cost_usd"]) - Decimal("2.505759")) < Decimal("0.01")
     assert sum(call[:3] == ["compute", "instances", "describe"] for call in cloud.calls()) == 1
+    calls = [call[:3] for call in cloud.calls()[before:]]
+    assert calls.count(["compute", "operations", "list"]) == 1
+    assert calls.index(["compute", "operations", "list"]) < calls.index(
+        ["compute", "instances", "describe"]
+    )
 
 
 @pytest.mark.parametrize("initial_status", ["STOPPING", "TERMINATED"])
@@ -2732,6 +2754,170 @@ def test_close_manual_settlement_does_not_fetch_guest_operations(cloud, model):
     assert saved["status"] == "closed" and saved["settled_cost_usd"] == "4.000000"
     assert saved["settlement_evidence"] == "saved billing export"
     assert not any(call[:3] == ["compute", "operations", "list"] for call in cloud.calls()[before:])
+
+
+def running_close_history(cloud, model):
+    deleted_operations(cloud, terminal="stop")
+    ledger = cloud.read()
+    session = ledger["sessions"][0]
+    session["launch"]["provisioning"] = model
+    # A previous close may have saved describe evidence before a failed deletion.
+    session["runtime_evidence"] = {
+        "start": session["last_start"],
+        "stop": "2026-11-12T00:40:00Z",
+        "creation": session["instance_created_at"],
+        "source": "instances.describe lastStartTimestamp/lastStopTimestamp",
+    }
+    cloud.ledger.write_text(json.dumps(ledger))
+    cloud.change(
+        instances=[
+            dict(
+                name="run-a",
+                id=session["instance_id"],
+                zone=session["launch"]["zone"],
+                status="RUNNING",
+                creationTimestamp=session["instance_created_at"],
+                lastStartTimestamp=session["last_start"],
+                disks=[],
+            )
+        ],
+        # This shorter describe interval must not replace operation history.
+        describe_updates=[{}, dict(lastStopTimestamp="2026-11-12T00:40:00Z")],
+        forbid_runtime_evidence=True,
+    )
+
+
+@pytest.mark.parametrize("model", ["SPOT", "STANDARD", "FLEX_START"])
+@pytest.mark.parametrize("failure", ["error", "warning"])
+def test_close_history_read_failure_still_stops_deletes_and_settles(cloud, model, failure):
+    running_close_history(cloud, model)
+    cloud.change(operations_reads=[{failure: "private-account@example.invalid\nprivate-user"}])
+    before = len(cloud.calls())
+    result = cloud.run("close", "run-a", ok=False)
+    calls = [call[:3] for call in cloud.calls()[before:]]
+    assert ["compute", "instances", "stop"] in calls
+    assert ["compute", "instances", "delete"] in calls
+    assert calls.count(["compute", "operations", "list"]) == 2
+    assert (
+        calls.index(["compute", "operations", "list"])
+        < calls.index(["compute", "instances", "describe"])
+        < calls.index(["compute", "instances", "stop"])
+        < calls.index(["compute", "instances", "delete"])
+        < len(calls) - 1
+    )
+    assert calls[-1] == ["compute", "operations", "list"]
+    assert result.returncode == 0, result.stdout + result.stderr
+    saved = cloud.read()["sessions"][0]
+    assert saved["status"] == "closed" and saved["settled_cost_usd"] == "4.018265"
+    assert saved["runtime_evidence"]["stop"] == "2026-11-12T01:10:00Z"
+    assert saved["settlement_evidence"] == (
+        "compute.operations.list targetId + zone; first boot/termination and completed delete; "
+        "boot disk through verified deletion (conservative)"
+    )
+    assert not saved.get("runtime_uncertain")
+    audit = saved["pre_stop_history_error"]
+    assert audit["reason"] == ("command_failed" if failure == "error" else "stderr")
+    datetime.fromisoformat(audit["observed_at"].replace("Z", "+00:00"))
+    assert len(result.stderr.splitlines()) == 1 and "describe" in result.stderr
+    assert "private-" not in cloud.ledger.read_text() + result.stdout + result.stderr
+    state = json.loads(cloud.state.read_text())
+    assert state["instances"] == state["disks"] == []
+
+
+@pytest.mark.parametrize("model", ["SPOT", "STANDARD", "FLEX_START"])
+@pytest.mark.parametrize("failure", ["error", "warning"])
+@pytest.mark.parametrize("post_read", ["failure", "empty"])
+def test_close_history_read_failure_retains_reservation_then_retry_settles(
+    cloud, model, failure, post_read
+):
+    running_close_history(cloud, model)
+    failed = {failure: "private-account@example.invalid\nprivate-user"}
+    cloud.change(
+        operations_reads=[failed, failed if post_read == "failure" else {"operations": []}]
+    )
+    before = len(cloud.calls())
+    result = cloud.run("close", "run-a", ok=False)
+    calls = [call[:3] for call in cloud.calls()[before:]]
+    assert ["compute", "instances", "stop"] in calls
+    assert ["compute", "instances", "delete"] in calls
+    assert calls.count(["compute", "operations", "list"]) == 2
+    assert result.returncode == 2 and "reservation retained" in result.stderr
+    saved = cloud.read()["sessions"][0]
+    assert saved["status"] == "needs_settlement" and saved["settled_cost_usd"] is None
+    assert not saved.get("runtime_evidence") and not saved.get("runtime_uncertain")
+    assert Decimal(json.loads(cloud.run("report").stdout)["committed_usd"]) == Decimal(
+        saved["reservation_usd"]
+    )
+    assert "private-" not in cloud.ledger.read_text() + result.stdout + result.stderr
+    state = json.loads(cloud.state.read_text())
+    assert state["instances"] == state["disks"] == []
+    before = len(cloud.calls())
+    cloud.run("close", "run-a")
+    retried = cloud.read()["sessions"][0]
+    assert retried["status"] == "closed" and retried["settled_cost_usd"] == "4.018265"
+    assert retried["pre_stop_history_error"] == saved["pre_stop_history_error"]
+    assert retried["runtime_evidence"]["source"].startswith("compute.operations.list")
+    calls = [call[:3] for call in cloud.calls()[before:]]
+    assert calls.count(["compute", "operations", "list"]) == 1
+    assert ["compute", "instances", "stop"] not in calls
+    assert ["compute", "instances", "delete"] not in calls
+
+
+@pytest.mark.parametrize("failure", ["timeout", "invalid_json"])
+def test_close_unreadable_pre_stop_history_still_waits_and_uses_history(
+    cloud, monkeypatch, capsys, failure
+):
+    running_close_history(cloud, "STANDARD")
+    cloud.change(
+        describe_updates=[
+            {},
+            dict(status="STOPPING", lastStopTimestamp=None),
+            dict(status="TERMINATED", lastStopTimestamp="2026-11-12T00:40:00Z"),
+        ]
+    )
+    module = runpy.run_path(str(GUARD))
+    real_cloud = module["Guard"].cloud
+    reads = []
+
+    def read(guard, *args, **kwargs):
+        if args[:3] == ("compute", "operations", "list"):
+            reads.append(args)
+            if len(reads) == 1:
+                if failure == "timeout":
+                    raise subprocess.TimeoutExpired("gcloud", 300, stderr="private-account")
+                raise json.JSONDecodeError("private-user", "private-account", 0)
+        return real_cloud(guard, *args, **kwargs)
+
+    monkeypatch.setattr(module["Guard"], "cloud", read)
+    elapsed = [0.0]
+    close_in_process(cloud, monkeypatch, elapsed=elapsed, module=module)
+    saved = cloud.read()["sessions"][0]
+    assert elapsed[0] == 5 and len(reads) == 2
+    assert saved["status"] == "closed" and saved["settled_cost_usd"] == "4.018265"
+    assert saved["pre_stop_history_error"]["reason"] == failure
+    assert saved["runtime_evidence"]["source"].startswith("compute.operations.list")
+    assert not saved.get("runtime_uncertain")
+    captured = capsys.readouterr()
+    assert len(captured.err.splitlines()) == 1
+    assert "private-" not in captured.out + captured.err + cloud.ledger.read_text()
+
+
+def test_close_does_not_swallow_unrelated_history_guard_error(cloud, monkeypatch):
+    running_close_history(cloud, "STANDARD")
+    module = runpy.run_path(str(GUARD))
+
+    def invalid_ledger(guard, session):
+        raise module["GuardError"]("invalid ledger")
+
+    monkeypatch.setattr(module["Guard"], "operations_evidence", invalid_ledger)
+    before = len(cloud.calls())
+    with pytest.raises(module["GuardError"], match="invalid ledger"):
+        close_in_process(cloud, monkeypatch, elapsed=[0.0], module=module)
+    assert not any(
+        call[:3] in (["compute", "instances", "stop"], ["compute", "instances", "delete"])
+        for call in cloud.calls()[before:]
+    )
+    assert "pre_stop_history_error" not in cloud.read()["sessions"][0]
 
 
 def test_guest_shutdown_malformed_timestamp_is_a_clean_refusal(cloud):

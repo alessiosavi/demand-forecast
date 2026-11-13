@@ -360,7 +360,12 @@ start observed during polling, or a described stop earlier than a retained
 matching guest power-off event, also keeps the reservation held.
 When an instance is still present, automatic settlement checks operation history
 before trusting describe for every provisioning model (`SPOT`, `STANDARD`, and
-`FLEX_START`). Explicit `--settled-usd` with `--evidence` skips this lookup.
+`FLEX_START`); explicit `--settled-usd` with `--evidence` skips this lookup.
+If the lookup fails, `close` records a sanitized reason in `pre_stop_history_error`,
+warns on stderr, and continues stopping/deleting, but skips all saved or new describe
+settlement evidence for that invocation. Only the history read after deletion can
+then settle automatically; failed or inconclusive history keeps the reservation
+held with exit code 2, and a later `close` can retry history settlement.
 
 Missing/expired operations, failed or unfinished operations, invalid timestamps,
 multiple inserts, or additional start/resume/reset operations retain the full

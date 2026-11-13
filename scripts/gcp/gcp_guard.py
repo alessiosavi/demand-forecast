@@ -43,6 +43,10 @@ class GuardError(Exception):
     """A refusal that preserves existing commitments."""
 
 
+class CloudStderrError(GuardError):
+    """A cloud read returned stderr, so its result cannot be trusted."""
+
+
 def number(value):
     try:
         result = Decimal(str(value))
@@ -269,7 +273,7 @@ class Guard:
             raise
         # Compute list can report partial failures as warnings with exit zero.
         if clean_stderr and result.stderr.strip():
-            raise GuardError("inventory stderr; absence unverified: " + result.stderr.strip())
+            raise CloudStderrError("inventory stderr; absence unverified: " + result.stderr.strip())
         # storage cat emits the object body even with --format=json.
         if raw:
             return result.stdout
@@ -1330,15 +1334,43 @@ class Guard:
                     + json.dumps(session["reopened"]),
                     file=sys.stderr,
                 )
+        pre_stop_history_failed = False
         if resources["instances"] and session.get("instance_id") and args.settled_usd is None:
-            self.operations_evidence(session)
-            if session["launch"]["provisioning"] == "SPOT" and any(
-                op.get("operationType") == "compute.instances.preempted"
-                for op in session.get("settlement_operations", [])
-            ):
-                raise GuardError(
-                    "preemption history contradicts present instance; reservation retained; reconcile manually"
+            try:
+                self.operations_evidence(session)
+            except (
+                subprocess.CalledProcessError,
+                subprocess.TimeoutExpired,
+                CloudStderrError,
+                json.JSONDecodeError,
+            ) as exc:
+                pre_stop_history_failed = True
+                # Do not retain a previous describe snapshot as a way around
+                # the unchecked preemption/guest-conflict checks on this close.
+                session.pop("runtime_evidence", None)
+                session["pre_stop_history_error"] = {
+                    "observed_at": stamp(now()),
+                    "reason": {
+                        subprocess.CalledProcessError: "command_failed",
+                        subprocess.TimeoutExpired: "timeout",
+                        CloudStderrError: "stderr",
+                        json.JSONDecodeError: "invalid_json",
+                    }.get(type(exc), "unreadable"),
+                }
+                self.save()  # Persist only a fixed reason, never cloud account/user text.
+                print(
+                    "gcp-guard: pre-stop operation history unreadable; "
+                    "continuing stop/delete; describe settlement evidence skipped",
+                    file=sys.stderr,
                 )
+            else:
+                if session["launch"]["provisioning"] == "SPOT" and any(
+                    op.get("operationType") == "compute.instances.preempted"
+                    for op in session.get("settlement_operations", [])
+                ):
+                    raise GuardError(
+                        "preemption history contradicts present instance; reservation retained; reconcile manually"
+                    )
         for item in resources["instances"]:
             vm = self.cloud(
                 "compute",
@@ -1374,7 +1406,8 @@ class Guard:
                     )
             vm = self.wait_for_runtime(session, vm, args)
             if (
-                vm
+                not pre_stop_history_failed
+                and vm
                 and vm.get("lastStartTimestamp")
                 and vm.get("lastStopTimestamp")
                 and vm.get("status") == "TERMINATED"
@@ -1451,7 +1484,18 @@ class Guard:
         if not evidence and args.settled_usd is None and session.get("instance_id"):
             session["status"] = "needs_settlement"
             self.save()
-            evidence = self.operations_evidence(session)
+            try:
+                evidence = self.operations_evidence(session)
+            except (
+                subprocess.CalledProcessError,
+                subprocess.TimeoutExpired,
+                CloudStderrError,
+                json.JSONDecodeError,
+            ):
+                if not pre_stop_history_failed:
+                    raise
+                # Deletion succeeded, but neither read could prove the cost.
+                # Leave evidence unset for the usual reservation-retained refusal.
             if evidence:
                 session["runtime_evidence"] = evidence
                 self.save()
