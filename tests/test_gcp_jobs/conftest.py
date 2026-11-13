@@ -36,3 +36,26 @@ def upstream(tmp_path_factory):
     sys.path.insert(0, str(target / "src"))
     yield target
     sys.path.remove(str(target / "src"))
+
+
+@pytest.fixture
+def audit_receipt():
+    """Write the corpus release handshake for tiny local layout fixtures."""
+    import json
+
+    def write(corpus):
+        (corpus / "attempt-status.json").write_text(
+            json.dumps(dict(attempt_id="tiny", complete=True, exit_code=0))
+        )
+        (corpus / "audit.json").write_text(
+            json.dumps(
+                dict(
+                    attempt_id="tiny",
+                    valid=True,
+                    exit_code=0,
+                    folders=[dict(folder="dataset", status="allowed", verdict="clean")],
+                )
+            )
+        )
+
+    return write

@@ -1,0 +1,750 @@
+diff --git a/src/simons/training/covariates/roles.py b/src/simons/training/covariates/roles.py
+--- a/src/simons/training/covariates/roles.py
++++ b/src/simons/training/covariates/roles.py
+@@ -359,6 +359,8 @@
+                 return ids, first
+ 
+         batch = RoleBatch(role, role_ids, meta[..., 1], two)
++        batch.exposure_synthetic = torch.zeros_like(role)
++        batch.exposure_synthetic[:n_eff] = True
+         return sequence, series_ids, host_slots, batch
+ 
+     def _flush(self):
+diff --git a/src/simons/training/covariates/stream.py b/src/simons/training/covariates/stream.py
+--- a/src/simons/training/covariates/stream.py
++++ b/src/simons/training/covariates/stream.py
+@@ -222,6 +222,7 @@
+         self.batches = iter(self.loader)
+         self.last_weight_sum = None
+         self.last_supervised_values = 0
++        self.last_exposure = None
+         self.stats = {"batches": 0, "windows": 0, "wait_seconds": 0.0, "kinds": {}}
+ 
+     def loss(self, model):
+@@ -237,6 +238,10 @@
+         inputs = batch["values"].masked_fill(batch["future"][:, None], float("nan"))
+         seen = torch.isfinite(inputs).unflatten(-1, (-1, PATCH)).any(-1).cummax(-1).values
+         self.last_supervised_values = int((torch.isfinite(target) & seen[..., :-1, None]).sum())
++        from simons.training.exposure import Counts, auxiliary_counts
++
++        self.last_exposure = Counts()
++        auxiliary_counts(self.last_exposure, batch, self.spec["history_weight"], self.weight)
+         loss, self.last_weight_sum = batch_loss(model, batch, self.spec["history_weight"],
+                                                 self.device)
+         return loss
+diff --git a/src/simons/training/exposure.py b/src/simons/training/exposure.py
+new file mode 100644
+--- /dev/null
++++ b/src/simons/training/exposure.py
+@@ -0,0 +1,130 @@
++"""Scalar target exposure at loss hooks, separate from quantiles and loss weights.
++
++Counts describe consumed model windows after augmentation. Original corpus row,
++source and augmentation ancestry multiplicities are not available at these hooks.
++"""
++
++import copy
++
++import torch
++
++KEYS = ("E_real", "E_synthetic", "S_real", "S_synthetic", "covariate_values", "channel_windows")
++MISSING = [
++    "source rows drawn before packing/replacement and per-source/detailed-role breakdown",
++    "original input ancestry multiplicity inside real mixup/stitching",
++    "work and billed time absent from restored telemetry",
++]
++
++
++class Counts:
++    def __init__(self, saved=None, legacy=False):
++        self.value = (
++            copy.deepcopy(saved)
++            if saved is not None
++            else {
++                "schema": "simons-exposure-1",
++                **dict.fromkeys(KEYS, 0),
++                "updates_attempted": 0,
++                "optimizer_updates": 0,
++                "replay": {
++                    "known_updates": 0,
++                    "lost_telemetry": "unknown",
++                    **dict.fromkeys(KEYS, 0),
++                },
++                "missing": MISSING + (["exposure before legacy checkpoint"] if legacy else []),
++            }
++        )
++
++    def add(self, **values):
++        for key, value in values.items():
++            self.value[key] += int(value)
++
++    def merge(self, other):
++        self.add(**{key: other.value[key] for key in KEYS})
++
++    def snapshot(self):
++        return copy.deepcopy(self.value)
++
++
++def main_counts(
++    counts, inputs, sequence, target, source, far_len, far_tokens, patch, synthetic_rows, roles
++):
++    """E is input/eligible-label union per target window; S is post-packing labels.
++
++    Far values participate in front-end normalization even with far attention off.
++    Packing removes leading padding, never finite positions of a valid window.
++    """
++    from simons.training.packing import gather
++
++    b, v, length = sequence.shape
++    synthetic = torch.zeros((b, v), dtype=torch.bool, device=sequence.device)
++    if synthetic_rows:
++        synthetic[-synthetic_rows:] = True
++    if roles is not None and hasattr(roles, "exposure_synthetic"):
++        synthetic |= roles.exposure_synthetic
++    target_role = torch.ones_like(synthetic) if roles is None else ~roles.role
++    admitted = torch.isfinite(inputs)
++    # Prediction token j supervises raw near patch j+1. Align labels to raw time.
++    eligible = torch.zeros_like(admitted)
++    eligible[..., far_len + patch :] = torch.isfinite(target[..., far_tokens:-1, :]).flatten(-2)
++    exposed = (admitted | eligible) & target_role[..., None]
++    # Ignore unused slots (IDs -1), including any finite filler values.
++    tokens = target.shape[2]
++    active = torch.zeros(b * v * tokens, dtype=torch.bool, device=sequence.device)
++    active[source[source >= 0]] = True
++    active = active.reshape(b, v, tokens).any(-1)
++    exposed &= active[..., None]
++    counts.add(
++        E_real=(exposed & ~synthetic[..., None]).sum(),
++        E_synthetic=(exposed & synthetic[..., None]).sum(),
++        covariate_values=(admitted & ~target_role[..., None] & active[..., None]).sum(),
++        channel_windows=(exposed.any(-1)).sum(),
++    )
++    labels = torch.isfinite(gather(target.reshape(-1, patch), source, float("nan")))
++    ancestry = synthetic[..., None].expand(b, v, tokens).reshape(-1)
++    packed_synthetic = gather(ancestry, source, False)
++    counts.add(
++        S_real=(labels & ~packed_synthetic[:, None]).sum(),
++        S_synthetic=(labels & packed_synthetic[:, None]).sum(),
++    )
++
++
++def auxiliary_counts(counts, batch, history_weight, weight):
++    """All auxiliary targets are real-derived, including effects.synthetic(base,...)."""
++    if weight <= 0:
++        return
++    patch = 32
++    values, future = batch["values"], batch["future"]
++    inputs = values.masked_fill(future[:, None], float("nan"))
++    observed = torch.isfinite(values.unflatten(-1, (-1, patch))[:, :, 1:])
++    seen = torch.isfinite(inputs).unflatten(-1, (-1, patch)).any(-1).cummax(-1).values
++    supervised = observed & seen[..., :-1, None]
++    if history_weight <= 0:
++        fut = future.unflatten(-1, (-1, patch))[:, 1:].any(-1)
++        supervised &= fut[:, None, :, None]
++    eligible = torch.zeros_like(values, dtype=torch.bool)
++    eligible[..., patch:] = supervised.flatten(-2)
++    exposed = torch.isfinite(inputs) | eligible
++    counts.add(
++        E_real=exposed.sum(),
++        S_real=supervised.sum(),
++        covariate_values=torch.isfinite(batch["covs"]).sum(),
++        channel_windows=exposed.any(-1).sum(),
++    )
++
++
++def resume_high_water(counts, directory, step):
++    """Surviving JSONL records give a lower bound on work repeated after rollback."""
++    import json
++    from pathlib import Path
++
++    replay = counts.value["replay"]
++    high = max(step, replay.get("observed_high_water_step", step))
++    for path in Path(directory).rglob("training.jsonl"):
++        for line in path.read_text().splitlines():
++            try:
++                high = max(high, int(json.loads(line).get("step", step)))
++            except (ValueError, TypeError):
++                pass  # A partially uploaded final JSONL record is unknown telemetry.
++    replay["observed_high_water_step"] = high
++    replay["restored_step"] = step
+diff --git a/src/simons/training/objective.py b/src/simons/training/objective.py
+--- a/src/simons/training/objective.py
++++ b/src/simons/training/objective.py
+@@ -53,7 +53,7 @@
+ 
+ 
+ def packed_loss(model, sequence, host_slots, mask_rate_max, mask_span_max, far_on=True,
+-                row_tokens=0, checkpoint_blocks=0, roles=None, micro_batches=1, rank=None):
++                row_tokens=0, checkpoint_blocks=0, roles=None, micro_batches=1, rank=None, exposure=None, synthetic_rows=0):
+     """Return (mean next-patch pinball loss, observed target count) for sequence [B,V,T].
+     `host_slots()` returns numpy window IDs and first observed patch indices [B,V].
+     With `micro_batches` > 1, this runs backward internally and returns a detached loss;
+@@ -116,6 +116,11 @@
+     if roles is not None:
+         packed_roles = gather(roles.token_roles(unpacked).reshape(-1), source, 0).view(shape)
+     segment = segment.view(shape)
++    if exposure is not None:
++        from simons.training.exposure import main_counts
++
++        main_counts(exposure, inputs, sequence, target, source, far_len, far_tokens,
++                    patch, synthetic_rows, roles)
+     if micro_batches <= 1:
+         prediction = network.trunk(model, packed_tokens, packed_rotary, packed_started, segment,
+                                    packed_far, checkpoint_blocks, roles=packed_roles,
+diff --git a/src/simons/training/screen.py b/src/simons/training/screen.py
+new file mode 100644
+--- /dev/null
++++ b/src/simons/training/screen.py
+@@ -0,0 +1,126 @@
++"""Registered screen clocks, corpus release receipts and compatible run identities."""
++
++import copy
++import hashlib
++import json
++from pathlib import Path
++
++FULL_UPDATES = 120208
++
++
++def screen_settings(root, leg, updates):
++    """Round absolute clocks; put total-rounding residual in the long mixed leg.
++
++    The registered screen uses the same clocks for every model size. Native 60M
++    clocks are retained by full runs only. Sampling mechanics are never scaled.
++    """
++    import yaml
++
++    if type(updates) is not int or updates < 100:
++        raise ValueError("screen updates must be an integer >= 100")
++    s = yaml.safe_load((Path(root) / f"configs/simons-25m-{leg}.yaml").read_text())["training"]
++
++    def scale(n):
++        return round(n * updates / FULL_UPDATES)
++
++    lengths = [scale(n) for n in (65000, 12000, 4000, 8000)]
++    end = scale(57600)
++    start = end - (updates - sum(lengths))
++    middle = scale(39957)
++    if not 0 < start < middle < end:
++        raise ValueError("screen budget cannot represent the context phases")
++    out = {}
++    if leg in ("stage1", "stage2"):
++        out["steps"] = lengths[0 if leg == "stage1" else 1]
++        for key in ("warmup_steps", "decay_steps", "rewarm_steps"):
++            if key in s:
++                out[key] = max(1, scale(s[key]))
++    else:
++        out.update(
++            steps=end,
++            warm_start_step=start
++            if leg == "stage3"
++            else end - lengths[2 if leg == "stage4" else 3],
++            context_schedule=f"8192:{start / end:.16f},7680:{(middle - start) / end:.16f},"
++            f"32768:{(end - middle) / end:.16f}",
++        )
++        for key in ("rewarm_steps", "synthetic_ramp_steps"):
++            out[key] = max(1, scale(s[key]))
++        # These dimensionless WSD parameters retain their fractions.
++        for key in ("warmup_fraction", "decay_fraction"):
++            if key in s:
++                out[key] = s[key]
++    return out
++
++
++def corpus_release(corpus, qualification_only=False):
++    """Fail closed on the corpus-v4 release handshake; hash the exact audit bytes."""
++    if qualification_only:
++        return {"qualification_only": True, "warning": "UNSAFE_UNAUDITED_CORPUS"}
++    try:
++        root = Path(corpus)
++        status = json.loads((root / "attempt-status.json").read_bytes())
++        data = (root / "audit.json").read_bytes()
++        audit = json.loads(data)
++        attempt = status["attempt_id"]
++        if not isinstance(attempt, str) or not attempt.strip():
++            raise ValueError("missing attempt id")
++        if (
++            status.get("complete") is not True
++            or type(status.get("exit_code")) is not int
++            or status["exit_code"] != 0
++        ):
++            raise ValueError("attempt is incomplete or failed")
++        if audit.get("attempt_id") != attempt or audit.get("valid") is not True:
++            raise ValueError("audit is invalid or belongs to another attempt")
++        if type(audit.get("exit_code")) is not int or audit["exit_code"] != 0:
++            raise ValueError("audit exited nonzero")
++        folders = audit["folders"]
++        if (
++            not isinstance(folders, list)
++            or not folders
++            or not any(f["status"] == "allowed" for f in folders)
++        ):
++            raise ValueError("audit has no allowed folders")
++        if any(f["status"] == "allowed" and f["verdict"] != "clean" for f in folders):
++            raise ValueError("an allowed folder is not clean")
++        return {"attempt_id": attempt, "audit_sha256": hashlib.sha256(data).hexdigest()}
++    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
++        raise ValueError(f"corpus audit gate: {error}") from error
++
++
++def mode(args):
++    name = getattr(args, "recipe", "full")
++    updates = getattr(args, "screen_updates", None)
++    return name, (25000 if updates is None else updates) if name == "screen" else None
++
++
++def check_identity(saved, args):
++    """Legacy identities mean full; provenance revisions may change across legs."""
++    if saved.get("qualification_only") or saved.get("corpus_release", {}).get("qualification_only"):
++        raise ValueError("qualification-only output cannot be a predecessor")
++    name, updates = mode(args)
++    if (saved.get("recipe_name", "full"), saved.get("screen_updates")) != (name, updates):
++        raise ValueError("recipe identity changed; use a separate STATE_URI")
++    for key in ("size", "seed", "upstream_pin"):
++        if hasattr(args, key) and saved.get(key) != getattr(args, key):
++            raise ValueError(f"experiment identity changed: {key}")
++    if (
++        getattr(args, "leg", None) != "export"
++        and saved.get("corpus_uri") is not None
++        and hasattr(args, "corpus_uri")
++    ):
++        if saved["corpus_uri"] != args.corpus_uri:
++            raise ValueError("corpus identity changed")
++
++
++def compatible_resume(saved, expected):
++    """Retain original full-run provenance, adding the first audited receipt if absent."""
++    old, new = copy.deepcopy(saved), copy.deepcopy(expected)
++    for key in ("repo_sha", "bundle_sha256"):
++        new[key] = old.get(key)
++    if "corpus_release" not in old and "corpus_release" in new:
++        old["corpus_release"] = new.get("corpus_release")
++    if old != new:
++        raise ValueError("experiment identity changed; use a separate STATE_URI")
++    return new
+diff --git a/src/simons/training/spot_job.py b/src/simons/training/spot_job.py
+--- a/src/simons/training/spot_job.py
++++ b/src/simons/training/spot_job.py
+@@ -1,6 +1,7 @@
+ """One recipe-preserving, restartable leg under the RUN_DIR/state guest contract."""
+ 
+ import argparse
++import copy
+ import json
+ import os
+ import pickle
+@@ -14,6 +15,8 @@
+ import yaml
+ 
+ from simons.training import config, schedule
++from simons.training.screen import (check_identity, compatible_resume, corpus_release, mode,
++                                    screen_settings)
+ from simons.training.reliability import (
+     FINAL_NAME,
+     checkpoint_hash,
+@@ -58,7 +61,11 @@
+     digest = checkpoint_hash(path)
+     if "sha256" in record and record["sha256"] != digest:
+         raise ValueError(f"checkpoint hash disagrees with {marker}")
+-    read_checkpoint(path)
++    payload = read_checkpoint(path)
++    if payload.get("qualification_only") or record.get("qualification_only"):
++        raise ValueError("qualification-only output cannot be a predecessor")
++    if payload.get("job_identity", {}).get("qualification_only"):
++        raise ValueError("qualification-only output cannot be a predecessor")
+     return path
+ 
+ 
+@@ -80,12 +87,18 @@
+     return {"data": str(corpus / "univariate"), "covariate_data": str(corpus / "covariates")}
+ 
+ 
+-def recipe(root, state, corpus, size, leg, seed, micro_batches):
++def recipe(root, state, corpus, size, leg, seed, micro_batches,
++           recipe_name="full", screen_updates=None):
+     """Copy the upstream YAML; width is the *only* model edit for 12m."""
+-    raw = yaml.safe_load((Path(root) / f"configs/simons-25m-{leg}.yaml").read_text())
++    native_size = "60m" if size == "60m" else "25m"
++    raw = yaml.safe_load((Path(root) / f"configs/simons-{native_size}-{leg}.yaml").read_text())
+     if size == "12m":
+         raw["model"]["width"] = 264
+     settings = raw["training"]
++    if recipe_name == "screen":
++        settings.update(screen_settings(root, leg, 25000 if screen_updates is None else screen_updates))
++    elif recipe_name != "full" or screen_updates is not None:
++        raise ValueError("screen updates require the screen recipe")
+     settings.update(seed=seed, micro_batches=micro_batches, **corpus_paths(corpus, leg))
+     previous = LEGS[leg]
+     settings["warm_start"] = None if previous is None else str(predecessor(state, leg))
+@@ -126,7 +139,7 @@
+     raw["training"].pop("micro_batches", None)
+     for key in ("warm_start", "data", "covariate_data"):
+         raw["training"].pop(key, None)  # Machine-local paths differ across restores.
+-    return {
++    result = {
+         "size": args.size,
+         "seed": args.seed,
+         "leg": args.leg,
+@@ -136,20 +149,35 @@
+         "corpus_uri": args.corpus_uri,
+         "recipe": raw,
+     }
++    name, updates = mode(args)
++    if name == "screen":
++        result.update(recipe_name=name, screen_updates=updates)
++    if getattr(args, "corpus_release", None) is not None:
++        result["corpus_release"] = args.corpus_release
++    return result
+ 
+ 
+ def run_leg(args):
+     state = Path(args.run_dir) / "state"
+     directory = state / args.leg
++    if getattr(args, "unsafe_qualification_allow_unaudited_corpus", False):
++        raise ValueError("unsafe corpus override is qualification-only")
+     # Completed jobs are no-ops even when local corpus/install scratch has disappeared.
+     if (directory / "completed.json").is_file():
+         try:
+-            completed_checkpoint(directory)
++            final = completed_checkpoint(directory)
++            saved = read_checkpoint(final).get("job_identity")
++            if saved is None and mode(args)[0] == "screen":
++                raise ValueError("missing screen identity")
++            if saved is not None:
++                check_identity(saved, args)
+             prune_checkpoints(directory)
+             return 0
+         except (OSError, ValueError, KeyError, RuntimeError, EOFError, pickle.UnpicklingError):
+             pass  # A marker can arrive before its large checkpoint during an interrupted upload.
+     paths = corpus_paths(args.corpus, args.leg)
++    args.corpus_release = (corpus_release(args.corpus)
++                           if args.leg in ("stage3", "stage4", "stage4-long") else None)
+     checkpoint = latest_checkpoint(directory)
+     # On resume no predecessor is required: the checkpoint owns model and optimizer.
+     # recipe() resolves the predecessor only for a new leg.
+@@ -158,30 +186,49 @@
+         manifest_path = directory / "identity.json"
+         if manifest_path.exists():
+             manifest = json.loads(manifest_path.read_text())
+-            if saved_identity is not None and saved_identity != manifest:
+-                raise ValueError("checkpoint and state experiment identities disagree")
++            if saved_identity is not None:
++                # A legacy manifest may have acquired its first audit receipt before
++                # an interruption prevented publication of an upgraded checkpoint.
++                compatible_resume(saved_identity, manifest)
+         elif saved_identity is not None:
+             manifest = saved_identity
+         else:
+             raise ValueError("checkpoint has no embedded identity and identity.json is missing")
+-        raw = manifest["recipe"]
++        check_identity(manifest, args)
++        raw = copy.deepcopy(manifest["recipe"])
+         raw["training"]["micro_batches"] = args.micro_batches
+         previous = LEGS[args.leg]
+         raw["training"]["warm_start"] = None if previous is None else str(state / previous)
+         raw["training"].update(paths)
+     else:
+         raw = recipe(
+-            args.root, state, args.corpus, args.size, args.leg, args.seed, args.micro_batches
++            args.root, state, args.corpus, args.size, args.leg, args.seed, args.micro_batches,
++            recipe_name=mode(args)[0], screen_updates=mode(args)[1]
+         )
++        previous_path = raw["training"].get("warm_start")
++        if previous_path is not None:
++            saved = read_checkpoint(previous_path).get("job_identity")
++            if saved is None:
++                raise ValueError("predecessor has no experiment identity")
++            check_identity(saved, args)
++            receipt = saved.get("corpus_release")
++            if receipt is not None and receipt != args.corpus_release:
++                raise ValueError("corpus audit identity changed between legs")
+     expected = identity(args, raw)
++    if checkpoint is not None:
++        expected = compatible_resume(manifest, expected)
+     directory.mkdir(parents=True, exist_ok=True)
+     manifest_path = directory / "identity.json"
+-    if manifest_path.exists() and json.loads(manifest_path.read_text()) != expected:
+-        raise ValueError("experiment identity changed; use a separate STATE_URI")
++    if manifest_path.exists():
++        compatible_resume(json.loads(manifest_path.read_text()), expected)
+     atomic_json(manifest_path, expected)
+     attempts = directory / "attempts"
+     attempts.mkdir(exist_ok=True)
+     attempt = Path(tempfile.mkdtemp(prefix="run-", dir=attempts))
++    atomic_json(attempt / "implementation.json", {
++        "repo_sha": args.repo_sha, "bundle_sha256": args.bundle_sha256,
++        "upstream_pin": args.upstream_pin,
++    })
+     if getattr(args, "environment_file", None):
+         shutil.copyfile(args.environment_file, attempt / "environment.txt")
+     path = write_recipe(raw, attempt)
+@@ -214,6 +261,7 @@
+     final = directory / FINAL_NAME
+     if checkpoint != final:
+         checkpoint.replace(final)
++    payload = read_checkpoint(final)
+     atomic_json(
+         directory / "completed.json",
+         {
+@@ -221,6 +269,12 @@
+             "step": step,
+             "bytes": final.stat().st_size,
+             "sha256": checkpoint_hash(final),
++            "job_identity": payload.get("job_identity"),
++            "corpus_release": payload.get("job_identity", {}).get("corpus_release"),
++            "exposure": payload.get("exposure"),
++            "elapsed_seconds": payload.get("elapsed_seconds"),
++            "gpu_hours": payload.get("gpu_hours"),
++            "config_sha256": payload.get("config_sha256"),
+         },
+     )
+     prune_checkpoints(directory)
+@@ -234,6 +288,7 @@
+     if (destination / "completed.json").is_file():
+         try:
+             marker = json.loads((destination / "completed.json").read_text())
++            check_identity(marker.get("job_identity", marker), args)
+             if all(
+                 (destination / n).stat().st_size == marker["artifacts"][n] > 0
+                 for n in ("config.json", "model.safetensors")
+@@ -242,6 +297,15 @@
+         except (OSError, KeyError, ValueError, TypeError):
+             pass
+     paths = [completed_checkpoint(state / leg) for leg in ("stage4", "stage4-long")]
++    for path in paths:
++        saved = read_checkpoint(path).get("job_identity")
++        if saved is None and mode(args)[0] == "screen":
++            raise ValueError("missing screen member identity")
++        if saved is not None:
++            check_identity(saved, args)
++    receipts = [read_checkpoint(p).get("job_identity", {}).get("corpus_release") for p in paths]
++    if receipts[0] != receipts[1]:
++        raise ValueError("soup members have different corpus audit identities")
+     temporary = Path(tempfile.mkdtemp(prefix="export-", dir=args.run_dir))
+     averaged = soup.write(paths, temporary / "checkpoint.pt")
+     export(averaged, temporary / "inference")
+@@ -253,6 +317,10 @@
+         destination / "completed.json",
+         {
+             "members": [str(p) for p in paths],
++            "job_identity": {**(read_checkpoint(paths[0]).get("job_identity") or {}),
++                             "recipe_name": mode(args)[0], "screen_updates": mode(args)[1]},
++            "recipe_name": mode(args)[0], "screen_updates": mode(args)[1],
++            "corpus_release": receipts[0],
+             "artifacts": {
+                 n: (destination / n).stat().st_size for n in ("config.json", "model.safetensors")
+             },
+@@ -267,9 +335,19 @@
+ 
+     directory = Path(args.run_dir)
+     state = directory / "state"
++    receipt = (corpus_release(args.corpus, qualification_only=getattr(
++        args, "unsafe_qualification_allow_unaudited_corpus", False))
++        if args.qualify_leg in ("stage3", "stage4", "stage4-long") else None)
+     raw = recipe(
+-        args.root, state, args.corpus, args.size, args.qualify_leg, args.seed, args.micro_batches
+-    )
++        args.root, state, args.corpus, args.size, args.qualify_leg, args.seed, args.micro_batches,
++        recipe_name=mode(args)[0], screen_updates=mode(args)[1]
++    )
++    previous = raw["training"].get("warm_start")
++    if previous is not None:
++        saved = read_checkpoint(previous).get("job_identity")
++        if saved is None:
++            raise ValueError("predecessor has no experiment identity")
++        check_identity(saved, args)
+     attempt = Path(tempfile.mkdtemp(prefix="qualify-attempt-", dir=directory))
+     path = write_recipe(raw, attempt)
+     # CUDA is mandatory here: a CPU smoke check must never masquerade as GPU qualification.
+@@ -284,17 +362,21 @@
+     start = probe_start(model, settings, args.qualify_step, updates)
+     measurement = Measurement(args.warmup, 500)
+     try:
+-        train(
++        final = train(
+             path,
+             attempt / "output",
+             max_steps=updates,
+             observer=measurement,
+             checkpoint_minutes=args.checkpoint_minutes,
+             probe_step=start,
++            checkpoint_metadata={"qualification_only": True, "corpus_release": receipt},
+         )
+     except torch.OutOfMemoryError:
+         return 42
+     result = measurement.result()
++    result["exposure"] = read_checkpoint(final).get("exposure")
++    result.update(qualification_only=True, corpus_release=receipt,
++                  recipe_name=mode(args)[0], screen_updates=mode(args)[1])
+     result.update(
+         size=args.size,
+         leg=args.qualify_leg,
+@@ -377,7 +459,10 @@
+ def main():
+     parser = argparse.ArgumentParser(description=__doc__)
+     parser.add_argument("--leg", required=True, choices=[*LEGS, "qualify", "export"])
+-    parser.add_argument("--size", choices=["25m", "12m"], required=True)
++    parser.add_argument("--size", choices=["25m", "12m", "60m"], required=True)
++    parser.add_argument("--recipe", choices=["full", "screen"], default="full")
++    parser.add_argument("--screen-updates", type=int)
++    parser.add_argument("--unsafe-qualification-allow-unaudited-corpus", action="store_true")
+     parser.add_argument("--root", type=Path, required=True)
+     parser.add_argument("--run-dir", type=Path, default=os.environ.get("RUN_DIR"), required=False)
+     parser.add_argument("--corpus", type=Path)
+@@ -406,6 +491,12 @@
+         )
+     if args.micro_batches < 1 or args.checkpoint_minutes <= 0 or args.warmup < 0:
+         parser.error("invalid microbatches, checkpoint interval or warm-up")
++    if args.screen_updates is not None and args.recipe != "screen":
++        parser.error("--screen-updates requires --recipe screen")
++    if args.recipe == "screen" and args.screen_updates is not None and args.screen_updates < 100:
++        parser.error("--screen-updates must be >= 100")
++    if args.unsafe_qualification_allow_unaudited_corpus and args.leg != "qualify":
++        parser.error("unsafe corpus override is qualification-only")
+     Path(args.run_dir).mkdir(parents=True, exist_ok=True)
+     if args.leg == "qualify":
+         return qualify_once(args) if args.qualify_child else qualify(args)
+diff --git a/src/simons/training/trainer.py b/src/simons/training/trainer.py
+--- a/src/simons/training/trainer.py
++++ b/src/simons/training/trainer.py
+@@ -15,6 +15,7 @@
+ from simons.synth import augment as synthetic_augment
+ from simons.training import config as config_module
+ from simons.training import network, objective, schedule
++from simons.training.exposure import KEYS, Counts
+ from simons.training.augment import RealAugmenter
+ from simons.training.data import (
+     MAX_VARIATES,
+@@ -80,7 +81,12 @@
+         os.close(descriptor)
+ 
+ 
+-def save_checkpoint(path: Path, model, optimizer, settings, step, seconds, metadata=None):
++def config_digest(model, settings):
++    value = {"model": model.config.to_dict(), "training": settings}
++    return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
++
++
++def save_checkpoint(path: Path, model, optimizer, settings, step, seconds, metadata=None, exposure=None):
+     write_checkpoint(path, {
+         "format": CHECKPOINT_FORMAT,
+         "model_config": model.config.to_dict(),
+@@ -89,7 +95,11 @@
+         "optimizer": optimizer.state_dict(),
+         "step": step,
+         "elapsed_seconds": seconds,
++        "config_sha256": config_digest(model, settings),
++        "gpu_hours": (seconds * int(os.environ.get("WORLD_SIZE", "1")) / 3600
++                      if next(model.parameters()).device.type == "cuda" else 0.0),
+         **({"job_identity": metadata} if metadata is not None else {}),
++        **({"exposure": exposure} if exposure is not None else {}),
+     })
+ 
+ 
+@@ -208,11 +218,17 @@
+     elif warm and not stage1:
+         warm_first = stages[s["warm_start_stage"]][1]
+     first_step, previous_seconds = warm_first, 0.0
++    exposure = Counts()
+     if resume is not None:
+         state = read_checkpoint(resume)
+         model.load_state_dict(state["model"])
+         optimizer.load_state_dict(state["optimizer"])
+         first_step, previous_seconds = state["step"], state["elapsed_seconds"]
++        exposure = Counts(state.get("exposure"), legacy="exposure" not in state)
++        from simons.training.exposure import resume_high_water
++
++        telemetry = checkpoint_dir if checkpoint_dir is not None else Path(resume).parent
++        resume_high_water(exposure, telemetry, first_step)
+         del state
+     if probe_step is not None:
+         if observer is None or resume is not None or not warm_first <= probe_step < s["steps"]:
+@@ -330,12 +346,12 @@
+         if rank.main:
+             if checkpoint_dir is None:
+                 checkpoint(output, model, optimizer, s, step, elapsed(), validation, device,
+-                           autocast, log)
++                           autocast, log, exposure.snapshot(), checkpoint_metadata)
+             else:
+                 final_path = destination / (FINAL_NAME if step == s["steps"]
+                                             else SNAPSHOT_NAMES[next_slot])
+                 save_checkpoint(final_path, model, optimizer, s, step, elapsed(),
+-                                checkpoint_metadata)
++                                checkpoint_metadata, exposure.snapshot())
+                 next_slot = 1 - next_slot
+                 if step == s["steps"]:
+                     prune_checkpoints(destination)
+@@ -370,7 +386,11 @@
+             record[f"{name}_loss"] = float(value)
+         if rank.main:
+             log.write(json.dumps({**record, "lr_multiplier": round(rate, 6), "phase": stage,
+-                                  "seconds": round(elapsed(), 1)}) + "\n")
++                                  "seconds": round(elapsed(), 1), "exposure": exposure.snapshot(),
++                                  "job_identity": checkpoint_metadata,
++                                  "config_sha256": config_digest(model, s),
++                                  "gpu_hours": elapsed() * rank.world / 3600
++                                               if device.type == "cuda" else 0.0}) + "\n")
+             log.flush()
+         logged, pass_logged = [], {}
+ 
+@@ -448,12 +468,15 @@
+             for group in optimizer.param_groups:
+                 group["lr"] = group["peak_lr"] * rate
+             optimizer.zero_grad(set_to_none=True)
++            exposure.add(updates_attempted=1)
++            update_exposure = Counts()
+             with autocast:
+                 loss, count = objective.packed_loss(
+                     model, sequence, host_slots, s["mask_rate_max"], s["mask_span_max"],
+                     far_on=far_on, row_tokens=s["pack_row_tokens"] if far_on else 0,
+                     checkpoint_blocks=s["checkpoint_blocks"], roles=roles,
+-                    micro_batches=s["micro_batches"], rank=rank)
++                    micro_batches=s["micro_batches"], rank=rank,
++                    exposure=update_exposure, synthetic_rows=synthetic_rows)
+             if s["micro_batches"] > 1:
+                 mean_loss = loss
+             else:
+@@ -464,10 +487,28 @@
+                     cov_loss = cov_pass.loss(model)
+                 (cov_pass.weight * pass_objective(cov_loss, cov_pass, s, rank, name)).backward()
+                 pass_logged.setdefault(name, []).append(cov_loss.detach())
++                if cov_pass.last_exposure is not None:
++                    update_exposure.merge(cov_pass.last_exposure)
+             rank.average_gradients(model)
+             norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+             nonfinite |= ~torch.isfinite(norm)
++            if not bool(torch.isfinite(norm)):
++                raise FloatingPointError(f"Non-finite gradient by step {step}")
+             optimizer.step()
++            if rank.active:
++                import torch.distributed as dist
++
++                totals = torch.tensor([update_exposure.value[k] for k in KEYS],
++                                      dtype=torch.int64, device=device)
++                dist.all_reduce(totals)
++                update_exposure.value.update(zip(KEYS, totals.tolist()))
++            exposure.merge(update_exposure)
++            exposure.add(optimizer_updates=1)
++            if step < exposure.value["replay"].get("observed_high_water_step", first_step):
++                replay = exposure.value["replay"]
++                replay["known_updates"] += 1
++                for key in KEYS:
++                    replay[key] = replay.get(key, 0) + update_exposure.value[key]
+             step += 1
+             logged.append(mean_loss.detach())
+             if observer is not None:
+@@ -559,12 +600,12 @@
+     return loss * (rank.world * local[0] / total[0].clamp_min(1.0)).to(loss.dtype)
+ 
+ 
+-def checkpoint(output, model, optimizer, s, step, seconds, validation, device, autocast, log):
++def checkpoint(output, model, optimizer, s, step, seconds, validation, device, autocast, log, exposure=None, metadata=None):
+     if validation:
+         loss = objective.validation_loss(model, validation, device, autocast)
+         log.write(json.dumps({"step": step, "validation_loss": loss}) + "\n")
+         log.flush()
+-    save_checkpoint(output / "checkpoint.pt", model, optimizer, s, step, seconds)
++    save_checkpoint(output / "checkpoint.pt", model, optimizer, s, step, seconds, metadata, exposure)
+ 
+ 
+ def stage_window_sampler(s, model_config, windows, mixture, index, context, future):

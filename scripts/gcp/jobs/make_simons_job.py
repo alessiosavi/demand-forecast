@@ -89,6 +89,9 @@ def generate(
     warmup=20,
     max_micro_batches=128,
     qualify_step=None,
+    recipe="full",
+    screen_updates=None,
+    unsafe_qualification_allow_unaudited_corpus=False,
 ):
     """Return executable shell text embedding the complete pinned source patch bundle."""
     pin = (BUNDLE / "PINNED").read_text().strip()
@@ -96,7 +99,7 @@ def generate(
         raise ValueError(f"upstream pin must equal {pin}")
     if not re.fullmatch(r"[0-9a-f]{40}", repo_sha):
         raise ValueError("repo SHA must be the full 40-character revision")
-    if size not in ("25m", "12m") or leg not in LEGS or qualify_leg not in LEGS[:5]:
+    if size not in ("25m", "12m", "60m") or leg not in LEGS or qualify_leg not in LEGS[:5]:
         raise ValueError("invalid size or leg")
     if (
         seed < 0
@@ -107,6 +110,16 @@ def generate(
         or checkpoint_minutes <= 0
     ):
         raise ValueError("invalid seed, micro-batches, warm-up or checkpoint minutes")
+    if recipe not in ("full", "screen"):
+        raise ValueError("invalid recipe")
+    if screen_updates is not None and recipe != "screen":
+        raise ValueError("screen updates require the screen recipe")
+    if recipe == "screen" and screen_updates is None:
+        screen_updates = 25000
+    if screen_updates is not None and (type(screen_updates) is not int or screen_updates < 100):
+        raise ValueError("screen updates must be an integer >= 100")
+    if unsafe_qualification_allow_unaudited_corpus and leg != "qualify":
+        raise ValueError("unsafe corpus override is qualification-only")
     needs_corpus = (qualify_leg if leg == "qualify" else leg) in LEGS[2:5]
     if needs_corpus and not corpus_uri:
         raise ValueError("a corpus URI is required for legs 3 to 5")
@@ -152,6 +165,10 @@ def generate(
         "--max-micro-batches",
         str(max_micro_batches),
     ]
+    if recipe == "screen":
+        arguments += ["--recipe", recipe, "--screen-updates", str(screen_updates)]
+    if unsafe_qualification_allow_unaudited_corpus:
+        arguments += ["--unsafe-qualification-allow-unaudited-corpus"]
     if qualify_step is not None:
         arguments += ["--qualify-step", str(qualify_step)]
     if corpus_uri:
@@ -165,6 +182,21 @@ import hashlib, json, pathlib, sys
 root = pathlib.Path(sys.argv[1])
 try:
     marker = json.loads((root / "completed.json").read_text())
+    identity_path = root / "identity.json"
+    saved = json.loads(identity_path.read_text()) if identity_path.is_file() else marker.get("job_identity")
+    if saved is None and sys.argv[2] == "export" and "recipe_name" in marker:
+        saved = marker
+    if saved is None:
+        if {recipe!r} != "full":
+            raise ValueError("missing screen identity")
+    else:
+        if (saved.get("recipe_name", "full"), saved.get("screen_updates")) != ({recipe!r}, {screen_updates!r}):
+            raise ValueError("recipe identity changed")
+        if saved.get("qualification_only"):
+            raise ValueError("qualification output")
+        for key, value in (("size", {size!r}), ("seed", {seed!r}), ("upstream_pin", {pin!r})):
+            if key in saved and saved[key] != value:
+                raise ValueError("experiment identity changed")
     if sys.argv[2] == "export":
         names = ["config.json", "model.safetensors"]
         valid = all((root / n).stat().st_size == marker["artifacts"][n] > 0 for n in names)
@@ -200,6 +232,8 @@ fi
     fetch = ""
     if needs_corpus:
         fetch = f"""mkdir -p "$RUN_DIR/corpus"
+# Remove stale release receipts before syncing a possibly incomplete prefix.
+rm -f "$RUN_DIR/corpus/attempt-status.json" "$RUN_DIR/corpus/audit.json"
 gcloud storage rsync --recursive {shlex.quote(corpus_uri)} "$RUN_DIR/corpus"
 """
     return f'''#!/usr/bin/env bash
@@ -209,6 +243,9 @@ set -euo pipefail
 : "${{STATE_URI:?guest must export STATE_URI}}"
 export RUN_DIR
 export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1
+export HOME="${{HOME:-$RUN_DIR/home}}"
+export PYTORCH_KERNEL_CACHE_PATH="$RUN_DIR/torch-kernel-cache"
+mkdir -p "$HOME" "$PYTORCH_KERNEL_CACHE_PATH"
 case "$RUN_DIR" in /*) ;; *) echo "RUN_DIR must be absolute" >&2; exit 2 ;; esac
 mkdir -p "$RUN_DIR/state"
 {early_exit}scratch=$(mktemp -d "$RUN_DIR/simons-install-XXXXXX")
@@ -236,7 +273,10 @@ python3 "$scratch/bundle/prepare.py" "$upstream" "$scratch/bundle"
 def main():
     """Write one executable job without contacting any cloud service."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--size", required=True, choices=["25m", "12m"])
+    parser.add_argument("--size", required=True, choices=["25m", "12m", "60m"])
+    parser.add_argument("--recipe", choices=["full", "screen"], default="full")
+    parser.add_argument("--screen-updates", type=int)
+    parser.add_argument("--unsafe-qualification-allow-unaudited-corpus", action="store_true")
     parser.add_argument("--leg", required=True, choices=LEGS)
     parser.add_argument("--seed", required=True, type=int)
     parser.add_argument("--micro-batches", type=int, default=1)

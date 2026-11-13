@@ -19,9 +19,14 @@ The complete upstream change set is:
   validation, embedded state identity and validated stable-final completion handling, append-only restart records, qualification with bounded OOM
   retries and telemetry, and upstream soup/export orchestration.
 
+- `0003-screen-audit-and-exposure.patch`: select native 60M configs, registered
+  screen clocks, corpus release receipts, full/screen identity separation with
+  legacy full-run compatibility, and checkpointed scalar exposure/replay counters.
+
 `prepare.py TREE BUNDLE` verifies the exact upstream HEAD and rejects source or
-config drift. It runs `git apply --check` on **all** patches before applying
-any of them, in filename order. A second application is an error. The generator
+config drift. It checks and applies the ordered series to a temporary source copy before
+applying any patch to the supplied tree. This allows later patches to extend
+files introduced by earlier ones without partially editing a rejected tree. A second application is an error. The generator
 embeds this installer, the pin, notice and patches into each standalone job.
 
 See [stage 2 operations](../../docs/stage2-simons.md) for job generation,
