@@ -22,11 +22,11 @@ Python entry points:
 ```python
 from demand_forecast.bench.adaptation import build_manifest, build_task_manifest
 
-manifest = build_task_manifest(task_yaml, task_name, output,
-                               phase="development", max_context=None)
+manifest = build_task_manifest(task_yaml, task_name, output, phase="development", max_context=None)
 # Lower-level seam for an already selected fev 0.10.0 Task:
-manifest = build_manifest(task, task_yaml=task_yaml, output=output,
-                          phase="development", max_context=None)
+manifest = build_manifest(
+    task, task_yaml=task_yaml, output=output, phase="development", max_context=None
+)
 ```
 
 The lower-level caller is responsible for matching `task` to `task_yaml`.
@@ -64,7 +64,34 @@ training and inner rows. These are structural checks, not sampler eligibility:
 the adaptation trainer must still enforce its registered minimum observed
 history (32 points), valid gradient windows and any model context limits.
 
-## Files and arrays (schema version 1)
+## Files and arrays (schema version 2)
+
+Parity with the unchanged yardstick runner and `SimonsAdapter` takes precedence
+over preserving source representations in model inputs. Version 2 decodes raw
+Arrow cells for timestamp validation, full-precision scoring fields and source
+hashes, then applies the scorer's formatting to bounded training/model slices.
+History and horizon are formatted separately, before the optional model cap,
+matching fev and the runner. Neither shared datasets nor scoring code change.
+Version 2 distinguishes these bundles from version 1. Regenerate any intermediate
+version 2 bundles built with the experimental runner change; source hashes
+distinguish them from the final implementation.
+
+Offline synthetic tasks using real fev objects establish the default NumPy path:
+
+| Source case | Unchanged scorer presents to Simons | Native training material |
+|---|---|---|
+| Null in text known covariate | `None`; literal `"None"` remains a distinct string | NaN for the null; a category code for literal `"None"` |
+| Null in numeric known covariate | NaN; finite values rounded to float32 | NaN; float32 numeric values |
+| Boolean known covariate | Boolean values in an object array | Numeric float32 0/1, matching Simons' numeric conversion |
+| Float64 target | Float32 target block | The same float32 values; scoring fields and source hashes retain float64 precision |
+
+These preserve the same missingness and model numeric representation. Numeric
+conversion also retains the scorer's float64 intermediate before float32,
+which matters for large integer values. The text case reflects the installed
+formatter, rather than assuming all NumPy/library
+versions behave identically. Actual formatted slices determine both native
+training encoding and inner inputs; a caller that changes fev's dataset format
+also changes its scorer inputs. Source hashes remain based on raw cells.
 
 ```text
 bundle/
@@ -98,12 +125,14 @@ for the main reader and `covariates/` for the covariate reader; do not treat the
 whole bundle as an interchangeable native training folder.
 
 Numeric/boolean training covariates become float32. String covariates use sorted
-categories fitted **only on that item's bounded training prefix**. Null/unknown
-values become NaN. `covariates.training_encodings` records each item's column
-`kind` (`numeric` or `categorical`), categorical `categories` and `unknown: null`.
+categories fitted **only on that item's scorer-formatted bounded training prefix**.
+Null/unknown values become NaN; a formatter-produced string would be treated as
+a category, just as Simons would. `covariates.training_encodings` records each
+item's column `kind` (`numeric` or `categorical`), categorical `categories` and
+`unknown: null`.
 The later trainer uses this mapping for native rows. Inner inference preserves
-raw covariate values so Simons can apply its own per-window conversion exactly
-as the scoring adapter does. Do not replace those raw values with native codes.
+scorer-formatted covariate values so Simons can apply its own per-window conversion
+exactly as the scoring adapter does. Do not replace those values with native codes.
 
 Each inner JSON contains `schema_version`, `origin_number` (0 or 1), `scoring`
 and `items`. Each item has:
@@ -113,7 +142,7 @@ and `items`. Each item has:
   `horizon_timestamps [H]`;
 - `model_input`: an ordered list of blocks, each with `target_indices [V]`,
   `target [V,L]` (float32 values) and `known_covariates` (null without covariates,
-  otherwise a column-name mapping to raw arrays `[L+H]`);
+  otherwise a column-name mapping to scorer-formatted arrays `[L+H]`);
 - `score_past [D,S]`: float64 history with the fev task's context cap;
 - `score_target [D,H]`: float64 held-out observations.
 
@@ -132,7 +161,7 @@ NaN is retained in native Parquet. Infinite permitted values fail.
 
 | Field | Meaning |
 |---|---|
-| `schema_version`, `phase`, `status` | Schema 1, declared provenance, `ready` or `frozen_fallback` |
+| `schema_version`, `phase`, `status` | Schema 2, declared provenance, `ready` or `frozen_fallback` |
 | `task` | `name`, exact source `yaml_sha256`, loaded fev `definition`, `freq`, `horizon`, ordered `target_columns` |
 | `versions` | fev package version; reference fev/Simons commits; SHA256 of installed fev task/metrics, scoring adapter, runner and builder source; PyArrow writer version |
 | `cutoffs` | `fev_initial_cutoff`, index `convention`, `inner_offsets [-2H,-H]`, `shared_training_boundary` (timestamp or null) |
@@ -186,7 +215,7 @@ The parity test compares this calculation with a real synthetic fev window.
 
 Training targets and training covariates stop before both the item's T−2H and
 the shared calendar boundary. Training encoders use that same prefix. Inner
-inputs stop before their origin; raw known covariates stop at origin+H. Held-out
+inputs stop before their origin; known covariates stop at origin+H. Held-out
 labels appear only in scoring fields and, causally, later inner history.
 Nothing uses or hashes observation values at/after the item's T.
 
@@ -204,3 +233,11 @@ cut-offs, covariate roles, causal perturbations, byte determinism, adapter calls
 and real fev SQL parity. No weights, cloud services or benchmark downloads are
 needed. Real cohort feasibility and model-training behavior require separate
 verification by the subsequent tasks.
+
+## Known scoring question
+
+Should the scorer's handling of nullable text covariates change? This remains
+open and is not fixed here. Any such scoring change belongs in a separate PR
+with before/after scores on real tasks, because it can move every model's
+reference rows and break leaderboard comparability. Adaptation follows the
+scorer accepted for those comparisons.
