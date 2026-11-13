@@ -304,6 +304,15 @@ prevents automatic settlement because it could hide earlier runtime. Do not
 restart an instance externally: create a new reserved session with resume instead.
 See the [instance fields](https://docs.cloud.google.com/compute/docs/reference/rest/v1/instances).
 
+When the guest is already `STOPPING`, or `TERMINATED` without its runtime
+timestamps, `close` polls describe for up to **180 seconds**, every **5 seconds**,
+and durably saves the timestamps before deleting. Configure this with
+`guard close train-01 --runtime-timeout 180 --poll-interval 5`; a zero runtime
+timeout skips polling. Each poll has a read timeout of at most 60 seconds and
+the remaining wait budget. Read timeouts retry within that budget; expiry
+proceeds to deletion and the operation-history fallback below. Dry runs do not wait. The polling budget does
+not include the initial describe, stop, delete, or inventory calls.
+
 When Google's deadline or Spot preemption already deleted the instance and there
 is no saved runtime evidence, `close` queries `compute operations list` with
 `--zones=<session zone> --filter=targetId=<recorded instance ID>`. It checks the
@@ -329,6 +338,26 @@ recorded creation to that **same instant**. `settlement_evidence` states this ru
 This measured-history rule does not use the guest marker as billing evidence.
 The ledger retains the operation fields used, omitting the operation's user field,
 as `settlement_operations` and `runtime_evidence.operations`.
+
+A guest power-off has its own narrow history rule: **exactly one** successful
+DONE `insert`, **exactly one** successful DONE
+`compute.instances.guestTerminate`, and optionally one successful DONE `delete`
+whose `insertTime` is at or after the power-off's `endTime`. Only `setLabels` and
+`simulateMaintenanceEvent` may accompany them. All operations must be DONE
+without errors, match the recorded instance ID/zone/link, and have consistent
+timestamps. The recorded first start and creation time are required; two
+power-offs, a start/resume/reset/automatic restart, another stop or preemption,
+or any unknown/failed operation keeps the reservation.
+
+With a delete operation, compute runs from the recorded first start through the
+delete's **endTime**, conservatively including the guest shutdown/deletion gap;
+disk runs from recorded creation to that same verified deletion. Without a
+delete operation, both instance and disk must be absent in **two** clean
+inventory reads; compute and disk end at the guest power-off's **endTime**.
+Any remaining instance or disk blocks settlement. `settlement_evidence` states
+the chosen rule, and sanitized operation evidence is retained as above. A changed
+start observed during polling, or a described stop earlier than a retained
+matching guest power-off event, also keeps the reservation held.
 
 Missing/expired operations, failed or unfinished operations, invalid timestamps,
 multiple inserts, or additional start/resume/reset operations retain the full

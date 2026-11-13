@@ -998,6 +998,7 @@ class Guard:
                 "stop",
                 "delete",
                 "compute.instances.preempted",
+                "compute.instances.guestTerminate",
                 "setLabels",
                 "simulateMaintenanceEvent",
             }
@@ -1012,6 +1013,8 @@ class Guard:
             for op in operations
         ):
             return None
+        if any(op.get("operationType") == "compute.instances.guestTerminate" for op in operations):
+            return self.guest_termination_evidence(session, operations, inserts)
         ends = [
             op
             for op in operations
@@ -1139,7 +1142,150 @@ class Guard:
             ],
         }
 
+    def guest_termination_evidence(self, session, operations, inserts):
+        """Prove one guest power-off, conservatively including any later deletion."""
+        guests = [
+            op for op in operations if op["operationType"] == "compute.instances.guestTerminate"
+        ]
+        deletes = [op for op in operations if op["operationType"] == "delete"]
+        reads = session.get("settlement_inventory", [])
+        if (
+            len(inserts) != 1
+            or len(guests) != 1
+            or len(deletes) > 1
+            or any(
+                op["operationType"]
+                not in {
+                    "insert",
+                    "compute.instances.guestTerminate",
+                    "delete",
+                    "setLabels",
+                    "simulateMaintenanceEvent",
+                }
+                or op.get("status") != "DONE"
+                or op.get("error")
+                or op.get("httpErrorStatusCode")
+                for op in operations
+            )
+            or len(reads) != 2
+            or any(reads[-1].get(kind) for kind in ("instances", "disks"))
+            or (not deletes and any(read.get("instances") or read.get("disks") for read in reads))
+        ):
+            return None
+        try:
+            inserted, guest = inserts[0], guests[0]
+            start, creation = session.get("last_start"), session.get("instance_created_at")
+            end = deletes[0]["endTime"] if deletes else guest["endTime"]
+            if (
+                not start
+                or not creation
+                or not (
+                    instant(creation)
+                    <= instant(start)
+                    <= instant(guest["startTime"])
+                    <= instant(guest["endTime"])
+                    <= instant(end)
+                    <= now()
+                    and instant(inserted["insertTime"])
+                    <= instant(inserted["startTime"])
+                    <= instant(inserted["endTime"])
+                    <= instant(guest["startTime"])
+                    and (
+                        instant(inserted["startTime"]) <= instant(start)
+                        or (
+                            session.get("adoption", {}).get("charge_from_insert_request")
+                            and instant(start) == instant(inserted["insertTime"])
+                        )
+                    )
+                )
+            ):
+                return None
+            if deletes and not (
+                instant(guest["endTime"])
+                <= instant(deletes[0]["insertTime"])
+                <= instant(deletes[0]["startTime"])
+                <= instant(end)
+            ):
+                return None
+            if any(
+                not instant(inserted["insertTime"])
+                <= instant(op["startTime"])
+                <= instant(op["endTime"])
+                <= instant(end)
+                or (
+                    op.get("insertTime") is not None
+                    and not instant(inserted["insertTime"])
+                    <= instant(op["insertTime"])
+                    <= instant(op["startTime"])
+                )
+                for op in operations
+            ):
+                return None
+        except (KeyError, TypeError, ValueError, AttributeError, GuardError):
+            return None
+        return {
+            "start": start,
+            "stop": end,
+            "creation": creation,
+            "deleted": end,
+            "billing_rule": "guest-termination-delete-end" if deletes else "guest-termination-end",
+            "source": "compute.operations.list targetId + zone; single guestTerminate: "
+            "machine from recorded start and disk from creation through "
+            + (
+                "completed delete endTime (conservative)"
+                if deletes
+                else "guestTerminate endTime; two clean instance/disk absence reads"
+            ),
+            "operations": session["settlement_operations"],
+        }
+
+    def wait_for_runtime(self, session, vm, args):
+        """Wait only for an in-progress guest stop, never delaying deletion indefinitely."""
+        deadline = time.monotonic() + args.runtime_timeout
+        while vm:
+            if session.get("instance_id") and str(vm.get("id")) != str(session["instance_id"]):
+                raise GuardError("instance identity changed; refusing to settle")
+            if (
+                vm.get("lastStartTimestamp")
+                and session.get("last_start")
+                and instant(vm["lastStartTimestamp"]) != instant(session["last_start"])
+            ):
+                session["runtime_uncertain"] = True
+                self.save()  # A later snapshot must not erase contradictory runtime evidence.
+            if self.dry_run or not (
+                vm.get("status") == "STOPPING"
+                or (
+                    vm.get("status") == "TERMINATED"
+                    and not (vm.get("lastStartTimestamp") and vm.get("lastStopTimestamp"))
+                )
+            ):
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(args.poll_interval, remaining))
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                vm = self.cloud(
+                    "compute",
+                    "instances",
+                    "describe",
+                    session["label"],
+                    f"--zone={session['launch']['zone']}",
+                    absent=True,
+                    timeout=min(60, remaining),
+                )
+            except subprocess.TimeoutExpired:
+                continue  # Retry only within the overall budget, then fall through to delete.
+        return vm
+
     def close(self, args):
+        if not 0 <= args.runtime_timeout < float("inf") or not 0 < args.poll_interval <= 60:
+            raise GuardError(
+                "close requires finite runtime-timeout >= 0 and 0 < poll-interval <= 60"
+            )
         session = self.session(args.label)
         if session["status"] == "closed":
             raise GuardError("session is already settled")
@@ -1231,6 +1377,7 @@ class Guard:
                         f"--zone={session['launch']['zone']}",
                         absent=True,
                     )
+            vm = self.wait_for_runtime(session, vm, args)
             if (
                 vm
                 and vm.get("lastStartTimestamp")
@@ -1240,9 +1387,32 @@ class Guard:
                 start, stop = instant(vm["lastStartTimestamp"]), instant(vm["lastStopTimestamp"])
                 if stop < start or stop > now() + timedelta(seconds=30):
                     raise GuardError("invalid runtime timestamps; reservation retained")
+                target = (
+                    f"/projects/{self.config['project']}/zones/{session['launch']['zone']}"
+                    f"/instances/{session['label']}"
+                )
+                guest_ends = [
+                    op.get("endTime")
+                    for op in session.get("settlement_operations", [])
+                    if op.get("operationType") == "compute.instances.guestTerminate"
+                    and op.get("status") == "DONE"
+                    and not op.get("error")
+                    and not op.get("httpErrorStatusCode")
+                    and str(op.get("targetId")) == str(session.get("instance_id"))
+                    and str(op.get("zone", "")).rsplit("/", 1)[-1] == session["launch"]["zone"]
+                    and str(op.get("targetLink", "")).endswith(target)
+                ]
+                try:
+                    guest_conflict = any(instant(end) > stop for end in guest_ends)
+                except (TypeError, ValueError, AttributeError, GuardError):
+                    guest_conflict = True
                 # Repeated starts can hide earlier runtime. Only this guard's
                 # first observed boot can be automatically settled.
-                if not session.get("last_start") or start != instant(session["last_start"]):
+                if (
+                    not session.get("last_start")
+                    or start != instant(session["last_start"])
+                    or guest_conflict
+                ):
                     session["runtime_uncertain"] = True
                 else:
                     session["runtime_evidence"] = {
@@ -1484,6 +1654,13 @@ def parser():
     close.add_argument("label", type=name)
     close.add_argument("--settled-usd")
     close.add_argument("--evidence")
+    close.add_argument(
+        "--runtime-timeout",
+        type=float,
+        default=180,
+        help="seconds to wait for guest-stop timestamps before deleting (default: 180; 0 disables)",
+    )
+    close.add_argument("--poll-interval", type=float, default=5)
     close.add_argument("--dry-run", action="store_true")
     sweep = commands.add_parser("sweep")
     sweep.add_argument("--delete", action="store_true")

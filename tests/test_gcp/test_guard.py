@@ -108,6 +108,8 @@ if args[:3] == ['compute', 'instances', 'describe']:
     matches = [v for v in state.get('instances', []) if v['name'] == args[3]
                and v['zone'].rsplit('/', 1)[-1] == opt('--zone')]
     if not matches: end(error='The resource was not found')
+    if state.get('describe_updates'):
+        matches[0].update(state['describe_updates'].pop(0))
     end(matches[0])
 if args[:3] == ['compute', 'instances', 'stop']:
     from datetime import datetime, timezone
@@ -118,6 +120,11 @@ if args[:3] == ['compute', 'instances', 'stop']:
             v.update(status='TERMINATED', lastStopTimestamp=datetime.now(timezone.utc).isoformat())
     end({})
 if args[:3] == ['compute', 'instances', 'delete']:
+    if state.get('require_runtime_evidence'):
+        ledger = json.loads(Path(os.environ['LEDGER']).read_text())
+        assert ledger['sessions'][0]['runtime_evidence']['stop'] == state['require_runtime_evidence']
+    if state.get('delete_error'): end(error='HTTP 503 delete failed')
+    if state.get('delete_noop'): end({})
     state['instances'] = [v for v in state.get('instances', []) if v['name'] != args[3]
                           or v['zone'].rsplit('/', 1)[-1] != opt('--zone')]
     if not state.get('orphan_disk'): state['disks'] = []
@@ -2203,3 +2210,464 @@ def test_adopted_session_with_expired_history_retains_safety_checks(cloud, fault
     assert saved["last_start"] == original["last_start"]
     if fault == "restart":
         assert saved["runtime_uncertain"]
+
+
+LIVE_GUEST_SHUTDOWNS = json.loads(
+    (ROOT / "tests/test_gcp/fixtures/guest_shutdowns.json").read_text()
+)
+
+
+def guest_shutdown_history(cloud, fixture=LIVE_GUEST_SHUTDOWNS[1]):
+    operations = deleted_operations(cloud)
+    ledger = cloud.read()
+    session = ledger["sessions"][0]
+    for key in ("last_start", "instance_created_at", "hourly_usd", "disk_hourly_usd"):
+        session[key] = fixture[key]
+    cloud.ledger.write_text(json.dumps(ledger))
+    base = operations[0]
+    operations = [
+        dict(op, **{key: base[key] for key in ("targetId", "targetLink", "zone")})
+        for op in fixture["operations"]
+    ]
+    cloud.change(operations=operations)
+    return operations
+
+
+def close_in_process(cloud, monkeypatch, *, elapsed=None, frozen=None, extra=(), module=None):
+    from types import SimpleNamespace
+
+    if module is None:
+        module = runpy.run_path(str(GUARD))
+    for key, value in cloud.env.items():
+        monkeypatch.setenv(key, value)
+    globals_ = module["Guard"].close.__globals__
+    if elapsed is not None:
+
+        def sleep(seconds):
+            elapsed[0] += seconds
+
+        monkeypatch.setitem(
+            globals_, "time", SimpleNamespace(monotonic=lambda: elapsed[0], sleep=sleep)
+        )
+    if frozen is not None:
+        monkeypatch.setitem(globals_, "now", lambda: frozen)
+    args = module["parser"]().parse_args(["--ledger", str(cloud.ledger), "close", "run-a", *extra])
+    module["Guard"](cloud.ledger).close(args)
+
+
+@pytest.mark.parametrize("with_delete,expected", [(True, "3.749472"), (False, "3.727433")])
+def test_real_guest_shutdown_history_settles_conservatively(cloud, with_delete, expected):
+    operations = guest_shutdown_history(cloud)
+    if not with_delete:
+        operations = [op for op in operations if op["operationType"] != "delete"]
+    # Failed harmless operations must also be checked; account data must not persist.
+    operations.append(
+        dict(operations[0], name="labels-op", operationType="setLabels", user="private-account")
+    )
+    cloud.change(operations=operations)
+    cloud.run("close", "run-a")
+    saved = cloud.read()["sessions"][0]
+    assert saved["status"] == "closed"
+    assert abs(Decimal(saved["settled_cost_usd"]) - Decimal(expected)) < Decimal("0.000002")
+    end = "2026-11-13T10:38:35.546-08:00" if with_delete else "2026-11-13T10:37:59.733-08:00"
+    assert saved["runtime_evidence"]["stop"] == saved["runtime_evidence"]["deleted"] == end
+    assert saved["runtime_evidence"]["start"] == LIVE_GUEST_SHUTDOWNS[1]["last_start"]
+    assert "guestTerminate" in saved["settlement_evidence"]
+    assert ("delete endTime" if with_delete else "guestTerminate endTime") in saved[
+        "settlement_evidence"
+    ]
+    assert len(saved["settlement_inventory"]) == 2
+    assert all(
+        not read["instances"] and not read["disks"] for read in saved["settlement_inventory"]
+    )
+    assert all("user" not in op for op in saved["settlement_operations"])
+
+
+def test_ad2_completed_describe_path_unchanged(cloud, monkeypatch):
+    fixture = LIVE_GUEST_SHUTDOWNS[0]
+    guest_shutdown_history(cloud, fixture)
+    cloud.change(
+        instances=[
+            dict(
+                name="run-a",
+                id="1",
+                zone="europe-west4-a",
+                status="TERMINATED",
+                creationTimestamp=fixture["instance_created_at"],
+                lastStartTimestamp=fixture["last_start"],
+                lastStopTimestamp=fixture["runtime_evidence"]["stop"],
+            )
+        ]
+    )
+    close_in_process(cloud, monkeypatch, frozen=datetime.fromisoformat(fixture["closed_at"]))
+    saved = cloud.read()["sessions"][0]
+    assert saved["runtime_evidence"] == fixture["runtime_evidence"]
+    assert abs(Decimal(saved["settled_cost_usd"]) - Decimal("2.505759")) < Decimal("0.01")
+    assert sum(call[:3] == ["compute", "instances", "describe"] for call in cloud.calls()) == 1
+
+
+@pytest.mark.parametrize("initial_status", ["STOPPING", "TERMINATED"])
+def test_close_waits_for_durable_stop_timestamps_before_delete(cloud, monkeypatch, initial_status):
+    guest_shutdown_history(cloud)
+    fixture = LIVE_GUEST_SHUTDOWNS[1]
+    stop = "2026-11-13T18:38:55Z"
+    cloud.change(
+        instances=[
+            dict(
+                name="run-a",
+                id="1",
+                zone="europe-west4-a",
+                status=initial_status,
+                lastStartTimestamp=fixture["last_start"],
+                creationTimestamp=fixture["instance_created_at"],
+            )
+        ],
+        describe_updates=[{}, {}, dict(status="TERMINATED", lastStopTimestamp=stop)],
+        require_runtime_evidence=stop,
+    )
+    elapsed = [0.0]
+    close_in_process(cloud, monkeypatch, elapsed=elapsed)
+    saved = cloud.read()["sessions"][0]
+    assert saved["runtime_evidence"]["stop"] == stop
+    assert saved["runtime_evidence"]["source"].startswith("instances.describe")
+    assert saved["status"] == "closed"
+    assert 0 < elapsed[0] <= 180
+    calls = cloud.calls()
+    assert not any(call[:3] == ["compute", "instances", "stop"] for call in calls)
+    assert sum(call[:3] == ["compute", "instances", "describe"] for call in calls) == 3
+
+
+@pytest.mark.parametrize("timeout", [0, 12, 180])
+def test_close_runtime_wait_expires_then_deletes_and_recovers_operations(
+    cloud, monkeypatch, timeout
+):
+    guest_shutdown_history(cloud)
+    fixture = LIVE_GUEST_SHUTDOWNS[1]
+    cloud.change(
+        instances=[
+            dict(
+                name="run-a",
+                id="1",
+                zone="europe-west4-a",
+                status="STOPPING",
+                lastStartTimestamp=fixture["last_start"],
+                creationTimestamp=fixture["instance_created_at"],
+            )
+        ]
+    )
+    elapsed = [0.0]
+    extra = () if timeout == 180 else ("--runtime-timeout", str(timeout))
+    close_in_process(cloud, monkeypatch, elapsed=elapsed, extra=extra)
+    saved = cloud.read()["sessions"][0]
+    assert elapsed[0] == timeout
+    assert saved["settled_cost_usd"] == "3.749472"
+    assert any(call[:3] == ["compute", "instances", "delete"] for call in cloud.calls())
+
+
+@pytest.mark.parametrize("with_delete", [False, True])
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "two-power-offs",
+        "start",
+        "resume",
+        "reset",
+        "automatic-restart",
+        "failed-guest",
+        "failed-insert",
+        "failed-labels",
+        "pending-guest",
+        "duplicate-insert",
+        "missing-insert",
+        "missing-start",
+        "missing-creation",
+        "delete-issued-before-power-off",
+        "wrong-target",
+        "reversed-times",
+        "unknown",
+        "extra-stop",
+        "disk-present",
+        "instance-present",
+    ],
+)
+def test_guest_shutdown_ambiguous_history_retains_reservation(cloud, with_delete, fault):
+    operations = guest_shutdown_history(cloud)
+    if not with_delete:
+        operations = [op for op in operations if op["operationType"] != "delete"]
+    guest = next(
+        op for op in operations if op["operationType"] == "compute.instances.guestTerminate"
+    )
+    insert = next(op for op in operations if op["operationType"] == "insert")
+    if fault == "two-power-offs":
+        operations.append(dict(guest, name="second-power-off"))
+    elif fault in {"start", "resume", "reset", "automatic-restart", "unknown", "extra-stop"}:
+        kind = {
+            "automatic-restart": "compute.instances.automaticRestart",
+            "unknown": "setMetadata",
+            "extra-stop": "stop",
+        }.get(fault, fault)
+        operations.append(dict(guest, name="extra-op", operationType=kind))
+    elif fault.startswith("failed-"):
+        op = guest if fault == "failed-guest" else insert
+        if fault == "failed-labels":
+            op = dict(insert, name="labels-op", operationType="setLabels")
+            operations.append(op)
+        op["error"] = {"errors": [{"code": "FAILED"}]}
+    elif fault == "pending-guest":
+        guest["status"] = "RUNNING"
+    elif fault == "duplicate-insert":
+        operations.append(dict(insert, name="second-insert"))
+    elif fault == "missing-insert":
+        operations.remove(insert)
+    elif fault in {"missing-start", "missing-creation"}:
+        ledger = cloud.read()
+        ledger["sessions"][0].pop(
+            "last_start" if fault == "missing-start" else "instance_created_at"
+        )
+        cloud.ledger.write_text(json.dumps(ledger))
+    elif fault == "delete-issued-before-power-off":
+        delete = next((op for op in operations if op["operationType"] == "delete"), None)
+        if delete is None:
+            operations.append(dict(guest, name="bad-delete", operationType="delete"))
+            delete = operations[-1]
+        delete["insertTime"] = "2026-11-13T18:37:58Z"
+    elif fault == "wrong-target":
+        guest["targetLink"] += "-foreign"
+    elif fault == "reversed-times":
+        guest["startTime"] = "2026-11-13T18:38:10Z"
+    elif fault == "disk-present":
+        cloud.change(
+            disks=[dict(name=cloud.read()["sessions"][0]["boot_disk"], zone="europe-west4-a")]
+        )
+    elif fault == "instance-present":
+        cloud.change(
+            instances=[dict(name="run-a", id="1", zone="europe-west4-a", status="STAGING")],
+            delete_noop=True,
+        )
+    cloud.change(operations=operations)
+    result = cloud.run("close", "run-a", ok=False)
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert "Traceback" not in result.stderr
+    saved = cloud.read()["sessions"][0]
+    assert saved["status"] == "needs_settlement" and saved["settled_cost_usd"] is None
+    assert Decimal(json.loads(cloud.run("report").stdout)["committed_usd"]) == Decimal(
+        saved["reservation_usd"]
+    )
+
+
+@pytest.mark.parametrize(
+    "option,value",
+    [
+        ("--runtime-timeout", "-1"),
+        ("--runtime-timeout", "nan"),
+        ("--runtime-timeout", "inf"),
+        ("--poll-interval", "0"),
+        ("--poll-interval", "61"),
+        ("--poll-interval", "nan"),
+    ],
+)
+def test_close_invalid_wait_budget_refuses_before_mutations(cloud, option, value):
+    cloud.setup()
+    cloud.launch()
+    before = len(cloud.calls())
+    assert cloud.run("close", "run-a", option, value, ok=False).returncode == 2
+    assert not any(
+        call[:3] in (["compute", "instances", "stop"], ["compute", "instances", "delete"])
+        for call in cloud.calls()[before:]
+    )
+
+
+@pytest.mark.parametrize(
+    "fault", ["changed-id", "changed-start", "delete-failed", "read-timeout", "disappeared"]
+)
+def test_close_runtime_poll_failures_preserve_money_and_evidence(cloud, monkeypatch, fault):
+    module = runpy.run_path(str(GUARD))
+    guest_shutdown_history(cloud)
+    fixture = LIVE_GUEST_SHUTDOWNS[1]
+    stop = "2026-11-13T18:38:55Z"
+    cloud.change(
+        instances=[
+            dict(
+                name="run-a",
+                id="1",
+                zone="europe-west4-a",
+                status="STOPPING",
+                lastStartTimestamp=fixture["last_start"],
+                creationTimestamp=fixture["instance_created_at"],
+            )
+        ],
+        describe_updates=[{}, dict(status="TERMINATED", lastStopTimestamp=stop)],
+    )
+    if fault == "changed-id":
+        cloud.change(
+            describe_updates=[{}, dict(id="foreign", status="TERMINATED", lastStopTimestamp=stop)]
+        )
+    elif fault == "changed-start":
+        cloud.change(
+            describe_updates=[
+                {},
+                dict(
+                    lastStartTimestamp="2026-11-13T18:00:00Z",
+                    status="TERMINATED",
+                    lastStopTimestamp=stop,
+                ),
+            ]
+        )
+    elif fault == "delete-failed":
+        cloud.change(delete_error=True, require_runtime_evidence=stop)
+    elif fault in {"read-timeout", "disappeared"}:
+        real_cloud = module["Guard"].cloud
+        describe_reads = []
+        elapsed = [0.0]
+
+        def read(guard, *args, **kwargs):
+            if args[:3] == ("compute", "instances", "describe"):
+                describe_reads.append(kwargs.get("timeout", 300))
+                if len(describe_reads) == 2:
+                    if fault == "read-timeout":
+                        elapsed[0] += kwargs["timeout"]
+                        raise subprocess.TimeoutExpired("gcloud", kwargs["timeout"])
+                    cloud.change(instances=[], disks=[])
+                    return None
+            return real_cloud(guard, *args, **kwargs)
+
+        monkeypatch.setattr(module["Guard"], "cloud", read)
+        close_in_process(
+            cloud,
+            monkeypatch,
+            elapsed=elapsed,
+            extra=("--runtime-timeout", "12", "--poll-interval", "5"),
+            module=module,
+        )
+        assert len(describe_reads) == 2 and describe_reads[-1] <= 7
+        assert cloud.read()["sessions"][0]["settled_cost_usd"] == "3.749472"
+        return
+    with pytest.raises((module["GuardError"], subprocess.CalledProcessError)):
+        close_in_process(cloud, monkeypatch, elapsed=[0.0], module=module)
+    saved = cloud.read()["sessions"][0]
+    assert saved["settled_cost_usd"] is None and saved["status"] == "needs_settlement"
+    if fault == "changed-id":
+        assert not any(call[:3] == ["compute", "instances", "delete"] for call in cloud.calls())
+    elif fault == "changed-start":
+        assert saved["runtime_uncertain"]
+    elif fault == "delete-failed":
+        assert saved["runtime_evidence"]["stop"] == stop
+
+
+def test_close_dry_run_does_not_wait_for_guest_stop(cloud):
+    guest_shutdown_history(cloud)
+    cloud.change(instances=[dict(name="run-a", id="1", zone="europe-west4-a", status="STOPPING")])
+    before = cloud.ledger.read_bytes()
+    # The CLI dry-run flag is normally handled by main; use its real subprocess path.
+    result = cloud.run("close", "run-a", "--dry-run")
+    assert "delete" in result.stdout
+    assert cloud.ledger.read_bytes() == before
+
+
+def test_close_retries_timed_out_runtime_read_until_overall_deadline(cloud, monkeypatch):
+    guest_shutdown_history(cloud)
+    fixture = LIVE_GUEST_SHUTDOWNS[1]
+    stop = "2026-11-13T18:38:55Z"
+    cloud.change(
+        instances=[
+            dict(
+                name="run-a",
+                id="1",
+                zone="europe-west4-a",
+                status="STOPPING",
+                lastStartTimestamp=fixture["last_start"],
+                creationTimestamp=fixture["instance_created_at"],
+            )
+        ],
+        describe_updates=[{}, dict(status="TERMINATED", lastStopTimestamp=stop)],
+        require_runtime_evidence=stop,
+    )
+    module = runpy.run_path(str(GUARD))
+    real_cloud = module["Guard"].cloud
+    elapsed = [0.0]
+    reads = []
+
+    def read(guard, *args, **kwargs):
+        if args[:3] == ("compute", "instances", "describe"):
+            reads.append(kwargs.get("timeout", 300))
+            if len(reads) == 2:
+                elapsed[0] += kwargs["timeout"]
+                raise subprocess.TimeoutExpired("gcloud", kwargs["timeout"])
+        return real_cloud(guard, *args, **kwargs)
+
+    monkeypatch.setattr(module["Guard"], "cloud", read)
+    close_in_process(cloud, monkeypatch, elapsed=elapsed, module=module)
+    saved = cloud.read()["sessions"][0]
+    assert len(reads) == 3 and reads[1] == 60
+    assert elapsed[0] == 70
+    assert saved["runtime_evidence"]["source"].startswith("instances.describe")
+    assert saved["status"] == "closed"
+
+
+def test_close_retains_reservation_after_contradictory_intermediate_start(cloud, monkeypatch):
+    guest_shutdown_history(cloud)
+    fixture = LIVE_GUEST_SHUTDOWNS[1]
+    cloud.change(
+        instances=[
+            dict(
+                name="run-a",
+                id="1",
+                zone="europe-west4-a",
+                status="STOPPING",
+                lastStartTimestamp=fixture["last_start"],
+                creationTimestamp=fixture["instance_created_at"],
+            )
+        ],
+        describe_updates=[
+            dict(lastStartTimestamp="2026-11-13T18:00:00Z"),
+            dict(
+                status="TERMINATED",
+                lastStartTimestamp=fixture["last_start"],
+                lastStopTimestamp="2026-11-13T18:38:55Z",
+            ),
+        ],
+    )
+    module = runpy.run_path(str(GUARD))
+    with pytest.raises(module["GuardError"], match="reservation retained"):
+        close_in_process(cloud, monkeypatch, elapsed=[0.0], module=module)
+    saved = cloud.read()["sessions"][0]
+    assert saved["runtime_uncertain"]
+    assert saved["settled_cost_usd"] is None and saved["status"] == "needs_settlement"
+    assert any(call[:3] == ["compute", "instances", "delete"] for call in cloud.calls())
+
+
+def test_close_retains_reservation_when_terminal_stop_predates_guest_event(cloud, monkeypatch):
+    operations = guest_shutdown_history(cloud)
+    fixture = LIVE_GUEST_SHUTDOWNS[1]
+    cloud.change(
+        operations=[op for op in operations if op["operationType"] != "delete"],
+        instances=[
+            dict(
+                name="run-a",
+                id="1",
+                zone="europe-west4-a",
+                status="STOPPING",
+                lastStartTimestamp=fixture["last_start"],
+                creationTimestamp=fixture["instance_created_at"],
+                lastStopTimestamp="2026-11-13T18:00:00Z",
+            )
+        ],
+        describe_updates=[{}, dict(status="TERMINATED")],
+    )
+    module = runpy.run_path(str(GUARD))
+    with pytest.raises(module["GuardError"], match="reservation retained"):
+        close_in_process(cloud, monkeypatch, elapsed=[0.0], module=module)
+    saved = cloud.read()["sessions"][0]
+    assert saved["runtime_uncertain"]
+    assert saved["settled_cost_usd"] is None and saved["status"] == "needs_settlement"
+
+
+def test_guest_shutdown_malformed_timestamp_is_a_clean_refusal(cloud):
+    operations = guest_shutdown_history(cloud)
+    next(op for op in operations if op["operationType"] == "compute.instances.guestTerminate")[
+        "endTime"
+    ] = 5
+    cloud.change(operations=operations)
+    result = cloud.run("close", "run-a", ok=False)
+    assert result.returncode == 2 and "Traceback" not in result.stderr
+    assert cloud.read()["sessions"][0]["settled_cost_usd"] is None
