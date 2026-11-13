@@ -96,6 +96,8 @@ if name == "git":
         print(os.environ.get("CHECKOUT_HEAD", "a" * 40) if args[0] == "-C" else "a" * 40)
 elif name == "gcloud":
     if args[:2] == ["storage", "cp"] and args[-1].endswith("fetch-attempt-status.json"):
+        if os.environ.get("SOURCE_STATUS_FAIL") == "1":
+            sys.exit(23)
         pathlib.Path(args[-1]).write_text(json.dumps({"attempt_id": "fetch-123", "repo_sha": "b" * 40}))
 elif name == "sleep":
     marker = pathlib.Path(os.environ["RUN_DIR"]) / "synced-once"
@@ -394,6 +396,23 @@ def test_guest_audits_completed_folders_after_fetch_failure(
     assert len(phases) == 2
     assert all("--memory-budget-gib" in args for args in phases)
     assert not json.loads((guest / "state/attempt-status.json").read_text())["complete"]
+
+
+def test_source_status_failure_does_not_republish_restored_audit(environment_guest, monkeypatch):
+    guest, _, invoke = environment_guest
+    audit = guest / "state/audit/audit.json"
+    audit.parent.mkdir(parents=True)
+    audit.write_text('{"exit_code":0,"valid":true}')
+    job = guest.parent / "job.sh"
+    job.write_text(render("a" * 40, "gs://fake-corpus/job", audit_only=True))
+    monkeypatch.setenv("SOURCE_STATUS_FAIL", "1")
+    result, calls = invoke()
+    assert result.returncode == 23, result.stderr
+    status = json.loads((guest / "state/attempt-status.json").read_text())
+    assert status["exit_code"] == 23 and not status["complete"]
+    assert not any(
+        c["name"] == "gcloud" and c["args"][-1] == "gs://fake-corpus/job/audit.json" for c in calls
+    )
 
 
 @pytest.mark.parametrize("failure", [None, "verification", "wrong-attempt", "missing-audit"])

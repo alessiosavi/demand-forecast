@@ -18,11 +18,23 @@ import numpy as np
 DEFAULT_MEMORY_BUDGET_BYTES = 32 * 1024**3
 READ_BUFFER_BYTES = 64 * 1024
 VALUE_CHUNK_POINTS = 65536
-MEASUREMENT_VERSION = "buffered-arrow-1"
+MEASUREMENT_VERSION = "buffered-arrow-2"
 
 
 def peak_rss_bytes():
-    """getrusage reports bytes on macOS and KiB on Linux."""
+    """Absolute RSS high-water mark for this interpreter's address space.
+
+    Linux getrusage retains the pre-exec high-water mark: even a fresh worker
+    can inherit a large launcher's RSS. VmHWM belongs to the current mm and
+    resets on exec. Keep the whole worker footprint, including imports and
+    shared/file-backed pages; subtracting a baseline would hide real memory.
+    macOS getrusage reports bytes and does not retain that pre-exec watermark.
+    """
+    if sys.platform == "linux":
+        for line in Path("/proc/self/status").read_text().splitlines():
+            if line.startswith("VmHWM:"):
+                return int(line.split()[1]) * 1024
+        raise ValueError("cannot measure Linux peak RSS: /proc/self/status has no VmHWM")
     return int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) * (
         1 if sys.platform == "darwin" else 1024
     )

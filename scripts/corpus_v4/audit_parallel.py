@@ -70,7 +70,7 @@ def pair_plans(store, aliases):
     from scripts.corpus_v4 import audit_fev_overlap as a
 
     groups = {}
-    for (encoded,) in store.db.execute("SELECT meta FROM series"):
+    for (encoded,) in store.db.execute("SELECT meta FROM series ORDER BY rowid"):
         meta = json.loads(encoded)
         groups.setdefault(meta["freq"], set()).add(meta["dataset"])
     for ca in aliases:
@@ -151,7 +151,9 @@ class DecodedRows:
             raise
 
     def rows(self, alias):
-        for (encoded,) in self.db.execute("SELECT meta FROM rows WHERE freq=?", (alias,)):
+        for (encoded,) in self.db.execute(
+            "SELECT meta FROM rows WHERE freq=? ORDER BY rowid", (alias,)
+        ):
             meta = json.loads(encoded)
             for name in ("target", "covariates"):
                 spec = meta[name]
@@ -736,7 +738,9 @@ def scan_folders(
                                 in {"target", "covariates"}
                             )
                             requests.append(req)
-        except (ValueError, OSError) as exc:
+        except Exception as exc:
+            # Arrow decode/metadata errors also include exceptions outside
+            # ValueError/OSError. Preserve the per-folder validation report.
             info["failed"] = exc
             reports.pop(name, None)
             # Missing/corrupt folders are themselves retryable failed units.

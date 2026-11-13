@@ -5,9 +5,11 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
+
+pytest.importorskip("pyarrow")
 import pyarrow as pa
 import pyarrow.parquet as pq
-import pytest
 
 from scripts.corpus_v4 import audit_fev_overlap as audit
 from scripts.corpus_v4.native import iter_rows
@@ -20,6 +22,83 @@ def oracle(*args, **kwargs):
     # Run the original scanner directly: its CLI worker name belongs to the new code.
     baseline._scan_in_subprocess = baseline._scan_folder
     return baseline.run_audit(*args, **kwargs)
+
+
+@pytest.mark.parametrize("failure", ["corrupt-page", "unsupported-decode"])
+def test_folder_discovery_errors_preserve_other_folders_and_audit(tmp_path, monkeypatch, failure):
+    from scripts.corpus_v4 import audit_parallel
+    from scripts.corpus_v4.native import folder_frequencies
+
+    root = tmp_path / "corpus"
+    bad = native(root / "univariate/bad/train-000.parquet", target=[0.0] * 96)
+    native(root / "univariate/good/train-000.parquet", target=[0.0] * 96)
+    if failure == "corrupt-page":
+        pq.write_table(pq.read_table(bad), bad, compression=None, use_dictionary=False)
+        with pq.ParquetFile(bad) as parquet:
+            column = parquet.schema_arrow.get_field_index("freq")
+            offset = parquet.metadata.row_group(0).column(column).data_page_offset
+        with bad.open("r+b") as stream:
+            stream.seek(offset)
+            stream.write(b"\xff" * 8)
+        with pq.ParquetFile(bad) as parquet:
+            assert parquet.num_row_groups == 1  # identity pass can still read the footer
+        with pytest.raises((pa.ArrowInvalid, OSError)):
+            folder_frequencies(bad.parent)
+    else:
+
+        def discover(path):
+            if path == bad.parent:
+                raise pa.ArrowNotImplementedError("unsupported page encoding")
+            return folder_frequencies(path)
+
+        monkeypatch.setattr(audit_parallel, "folder_frequencies", discover)
+    data = manifest()
+    data["folders"] = [manifest(f"univariate/{name}")["folders"][0] for name in ("bad", "good")]
+    report, code = audit.run_audit(
+        root,
+        tmp_path / "out",
+        data,
+        [audit.BenchmarkSeries("bench", "b", "target", "h", np.zeros(96))],
+        state=tmp_path / "state",
+        workers=1,
+        control_runner=lambda *args: {"ok": True},
+    )
+    assert code == 2
+    assert report["failed_folders"] == ["univariate/bad"]
+    assert [folder["verdict"] for folder in report["folders"]] == ["inconclusive", "clean"]
+    assert report["folders"][0]["error"]
+    assert json.loads((tmp_path / "out/audit.json").read_text()) == report
+
+
+def test_sqlite_scan_order_is_stable_with_reversed_unordered_selects(tmp_path):
+    from scripts.corpus_v4.audit_parallel import DecodedRows, pair_plans
+
+    series = [audit.BenchmarkSeries("bench", str(i), "target", "h", np.zeros(96)) for i in range(3)]
+    store = audit.BenchmarkStore(tmp_path / "bench.sqlite", series)
+    native(tmp_path / "corpus/univariate/demo/train-000.parquet", target=[0.0] * 96)
+    path = tmp_path / "corpus/univariate/demo/train-000.parquet"
+    pq.write_table(pa.concat_tables([pq.read_table(path)] * 3), path)
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    decoded = DecodedRows(
+        scratch,
+        tmp_path / "corpus",
+        manifest()["folders"][0],
+        dict(shard=path.name, group=0),
+        32 * 1024**3,
+        dict(native_values_decoded=0),
+        lambda: None,
+    )
+    try:
+        plans = list(pair_plans(store, ["h"]))
+        store.db.execute("PRAGMA reverse_unordered_selects=ON")
+        decoded.db.execute("PRAGMA reverse_unordered_selects=ON")
+        assert [row["row_index"] for row in decoded.rows("h")] == [0, 1, 2]
+        assert [item.item_id for item in store.iter_frequency("h")] == ["0", "1", "2"]
+        assert list(pair_plans(store, ["h"])) == plans
+    finally:
+        decoded.close()
+        store.close()
 
 
 @pytest.mark.parametrize("workers", [1, 2, 4])
