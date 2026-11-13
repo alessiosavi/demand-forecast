@@ -181,7 +181,7 @@ class BenchmarkStore:
     def iter_frequency(self, alias=..., *, timestamps=True):
         """Project metadata before mapping histories; identity searches need no dates."""
         for meta, start, length, timed in self.db.execute(
-            "SELECT meta, start, length, timed FROM series"
+            "SELECT meta, start, length, timed FROM series ORDER BY rowid"
         ):
             item = json.loads(meta)
             if alias is not ... and item["freq"] != alias:

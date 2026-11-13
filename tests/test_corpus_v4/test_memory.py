@@ -4,6 +4,8 @@ import json
 import os
 import subprocess
 import sys
+from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -12,6 +14,74 @@ pa = pytest.importorskip("pyarrow")
 pq = pytest.importorskip("pyarrow.parquet")
 
 from scripts.corpus_v4.native import iter_rows, measure_folder  # noqa: E402
+
+
+def test_linux_peak_rss_uses_current_address_space_high_water(monkeypatch):
+    from scripts.corpus_v4 import native
+
+    monkeypatch.setattr(native, "sys", SimpleNamespace(platform="linux"))
+    monkeypatch.setattr(
+        native.resource, "getrusage", lambda _: SimpleNamespace(ru_maxrss=3 * 1024**2)
+    )
+
+    def status(path):
+        assert path == Path("/proc/self/status")
+        return "Name:\tpython\nVmHWM:\t98304 kB\nVmRSS:\t65536 kB\n"
+
+    monkeypatch.setattr(
+        native, "Path", lambda path: SimpleNamespace(read_text=lambda: status(Path(path)))
+    )
+    assert native.peak_rss_bytes() == 96 * 1024**2
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork/exec")
+@pytest.mark.parametrize("watchdog", [False, True])
+def test_worker_rss_is_independent_of_large_fork_parent(tmp_path, watchdog):
+    pq.write_table(
+        pa.Table.from_pylist([dict(item_id="a", source="x", freq="h", target=[[0.0] * 96])]),
+        tmp_path / "train-000.parquet",
+    )
+    worker = (
+        """
+import time
+from scripts.corpus_v4.native import start_memory_watchdog, peak_rss_bytes
+start_memory_watchdog(peak_rss_bytes() + 32*1024**2)
+payload = bytearray(96*1024**2)
+time.sleep(2)
+"""
+        if watchdog
+        else """
+import json, sys
+from scripts.corpus_v4.native import measure_folder
+print(json.dumps(measure_folder(sys.argv[1], 'univariate', memory_budget_bytes=256*1024**2)))
+"""
+    )
+    parent = """
+import json, resource, subprocess, sys
+payload = bytearray(384*1024**2)
+parent_peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * (1 if sys.platform == 'darwin' else 1024)
+# preexec_fn forces fork/exec instead of posix_spawn/vfork. The parent is single-threaded.
+child = subprocess.run([sys.executable, '-c', sys.argv[1], sys.argv[2]],
+    capture_output=True, text=True, timeout=20, preexec_fn=lambda: None)
+print(json.dumps(dict(parent_peak=parent_peak, code=child.returncode, stdout=child.stdout, stderr=child.stderr)))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", parent, worker, str(tmp_path)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=dict(os.environ, OPENBLAS_NUM_THREADS="1"),
+    )
+    assert result.returncode == 0, result.stderr
+    child = json.loads(result.stdout)
+    assert child["parent_peak"] >= 384 * 1024**2
+    assert child["code"] == (97 if watchdog else 0), child["stderr"]
+    if watchdog:
+        assert "memory budget exceeded: peak_rss_bytes=" in child["stderr"]
+    else:
+        stats = json.loads(child["stdout"])
+        assert stats["rows"] == 1
+        assert 0 < stats["measurement"]["peak_rss_bytes"] < 256 * 1024**2
 
 
 def large_shard(path, kind, rows, *, steps=2_100_001):

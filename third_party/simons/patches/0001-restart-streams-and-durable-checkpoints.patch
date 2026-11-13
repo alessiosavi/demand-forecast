@@ -1,0 +1,468 @@
+diff --git a/src/simons/training/trainer.py b/src/simons/training/trainer.py
+--- a/src/simons/training/trainer.py
++++ b/src/simons/training/trainer.py
+@@ -1,6 +1,7 @@
+ """Train synthetic or mixed real/synthetic batches and export model checkpoints."""
+ 
+ import copy
++import hashlib
+ import json
+ import os
+ import time
+@@ -26,6 +27,17 @@
+ )
+ from simons.training.distributed import Rank
+ from simons.training.optim import NorMuonAdamW
++from simons.training.reliability import (
++    CHECKPOINT_NAMES,
++    FINAL_NAME,
++    HASH_TRAILER,
++    SNAPSHOT_NAMES,
++    checkpoint_hash,
++    prune_checkpoints,
++    reseed,
++    role_position,
++    seed_worker,
++)
+ from simons.training.warp import power_warp
+ 
+ CHECKPOINT_FORMAT = "simons-train-1"
+@@ -40,6 +52,7 @@
+ 
+ def read_checkpoint(path) -> dict:
+     """A training checkpoint.pt (or soup) on the CPU; raises unless it has the format."""
++    checkpoint_hash(path, required=Path(path).name in CHECKPOINT_NAMES)
+     checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+     if checkpoint.get("format") != CHECKPOINT_FORMAT:
+         raise ValueError(f"{path} is not a Simons training checkpoint")
+@@ -49,11 +62,25 @@
+ def write_checkpoint(path: Path, payload: dict):
+     """Save `payload` to `path` atomically (a temporary file, then a rename)."""
+     temporary = path.with_suffix(".pt.tmp")
+-    torch.save(payload, temporary)
++    with temporary.open("w+b") as handle:
++        torch.save(payload, handle)
++        handle.flush()
++        handle.seek(0)
++        digest = hashlib.sha256()
++        for block in iter(lambda: handle.read(1 << 20), b""):
++            digest.update(block)
++        handle.write(HASH_TRAILER + digest.hexdigest().encode())
++        handle.flush()
++        os.fsync(handle.fileno())
+     temporary.replace(path)
+-
+-
+-def save_checkpoint(path: Path, model, optimizer, settings, step, seconds):
++    descriptor = os.open(path.parent, os.O_RDONLY)
++    try:
++        os.fsync(descriptor)
++    finally:
++        os.close(descriptor)
++
++
++def save_checkpoint(path: Path, model, optimizer, settings, step, seconds, metadata=None):
+     write_checkpoint(path, {
+         "format": CHECKPOINT_FORMAT,
+         "model_config": model.config.to_dict(),
+@@ -62,6 +89,7 @@
+         "optimizer": optimizer.state_dict(),
+         "step": step,
+         "elapsed_seconds": seconds,
++        **({"job_identity": metadata} if metadata is not None else {}),
+     })
+ 
+ 
+@@ -134,11 +162,13 @@
+ def train(config_path: Path, output: Path, data: str | None = None,
+           warm_start: str | None = None, resume: Path | None = None,
+           covariate_data: str | None = None, max_steps: int | None = None,
+-          shape_clusters: str | None = None):
++          shape_clusters: str | None = None, checkpoint_dir: Path | None = None,
++          checkpoint_minutes: float = 10.0, observer=None, probe_step: int | None = None,
++          checkpoint_metadata: dict | None = None):
+     """Train one YAML-configured stage and return its final checkpoint.pt path.
+     `output` must be new or empty; `max_steps` limits execution without changing the plan.
+     `warm_start` loads weights with a fresh optimizer; `resume` restores optimizer and step
+-    but restarts random streams and role phases over the remaining steps."""
++    and deterministically rebuilds random streams; role phases retain their leg origin."""
+     # Expandable CUDA segments avoid fragmentation from packed shapes changing every step.
+     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+     model_config, s = config_module.load(config_path, {
+@@ -184,6 +214,10 @@
+         optimizer.load_state_dict(state["optimizer"])
+         first_step, previous_seconds = state["step"], state["elapsed_seconds"]
+         del state
++    if probe_step is not None:
++        if observer is None or resume is not None or not warm_first <= probe_step < s["steps"]:
++            raise ValueError("probe_step requires qualification and a step within the original leg")
++        first_step = probe_step
+     if first_step >= s["steps"]:
+         raise ValueError("Nothing to train: the start step is past the plan's steps")
+     if rank.main:
+@@ -196,7 +230,9 @@
+     synthetic_augment.configure(s["synthetic_augment"], s["synthetic_augment_rate"],
+                                 s["synthetic_augment_weights"])
+     mech.configure(s["mech_bank"], s["mech_length"], s["mech_refresh"], s["mech_refresh_part"])
+-    stream = rank.stream_seed(s["seed"])
++    # Reset every rank's global/private streams from the absolute restart point.
++    # configure() above clears mechanistic banks; mixers and workers below are fresh.
++    stream = reseed(s["seed"], rank.rank, first_step)
+     base_share = 1.0 if stage1 else s["synthetic_fraction"]
+     mixer = None
+     if base_share > 0:
+@@ -212,7 +248,7 @@
+ 
+         if mixer is None or mixer.multi is None:
+             raise ValueError("covariate roles need the run's synthetic mixer with coupled groups")
+-        roles_hook = Hook(role_spec, stream, first_step, device, s["steps"] - first_step,
++        roles_hook = Hook(role_spec, stream, first_step, device, s["steps"] - warm_first,
+                           s["synthetic_context"] + future)
+         mixer.multi.roles = roles_hook.planner
+     if s["covariate_weight"] > 0:
+@@ -254,7 +290,8 @@
+                                        rank_batch)),
+             batch_size=rank_batch, collate_fn=collate(patch),
+             num_workers=rank.loader_workers(s["loader_workers"]) if device.type == "cuda" else 0,
+-            pin_memory=device.type == "cuda", generator=torch.Generator(),
++            pin_memory=device.type == "cuda", worker_init_fn=seed_worker,
++            generator=torch.Generator().manual_seed(stream * 1013 + index),
+         )
+ 
+     def batches():
+@@ -279,6 +316,31 @@
+     autocast = torch.autocast("cuda", torch.bfloat16, enabled=bf16)
+     model.train()
+     started, paused = time.monotonic(), 0.0
++    last_save = time.monotonic()
++    destination = checkpoint_dir or output
++    destination.mkdir(parents=True, exist_ok=True)
++    final_path = destination / "checkpoint.pt"
++    # Replace the older slot first after a restart, preserving the selected checkpoint.
++    next_slot = 1 if resume is not None and Path(resume).name == SNAPSHOT_NAMES[0] else 0
++
++    def persist():
++        nonlocal final_path, last_save, next_slot
++        sync()
++        check_finite()
++        if rank.main:
++            if checkpoint_dir is None:
++                checkpoint(output, model, optimizer, s, step, elapsed(), validation, device,
++                           autocast, log)
++            else:
++                final_path = destination / (FINAL_NAME if step == s["steps"]
++                                            else SNAPSHOT_NAMES[next_slot])
++                save_checkpoint(final_path, model, optimizer, s, step, elapsed(),
++                                checkpoint_metadata)
++                next_slot = 1 - next_slot
++                if step == s["steps"]:
++                    prune_checkpoints(destination)
++        rank.barrier()
++        last_save = time.monotonic()
+     step, logged, pass_logged = first_step, [], {}
+     nonfinite = torch.zeros((), dtype=torch.bool, device=device)
+ 
+@@ -312,8 +374,20 @@
+             log.flush()
+         logged, pass_logged = [], {}
+ 
++    def observed_batches():
++        iterator = iter(batches())
++        while True:
++            if observer is not None:
++                observer.begin(device)
++                observer.aux_wait = sum(p.stats["wait_seconds"] for _, p in passes)
++            try:
++                item = next(iterator)
++            except StopIteration:
++                return
++            yield item
++
+     try:
+-        for stage, (sequence, series_ids, slot_first) in batches():
++        for stage, (sequence, series_ids, slot_first) in observed_batches():
+             far_on = stage1 or stage >= s["far_from_stage"]
+             if mixer is not None:
+                 if stage > 0:
+@@ -329,7 +403,7 @@
+                     mixer.fraction = schedule.ramp_fraction(rows, len(keep), base_share)
+             if roles_hook is not None:
+                 # Prefetched pools use the preceding step's role phase, except at the first step.
+-                roles_hook.planner.step = max(step - 1, first_step) - first_step
++                roles_hook.planner.step = role_position(step, warm_first)[1]
+             host_ids = series_ids.numpy().copy()
+             host_first = slot_first.numpy().copy()
+             sequence = sequence.to(device, non_blocking=True)
+@@ -366,8 +440,10 @@
+             roles = None
+             if roles_hook is not None:
+                 sequence, series_ids, host_slots, roles = roles_hook.prepare(
+-                    step - first_step, mixer, sequence, series_ids, host_slots,
++                    role_position(step, warm_first)[0], mixer, sequence, series_ids, host_slots,
+                     far_offset=far_len)
++            if observer is not None:
++                observer.generated(device)
+             rate = schedule.multiplier(step, s, warm_first, warm)
+             for group in optimizer.param_groups:
+                 group["lr"] = group["peak_lr"] * rate
+@@ -394,26 +470,29 @@
+             optimizer.step()
+             step += 1
+             logged.append(mean_loss.detach())
++            if observer is not None:
++                supervised = int(count) + sum(p.last_supervised_values for _, p in passes)
++                auxiliary_wait = sum(p.stats["wait_seconds"] for _, p in passes) - observer.aux_wait
++                observer.end(device, step, supervised, auxiliary_wait)
+             if step % s["log_every"] == 0 or step == s["steps"]:
+                 write_log(rate, stage)
+             if s["max_steps"] is not None and step - first_step >= s["max_steps"]:
+                 break
+-            if step % s["checkpoint_every"] == 0 and step < s["steps"]:
++            due = time.monotonic() - last_save >= checkpoint_minutes * 60
++            if rank.active:
++                due = bool(rank.mean_value(torch.tensor(float(due), device=device)))
++            if (step % s["checkpoint_every"] == 0 or due) and step < s["steps"]:
+                 sync()
+                 check_finite()
+                 pause = time.monotonic()
+-                if rank.main:
+-                    checkpoint(output, model, optimizer, s, step, elapsed(), validation, device,
+-                               autocast, log)
+-                rank.barrier()
++                persist()
+                 paused += time.monotonic() - pause
+         sync()
+         if logged:
+             write_log(rate, stage)
+         check_finite()
++        persist()
+         if rank.main:
+-            checkpoint(output, model, optimizer, s, step, elapsed(), validation, device, autocast,
+-                       log)
+             covariates = {}
+             if roles_hook is not None:
+                 covariates["roles"] = roles_hook.summary()
+@@ -430,12 +509,14 @@
+             })
+         rank.barrier()
+     finally:
++        if observer is not None:
++            observer.close()
+         if log is not None:
+             log.close()
+         for _, cov_pass in passes:
+             cov_pass.close()
+         rank.close()
+-    return output / "checkpoint.pt"
++    return final_path
+ 
+ 
+ def covariate_passes(s, model_config, rank, stream_seed, first_step, device):
+diff --git a/src/simons/training/reliability.py b/src/simons/training/reliability.py
+new file mode 100644
+--- /dev/null
++++ b/src/simons/training/reliability.py
+@@ -0,0 +1,145 @@
++"""Distribution-correct restart streams, absolute role clocks and durable checkpoints."""
++
++import hashlib
++import json
++import os
++import pickle
++import random
++import socket
++from datetime import datetime, timezone
++from pathlib import Path
++
++import numpy as np
++import torch
++
++
++def reseed(seed, rank, step):
++    """Reset global streams; return a bounded seed for all fresh private streams.
++
++    The bound leaves room for upstream's affine private-generator seed offsets.
++    Pools, banks and worker iterators must be constructed *after* this call.
++    """
++    value = (
++        int.from_bytes(
++            hashlib.sha256(f"simons-spot-v1:{seed}:{rank}:{step}".encode()).digest()[:4], "little"
++        )
++        & 0x7FFFFFFF
++    )
++    random.seed(value)
++    np.random.seed(value)
++    torch.manual_seed(value)
++    if torch.cuda.is_available():
++        torch.cuda.manual_seed_all(value)
++    return value
++
++
++def seed_worker(_worker):
++    """Seed Python/NumPy/Torch in each loader worker from its private loader stream."""
++    from simons.synth import mech
++
++    mech.configure()  # Never inherit a parent trajectory bank into a worker.
++    value = torch.initial_seed()
++    random.seed(value)
++    np.random.seed(value % 2**32)
++    torch.manual_seed(value)
++
++
++def role_position(step, origin):
++    """Current and prefetched-pool role positions in the original leg's curriculum."""
++    return step - origin, max(step - 1, origin) - origin
++
++
++HASH_TRAILER = b"\nSIMONS-SHA256:"
++SNAPSHOT_NAMES = ("checkpoint-slot-0.pt", "checkpoint-slot-1.pt")
++FINAL_NAME = "checkpoint-final.pt"
++CHECKPOINT_NAMES = (*SNAPSHOT_NAMES, FINAL_NAME)
++
++
++def checkpoint_hash(path, required=True):
++    """Verify the SHA-256 footer covering all serialized bytes, including identity/step."""
++    path = Path(path)
++    trailer_size = len(HASH_TRAILER) + 64
++    with path.open("rb") as handle:
++        size = handle.seek(0, os.SEEK_END)
++        if size < trailer_size:
++            if not required:
++                return None
++            raise ValueError(f"missing checkpoint content hash: {path}")
++        handle.seek(-trailer_size, os.SEEK_END)
++        trailer = handle.read()
++        if not trailer.startswith(HASH_TRAILER):
++            if not required:
++                return None  # Upstream checkpoints outside durable state remain readable.
++            raise ValueError(f"missing checkpoint content hash: {path}")
++        handle.seek(0)
++        remaining = size - trailer_size
++        digest = hashlib.sha256()
++        while remaining:
++            block = handle.read(min(1 << 20, remaining))
++            if not block:
++                raise ValueError(f"truncated checkpoint: {path}")
++            digest.update(block)
++            remaining -= len(block)
++        value = digest.hexdigest()
++        if trailer[len(HASH_TRAILER) :] != value.encode():
++            raise ValueError(f"checkpoint content hash mismatch: {path}")
++        return value
++
++
++def latest_checkpoint(directory):
++    """Select by embedded absolute step after validation; names/mtimes carry no order."""
++    from simons.training.trainer import read_checkpoint
++
++    candidates = list(Path(directory).glob("checkpoint-*.pt"))
++    newest, newest_step = None, -1
++    for path in candidates:
++        if path.name not in CHECKPOINT_NAMES:
++            continue
++        try:
++            state = read_checkpoint(path)
++            required = {"model", "optimizer", "model_config", "training", "elapsed_seconds"}
++            step = state["step"]
++            if required <= state.keys() and type(step) is int and step > newest_step:
++                newest, newest_step = path, step
++        except (
++            OSError,
++            RuntimeError,
++            ValueError,
++            EOFError,
++            KeyError,
++            TypeError,
++            pickle.UnpicklingError,
++        ):
++            continue
++    if newest is not None:
++        return newest
++    if candidates:
++        raise ValueError(f"no valid committed checkpoint in {directory}; refusing a fresh run")
++    return None
++
++
++def prune_checkpoints(directory):
++    """A completed leg retains its stable final; remote slots remain bounded without deletes."""
++    directory = Path(directory)
++    if (directory / FINAL_NAME).is_file():
++        checkpoint_hash(directory / FINAL_NAME)
++        for name in SNAPSHOT_NAMES:
++            (directory / name).unlink(missing_ok=True)
++            (directory / (name + ".tmp")).unlink(missing_ok=True)
++
++
++def resume_record(directory, step):
++    """Record each restart in the experiment's durable append-only log."""
++    with (Path(directory) / "resume-log.jsonl").open("a") as handle:
++        handle.write(
++            json.dumps(
++                {
++                    "step": step,
++                    "utc": datetime.now(timezone.utc).isoformat(),
++                    "host": socket.gethostname(),
++                }
++            )
++            + "\n"
++        )
++        handle.flush()
++        os.fsync(handle.fileno())
+diff --git a/src/simons/training/covariates/roles.py b/src/simons/training/covariates/roles.py
+--- a/src/simons/training/covariates/roles.py
++++ b/src/simons/training/covariates/roles.py
+@@ -5,6 +5,8 @@
+ import numpy as np
+ import torch
+ from torch.utils.data import DataLoader, IterableDataset, get_worker_info
++
++from simons.training.reliability import seed_worker
+ 
+ from simons.covariates import ROLE_BINARY, ROLE_KNOWN, known_rows
+ from simons.synth.multi import MECHANISMS
+@@ -282,6 +284,7 @@
+             private.manual_seed(int(seed) * 1013 + 9049 + int(first_step))
+             loader = DataLoader(EffectRows(self.s, seed, first_step, self.length),
+                                 batch_size=None, generator=private, num_workers=workers,
++                                worker_init_fn=seed_worker,
+                                 pin_memory=self.device.type == "cuda",
+                                 persistent_workers=workers > 0,
+                                 prefetch_factor=8 if workers > 0 else None)
+diff --git a/src/simons/training/covariates/stream.py b/src/simons/training/covariates/stream.py
+--- a/src/simons/training/covariates/stream.py
++++ b/src/simons/training/covariates/stream.py
+@@ -6,6 +6,8 @@
+ import numpy as np
+ import torch
+ from torch.utils.data import DataLoader, IterableDataset, get_worker_info
++
++from simons.training.reliability import seed_worker
+ 
+ from simons.model import QUANTILES
+ from simons.synth.covariates import effects
+@@ -213,12 +215,13 @@
+         private.manual_seed(int(seed) * 1009 + 3304 + int(first_step)
+                             + (0 if tag == 3232 else 7 * tag))
+         self.loader = DataLoader(Batches(self.spec, seed, first_step), batch_size=None,
+-                                 generator=private, num_workers=workers,
++                                 generator=private, num_workers=workers, worker_init_fn=seed_worker,
+                                  pin_memory=device.type == "cuda",
+                                  persistent_workers=workers > 0,
+                                  prefetch_factor=4 if workers > 0 else None)
+         self.batches = iter(self.loader)
+         self.last_weight_sum = None
++        self.last_supervised_values = 0
+         self.stats = {"batches": 0, "windows": 0, "wait_seconds": 0.0, "kinds": {}}
+ 
+     def loss(self, model):
+@@ -230,6 +233,10 @@
+         self.stats["windows"] += len(batch["values"])
+         for k, n in batch["kinds"].items():
+             self.stats["kinds"][k] = self.stats["kinds"].get(k, 0) + int(n)
++        target = batch["values"].unflatten(-1, (-1, PATCH))[:, :, 1:]
++        inputs = batch["values"].masked_fill(batch["future"][:, None], float("nan"))
++        seen = torch.isfinite(inputs).unflatten(-1, (-1, PATCH)).any(-1).cummax(-1).values
++        self.last_supervised_values = int((torch.isfinite(target) & seen[..., :-1, None]).sum())
+         loss, self.last_weight_sum = batch_loss(model, batch, self.spec["history_weight"],
+                                                 self.device)
+         return loss

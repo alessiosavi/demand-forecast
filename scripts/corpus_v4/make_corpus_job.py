@@ -192,9 +192,9 @@ finish() {{
 trap finish EXIT
 trap 'exit 143' TERM
 trap 'exit 130' INT
-{source_status}# Invalidate previous success before provisioning or fetching anything.
+# Invalidate previous success before the source-status copy or any provisioning.
 rm -f "$AUDIT/audit.json"
-write_status -1
+{source_status}write_status -1
 gcloud storage cp "$RUN_DIR/state/attempt-status.json" "$CORPUS_URI/attempt-status.json"
 # The host restores state before invoking us. Upload every ten minutes as well.
 (

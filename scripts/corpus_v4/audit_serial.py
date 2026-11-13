@@ -33,7 +33,7 @@ def _scan_folder(root, entry, store, opportunities, memory_budget_bytes):
     budget = MemoryBudget(memory_budget_bytes)
     aliases = folder_frequencies(path)
     benchmark_groups = {}
-    for (encoded,) in store.db.execute("SELECT meta FROM series"):
+    for (encoded,) in store.db.execute("SELECT meta FROM series ORDER BY rowid"):
         meta = json.loads(encoded)
         benchmark_groups.setdefault(meta["freq"], set()).add(meta["dataset"])
     benchmark_aliases = sorted(benchmark_groups, key=lambda alias: alias or "")
