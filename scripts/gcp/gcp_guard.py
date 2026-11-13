@@ -188,7 +188,7 @@ class Guard:
             if temporary and os.path.exists(temporary):
                 os.unlink(temporary)
 
-    def cloud(self, *args, mutate=False, absent=False, timeout=300, clean_stderr=False):
+    def cloud(self, *args, mutate=False, absent=False, timeout=300, clean_stderr=False, raw=False):
         command = [
             "gcloud",
             *args,
@@ -221,6 +221,9 @@ class Guard:
         # Compute list can report partial failures as warnings with exit zero.
         if clean_stderr and result.stderr.strip():
             raise GuardError("inventory stderr; absence unverified: " + result.stderr.strip())
+        # storage cat emits the object body even with --format=json.
+        if raw:
+            return result.stdout
         return json.loads(result.stdout) if result.stdout.strip() else None
 
     def init(self, args):
@@ -310,13 +313,24 @@ class Guard:
             ]
         return resources
 
+    def marker(self, state_uri, key):
+        marker_uri = state_uri + "/" + key
+        metadata = self.cloud("storage", "objects", "describe", marker_uri, absent=True)
+        if metadata is None:
+            return None
+        body = self.cloud("storage", "cat", marker_uri, raw=True)
+        job_uri = next(
+            (
+                line.removeprefix("job_uri=")
+                for line in body.splitlines()
+                if line.startswith("job_uri=")
+            ),
+            None,
+        )
+        return dict(metadata, job_uri=job_uri or None)
+
     def markers(self, session):
-        return {
-            marker: self.cloud(
-                "storage", "objects", "describe", session["state_uri"] + "/" + marker, absent=True
-            )
-            for marker in MARKERS
-        }
+        return {key: self.marker(session["state_uri"], key) for key in MARKERS}
 
     def labels(self, session):
         return f"guard-ledger={self.config['token']},guard-session={session['label']}"
@@ -370,11 +384,16 @@ class Guard:
                 v.get("name") == old["label"] for v in inventory["instances"]
             ):
                 raise GuardError("state prefix already has an instance; close it before resuming")
-        if (
-            self.cloud("storage", "objects", "describe", state_uri + "/DONE", absent=True)
-            is not None
-        ):
-            raise GuardError("state prefix is DONE; refusing launch/resume")
+        done = self.marker(state_uri, "DONE")
+        if done is not None:
+            if not done["job_uri"]:
+                raise GuardError(
+                    "DONE has no job URI (legacy format); refusing launch/resume. "
+                    "Use a new state prefix, or verify the completed job and archive "
+                    "the legacy DONE before launching a different job."
+                )
+            if done["job_uri"] == args.job_uri:
+                raise GuardError("job URI is DONE; refusing launch/resume")
         session = {
             "label": args.label,
             "state_uri": state_uri,

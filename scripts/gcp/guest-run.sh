@@ -42,7 +42,11 @@ cloud() {
 log() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" >&2; }
 
 # Failures before usable metadata still end the VM. GCE's deadline remains armed.
-early_exit() { shutdown -h now; }
+early_exit() {
+    # Suppress the platform hook's copy/marker if startup has not been admitted.
+    if [[ -n ${FINISHED:-} ]]; then touch "$FINISHED"; fi
+    shutdown -h now
+}
 trap early_exit EXIT
 LABEL=$(metadata guard-label)
 STATE_URI=$(metadata guard-state-uri)
@@ -67,7 +71,8 @@ copy_state() {
 
 marker() {
     local key=$1 status=$2
-    printf 'label=%s\nexit_status=%s\ntime=%s\n' "$LABEL" "$status" "$(date -u +%FT%TZ)" > "$RUN_DIR/.$key"
+    printf 'label=%s\njob_uri=%s\nexit_status=%s\ntime=%s\n' \
+        "$LABEL" "$JOB_URI" "$status" "$(date -u +%FT%TZ)" > "$RUN_DIR/.$key"
     if [[ $key == STARTED ]]; then printf 'boot_time=%s\n' "$BOOT_TIME" >> "$RUN_DIR/.$key"; fi
     cloud "$MARKER_LIMIT" storage cp "$RUN_DIR/.$key" "$STATE_URI/$key"
 }
@@ -134,24 +139,67 @@ finish() {
     shutdown -h now
     exit "$status"
 }
+# Install before fetching the job, so the platform hook can flush local state.
+install -m 0755 -- "$0" /usr/local/sbin/gcp-guest-run.sh
+
+read_marker() {
+    local key=$1
+    MARKER_JOB_URI=
+    # Describe distinguishes an absent object from cat's unmatched-URL error.
+    if cloud "$MARKER_LIMIT" storage objects describe "$STATE_URI/$key" \
+        > "$RUN_DIR/.marker.json" 2> "$RUN_DIR/.marker-error"; then
+        if ! cloud "$MARKER_LIMIT" storage cat "$STATE_URI/$key" \
+            > "$RUN_DIR/.$key.previous" 2> "$RUN_DIR/.marker-error"; then
+            log "cannot read $key body; refusing to run"
+            exit 1
+        fi
+        MARKER_JOB_URI=$(sed -n 's/^job_uri=//p' "$RUN_DIR/.$key.previous")
+        return 0
+    elif ! grep -Eq '403|PERMISSION_DENIED|Permission denied' "$RUN_DIR/.marker-error" \
+        && grep -Eq '404|NOT_FOUND|not found|No such object' "$RUN_DIR/.marker-error"; then
+        return 1
+    else
+        log "cannot read $key or verify its absence"
+        exit 1
+    fi
+}
+
+if read_marker DONE; then
+    if [[ -z $MARKER_JOB_URI ]]; then
+        log 'DONE has no job URI (legacy format); refusing to run. Use a new state prefix, or verify the completed job and archive the legacy DONE before launching a different job.'
+        exit 0
+    elif [[ $MARKER_JOB_URI == "$JOB_URI" ]]; then
+        log 'job URI is DONE; refusing to run'
+        exit 0
+    fi
+    HAS_DONE=1
+else
+    HAS_DONE=0
+fi
+
+# Preserve prior outcomes before publishing this attempt. Interrupted/failed
+# attempts of the same job are archived too, so resume cannot leave stale results.
+# Keep the early-exit trap until admission ends: an archive failure must not run
+# finish(), sync local state, overwrite a result or invoke the preemption copy.
+ARCHIVE_TIME=$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)
+for key in DONE FAILED TIMEOUT PREEMPTED; do
+    if [[ $key == DONE ]]; then
+        [[ $HAS_DONE == 1 ]] || continue
+    elif ! read_marker "$key"; then
+        continue
+    fi
+    cloud "$MARKER_LIMIT" storage cp "$STATE_URI/$key" "$STATE_URI/history/$ARCHIVE_TIME-$LABEL-$key" \
+        || { log "archive copy failed for $key; refusing to run"; exit 1; }
+    cloud "$MARKER_LIMIT" storage rm "$STATE_URI/$key" \
+        || { log "archive delete failed for $key; refusing to run"; exit 1; }
+done
+
 trap 'finish $?' EXIT
 trap 'exit 143' TERM
 trap 'exit 130' INT
-
-# Install before fetching the job, so the platform hook can flush local state.
-install -m 0755 -- "$0" /usr/local/sbin/gcp-guest-run.sh
-if cloud "$MARKER_LIMIT" storage objects describe "$STATE_URI/DONE" > "$RUN_DIR/.done.json" 2> "$RUN_DIR/.done-error"; then
-    touch "$FINISHED"
-    trap - EXIT
-    shutdown -h now
-    exit 0
-elif ! grep -Eq '404|NOT_FOUND|not found|No such object' "$RUN_DIR/.done-error"; then
-    log 'cannot verify DONE absence'
-    exit 1
-fi
 marker STARTED started
 cloud "$RESTORE_LIMIT" storage rsync "$STATE_URI/" "$RUN_DIR/state/" --recursive \
-    --exclude='(^|/)(STARTED|DONE|FAILED|TIMEOUT|PREEMPTED|HEARTBEAT|logs)(/|$)'
+    --exclude='(^|/)(STARTED|DONE|FAILED|TIMEOUT|PREEMPTED|HEARTBEAT|logs|history)(/|$)'
 cloud "$JOB_FETCH_LIMIT" storage cp "$JOB_URI" "$RUN_DIR/job.sh"
 
 remaining=$(( $(date -u -d "$RESERVED_END" +%s) - $(date -u +%s) - 600 ))

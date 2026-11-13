@@ -13,6 +13,15 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts/gcp/guest-run.sh"
 
+
+def assert_marker_identity(path, label="run-a", job_uri="gs://test-bucket/job.sh"):
+    fields = dict(line.split("=", 1) for line in path.read_text().splitlines())
+    assert fields["label"] == label
+    assert fields["job_uri"] == job_uri
+    assert fields["time"].endswith("Z")
+    datetime.fromisoformat(fields["time"].replace("Z", "+00:00"))
+
+
 STUB = r"""
 import json, os, shutil, sys, time
 from pathlib import Path
@@ -31,7 +40,7 @@ elif name == 'timeout':
 elif name == 'gcloud':
     assert '--format=json' in args
     if args[:3] == ['storage', 'objects', 'describe']:
-        if (store/'DONE').exists(): print('{}')
+        if (store/args[3].rsplit('/', 1)[1]).exists(): print('{}')
         else:
             print('HTTPError 404: No such object', file=sys.stderr)
             sys.exit(1)
@@ -48,9 +57,12 @@ elif name == 'gcloud':
             Path(dst).mkdir(parents=True, exist_ok=True)
             import re
             exclude = next((a.split('=', 1)[1] for a in args if a.startswith('--exclude=')), '')
-            for p in store.iterdir():
-                if p.is_file() and not (exclude and re.search(exclude, p.name)):
-                    shutil.copy(p, Path(dst)/p.name)
+            for p in store.rglob('*'):
+                relative = p.relative_to(store)
+                if p.is_file() and not (exclude and re.search(exclude, str(relative))):
+                    target = Path(dst)/relative
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy(p, target)
         else:
             count = Path(os.environ['COUNT'])
             n = int(count.read_text())+1 if count.exists() else 1
@@ -64,11 +76,30 @@ elif name == 'gcloud':
     elif args[:2] == ['storage', 'cp']:
         src, dst = args[2:4]
         if os.environ.get('HANG_MARKER') and dst.endswith('/PREEMPTED'): time.sleep(30)
-        if src.startswith('gs://'): shutil.copy(os.environ['JOB'], dst)
+        if src.startswith('gs://') and dst.startswith('gs://'):
+            if src.endswith('/'+os.environ.get('FAIL_ARCHIVE', 'NO_MARKER')):
+                print('synthetic archive copy failure', file=sys.stderr)
+                sys.exit(1)
+            target = store/dst.split('/state/', 1)[1]
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(store/src.split('/state/', 1)[1], target)
+        elif src.startswith('gs://'): shutil.copy(os.environ['JOB'], dst)
         else:
             target = store/dst.split('/state/', 1)[1]
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy(src, target)
+    elif args[:2] == ['storage', 'cat']:
+        target = store/args[2].split('/state/', 1)[1]
+        if os.environ.get('MARKER_READ_ERROR'):
+            print('403 Permission denied', file=sys.stderr)
+            sys.exit(1)
+        if not target.exists():
+            # SDK 593 storage cat uses NameExpansionIterator, unlike describe.
+            print('The following URLs matched no objects or files:\n'+args[2], file=sys.stderr)
+            sys.exit(1)
+        sys.stdout.write(target.read_text())
+    elif args[:2] == ['storage', 'rm']:
+        (store/args[2].split('/state/', 1)[1]).unlink()
     else: raise AssertionError(args)
 else: raise AssertionError(name)
 """
@@ -118,7 +149,21 @@ def guest(tmp_path):
     )
 
     class Guest:
-        def run(self, *args, fail="", seconds=610, hang="", hang_marker="", **overrides):
+        def run(
+            self,
+            *args,
+            fail="",
+            seconds=610,
+            hang="",
+            hang_marker="",
+            label=None,
+            job_uri=None,
+            **overrides,
+        ):
+            if label is not None:
+                metadata["guard-label"] = label
+            if job_uri is not None:
+                metadata["guard-job-uri"] = job_uri
             metadata["guard-reserved-end"] = (
                 datetime.now(timezone.utc) + timedelta(seconds=seconds)
             ).isoformat()
@@ -157,6 +202,8 @@ def test_failed_periodic_copy_does_not_kill_job_and_next_copy_recovers(guest):
     assert "copy failed" in result.stderr
     assert (guest.store / "logs/run-a.log").exists()
     assert any(c[0] == "shutdown" for c in guest.calls())
+    for key in ("STARTED", "HEARTBEAT", "DONE"):
+        assert_marker_identity(guest.store / key)
 
 
 def test_job_timeout_writes_timeout_and_powers_off(guest):
@@ -166,6 +213,7 @@ def test_job_timeout_writes_timeout_and_powers_off(guest):
     assert (guest.store / "TIMEOUT").exists(), result.stderr
     assert not (guest.store / "DONE").exists()
     assert any(c[0] == "shutdown" for c in guest.calls())
+    assert_marker_identity(guest.store / "TIMEOUT")
 
 
 def test_done_never_fetches_or_runs_job(guest):
@@ -174,6 +222,8 @@ def test_done_never_fetches_or_runs_job(guest):
     assert result.returncode == 0, result.stderr
     assert not any(c[:3] == ["gcloud", "storage", "cp"] for c in guest.calls())
     assert any(c[0] == "shutdown" for c in guest.calls())
+    assert "no job URI" in result.stderr
+    assert "archive" in result.stderr and "new state prefix" in result.stderr
 
 
 def test_failed_final_copy_never_writes_done(guest):
@@ -191,6 +241,7 @@ def test_preemption_copies_state_once_and_marks_interruption(guest):
     assert result.returncode == 0, result.stderr
     assert (guest.store / "checkpoint").read_text() == "resume me"
     assert (guest.store / "PREEMPTED").exists()
+    assert_marker_identity(guest.store / "PREEMPTED")
     assert not any(c[0] == "shutdown" for c in guest.calls())
 
 
@@ -199,6 +250,7 @@ def test_job_failure_preserves_status_and_preemption_hook_ignores_normal_end(gue
     result = guest.run()
     assert result.returncode == 7, result.stderr
     assert "exit_status=7" in (guest.store / "FAILED").read_text()
+    assert_marker_identity(guest.store / "FAILED")
     guest.run("--preempt")
     assert not (guest.store / "PREEMPTED").exists()
 
@@ -381,3 +433,132 @@ def test_final_copy_enforces_its_override_and_refuses_done_on_timeout(guest):
     assert result.returncode != 0, result.stderr
     assert not (guest.store / "DONE").exists()
     assert (guest.store / "FAILED").exists()
+
+
+def test_different_job_archives_terminal_markers_before_started_and_restores_checkpoint(guest):
+    assert guest.run().returncode == 0
+    old_done = (guest.store / "DONE").read_text()
+    previous = "label=run-a\njob_uri=gs://test-bucket/job.sh\ntime=2026-11-13T00:00:00Z\n"
+    for key in ("FAILED", "TIMEOUT", "PREEMPTED"):
+        (guest.store / key).write_text(previous)
+    guest.job.write_text(
+        '[ "$(cat "$RUN_DIR/state/checkpoint")" = checkpoint ] || exit 9\n'
+        'printf next > "$RUN_DIR/state/checkpoint"\n'
+    )
+    before = len(guest.calls())
+    result = guest.run(label="run-b", job_uri="gs://test-bucket/leg-2.sh")
+    assert result.returncode == 0, result.stderr
+    assert (guest.store / "checkpoint").read_text() == "next"
+    assert_marker_identity(guest.store / "DONE", "run-b", "gs://test-bucket/leg-2.sh")
+    calls = guest.calls()[before:]
+    started = next(
+        i
+        for i, c in enumerate(calls)
+        if c[:3] == ["gcloud", "storage", "cp"] and c[4].endswith("/STARTED")
+    )
+    for key in ("DONE", "FAILED", "TIMEOUT", "PREEMPTED"):
+        archived = list((guest.store / "history").glob(f"*-run-b-{key}"))
+        assert len(archived) == 1
+        assert archived[0].read_text() == (old_done if key == "DONE" else previous)
+        timestamp = archived[0].name.removesuffix(f"-run-b-{key}")
+        assert timestamp.endswith("Z")
+        datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        copied = next(
+            i
+            for i, c in enumerate(calls)
+            if c[:3] == ["gcloud", "storage", "cp"]
+            and c[3].endswith("/" + key)
+            and "/history/" in c[4]
+        )
+        deleted = next(
+            i
+            for i, c in enumerate(calls)
+            if c[:3] == ["gcloud", "storage", "rm"] and c[3].endswith("/" + key)
+        )
+        assert copied < deleted < started
+        if key != "DONE":
+            assert not (guest.store / key).exists()
+
+
+@pytest.mark.parametrize("key", ["DONE", "FAILED", "TIMEOUT", "PREEMPTED"])
+def test_archive_copy_failure_preserves_marker_and_never_runs_job(guest, key):
+    previous = "label=old\njob_uri=gs://test-bucket/old.sh\ntime=2026-11-13T00:00:00Z\n"
+    (guest.store / key).write_text(previous)
+    (guest.store / "checkpoint").write_text("saved")
+    guest.job.write_text('touch "$RUN_DIR/ran-job"\n')
+    result = guest.run(FAIL_ARCHIVE=key)
+    assert result.returncode != 0, result.stderr
+    assert (guest.store / key).read_text() == previous
+    assert (guest.store / "checkpoint").read_text() == "saved"
+    assert not (guest.store / "STARTED").exists()
+    assert not (guest.tmp / "runs/run-a/ran-job").exists()
+    assert not any(c[:3] == ["gcloud", "storage", "rm"] for c in guest.calls())
+    assert not any(c[:3] == ["gcloud", "storage", "rsync"] for c in guest.calls())
+    assert any(c[0] == "shutdown" for c in guest.calls())
+    # A platform hook following this power-off must not publish another result.
+    before = len(guest.calls())
+    assert guest.run("--preempt").returncode == 0
+    assert not any(c[0] == "gcloud" for c in guest.calls()[before:])
+
+
+def test_same_job_done_powers_off_without_fetching_or_archiving(guest):
+    previous = "label=old\njob_uri=gs://test-bucket/job.sh\ntime=2026-11-13T00:00:00Z\n"
+    (guest.store / "DONE").write_text(previous)
+    result = guest.run()
+    assert result.returncode == 0, result.stderr
+    assert (guest.store / "DONE").read_text() == previous
+    assert not (guest.store / "STARTED").exists()
+    assert not any(c[:3] == ["gcloud", "storage", "cp"] for c in guest.calls())
+    assert any(c[0] == "shutdown" for c in guest.calls())
+
+
+def test_same_job_preempted_marker_is_archived_on_resume(guest):
+    local = guest.tmp / "runs/run-a/state"
+    local.mkdir(parents=True)
+    (local / "checkpoint").write_text("preempted")
+    assert guest.run("--preempt").returncode == 0
+    previous = (guest.store / "PREEMPTED").read_text()
+    guest.job.write_text(
+        '[ "$(cat "$RUN_DIR/state/checkpoint")" = preempted ] || exit 9\n'
+        'printf resumed > "$RUN_DIR/state/checkpoint"\n'
+    )
+    result = guest.run(label="run-b")
+    assert result.returncode == 0, result.stderr
+    archived = list((guest.store / "history").glob("*-run-b-PREEMPTED"))
+    assert len(archived) == 1 and archived[0].read_text() == previous
+    assert not (guest.store / "PREEMPTED").exists()
+    assert (guest.store / "checkpoint").read_text() == "resumed"
+    assert_marker_identity(guest.store / "DONE", "run-b")
+
+
+def test_restore_excludes_history_logs_and_all_marker_objects(guest):
+    (guest.store / "history").mkdir()
+    (guest.store / "history/old-DONE").write_text("archived result")
+    (guest.store / "logs").mkdir()
+    (guest.store / "logs/old.log").write_text("old log")
+    for key in ("STARTED", "HEARTBEAT", "DONE", "FAILED", "TIMEOUT", "PREEMPTED"):
+        (guest.store / key).write_text("job_uri=gs://test-bucket/old.sh\n")
+    (guest.store / "checkpoints").mkdir()
+    (guest.store / "checkpoints/final").write_text("saved")
+    guest.job.write_text(
+        '[ "$(cat "$RUN_DIR/state/checkpoints/final")" = saved ] || exit 9\n'
+        'printf ran > "$RUN_DIR/ran-job"\n'
+    )
+    result = guest.run()
+    assert result.returncode == 0, result.stderr
+    local = guest.tmp / "runs/run-a/state"
+    assert sorted(str(p.relative_to(local)) for p in local.rglob("*")) == [
+        "checkpoints",
+        "checkpoints/final",
+    ]
+    assert (guest.tmp / "runs/run-a/ran-job").read_text() == "ran"
+
+
+def test_unreadable_done_fails_closed_without_running_job(guest):
+    previous = "job_uri=gs://test-bucket/old.sh\n"
+    (guest.store / "DONE").write_text(previous)
+    result = guest.run(MARKER_READ_ERROR="yes")
+    assert result.returncode != 0
+    assert (guest.store / "DONE").read_text() == previous
+    assert not (guest.store / "STARTED").exists()
+    assert not any(c[:3] == ["gcloud", "storage", "cp"] for c in guest.calls())

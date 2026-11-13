@@ -178,12 +178,49 @@ The default state prefix is `gs://<bucket>/runs/<label>/state`; `--state-uri` ca
 select another prefix in the same bucket. Resume copies the previous launch
 configuration and reserves **new** money against the same prefix. It does not
 release the old reservation. Any existing instance using that prefix blocks a new
-launch, even a stopped VM: close it first. A `DONE` object blocks both launch and
-resume. Storage permission and transport errors are refusals, not absent markers.
-`status` returns VM data and object metadata for STARTED, DONE, FAILED, TIMEOUT,
-PREEMPTED and HEARTBEAT; heartbeat update time shows checkpoint liveness. STARTED
-is informational and never prevents a launch or resume. Old interruption
-markers persist; their bodies identify their session and time.
+launch, even a stopped VM: close it first. `DONE` means that **its job URI** has
+finished, rather than that the whole prefix has finished. Both launch and resume
+refuse a DONE whose `job_uri` equals the job being started. Resume retains the
+old session's job URI; it cannot start the next leg of a chain. Use a new label
+and a different job URI with `launch --state-uri` for that.
+
+A legacy DONE without a nonempty `job_uri` is conservatively treated as the same
+job and blocks both commands and guest startup. The refusal explains recovery:
+use a new state prefix, or verify which job completed and manually copy the legacy
+DONE into `history/`, then remove its root object only after the copy succeeds,
+before launching a different job on the shared checkpoints. Do not remove a DONE
+to rerun a completed job accidentally. Give each leg a distinct job URI; changing
+the contents at the same URI does not change its identity.
+
+For example, after publishing two distinct job scripts, run a chain sequentially:
+
+```bash
+CHAIN_STATE="gs://$GCP_BUCKET/runs/chain-01/state"
+guard launch chain-leg-1 --machine-type "$GCP_MACHINE" --zone "$GCP_ZONE" \
+  --provisioning "$GCP_PROVISIONING" --hours 2 --boot-disk-size 100 \
+  --image-family "$GCP_IMAGE_FAMILY" --image-project "$GCP_IMAGE_PROJECT" \
+  --state-uri "$CHAIN_STATE" --job-uri "gs://$GCP_BUCKET/jobs/leg-1.sh"
+guard status chain-leg-1
+# Wait for leg-1's DONE, then verify/settle deletion of its VM and disk.
+guard close chain-leg-1
+guard launch chain-leg-2 --machine-type "$GCP_MACHINE" --zone "$GCP_ZONE" \
+  --provisioning "$GCP_PROVISIONING" --hours 2 --boot-disk-size 100 \
+  --image-family "$GCP_IMAGE_FAMILY" --image-project "$GCP_IMAGE_PROJECT" \
+  --state-uri "$CHAIN_STATE" --job-uri "gs://$GCP_BUCKET/jobs/leg-2.sh"
+guard status chain-leg-2
+```
+
+Add any hardware-specific disk/NIC options described above to each launch.
+Leg 2 restores leg 1's final checkpoint from the same prefix; it archives leg 1's
+DONE before writing its own STARTED. To continue an interrupted leg instead,
+use `resume chain-leg-2 chain-leg-2-retry` after its VM is gone, keeping that
+leg's job URI. Close and settle each session separately.
+
+Storage permission and transport errors are refusals, not absent markers.
+`status` returns VM data and object metadata plus `job_uri` for each STARTED,
+DONE, FAILED, TIMEOUT, PREEMPTED and HEARTBEAT (null for a legacy marker);
+heartbeat update time shows checkpoint liveness. STARTED is informational and
+never prevents a launch or resume.
 
 Dry runs print exact JSON argv arrays, execute only read-only discovery, and
 change neither resources nor ledger bytes (including its lock file). They validate
@@ -271,13 +308,22 @@ It may destroy an overdue job's unflushed state; inspect the dry run first.
 ## Guest contract and recovery
 
 The guest reads `guard-label`, `guard-state-uri`, `guard-job-uri` and
-`guard-reserved-end` from instance metadata. It checks DONE before restoring state
-or fetching the job. It then writes STARTED with its label and UTC boot time,
+`guard-reserved-end` from instance metadata. It reads DONE before restoring state
+or fetching the job, powering off if it belongs to this job URI or has no job URI.
+Before STARTED, it copies terminal markers DONE, FAILED, TIMEOUT and PREEMPTED to
+`<state URI>/history/<UTC time>-<new label>-<MARKER>`, deleting each root object
+only after that copy succeeds. This includes interruption/failure markers of the
+same job when resuming; a matching or legacy DONE is never archived automatically.
+An archive read/copy/delete failure powers off before state upload or job execution,
+preserving every marker that was not successfully copied. STARTED and HEARTBEAT
+are refreshed in place, rather than archived.
+Every marker body records `label`, `job_uri`, `exit_status` and UTC `time`.
+It then writes STARTED with its UTC boot time as well,
 creating the prefix before restore: real `gcloud storage rsync` rejects a source
 prefix with no objects. STARTED is excluded from restore and is not a terminal
 marker. Other restore errors still fail closed without running the job.
 Data in the state prefix is restored to `$RUN_DIR/state`;
-markers and logs are excluded. `RUN_DIR` defaults to `/var/lib/gcp-run/<label>`;
+markers, `history/` and logs are excluded. `RUN_DIR` defaults to `/var/lib/gcp-run/<label>`;
 `STATE_URI` and `RUN_DIR` are exported to the Bash job. The job must reconstruct
 itself from `$RUN_DIR/state` and write **only there** what it needs to continue.
 Everything else, including Local SSD and the boot disk, is disposable.

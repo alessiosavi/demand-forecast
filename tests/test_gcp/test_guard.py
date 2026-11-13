@@ -42,6 +42,13 @@ if args[:3] == ['storage', 'objects', 'describe']:
     if state.get('marker_error'): end(error='403 Permission denied')
     if marker in state.get('markers', []): end(dict(name=marker, update_time='2026-11-13T00:00:00Z'))
     end(error='HTTPError 404: No such object')
+if args[:2] == ['storage', 'cat']:
+    marker = args[2].rsplit('/', 1)[1]
+    if state.get('marker_read_error'): end(error='403 Permission denied')
+    if marker not in state.get('markers', []): end(error='HTTPError 404: No such object')
+    save()
+    sys.stdout.write(state.get('marker_bodies', {}).get(marker, ''))
+    sys.exit(0)
 if args[:3] == ['compute', 'instances', 'create']:
     ledger = json.loads(Path(os.environ['LEDGER']).read_text())
     session = ledger['sessions'][-1]
@@ -488,6 +495,90 @@ def test_done_or_active_state_refuses_resume_and_status_has_markers(cloud):
     assert status[0]["markers"]["DONE"]["name"] == "DONE"
     assert status[0]["markers"]["STARTED"]["name"] == "STARTED"
     assert status[0]["markers"]["HEARTBEAT"]["update_time"]
+
+
+def test_different_job_launches_on_done_prefix_but_same_job_and_resume_are_refused(cloud):
+    cloud.setup()
+    cloud.launch()
+    prefix = cloud.read()["sessions"][0]["state_uri"]
+    old_job = "gs://test-bucket/jobs/job.sh"
+    cloud.change(markers=["DONE"], marker_bodies={"DONE": f"job_uri={old_job}\n"})
+    # The prefix's existing instance still blocks even a different job.
+    active = cloud.launch(
+        "run-b", "--state-uri", prefix, "--job-uri", "gs://test-bucket/jobs/leg-2.sh", ok=False
+    )
+    assert active.returncode == 2 and "already has an instance" in active.stderr
+    cloud.change(instances=[], disks=[])
+    before = cloud.ledger.read_bytes()
+    same = cloud.launch("same", "--state-uri", prefix, ok=False)
+    resumed = cloud.run("resume", "run-a", "resumed", ok=False)
+    assert same.returncode == resumed.returncode == 2
+    assert "DONE" in same.stderr and "DONE" in resumed.stderr
+    assert cloud.ledger.read_bytes() == before
+    cloud.launch("run-b", "--state-uri", prefix, "--job-uri", "gs://test-bucket/jobs/leg-2.sh")
+    second = cloud.read()["sessions"][1]
+    assert second["state_uri"] == prefix
+    assert second["launch"]["job_uri"] == "gs://test-bucket/jobs/leg-2.sh"
+    creates = [c for c in cloud.calls() if c[:3] == ["compute", "instances", "create"]]
+    assert len(creates) == 2
+
+
+@pytest.mark.parametrize("body", ["", "label=old\ntime=2026-11-13T00:00:00Z\n", "job_uri=\n"])
+def test_legacy_done_refuses_launch_and_resume_with_recovery_message(cloud, body):
+    cloud.setup()
+    cloud.launch()
+    prefix = cloud.read()["sessions"][0]["state_uri"]
+    cloud.change(instances=[], disks=[], markers=["DONE"], marker_bodies={"DONE": body})
+    before = cloud.ledger.read_bytes()
+    for result in (
+        cloud.launch(
+            "run-b", "--state-uri", prefix, "--job-uri", "gs://test-bucket/other.sh", ok=False
+        ),
+        cloud.run("resume", "run-a", "run-c", ok=False),
+    ):
+        assert result.returncode == 2
+        assert "no job URI" in result.stderr
+        assert "archive" in result.stderr and "new state prefix" in result.stderr
+    assert cloud.ledger.read_bytes() == before
+
+
+def test_preempted_same_job_can_resume_with_original_job_uri(cloud):
+    cloud.setup()
+    cloud.launch()
+    original = cloud.read()["sessions"][0]
+    cloud.change(
+        instances=[],
+        disks=[],
+        markers=["PREEMPTED"],
+        marker_bodies={"PREEMPTED": "job_uri=gs://test-bucket/jobs/job.sh\n"},
+    )
+    cloud.run("resume", "run-a", "run-b")
+    resumed = cloud.read()["sessions"][1]
+    assert resumed["launch"]["job_uri"] == original["launch"]["job_uri"]
+    assert resumed["state_uri"] == original["state_uri"]
+    create = next(c for c in reversed(cloud.calls()) if c[:3] == ["compute", "instances", "create"])
+    assert any("guard-job-uri=gs://test-bucket/jobs/job.sh" in a for a in create)
+
+
+def test_status_shows_each_markers_job_uri(cloud):
+    cloud.setup()
+    cloud.launch()
+    keys = ["STARTED", "HEARTBEAT", "DONE", "FAILED", "TIMEOUT", "PREEMPTED"]
+    cloud.change(
+        markers=keys,
+        marker_bodies={key: f"job_uri=gs://test-bucket/{key}.sh\n" for key in keys},
+    )
+    markers = json.loads(cloud.run("status", "run-a").stdout)[0]["markers"]
+    for key in keys:
+        assert markers[key]["job_uri"] == f"gs://test-bucket/{key}.sh"
+        assert markers[key]["name"] == key
+
+
+def test_unreadable_done_blocks_launch_without_reservation(cloud):
+    cloud.setup()
+    cloud.change(markers=["DONE"], marker_read_error=True)
+    assert cloud.launch(ok=False).returncode == 2
+    assert not cloud.read()["sessions"]
 
 
 @pytest.mark.parametrize("operation", ["launch", "resume", "close", "sweep"])
