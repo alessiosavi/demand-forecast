@@ -1812,12 +1812,33 @@ def test_cancelled_session_reopens_money_before_preemption_history_errors(cloud)
     session.update(status="cancelled", settled_cost_usd="0.000000")
     cloud.ledger.write_text(json.dumps(ledger))
     cloud.change(
-        instances=[dict(name="run-a", id="1", zone="europe-west4-a", status="RUNNING")],
+        instances=[
+            dict(
+                name="run-a",
+                id=session["instance_id"],
+                zone=session["launch"]["zone"],
+                status="RUNNING",
+                creationTimestamp=session["instance_created_at"],
+                lastStartTimestamp=session["last_start"],
+                disks=[],
+            )
+        ],
         operations_warning="partial operation history",
     )
-    assert cloud.run("close", "run-a", ok=False).returncode == 2
+    before = len(cloud.calls())
+    result = cloud.run("close", "run-a", ok=False)
+    # Unreadable history no longer aborts the close: the machine is stopped and deleted, the
+    # re-opened money stays held, and the refusal is the guard's own (not a failing fake).
+    assert result.returncode == 2 and "reservation retained" in result.stderr
+    assert "Traceback" not in result.stderr
+    calls = [call[:3] for call in cloud.calls()[before:]]
+    assert ["compute", "instances", "stop"] in calls
+    assert ["compute", "instances", "delete"] in calls
     saved = cloud.read()["sessions"][0]
     assert saved["status"] == "needs_settlement" and saved["settled_cost_usd"] is None
+    assert saved["pre_stop_history_error"]["reason"] == "stderr"
+    assert saved["reopened"]["reason"] == "cancelled_session_resource"
+    assert json.loads(cloud.state.read_text())["instances"] == []
 
 
 @pytest.mark.parametrize("command", ["status", "wait", "close"])
