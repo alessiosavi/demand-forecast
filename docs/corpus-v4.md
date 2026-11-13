@@ -54,6 +54,27 @@ identities. Existing completed folders are rehashed before skip; measurements
 are regenerated to avoid trusting modified stats. Policy/revision mismatches in
 an existing corpus require a new root.
 
+The pinned tree contains 150 Parquet shards in exactly 121 dataset folders
+(62 univariate, 59 covariate), matching all 97 allowed and 24 quarantined
+manifest entries. Each shard sits directly inside its dataset folder; 115
+folders have one shard and six have multiple shards (up to 13). Inventory keeps
+all of them. Under the two data roots, only `train-*.parquet`,
+`validation-*.parquet`, `LICENSE.md` and `articles.csv` are accepted, at exactly
+`<root>/<dataset>/<file>`. Every folder must contain a training shard; side
+files cannot satisfy that requirement. Invalid paths are reported together
+before transfer. Root documentation, assets and `statistics/` are outside this
+folder inventory.
+
+Ten `LICENSE.md` files retain per-source licence records. Three `articles.csv`
+files in `nyc_subway_events`, `wikipedia_sports_fixtures` and
+`wikipedia_tv_episodes` retain Wikipedia attribution: the release README points
+to NOTICE, which describes the article/series mappings and dated revisions.
+These side files are fetched, verified, recorded in the same folder receipt,
+restored after interruptions and kept beside the data, including in quarantine.
+All 13 are non-LFS Git blobs in this revision, verified with the Git blob SHA1
+(including the blob header); the 150 shards use LFS SHA256. Side files are never
+parsed or included in row/value statistics or the content audit.
+
 Allowed data lands only in `corpus/univariate/<dataset>` and
 `corpus/covariates/<dataset>`. Quarantine lands only in
 `corpus/quarantine/{univariate,covariates}/<dataset>`. Pass the two explicit
@@ -71,6 +92,31 @@ columns and nonnumeric sequences fail. NaN/null observations remain missing.
 `train-*.parquet` and `validation-*.parquet` are the only accepted shard names.
 Original segment IDs and channel ordering are preserved; ingestion does not
 stitch, resample, flatten, or truncate native files.
+
+The metadata-only regression fixture
+`tests/test_corpus_v4/fixtures/simons-5f17ab8-tree.json` contains all 172 release
+paths, sizes and hashes, with no dataset payloads. Its paths come from the stored
+`simons_api.json`; sizes/Git oids/LFS oids come from `simons_tree.json` alongside
+it (the API capture has paths only). The stored `simons_manifest.json` is the
+release's `statistics/manifest.json`: its `files[].folder` set matches the
+frozen policy exactly. Dataset display names and `source` aliases can differ
+from folder names and are not used to infer paths. The breakdown CSVs describe
+public, private and synthetic training populations, so their totals are not
+acceptance counts for this public subset. They do not specify per-row lengths,
+Arrow schemas or exact frequency strings; these remain runtime checks. The
+README's segment IDs and optional metadata agree with the native validator;
+empty covariate lists are supported, as required by the NOTICE's seven clubs
+without schedule pages. Long-row counts and memory-guard compatibility still
+require the cloud run; no row is truncated to fit a guard.
+
+Trainer compatibility was checked against upstream Simons commit
+`8e338e915d26c8960713889ef12ab1cf5c08d591`:
+`src/simons/training/data.py::corpus_files` selects only
+`<split>-*.parquet` in the supplied root or one dataset directory below it and
+rejects deeper Parquet nesting. The covariate loader in
+`src/simons/training/covariates/windows.py` uses the same selector. Licence,
+attribution, receipt and statistics files therefore cannot enter either loader.
+Supply the explicit `univariate/` and `covariates/` roots described above.
 
 Each folder has `stats.json`: rows and split counts, target variates, exact
 length histogram/min/max/mean, count of rows at least 16,384 steps, target and

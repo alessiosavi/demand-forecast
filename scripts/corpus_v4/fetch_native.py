@@ -12,6 +12,8 @@ from typing import Protocol
 from scripts.corpus_v4.freeze_manifest import DEFAULT_MANIFEST, read_manifest, validate_manifest
 from scripts.corpus_v4.native import atomic_json, digest, folder_path, measure_folder
 
+SIDECAR_NAMES = {"LICENSE.md", "articles.csv"}
+
 
 @dataclass(frozen=True)
 class HubFile:
@@ -24,10 +26,10 @@ class HubFile:
 
 
 class Hub(Protocol):
-    """Only production boundary with the public Hub; synthetic fakes implement this."""
+    """Only production boundary with the public Hub; offline fakes implement this."""
 
     def inventory(self, repo_id: str, revision: str) -> tuple[str, list[HubFile]]:
-        """Return resolved revision and complete native shard metadata."""
+        """Return resolved revision and all files under the two native data roots."""
         ...
 
     def download(self, repo_id: str, revision: str, file: HubFile, destination: Path):
@@ -46,8 +48,8 @@ class PublicHub:
         for item in info.siblings:
             if not item.rfilename.startswith(("univariate/", "covariates/")):
                 continue
-            if not item.rfilename.endswith(".parquet"):
-                raise ValueError(f"unexpected native tree file: {item.rfilename}")
+            # Keep side files and unknown paths: inventory validates the complete
+            # tree against the manifest and reports every offending path together.
             lfs = item.lfs
             files.append(
                 HubFile(
@@ -93,23 +95,40 @@ def inventory(manifest, hub):
         raise ValueError("Hub resolved another revision")
     by_folder = {entry["folder"]: [] for entry in manifest["folders"]}
     seen = set()
+    unexpected = []
     for file in sorted(files, key=lambda f: f.path):
         path = PurePosixPath(file.path)
         folder = str(path.parent)
         if (
             folder not in by_folder
             or len(path.parts) != 3
+            or ".." in path.parts
             or str(path) != file.path
             or "\\" in file.path
             or file.path in seen
-            or not path.name.startswith(("train-", "validation-"))
-            or path.suffix != ".parquet"
+            or not (
+                path.name in SIDECAR_NAMES
+                or (path.name.startswith(("train-", "validation-")) and path.suffix == ".parquet")
+            )
         ):
-            raise ValueError(f"file/folder not in manifest: {file.path}")
+            unexpected.append(file.path)
+            continue
         seen.add(file.path)
         by_folder[folder].append(file)
-    if any(not files for files in by_folder.values()):
-        raise ValueError("manifest folder missing from pinned inventory")
+    if unexpected:
+        raise ValueError("unexpected native tree files or folders:\n" + "\n".join(unexpected))
+    missing = [
+        folder
+        for folder, files in by_folder.items()
+        if not any(
+            PurePosixPath(file.path).name.startswith("train-") and file.path.endswith(".parquet")
+            for file in files
+        )
+    ]
+    if missing:
+        raise ValueError(
+            "manifest folders missing train shards from pinned inventory:\n" + "\n".join(missing)
+        )
     return by_folder
 
 
