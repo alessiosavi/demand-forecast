@@ -1,5 +1,6 @@
 # Separate Python 3.12 environment. Install the CUDA torch wheel first (see docs).
 # Adapter sources: autogluon/fev@9cf943c388e5cfaf352175ea3c69e408b197d997.
+# Simons adapter source: Abel-ai-lab/Simons@8e338e915d26c8960713889ef12ab1cf5c08d591 (optional install, see docs).
 fev==0.10.0
 chronos-forecasting==2.2.2
 timestral @ git+https://github.com/mistralai/timestral.git@a534bdbd244d64f3d9d743f46c7bf6fc330ed4ff

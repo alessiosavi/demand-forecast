@@ -54,6 +54,19 @@ into a shared runner. The same Apache-2.0 text ships beside the module as
 `demand_forecast/bench/yardsticks/LICENSE-APACHE-2.0`. The models themselves are
 not redistributed; their weights keep their own licences.
 
+The Simons adapter in the same module (`SimonsAdapter`) follows the fev benchmark
+script of Simons at commit `8e338e915d26c8960713889ef12ab1cf5c08d591`
+(`benchmarks/fev_bench.py`), licensed under Apache-2.0, Copyright 2026 Abel AI Lab:
+https://github.com/Abel-ai-lab/Simons/tree/8e338e915d26c8960713889ef12ab1cf5c08d591
+
+Its NOTICE states: "This product includes software developed at Abel AI Lab
+(https://abel.ai)." The port keeps the upstream grouping of an item's targets
+(blocks of at most 32), the known-future covariate layout and the quantile sorting
+and interpolation, and adds an explicit processing switch: `raw` turns the inference
+processing rules off, `published` leaves an exported configuration untouched. The
+same Apache-2.0 text applies (`demand_forecast/bench/yardsticks/LICENSE-APACHE-2.0`).
+Simons itself, its weights and its training data are not redistributed.
+
 `demand_forecast/bench/tasks/fev_bench_weekly.yaml` contains seven unmodified
 entries from fev's `benchmarks/fev_bench/tasks.yaml` at tag `v0.10.0`:
 https://github.com/autogluon/fev/blob/v0.10.0/benchmarks/fev_bench/tasks.yaml
