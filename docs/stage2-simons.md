@@ -309,10 +309,13 @@ state prefix. No launch, cloud access or model download happens in the generator
 Replace `--checkpoint-uri` with `--hub-weights abel-lab/REPO --hub-revision SHA`
 for an anonymous Hub download; the full 40-character revision is mandatory.
 Only `config.json` and `model.safetensors` are copied. Both files are SHA-256
-hashed before scoring, and changed checkpoint contents on a resumed prefix are
-refused. The task YAML and optional one-name-per-line selection require SHA-256
-hashes. Omit both names switches to select the complete YAML. `--max-context N`
-is the only extra inference switch; it must be a positive integer.
+hashed before scoring, and changed checkpoint contents are refused when resume
+downloads them again. A completed marker's early exit checks only recorded state;
+it does not contact the checkpoint source or detect changes there. Use a new score
+name/state prefix to score a changed checkpoint. The task YAML and optional
+one-name-per-line selection require SHA-256 hashes. Omit both names switches to
+select the complete YAML. `--max-context N` is the only extra inference switch;
+it must be a positive integer.
 
 The job starts with the training environment's system-site-packages venv and uv
 fallback for missing ensurepip. The full yardstick requirements cannot run on
@@ -342,9 +345,16 @@ completed and failed task names (first error line), wall seconds and provenance.
 `completed.json` is published atomically after both modes finish; failed tasks or
 a nonzero scorer status give a nonzero job exit. Failed runs remain resumable.
 A successful marker permits a dependency-free exit only after hashing the recorded
-state artifacts and checking task/window coverage; partial or damaged restored
-artifacts cause the normal resume path. This is evidence consistency checking,
-not a fresh recomputation of fev scores. There is no concurrent-writer lock: use
-one guest per score name/state prefix. GPU execution, numerical parity, memory fit
+state artifacts and checking task/window coverage. Missing or damaged input
+identity can be repaired from the marker before this check. Incomplete evidence
+requires the normal resume path; damaged checkpoint hashes are repaired only when
+freshly downloaded hashes match the marker's independent copy. Without independent
+evidence, damaged identity or checkpoint hashes cause refusal to overwrite state.
+Changed inputs, or downloaded checkpoint contents that differ from trusted
+recorded hashes, cause refusal. State written by the `139f3f7` guest retains its
+input identity and checkpoint path through these recovery fixes. This is evidence
+consistency checking, not a fresh recomputation of fev scores. There is no
+concurrent-writer lock: use one guest per score name/state prefix. GPU execution,
+numerical parity, memory fit
 and real preemption/copy recovery require a GPU canary; offline stubs establish
 control flow, input validation and local recovery behavior only.

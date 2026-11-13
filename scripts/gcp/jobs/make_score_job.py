@@ -49,6 +49,29 @@ def read(path):
     return json.loads(path.read_text())
 
 
+def read_object(path):
+    try:
+        value = read(path)
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def restored_config(config, root):
+    # Recovery-only fixes remain compatible with the guest shipped in 139f3f7.
+    # Preserve its recorded identity, including the adapter's checkpoint path.
+    legacy = dict(config, guest_sha256="a726e1e81f4ad804683b5164aebbf38aefb2107a7983a0b4faad8b1de200916f")
+    if legacy in (read_object(root / "inputs.json"), read_object(root / "completed.json").get("inputs")):
+        return legacy
+    return config
+
+
+def valid_checkpoint_hashes(value):
+    return (isinstance(value, dict) and set(value) == {"config.json", "model.safetensors"}
+            and all(isinstance(h, str) and len(h) == 64 and set(h) <= set("0123456789abcdef")
+                    for h in value.values()))
+
+
 def safe_child(root, name):
     parts = pathlib.PurePosixPath(name).parts
     if not parts or name.startswith("/") or any(p in (".", "..") for p in name.split("/")) or "\\" in name:
@@ -95,29 +118,25 @@ def evidence(root, mode, names, label):
                      and all(digest(safe_child(task, p)) == h for p, h in windows.items()))
             if valid:
                 completed.append(name)
-        except (OSError, ValueError, KeyError, TypeError):
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
             pass
     return completed
 
 
 def preflight(config, root):
     identity = root / "inputs.json"
-    marker_path = root / "completed.json"
-    marker = None
-    if marker_path.exists():
-        try:
-            marker = read(marker_path)
-        except (ValueError, OSError):
-            pass  # A partial remote copy is repaired using the durable identity.
-        if isinstance(marker, dict) and marker.get("inputs") != config:
-            raise ValueError("different inputs under the same score name; choose a new name")
-    if identity.exists():
-        if read(identity) != config:
+    marker = read_object(root / "completed.json")
+    marker_inputs = marker.get("inputs")
+    if isinstance(marker_inputs, dict) and marker_inputs.keys() == config.keys() and marker_inputs != config:
+        raise ValueError("different inputs under the same score name; choose a new name")
+    recorded = read_object(identity)
+    if recorded.keys() == config.keys():
+        if recorded != config:
             raise ValueError("different inputs under the same score name; choose a new name")
     else:
-        if not isinstance(marker, dict) and any(
+        if marker_inputs != config and any(
                 p.name != "completed.json" and not p.name.endswith(".tmp") for p in root.iterdir()):
-            raise ValueError("score state has no input identity; refusing to overwrite")
+            raise ValueError("score state has no valid input identity; refusing to overwrite")
         # A matching completion marker carries the full identity independently;
         # remote copies can deliver it and task evidence before inputs.json.
         atomic(identity, config)
@@ -155,7 +174,7 @@ def preflight(config, root):
                 required.update(mode + "/" + name + "/" + p for p in record["window_sha256"])
             required.add(mode + "/summaries.csv")
         return 0 if required <= hashes.keys() else 10
-    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, csv.Error):
         return 10
 
 
@@ -220,7 +239,17 @@ def inputs(config, root, scratch):
             raise ValueError("empty checkpoint file: " + filename)
     hashes = {name: digest(download / name) for name in ("config.json", "model.safetensors")}
     prior = root / "checkpoint-sha256.json"
-    if prior.exists() and read(prior) != hashes:
+    recorded = read_object(prior)
+    marker = read_object(root / "completed.json")
+    marker_hashes = marker.get("checkpoint_sha256") if marker.get("inputs") == config else None
+    if valid_checkpoint_hashes(marker_hashes):
+        # The marker is independent of a partial or damaged local hash manifest.
+        recorded = marker_hashes
+    elif not valid_checkpoint_hashes(recorded):
+        if prior.exists() or (root / "completed.json").exists():
+            raise ValueError("checkpoint hash evidence is damaged or missing; refusing to overwrite without matching completion hashes")
+        recorded = None
+    if recorded is not None and recorded != hashes:
         raise ValueError("different checkpoint contents under the same score name")
     atomic(prior, hashes)
     # The adapter hashes its absolute checkpoint path in the resume identity.
@@ -305,6 +334,7 @@ def main():
     action, config_file, scratch_dir, repo_dir, python = sys.argv[1:]
     config, scratch, repo = read(pathlib.Path(config_file)), pathlib.Path(scratch_dir), pathlib.Path(repo_dir)
     root = state_root(config)
+    config = restored_config(config, root)
     if action == "preflight":
         return preflight(config, root)
     if action == "image":

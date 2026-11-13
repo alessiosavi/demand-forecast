@@ -84,6 +84,7 @@ def test_generated_shell_is_valid(score_jobs, tmp_path, processing):
 
 @pytest.fixture
 def machine(score_jobs, tmp_path):
+    score_name = "probe_" + hashlib.sha256(str(tmp_path).encode()).hexdigest()[:16]
     bins = tmp_path / "bin"
     bins.mkdir()
     cloud = tmp_path / "cloud"
@@ -254,7 +255,9 @@ def machine(score_jobs, tmp_path):
     script = tmp_path / "job.sh"
 
     def run(options=None, **overrides):
-        script.write_text(score_jobs.generate(**arguments(**(options or {}))))
+        script.write_text(
+            score_jobs.generate(**arguments(**{"name": score_name, **(options or {})}))
+        )
         return subprocess.run(
             ["bash", str(script)], env={**env, **overrides}, capture_output=True, text=True
         )
@@ -262,7 +265,7 @@ def machine(score_jobs, tmp_path):
     def events():
         return [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()]
 
-    yield run, Path(env["RUN_DIR"]) / "state/score/probe_1", events, cloud
+    yield run, Path(env["RUN_DIR"]) / "state/score" / score_name, events, cloud
     # The checkpoint path must remain stable across guest labels for the adapter's identity.
     for event in events():
         if event[0] == "score":
@@ -406,7 +409,7 @@ def test_restored_state_resumes_with_new_guest_label(machine, tmp_path):
     checkpoints = [e[2][e[2].index("--checkpoint") + 1] for e in calls]
     assert len(set(checkpoints)) == 1
     assert (
-        new_run / "state/score/probe_1/raw/beta/new/window_0.npz"
+        new_run / "state/score" / state.name / "raw/beta/new/window_0.npz"
     ).stat().st_mtime_ns == saved_time
 
 
@@ -447,4 +450,195 @@ def test_completion_repairs_identity_missing_from_partial_restore(machine):
     result = run()
     assert result.returncode == 0, result.stderr
     assert (state / "inputs.json").is_file()
+    assert not any(e[0] in ["score", "git", "gcloud"] for e in events()[before:])
+
+
+@pytest.mark.parametrize("damage", ["{", "null", "{}"])
+@pytest.mark.parametrize("marker_state", ["matching", "missing", "different"])
+def test_damaged_identity_requires_matching_completion_marker(machine, damage, marker_state):
+    run, state, events, _ = machine
+    assert run().returncode == 0
+    identity = state / "inputs.json"
+    original = identity.read_bytes()
+    identity.write_text(damage)
+    marker_path = state / "completed.json"
+    if marker_state == "missing":
+        marker_path.unlink()
+    elif marker_state == "different":
+        marker = json.loads(marker_path.read_text())
+        marker["inputs"]["max_context"] = 1024
+        marker_path.write_text(json.dumps(marker))
+    before = len(events())
+    result = run()
+    if marker_state == "matching":
+        assert result.returncode == 0, result.stderr
+        assert identity.read_bytes() == original
+    else:
+        assert result.returncode != 0
+        assert (
+            "input identity" if marker_state == "missing" else "different inputs"
+        ) in result.stderr
+        assert identity.read_text() == damage
+    assert not any(e[0] in ["score", "git", "gcloud"] for e in events()[before:])
+
+
+@pytest.mark.parametrize("damage", ["{", "null", "{}"])
+@pytest.mark.parametrize("with_marker", [False, True])
+@pytest.mark.parametrize("changed", [False, True])
+def test_damaged_checkpoint_hashes_require_independent_evidence(
+    machine, damage, with_marker, changed
+):
+    run, state, events, cloud = machine
+    assert run().returncode == 0
+    prior = state / "checkpoint-sha256.json"
+    original = prior.read_bytes()
+    prior.write_text(damage)
+    if not with_marker:
+        (state / "completed.json").unlink()
+    if changed:
+        (cloud / "export/model.safetensors").write_bytes(b"different checkpoint")
+    before = len(events())
+    result = run()
+    calls = [e for e in events()[before:] if e[0] == "score"]
+    if with_marker and not changed:
+        assert result.returncode == 0, result.stderr
+        assert prior.read_bytes() == original
+        assert [e[1] for e in calls] == ["raw", "published"]
+    else:
+        assert result.returncode != 0
+        expected = "different checkpoint contents" if with_marker else "checkpoint hash evidence"
+        assert expected in result.stderr
+        if not with_marker:
+            assert "different checkpoint contents" not in result.stderr
+        assert prior.read_text() == damage
+        assert not calls
+
+
+@pytest.mark.parametrize("changed", [False, True])
+def test_missing_checkpoint_hashes_use_completion_evidence(machine, changed):
+    run, state, events, cloud = machine
+    assert run().returncode == 0
+    (state / "checkpoint-sha256.json").unlink()
+    if changed:
+        (cloud / "export/model.safetensors").write_bytes(b"different checkpoint")
+    before = len(events())
+    result = run()
+    calls = [e for e in events()[before:] if e[0] == "score"]
+    if changed:
+        assert result.returncode != 0 and "different checkpoint contents" in result.stderr
+        assert not (state / "checkpoint-sha256.json").exists()
+        assert not calls
+    else:
+        assert result.returncode == 0, result.stderr
+        assert (state / "checkpoint-sha256.json").is_file()
+        assert [e[1] for e in calls] == ["raw", "published"]
+
+
+@pytest.mark.parametrize("damage", ["{}", "null"])
+def test_missing_hashes_and_damaged_marker_refuse_without_independent_evidence(machine, damage):
+    run, state, events, _ = machine
+    assert run().returncode == 0
+    (state / "checkpoint-sha256.json").unlink()
+    (state / "completed.json").write_text(damage)
+    before = len(events())
+    result = run()
+    assert result.returncode != 0 and "checkpoint hash evidence" in result.stderr
+    assert not (state / "checkpoint-sha256.json").exists()
+    assert not any(e[0] == "score" for e in events()[before:])
+
+
+@pytest.mark.parametrize("changed", [False, True])
+def test_completion_hashes_decide_when_local_hashes_conflict(machine, changed):
+    run, state, events, cloud = machine
+    assert run().returncode == 0
+    prior = state / "checkpoint-sha256.json"
+    original = prior.read_bytes()
+    local_hashes = json.loads(original)
+    local_hashes["model.safetensors"] = hashlib.sha256(b"different checkpoint").hexdigest()
+    prior.write_text(json.dumps(local_hashes))
+    damaged = prior.read_bytes()
+    if changed:
+        (cloud / "export/model.safetensors").write_bytes(b"different checkpoint")
+    before = len(events())
+    result = run()
+    calls = [e for e in events()[before:] if e[0] == "score"]
+    if changed:
+        assert result.returncode != 0 and "different checkpoint contents" in result.stderr
+        assert prior.read_bytes() == damaged
+        assert not calls
+    else:
+        assert result.returncode == 0, result.stderr
+        assert prior.read_bytes() == original
+        assert [e[1] for e in calls] == ["raw", "published"]
+
+
+@pytest.mark.parametrize("damage", ["{", "null", "{}", '{"inputs": null}'])
+def test_damaged_completion_marker_resumes_with_durable_identity(machine, damage):
+    run, state, events, _ = machine
+    assert run().returncode == 0
+    (state / "completed.json").write_text(damage)
+    result = run()
+    assert result.returncode == 0, result.stderr
+    assert len([e for e in events() if e[0] == "score"]) == 4
+
+
+@pytest.mark.parametrize("windows", [["window_0.npz"], "window_0.npz"])
+def test_damaged_window_manifest_is_incomplete_evidence(score_jobs, tmp_path, windows):
+    guest = {"__name__": "score_job_test"}
+    exec(score_jobs.GUEST, guest)
+    task = tmp_path / "raw/alpha"
+    task.mkdir(parents=True)
+    (task.parent / "summaries.csv").write_text(
+        "task,model_name,run_identity\nalpha,probe-raw,identity\n"
+    )
+    (task / "run.json").write_text(
+        json.dumps({"run_identity": "identity", "summary": {}, "window_sha256": windows})
+    )
+    assert guest["evidence"](tmp_path, "raw", ["alpha"], "probe-raw") == []
+
+
+@pytest.mark.parametrize("failed", [False, True])
+@pytest.mark.parametrize("identity_damage", [None, "{", "null"])
+def test_139f3f7_state_keeps_its_identity_and_checkpoint_path(machine, failed, identity_damage):
+    run, state, events, _ = machine
+    assert run(FAIL_TASK="1" if failed else "0").returncode == int(failed)
+    identity = state / "inputs.json"
+    config = json.loads(identity.read_text())
+    config["guest_sha256"] = "a726e1e81f4ad804683b5164aebbf38aefb2107a7983a0b4faad8b1de200916f"
+    identity.write_text(json.dumps(config, sort_keys=True) + "\n")
+    marker_path = state / "completed.json"
+    marker = json.loads(marker_path.read_text())
+    marker["inputs"] = config
+    marker["artifacts"]["inputs.json"] = hashlib.sha256(identity.read_bytes()).hexdigest()
+    marker_path.write_text(json.dumps(marker))
+    if identity_damage is not None:
+        identity.write_text(identity_damage)
+    before = len(events())
+    result = run()
+    assert result.returncode == 0, result.stderr
+    assert json.loads(identity.read_text()) == config
+    calls = [e for e in events()[before:] if e[0] == "score"]
+    if failed:
+        expected = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()
+        assert len(calls) == 2
+        assert all(
+            Path(e[2][e[2].index("--checkpoint") + 1])
+            == Path("/tmp") / ("demand-forecast-score-" + expected) / "checkpoint"
+            for e in calls
+        )
+    else:
+        assert not any(e[0] in ["score", "git", "gcloud"] for e in events()[before:])
+
+
+def test_unknown_guest_identity_is_refused(machine):
+    run, state, events, _ = machine
+    assert run().returncode == 0
+    identity = state / "inputs.json"
+    config = json.loads(identity.read_text())
+    config["guest_sha256"] = "f" * 64
+    identity.write_text(json.dumps(config))
+    before = len(events())
+    result = run()
+    assert result.returncode != 0 and "different inputs" in result.stderr
+    assert json.loads(identity.read_text()) == config
     assert not any(e[0] in ["score", "git", "gcloud"] for e in events()[before:])
