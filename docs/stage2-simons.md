@@ -50,9 +50,46 @@ The job copies the prefix to `$RUN_DIR/corpus/` on local disk. No corpus is
 needed for the first two legs or export. Long-pass usable lengths/observation
 requirements remain as upstream specifies; missing usable rows are errors.
 
-Supply the executable `job.sh` to the Google guest runner as its one job script.
-The runner's machine-launch interface is maintained separately; this integration
-relies only on its stated contract. On the guest, the actual job invocation is:
+Upload each leg's generated `job.sh` under its own Cloud Storage object name,
+for example `gs://BUCKET/jobs/simons-25m-seed11-stage1.sh`, then
+`gs://BUCKET/jobs/simons-25m-seed11-stage2.sh`, and so on through export.
+**Every leg's job URI must be distinct.** Do not overwrite a shared job object
+between legs: the runner associates terminal markers with the job URI.
+
+Use one state prefix per run for all five training legs and export, with the
+same size and seed. Start each leg with `launch` and a new session label,
+passing `--state-uri <run prefix>` and that leg's `--job-uri`. For example,
+with `guard` configured as described in the separately maintained `docs/gcp.md`:
+
+```bash
+gcloud storage cp /tmp/simons-stage1/job.sh \
+  gs://BUCKET/jobs/simons-25m-seed11-stage1.sh
+guard launch simons-stage1-01 \
+  --machine-type "$GCP_MACHINE" --zone "$GCP_ZONE" \
+  --provisioning "$GCP_PROVISIONING" --hours 2 --boot-disk-size 100 \
+  --image-family "$GCP_IMAGE_FAMILY" --image-project "$GCP_IMAGE_PROJECT" \
+  --state-uri gs://BUCKET/runs/simons-25m-seed11/state \
+  --job-uri gs://BUCKET/jobs/simons-25m-seed11-stage1.sh
+# Continue this leg after preemption, once its old VM is absent:
+guard resume simons-stage1-01 simons-stage1-02
+```
+
+After a leg completes, close its session before starting the next leg. For
+stage2, upload that leg's generator output under its own object name and use
+`launch simons-stage2-01` with the same machine options and
+`--state-uri gs://BUCKET/runs/simons-25m-seed11/state`, changing `--job-uri` to
+`gs://BUCKET/jobs/simons-25m-seed11-stage2.sh`. Repeat for stage3, stage4,
+stage4-long and export, waiting for each leg to complete. Use `resume` only
+to continue an interrupted leg; it retains that leg's job URI and state prefix
+and takes a new session label, rather than selecting the next leg.
+
+A terminal marker belongs to a job URI, not to the whole state prefix. Launching
+a different job URI on the run prefix archives the previous job's terminal
+markers and runs the new leg, preserving the training state for its predecessor
+weights. Launch or resume of the same job URI is refused once it is `DONE`.
+
+The guest runner's implementation is maintained separately. On the guest, the
+actual job invocation is:
 
 ```bash
 # RUN_DIR and STATE_URI are already exported by the guest runner.
@@ -61,8 +98,9 @@ bash /path/to/job.sh
 ```
 
 Use one GPU per job and one active writer per `STATE_URI`. All jobs in one
-chain share the same state prefix, size and seed; use a separate prefix for
-another chain/size/seed. The guest image needs NVIDIA drivers, Linux, Git,
+chain share the run prefix, size and seed; use a separate prefix for another
+chain/size/seed. Qualification runs use their own state prefix, separate from
+the training run. The guest image needs NVIDIA drivers, Linux, Git,
 Python with venv/pip, and authenticated `gcloud` for corpus copying. Jobs install
 Simons and its upstream dependencies in a fresh virtual environment; they do
 not install into our package. They fetch upstream source, never model weights.
@@ -74,8 +112,10 @@ the exact patch bytes, including changes not yet committed when generated.
 The guest restores `<STATE_URI>/` to `$RUN_DIR/state/`, copies it back every ten
 minutes, and once more on exit. The job itself neither creates machines nor
 performs state uploads. A nonzero job status remains a failure/interruption;
-only a complete leg returns zero. An already completed training leg or export
-returns zero before source/dependency installation or corpus copying.
+only a complete leg returns zero. If invoked directly with restored completed
+state, a training leg or export returns zero before source/dependency
+installation or corpus copying; the guest runner refuses a job URI already
+marked `DONE` before invoking it.
 
 State is organized as follows:
 
@@ -153,9 +193,13 @@ python scripts/gcp/jobs/make_simons_job.py \
 ```
 
 Qualification uses the named leg's configuration and starting weights; it needs
-that leg's predecessor, and corpus for legs 3–5. It never advances or completes
-that training leg. It warms up for 20 updates by default, then measures exactly
-500 updates with synchronized CUDA boundaries. CPU execution fails clearly.
+that leg's predecessor, and corpus for legs 3–5. Before qualifying a later leg,
+copy the completed predecessor state into the qualification run's own state
+prefix. Upload the qualification job under its own object name and launch it
+with a new session label, that `--job-uri`, and the qualification `--state-uri`.
+It never advances or completes that training leg. It warms up for 20 updates by
+default, then measures exactly 500 updates with synchronized CUDA boundaries.
+CPU execution fails clearly.
 Every OOM attempt runs in a separate process, doubles only `micro_batches`, and
 is recorded; the count stops at `--max-micro-batches`. An exhausted limit returns
 nonzero with an explicit report. Other failures do not trigger OOM retries.

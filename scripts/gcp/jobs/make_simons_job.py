@@ -55,8 +55,11 @@ def generate(
     if corpus_uri and not re.fullmatch(r"gs://[A-Za-z0-9._-]+(?:/[^\r\n]*)?", corpus_uri):
         raise ValueError("corpus URI must be a Cloud Storage prefix")
     name = name or f"{size}-{qualify_leg}"
-    if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
-        raise ValueError("qualification name may contain letters, digits, underscore or hyphen")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", name):
+        raise ValueError(
+            "qualification name must start with a letter or digit; "
+            "then contain only letters, digits, underscore or hyphen"
+        )
     paths = [BUNDLE / p for p in ("PINNED", "NOTICE", "prepare.py")]
     patches = sorted((BUNDLE / "patches").glob("*.patch"))
     if not patches:

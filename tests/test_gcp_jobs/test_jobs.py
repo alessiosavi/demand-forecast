@@ -49,6 +49,69 @@ def test_corpus_required_and_pin_checked(jobs):
         jobs.generate(**args)
 
 
+@pytest.mark.parametrize("name", ["-x", "--help", "_probe"])
+def test_generator_rejects_name_without_alphanumeric_start(jobs, name):
+    with pytest.raises(ValueError, match="qualification name.*start"):
+        jobs.generate(
+            size="25m",
+            leg="qualify",
+            seed=11,
+            micro_batches=1,
+            checkpoint_minutes=10,
+            repo_sha=SHA,
+            upstream_pin=PIN,
+            name=name,
+        )
+
+
+@pytest.mark.parametrize(
+    "name,valid",
+    [
+        ("-x", False),
+        ("--help", False),
+        ("_probe", False),
+        ("a100-stage1", True),
+        ("A_1", True),
+        ("0", True),
+    ],
+)
+def test_spot_job_name_requires_alphanumeric_start(
+    upstream, tmp_path, monkeypatch, capsys, name, valid
+):
+    import sys
+
+    from simons.training import spot_job
+
+    calls = []
+    monkeypatch.setattr(spot_job, "qualify", lambda args: calls.append(args.name) or 0)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "spot_job",
+            "--leg=qualify",
+            "--size=25m",
+            f"--root={upstream}",
+            f"--run-dir={tmp_path / 'run'}",
+            "--seed=11",
+            f"--repo-sha={SHA}",
+            f"--upstream-pin={PIN}",
+            "--bundle-sha256=test",
+            f"--name={name}",
+        ],
+    )
+    if valid:
+        assert spot_job.main() == 0
+        assert calls == [name]
+    else:
+        with pytest.raises(SystemExit) as error:
+            spot_job.main()
+        assert error.value.code == 2
+        assert "qualification name must start" in capsys.readouterr().err
+        assert not calls
+        assert not (tmp_path / "run").exists()
+
+
 def test_role_phase_origin_and_schedule(upstream):
     from simons.training import config, schedule
     from simons.training.covariates.roles import Hook

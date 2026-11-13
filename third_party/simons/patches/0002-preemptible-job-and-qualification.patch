@@ -2,7 +2,7 @@ diff --git a/src/simons/training/spot_job.py b/src/simons/training/spot_job.py
 new file mode 100644
 --- /dev/null
 +++ b/src/simons/training/spot_job.py
-@@ -0,0 +1,415 @@
+@@ -0,0 +1,418 @@
 +"""One recipe-preserving, restartable leg under the RUN_DIR/state guest contract."""
 +
 +import argparse
@@ -404,8 +404,11 @@ new file mode 100644
 +    args = parser.parse_args()
 +    if args.run_dir is None:
 +        parser.error("RUN_DIR or --run-dir is required")
-+    if not re.fullmatch(r"[A-Za-z0-9_-]+", args.name):
-+        parser.error("qualification name must be letters, digits, underscore or hyphen")
++    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", args.name):
++        parser.error(
++            "qualification name must start with a letter or digit; "
++            "then contain only letters, digits, underscore or hyphen"
++        )
 +    if args.micro_batches < 1 or args.checkpoint_minutes <= 0 or args.warmup < 0:
 +        parser.error("invalid microbatches, checkpoint interval or warm-up")
 +    Path(args.run_dir).mkdir(parents=True, exist_ok=True)
