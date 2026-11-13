@@ -569,3 +569,113 @@ preserves that decision. Never move quarantine bytes into the allowed tree by
 hand. The cloud run still must measure native schema validity, actual sizes and
 counts, first-shard representativeness, long-row suitability, real overlaps,
 control success at real search scale, runtime, memory and transfer/restart safety.
+
+## Provisional endpoint sketch triage (W4s)
+
+`audit_sketch` produces **provisional triage, never clearance**. It cannot
+satisfy an audit or training release gate, even when execution and controls
+pass. A negative result is not evidence that the corpus has independent lineage.
+Existing audit semantics, numerical thresholds, manifest and generated audit
+jobs are unchanged. This baseline does not contain the Simons v4 training
+consumer: training gate integration remains an orchestrator check. The existing
+audit-only guest contract refuses a renamed sketch report because it lacks
+`valid` and `exit_code`; those fields are deliberately absent. Sketch output has
+`artifact_type: corpus-sketch-triage`, `provisional: true`,
+`release_eligible: false`, and a separate `execution_ok` diagnostic. Never rename
+its output to `audit.json` or publish it over the corpus attempt-status gate.
+
+Every numeric target and covariate is read with the buffered native reader,
+including quarantined folders. Each transient sketch records complete length,
+positional finite-mask digest, canonical float64 raw fingerprint, quantiles,
+zero/change fractions, longest positional run, and autocorrelation at lags 1
+and 7. Prefix and suffix fingerprints at 24, 64 and 256 positions use float32
+values and sign-canonical local z-scores quantised in .05 steps on two shifted
+grids. Float32 hashes catch round trips; local normalisation proposes positive
+and negative affine copies and shifts. Endpoint positions provide the crop
+offset. These grids improve recall but do not guarantee it across quantisation
+boundaries. No missing positions are compacted or imputed.
+
+Only the benchmark keys persist: sorted 128-bit fingerprints plus owner and
+position occupy 32 bytes per posting, at most 20 postings and 44 feature bytes
+per benchmark channel (684 bytes/channel). Workers share read-only mapped
+files; corpus sketches are discarded after the channel. Full arrays stay in
+the existing float64 benchmark spool and native Arrow row. Exact and endpoint
+hash hits propose original-array alignments; every proposed pair calls
+`audit_match.fit_segment`, then the existing short-period, calendar,
+strict-ramp and information-score gates with the legacy opportunity bound.
+No hash or summary can declare a match. Reports include fitted coefficients,
+benchmark identity, both overlap bounds and both information scores.
+
+Summary buckets use affine-invariant quantile shape and lag-1 correlation.
+The closest bucket neighbour competes for a bounded per-folder human review
+list and is numerically verified before reporting. This is a heuristic ranking,
+not a global nearest-neighbour search. Equal-key buckets retain at most 64
+postings with explicit unresolved diagnostics; no Cartesian product is built.
+All proposed-pair evidence and cap reasons stream to per-folder JSONL files.
+The JSON report contains the first 100 verified matches and the best 20
+unverified pairs per folder, with full evidence filename and SHA256 and total
+counts. Allowed and quarantined counts are separate; no folder becomes clean.
+Metadata joins include native source/frequency, manifest lineage/domain, and
+benchmark dataset names/frequencies/domains. Shared names are token-based
+routing hints. Unknown benchmark domains remain unknown; metadata never
+excludes a value comparison.
+
+Each invocation writes benchmark-derived controls to `state/sketch-controls`,
+outside all corpus/training trees. Numerically eligible full benchmark histories
+of 96–65,536 positions supply whole, positive/negative affine, shift, float32,
+prefix and suffix plants; a deliberate interior crop is the documented miss.
+Constants, ramps and a calendar motif are negative controls. Selection never
+screens for successful retrieval. Every invocation, including resume, sends
+these native Parquet sidecars through the full crowded benchmark index and
+ordinary reader, worker, candidate lookup and verifier. Correct benchmark and
+overlap are required. Unplantable datasets and unsupported classes are explicit.
+Controls demonstrate these instances, not general recall. Interior crops,
+changed masks, unsampled/unstable endpoints, fixed-ratio/calendar aggregation
+and every aggregation phase remain unsupported in this pass.
+
+The CLI verifies the published corpus with `verify_published` before scanning.
+Benchmark reuse requires a `benchmark.sketch-identity.json` binding revision,
+task definitions, loader source and SHA256 of all three spool files. Legacy
+spools without that evidence are rebuilt using the existing full-history
+loader and revision-scoped `benchmark-cache`; corpus bytes never use the Hub.
+Index/checkpoint identities bind method source, full benchmark identity,
+manifest and every corpus shard hash. Evidence is renamed before its atomic
+completion marker. Resume rehashes completed evidence and replays unfinished
+folders; killed workers cannot publish completion. Scheduling does not enter
+the deterministic report. Memory admission divides the total budget across
+workers, charging the mapped index conservatively in each worker's RSS quota;
+the existing watchdog also covers whole-row Arrow allocations.
+
+Generate a separate guest job, using the GCP host's existing `RUN_DIR` and
+`STATE_URI` restore/periodic/preemption-copy contract:
+
+```bash
+python -m scripts.corpus_v4.make_sketch_job FULL_REPO_SHA \
+  gs://veliu-forecast-train-us-east1/corpus-v4 \
+  gs://veliu-forecast-train-us-east1/reports/corpus-v4-sketch sketch-job.sh \
+  --state-prefix gs://veliu-forecast-train-us-east1/runs/corpus-v4-sketch/state \
+  --benchmark-state-prefix gs://veliu-forecast-train-us-east1/runs/corpus-v4/state \
+  --workers 16 --memory-budget-gib 104
+bash -n sketch-job.sh
+```
+
+The separate generator reuses the existing pinned editable environment setup.
+It rejects overlapping corpus/state/report prefixes, reads corpus objects only
+from GCS, writes `state/sketch/sketch-report.{json,md}` plus evidence, and copies
+them to the separate report prefix. It never writes the corpus audit or attempt
+status. Upload failure exits nonzero. The host supplies periodic state copies;
+final publication uploads evidence before its separate `sketch-status.json`.
+No cloud resource or paid job is started by generation.
+
+The conditional target is **100 minutes on n2d-standard-32 (128 GiB)**, initially
+16 workers, with 104 GiB total worker/parent budget and a 200 GiB persistent disk.
+For 11.4B values and 13.8M channels, assume whole-machine 5M values/s for Arrow,
+hashing and statistics (40 min), 12k channels/s for endpoint probes (20 min),
+10 min for the 752M-value benchmark index, and 30 min for verification and
+transfers. These additive allowances are an unmeasured planning model. Cold
+benchmark downloads, a dominant serial folder or popular buckets can exceed
+two hours. Actual index size is reported; expected memory is the shared index,
+at most roughly 6 GiB private RSS per worker and an 8 GiB reserve. The cloud
+run must measure full-index build time/size, the largest folder's throughput
+and peak RSS, candidate/verification work, transfer time and every planted
+control. Revise the forecast if those measurements do not support two hours.
