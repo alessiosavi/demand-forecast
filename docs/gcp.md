@@ -216,10 +216,17 @@ DONE before writing its own STARTED. To continue an interrupted leg instead,
 use `resume chain-leg-2 chain-leg-2-retry` after its VM is gone, keeping that
 leg's job URI. Close and settle each session separately.
 
+`launch --copy-interval SECONDS` sets the periodic state-copy cadence (whole seconds,
+60–3600, default 600). The value is stored in the session's `launch.copy_interval`,
+passed as `guard-copy-interval` in create metadata, and retained by `resume`.
+Each cycle sleeps the interval after its preceding copy; copies never overlap.
+Old ledger sessions without the option resume with 600 seconds.
+
 Storage permission and transport errors are refusals, not absent markers.
 `status` returns VM data and object metadata plus `job_uri` for each STARTED,
 DONE, FAILED, TIMEOUT, PREEMPTED and HEARTBEAT (null for a legacy marker);
-heartbeat update time shows checkpoint liveness. STARTED is informational and
+PREEMPTED also exposes `source=watcher` or `source=hook` (null for older markers).
+The heartbeat update time shows checkpoint liveness. STARTED is informational and
 never prevents a launch or resume.
 
 Dry runs print exact JSON argv arrays, execute only read-only discovery, and
@@ -305,7 +312,21 @@ returned identity, zone and instance link. A single successful insert's `endTime
 `compute.instances.preempted`, `stop` or `delete` operation's `startTime` ends it.
 Boot disk cost runs from the recorded creation time (or insert `insertTime`)
 through the completed delete's `endTime`, rather than through today's close time.
-A completed successful delete and verified absence of both VM and disk are required.
+For this explicit-delete path, a completed successful delete and verified absence
+of both VM and disk are required.
+
+A separate Spot DELETE path accepts **exactly one** successful DONE `insert` and
+**exactly one** successful DONE `compute.instances.preempted`, with no `delete`.
+The only additional operation types accepted are `setLabels` and
+`simulateMaintenanceEvent`; all operations must be DONE without errors, match the
+recorded instance ID/zone/link, and have consistent timestamps. Any unknown type,
+second insert/preemption, start/resume/reset, stop, missing recorded start/creation,
+or contradictory inventory keeps the reservation. Both the instance and the
+session's tokenized boot disk must be absent in **two** clean inventory reads,
+stored in `settlement_inventory`. Compute is charged from the recorded first start
+to the preemption operation's **endTime** (minimum one minute), and disk from
+recorded creation to that **same instant**. `settlement_evidence` states this rule.
+This measured-history rule does not use the guest marker as billing evidence.
 The ledger retains the operation fields used, omitting the operation's user field,
 as `settlement_operations` and `runtime_evidence.operations`.
 
@@ -374,7 +395,7 @@ required resume data only in process memory. Jobs must handle signals and leave
 usable checkpoints throughout training, not only on successful exit.
 
 GNU timeout ends the job ten minutes before the conservative metadata deadline,
-with TERM then KILL after 30 seconds. Every ten minutes the runner copies state
+with TERM then KILL after 30 seconds. At the configured cadence the runner copies state
 and updates HEARTBEAT after a successful copy. Failed periodic copies are logged
 and retried next round without killing training. At exit it attempts a final copy,
 writes DONE/FAILED/TIMEOUT with exit status, uploads the per-session job log, then
@@ -395,12 +416,47 @@ Overrides use GNU timeout durations, such as `2s` or `0.2s`, and must be supplie
 in the guest's environment. The final copy, marker and log budgets total the
 600-second final-copy window; process termination/escalation can consume extra
 seconds, so this is best effort and does not replace Google's deadline.
-Interrupted jobs and periodic writers
-are terminated and reaped before the final copy. The entire preemption hook is
-bounded to 25 seconds, including metadata and marker/log writes. It attempts one
-copy and PREEMPTED; normal completion
-is distinguished with a local finished flag. Spot's short notice cannot guarantee
-a checkpoint, marker or log reaches storage.
+Interrupted jobs and periodic writers are terminated and reaped before a normal
+final copy. A separate Python 3 monitor watches `instance/preempted` while the job
+runs, polling at one-second intervals with bounded requests and reconnecting after
+HTTP errors/timeouts. Only the literal `TRUE` response (with an optional newline)
+triggers; `FALSE`, empty responses and transport failures never do.
+
+The watcher owns a single preemption outcome, serialized against normal finish:
+
+1. Publish PREEMPTED with `job_uri` and `source=watcher`, using the [Storage JSON media-upload API](https://docs.cloud.google.com/storage/docs/json_api/v1/objects/insert) and a metadata-server access token; fall back to `gcloud`
+   within the **same 3 s** budget. Only HTTP 200 confirms the JSON upload. No credential is saved to disk or logged.
+2. Cancel and reap any periodic copy, without signalling the job. Atomically write
+   a fresh nonce plus newline to `$RUN_DIR/checkpoint-request`. Wait up to **8 s**
+   (guest environment `GCP_CHECKPOINT_WAIT`, clamped to 0–8 s). A supporting job
+   publishes an immutable checkpoint generation, then atomically replaces
+   `$RUN_DIR/checkpoint-done` with that exact nonce. Stale acknowledgements do not
+   count. Jobs ignoring these files simply continue running.
+3. Copy regular state files in descending modification-time order, preserving
+   relative paths, within **8 s total**. New checkpoint files precede old logs;
+   this is best effort, never a transactional snapshot. Symlinks are skipped.
+4. Copy the job log within **1 s**, then reserve up to **3 s** for completion
+   reconciliation. If the job ended during saving and every file was copied with
+   an unchanged final inventory, archive the event and publish DONE/FAILED/TIMEOUT;
+   otherwise keep PREEMPTED. If publishing the completion marker and restoring
+   PREEMPTED both fail, the event remains archived. Normal finish cannot race a
+   second terminal upload.
+5. Leave the job running. Sending TERM could interrupt a checkpoint write; the
+   job must publish immutable generations by atomic rename. Google's imminent
+   shutdown owns termination. The watcher never signals the job to checkpoint.
+
+An independent **24 s wall-clock alarm**, including child-process cancellation
+and directory traversal, bounds the entire save sequence to fit the 25 s window.
+Every upload has a deadline and its own process group; stuck children are killed
+and reaped. A job already finished when TRUE is observed takes the normal finish
+path without being labelled PREEMPTED. PREEMPTED records an event and an
+interrupted durable-state save; it cannot promise that all computation stopped.
+
+`guest-stop.sh` remains installed as a **marker-only, 5 s best-effort fallback**
+with `source=hook`; it starts no checkpoint request or state/log copy and cannot
+replace a watcher marker. It is **not relied upon**: four measured shutdown hooks
+on real Spot machines produced no marker, copy or log. Normal completion is
+claimed locally before final copying so that the hook cannot mislabel power-off.
 
 Power-off can leave a stopped instance and billable boot disk: stopping clears
 Compute Engine's termination timestamp. The guest's final power-off is **not**
@@ -482,10 +538,42 @@ not required for it. The operator's live canary on **2026-11-13** covered:
 - A Flex-start request that remained PENDING after the CLI operation poll failed
   with HTTP 502; inventory showed the instance and its reservation was retained.
 
-Still unverified live: Spot preemption and resume from a checkpoint; settlement
-from retained operations (including expiry/failure and operation field/type
-completeness); the new asynchronous Flex-start submission/status/wait flow;
-server deadline deletion and automatic boot-disk deletion. The pending-request
+Four additional simulated-maintenance tests on 2026-11-13 used one
+`a2-highgpu-1g` training VM and three `c3d-standard-16` canaries (UTC):
+
+| Session | Event | Metadata TRUE | Guest shutdown | Preemption operation, insertTime → endTime |
+| --- | --- | --- | --- | --- |
+| l1-a1 | 10:06:48 | not watched | not observed | 10:08:41.780 → 10:08:53.216 |
+| canary-p1 | 10:32:56 | not watched | 10:33:31.2 | 10:33:54.130 → 10:34:03.814 |
+| canary-p2 | 10:47:06 | 10:47:15.3 | console not captured | 10:48:14.016 → 10:48:23.373 |
+| canary-p3 | 10:54:07 | 10:54:12.3 | console not captured | 10:54:59.865 → 10:55:11.956 |
+
+The flag was usable 5–9 s after the event; `maintenance-event` remained `NONE`.
+Canary-p1's console shows the shutdown script discovered at 10:33:31.9 and ends
+mid-line at 10:33:32.15. Even an instrumented first-action 0.13 s JSON upload
+failed to appear, including with cached DNS. A job-side poller could upload at
+TRUE. Measured guest times: tiny `gcloud cp` 0.9 s, 190 MB `cp` 1.66 s, small
+`rsync` 1.84 s, JSON media upload with metadata token 0.13 s (HTTP 200).
+
+All four histories contained insert, optional harmless operations and successful
+`compute.instances.preempted`, **no delete**. Instance and auto-delete boot disk
+subsequently disappeared. The former guard refused them; the operator settled
+manually through preemption endTime. Resume of l1-a1 from the last bucket copy
+worked, losing about 12 minutes with unsynchronized ten-minute checkpoints/copies.
+Sanitized operation fixtures live in `tests/test_gcp/fixtures/spot_preemptions.json`.
+
+Still unverified live: this new watcher's delivery timing, the nonce checkpoint
+handshake, newest-first copy durability under real shutdown, and automatic
+settlement of a new preemption. A canary must timestamp TRUE, check that a
+watcher-sourced PREEMPTED precedes checkpoint-request and copies. Instrument the
+canary job to log request/done nonces and UTC timestamps after atomic checkpoint
+publication; the protocol files themselves are local, outside the copied state.
+Confirm that the uploaded job log contains matching nonces, the fresh checkpoint
+reaches the bucket before older files in that save, and resume validates that
+exact checkpoint generation. After deletion, `close` must show two absent VM/disk
+reads, machine/disk endTime at the preemption end, and the stated charge rule.
+Also unverified: the asynchronous Flex-start submission/status/wait flow and
+server deadline deletion. The pending-request
 incident did not verify a clean-inventory polling failure. Fake-CLI tests cover
 that case and the new accounting rules but cannot establish live control-plane
 behaviour, checkpoint durability or billing accuracy.

@@ -65,6 +65,14 @@ def stamp(value):
     return value.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
+def inventory_evidence(resources):
+    fields = ("name", "id", "zone", "region", "status", "labels")
+    return {
+        kind: [{key: item[key] for key in fields if key in item} for item in items]
+        for kind, items in resources.items()
+    }
+
+
 def instant(value):
     parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     if parsed.tzinfo is None:
@@ -103,6 +111,16 @@ def request_seconds(value):
     seconds = sum(int(part or 0) * scale for part, scale in zip(match.groups(), (3600, 60, 1)))
     if seconds != 0 and not 90 <= seconds <= 7200:
         raise GuardError("Flex-start wait must be 0s or between 90s and 2h")
+    return seconds
+
+
+def copy_interval(value):
+    try:
+        seconds = int(value)
+    except (ValueError, TypeError) as exc:
+        raise argparse.ArgumentTypeError("copy interval must be 60–3600 whole seconds") from exc
+    if str(seconds) != str(value) or not 60 <= seconds <= 3600:
+        raise argparse.ArgumentTypeError("copy interval must be 60–3600 whole seconds")
     return seconds
 
 
@@ -321,7 +339,7 @@ class Guard:
                 return session
         raise GuardError(f"unknown session: {label}")
 
-    def inventory(self, session=None):
+    def inventory(self, session=None, include_all=False):
         # Include tokenized boot disks left before the post-create label call.
         resources = {}
         for kind in ("instances", "disks"):
@@ -331,7 +349,8 @@ class Guard:
             resources[kind] = [
                 item
                 for item in items
-                if item.get("labels", {}).get("guard-ledger") == self.config["token"]
+                if include_all
+                or item.get("labels", {}).get("guard-ledger") == self.config["token"]
                 or (
                     session is not None
                     and item.get("name")
@@ -358,7 +377,8 @@ class Guard:
             ),
             None,
         )
-        return dict(metadata, job_uri=job_uri or None)
+        source = next((line[7:] for line in body.splitlines() if line.startswith("source=")), None)
+        return dict(metadata, job_uri=job_uri or None, source=source)
 
     def markers(self, session):
         return {key: self.marker(session["state_uri"], key) for key in MARKERS}
@@ -419,13 +439,7 @@ class Guard:
                 time.sleep(3)
             observed = {"observed_at": stamp(now())}
             try:
-                fields = ("name", "id", "zone", "region", "status", "labels")
-                observed.update(
-                    {
-                        kind: [{key: item[key] for key in fields if key in item} for item in items]
-                        for kind, items in self.inventory(session).items()
-                    }
-                )
+                observed.update(inventory_evidence(self.inventory(session)))
             except (GuardError, ValueError, OSError, subprocess.SubprocessError) as exc:
                 observed["error"] = str(getattr(exc, "stderr", "") or exc)
             reads.append(observed)
@@ -465,6 +479,7 @@ class Guard:
         if request_valid_for is not None and args.provisioning != "FLEX_START":
             raise GuardError("--request-valid-for is only supported with FLEX_START")
         request_seconds(request_valid_for or "0s")
+        interval = copy_interval(getattr(args, "copy_interval", 600))
         key = f"{args.machine_type}|{args.provisioning}|{region}"
         if key not in self.data["prices"]:
             raise GuardError(f"no stored price for {key}")
@@ -547,6 +562,7 @@ class Guard:
         session["launch"]["request_valid_for"] = request_valid_for
         session["launch"]["boot_disk_type"] = disk_type
         session["launch"]["nic_type"] = getattr(args, "nic_type", None)
+        session["launch"]["copy_interval"] = interval
         if len(session["boot_disk"]) > 63:
             raise GuardError(
                 "label is too long for tokenized boot disk name (maximum 34 characters)"
@@ -560,6 +576,7 @@ class Guard:
                 ("state-uri", state_uri),
                 ("job-uri", args.job_uri),
                 ("reserved-end", session["reserved_end"]),
+                ("copy-interval", interval),
             )
         )
         command = [
@@ -690,6 +707,133 @@ class Guard:
             launch["hours"] = args.hours
         self.launch(argparse.Namespace(**launch), previous=previous)
 
+    def adopt(self, session, vm=None):
+        """Recover an ambiguous insert without trusting a matching name alone."""
+        if session["status"] not in OPEN or (
+            session.get("instance_id") and not session.get("adoption")
+        ):
+            return
+        zone = session["launch"]["zone"]
+        if session["boot_disk"] != f"gcp-{self.config['token']}-{session['label']}":
+            raise GuardError("reservation token mismatch; reservation retained")
+        if vm and (
+            vm.get("name") != session["label"]
+            or vm.get("zone", "").rsplit("/", 1)[-1] != zone
+            or vm.get("labels", {}).get("guard-ledger") != self.config["token"]
+            or vm.get("labels", {}).get("guard-session") != session["label"]
+            or not vm.get("id")
+            or (session.get("instance_id") and str(vm["id"]) != str(session["instance_id"]))
+        ):
+            raise GuardError("instance ownership mismatch; reservation retained")
+        if session.get("instance_id") and session.get("adoption"):
+            # Initial adoption already proved the insert identity. Its operation
+            # may expire long before the owned VM does; refresh from that VM
+            # without making inspection or manual settlement depend on retention.
+            if vm and vm.get("lastStartTimestamp"):
+                started = vm["lastStartTimestamp"]
+                try:
+                    if not instant(session["instance_created_at"]) <= instant(started) <= now():
+                        raise ValueError("invalid instance start")
+                except (KeyError, TypeError, ValueError, GuardError) as exc:
+                    raise GuardError(
+                        "instance timestamps unverified; reservation retained"
+                    ) from exc
+                previous_start = session.get("last_start")
+                if session["adoption"].get("charge_from_insert_request") or not previous_start:
+                    session["last_start"] = started
+                    session["adoption"]["charge_from_insert_request"] = False
+                elif instant(started) != instant(previous_start):
+                    session["runtime_uncertain"] = True
+                self.save()
+            return
+        # Save the pre-existing evidence before the fresh query replaces anything.
+        retained = session.get("create_failure_operations", {}).get("operations", [])
+        if session.get("create_operation"):
+            retained = [session["create_operation"]]
+        operations = self.insert_operations(session, "adoption_operations")
+        if not operations or len(operations) != 1:
+            if vm:
+                raise GuardError("insert identity unverified; reservation retained")
+            return
+        op = operations[0]
+        if (
+            op["status"] not in {"RUNNING", "DONE"}
+            or operation_failed(op)
+            or not op.get("targetId")
+            or (vm and str(op["targetId"]) != str(vm["id"]))
+            or (session.get("instance_id") and str(op["targetId"]) != str(session["instance_id"]))
+        ):
+            if vm:
+                raise GuardError("insert identity or outcome unverified; reservation retained")
+            return
+        if not vm and not any(
+            all(
+                str(recorded.get(k)) == str(op.get(k))
+                for k in ("name", "targetId", "targetLink", "zone", "insertTime")
+            )
+            for recorded in retained
+        ):
+            return  # No historical ownership correlation: keep the reservation held.
+        try:
+            requested = op["insertTime"]
+            if (
+                not instant(session["created_at"])
+                <= instant(requested)
+                <= min(now(), instant(session["reserved_end"]))
+            ):
+                raise ValueError("insert outside reservation")
+            if not instant(requested) <= instant(op["startTime"]) <= now():
+                raise ValueError("invalid insert start")
+            if (
+                op["status"] == "DONE"
+                and not instant(op["startTime"]) <= instant(op["endTime"]) <= now()
+            ):
+                raise ValueError("invalid insert end")
+            creation = vm.get("creationTimestamp") if vm else None
+            started = vm.get("lastStartTimestamp") if vm else None
+            if creation and not instant(session["created_at"]) <= instant(creation) <= now():
+                raise ValueError("invalid instance creation")
+            if started and not instant(creation or requested) <= instant(started) <= now():
+                raise ValueError("invalid instance start")
+        except (KeyError, TypeError, ValueError, GuardError) as exc:
+            raise GuardError("insert timestamps unverified; reservation retained") from exc
+        # Never infer a start from insert endTime: that could omit billable runtime.
+        # Only a provisional request bound can be replaced by an actual start.
+        previous_start = session.get("last_start")
+        provisional = session.get("adoption", {}).get("charge_from_insert_request", False)
+        if (
+            started
+            and previous_start
+            and not provisional
+            and instant(started) != instant(previous_start)
+        ):
+            session["runtime_uncertain"] = True
+        recorded_start = (
+            previous_start
+            if previous_start and not provisional
+            else started or previous_start or requested
+        )
+        session.update(
+            instance_id=op["targetId"],
+            instance_created_at=creation or session.get("instance_created_at") or requested,
+            last_start=recorded_start,
+            adoption={
+                "observed_at": stamp(now()),
+                "source": "owned instance + insert operation"
+                if vm
+                else "retained insert operation + tokenized reservation",
+                "operation": op["name"],
+                "charge_from_insert_request": not bool(started)
+                and (
+                    not session.get("last_start")
+                    or session.get("adoption", {}).get("charge_from_insert_request", False)
+                ),
+            },
+        )
+        if session["status"] == "reserved":
+            session["status"] = "open"
+        self.save()  # Keep the original reserved_end: adoption never extends a deadline.
+
     def queue(self, session):
         """Observe Flex-start without waiting in gcloud or extending the guest deadline."""
         vm = self.cloud(
@@ -702,7 +846,9 @@ class Guard:
             clean_stderr=True,
             timeout=60,
         )
-        if vm:
+        if session["status"] == "reserved" or session.get("adoption"):
+            self.adopt(session, vm)
+        elif vm:
             if (
                 vm.get("name") != session["label"]
                 or vm.get("zone", "").rsplit("/", 1)[-1] != session["launch"]["zone"]
@@ -737,16 +883,35 @@ class Guard:
         return result
 
     def status(self, args):
-        inventory = self.inventory()
         sessions = [self.session(args.label)] if args.label else self.data["sessions"]
+        inventory = self.inventory()
+        instances = {
+            session["label"]: [
+                vm
+                for vm in inventory["instances"]
+                if vm.get("name") == session["label"]
+                and vm.get("zone", "").rsplit("/", 1)[-1] == session["launch"]["zone"]
+                and vm.get("labels", {}).get("guard-ledger") == self.config["token"]
+                and vm.get("labels", {}).get("guard-session") == session["label"]
+            ]
+            for session in sessions
+        }
+        for session in sessions:
+            if (
+                session["launch"]["provisioning"] != "FLEX_START"
+                and session["status"] in OPEN
+                and (not session.get("instance_id") or session.get("adoption"))
+            ):
+                matches = instances[session["label"]]
+                if len(matches) > 1:
+                    raise GuardError("ambiguous instance identity; reservation retained")
+                self.adopt(session, matches[0] if matches else None)
         print(
             json.dumps(
                 [
                     {
                         "session": session,
-                        "instances": [
-                            v for v in inventory["instances"] if v.get("name") == session["label"]
-                        ],
+                        "instances": instances[session["label"]],
                         "markers": self.markers(session),
                         "queue": self.queue(session)
                         if session["launch"]["provisioning"] == "FLEX_START"
@@ -763,8 +928,12 @@ class Guard:
             kind: [
                 item
                 for item in items
-                if item.get("labels", {}).get("guard-session") == session["label"]
-                or item.get("name") in {session["label"], session["boot_disk"]}
+                if (
+                    item.get("labels", {}).get("guard-session") == session["label"]
+                    or item.get("name") in {session["label"], session["boot_disk"]}
+                )
+                # Unknown zones still block settlement; another zone does not.
+                and item.get("zone", "").rsplit("/", 1)[-1] in {"", session["launch"]["zone"]}
             ]
             for kind, items in inventory.items()
         }
@@ -793,8 +962,9 @@ class Guard:
             "list",
             f"--zones={zone}",
             f"--filter=targetId={session['instance_id']}",
+            clean_stderr=True,
         )
-        if not isinstance(operations, list):
+        if not isinstance(operations, list) or any(not isinstance(op, dict) for op in operations):
             return None
         # Retain only settlement fields, never the operation's user/account field.
         fields = {
@@ -818,8 +988,19 @@ class Guard:
         target = f"/projects/{self.config['project']}/zones/{zone}/instances/{session['label']}"
         if not operations or any(
             str(op.get("targetId")) != str(session["instance_id"])
-            or op.get("zone", "").rsplit("/", 1)[-1] != zone
-            or not op.get("targetLink", "").endswith(target)
+            or not isinstance(op.get("zone"), str)
+            or op["zone"].rsplit("/", 1)[-1] != zone
+            or not isinstance(op.get("targetLink"), str)
+            or not op["targetLink"].endswith(target)
+            or op.get("operationType")
+            not in {
+                "insert",
+                "stop",
+                "delete",
+                "compute.instances.preempted",
+                "setLabels",
+                "simulateMaintenanceEvent",
+            }
             for op in operations
         ):
             return None
@@ -837,6 +1018,84 @@ class Guard:
             if op.get("operationType") in {"compute.instances.preempted", "stop", "delete"}
         ]
         deletes = [op for op in ends if op["operationType"] == "delete"]
+        if not deletes:
+            # DELETE-on-preemption produces no delete operation on real Spot VMs.
+            # This is a separate, deliberately narrow proof, not a general fallback.
+            harmless = {"setLabels", "simulateMaintenanceEvent"}
+            preemptions = [
+                op for op in ends if op["operationType"] == "compute.instances.preempted"
+            ]
+            reads = session.get("settlement_inventory", [])
+            if (
+                session["launch"]["provisioning"] != "SPOT"
+                or len(inserts) != 1
+                or len(preemptions) != 1
+                or any(
+                    op.get("operationType")
+                    not in harmless | {"insert", "compute.instances.preempted"}
+                    for op in operations
+                )
+                or any(
+                    op.get("status") != "DONE" or op.get("error") or op.get("httpErrorStatusCode")
+                    for op in operations
+                )
+                or len(reads) != 2
+                or any(read.get("instances") or read.get("disks") for read in reads)
+            ):
+                return None
+            try:
+                inserted, preempted = inserts[0], preemptions[0]
+                start = session.get("last_start")
+                creation = session.get("instance_created_at")
+                end = preempted["endTime"]
+                if (
+                    not start
+                    or not creation
+                    or not (
+                        instant(creation)
+                        <= instant(start)
+                        <= instant(preempted["startTime"])
+                        <= instant(end)
+                        <= now()
+                        and instant(inserted["insertTime"])
+                        <= instant(inserted["startTime"])
+                        <= instant(inserted["endTime"])
+                        <= instant(preempted["startTime"])
+                        and (
+                            instant(inserted["startTime"]) <= instant(start)
+                            or (
+                                session.get("adoption", {}).get("charge_from_insert_request")
+                                and instant(start) == instant(inserted["insertTime"])
+                            )
+                        )
+                    )
+                ):
+                    return None
+                if any(
+                    not instant(inserted["insertTime"])
+                    <= instant(op["startTime"])
+                    <= instant(op["endTime"])
+                    <= instant(end)
+                    for op in operations
+                ):
+                    return None
+            except (KeyError, TypeError, ValueError, GuardError):
+                return None
+            return {
+                "start": start,
+                "stop": end,
+                "creation": creation,
+                "deleted": end,
+                "billing_rule": "spot-preemption-end",
+                "source": "compute.operations.list targetId + zone; Spot DELETE: "
+                + (
+                    "machine and disk charged from insert request (no instance start recorded)"
+                    if session.get("adoption", {}).get("charge_from_insert_request")
+                    else "machine from recorded start and disk from creation"
+                )
+                + " through preemption endTime; two clean instance/disk absence reads",
+                "operations": session["settlement_operations"],
+            }
         used = inserts + ends
         if len(deletes) != 1 or any(
             op.get("status") != "DONE" or op.get("error") or op.get("httpErrorStatusCode")
@@ -888,10 +1147,21 @@ class Guard:
             args.evidence is not None and not args.evidence.strip()
         ):
             raise GuardError("manual settlement requires both --settled-usd and --evidence")
+        resources = self.matches(self.inventory(session), session)
+        if session["status"] in OPEN and (
+            not session.get("instance_id") or session.get("adoption")
+        ):
+            if len(resources["instances"]) > 1:
+                raise GuardError("ambiguous instance identity; reservation retained")
+            self.adopt(session, resources["instances"][0] if resources["instances"] else None)
+            if resources["instances"] and not session.get("instance_id"):
+                raise GuardError("instance ownership unverified; reservation retained")
         if session["status"] in OPEN:
             session["status"] = "needs_settlement"
             self.save()
-        resources = self.matches(self.inventory(session), session)
+        session["settlement_inventory"] = [
+            {"observed_at": stamp(now()), **inventory_evidence(resources)}
+        ]
         had_resources = any(resources.values())
         if session["status"] == "cancelled":
             if not had_resources:
@@ -913,6 +1183,20 @@ class Guard:
                     "gcp-guard: re-opened cancelled session; overrun "
                     + json.dumps(session["reopened"]),
                     file=sys.stderr,
+                )
+        if (
+            resources["instances"]
+            and session.get("instance_id")
+            and session["launch"]["provisioning"] == "SPOT"
+            and args.settled_usd is None
+        ):
+            self.operations_evidence(session)
+            if any(
+                op.get("operationType") == "compute.instances.preempted"
+                for op in session.get("settlement_operations", [])
+            ):
+                raise GuardError(
+                    "preemption history contradicts present instance; reservation retained; reconcile manually"
                 )
         for item in resources["instances"]:
             vm = self.cloud(
@@ -972,6 +1256,10 @@ class Guard:
         if self.dry_run:
             return
         remaining = self.matches(self.inventory(session), session)
+        session["settlement_inventory"].append(
+            {"observed_at": stamp(now()), **inventory_evidence(remaining)}
+        )
+        self.save()
         if any(remaining.values()):
             raise GuardError("instance or disk remains; reservation retained; use sweep")
         evidence = session.get("runtime_evidence")
@@ -1014,7 +1302,9 @@ class Guard:
                 Decimal(str(seconds)) / 3600 * number(session["hourly_usd"])
                 + Decimal(str(disk_seconds)) / 3600 * number(session["disk_hourly_usd"])
             )
-            reason = evidence["source"] + "; boot disk through verified deletion (conservative)"
+            reason = evidence["source"]
+            if evidence.get("billing_rule") != "spot-preemption-end":
+                reason += "; boot disk through verified deletion (conservative)"
         else:
             session["status"] = "needs_settlement"
             self.save()
@@ -1168,6 +1458,12 @@ def parser():
     launch.add_argument("--accelerator")
     launch.add_argument("--local-ssd", type=int, default=0, choices=range(25))
     launch.add_argument(
+        "--copy-interval",
+        type=copy_interval,
+        default=600,
+        help="state copy interval in seconds (60–3600; default: 600)",
+    )
+    launch.add_argument(
         "--request-valid-for", help="Flex-start capacity wait: 0s (default), or 90s–2h"
     )
     launch.add_argument("--dry-run", action="store_true")
@@ -1212,8 +1508,6 @@ def wait_for_session(path, args):
         with locked(path, False):
             guard = Guard(path)
             session = guard.session(args.label)
-            if session["launch"]["provisioning"] != "FLEX_START":
-                raise GuardError("wait is for FLEX_START sessions; use status")
             queue = guard.queue(session)
             print(json.dumps({"label": args.label, "queue": queue}), flush=True)
         if queue["state"] == "running":
