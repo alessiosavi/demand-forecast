@@ -286,8 +286,10 @@ class Job:
                        "--output", str(output)]
             self.command(command, state / "bundle.log")
         manifest = read(output / "manifest.json")
-        if (type(manifest["schema_version"]) is not int or manifest["schema_version"] < 1
-                or manifest["task"]["name"] != name or manifest["phase"] != "development"):
+        version = manifest.get("schema_version")
+        if type(version) is not int or version != 2:
+            raise ValueError("bundle schema_version must be 2, found " + repr(version))
+        if manifest["task"]["name"] != name or manifest["phase"] != "development":
             raise ValueError("bundle manifest identity mismatch")
         for file, expected in manifest["files"].items():
             path = child(output, file)

@@ -161,9 +161,22 @@ def bundle_factory(tmp_path):
     )
     from demand_forecast.bench.adaptation.data import build_manifest
 
-    def build(lengths=(104, 100), name="bundle"):
-        rows, targets = inputs.task_rows(lengths=lengths, starts=(0,) * len(lengths), channels=2)
-        task = inputs.SyntheticTask(rows, targets, cutoff=-8)
+    def build(lengths=(104, 100), name="bundle", *, formatter=None, known=True, precise=False):
+        import datasets
+
+        rows, targets = inputs.task_rows(
+            lengths=lengths, starts=(0,) * len(lengths), channels=2, known=known
+        )
+        for row in rows:
+            n = len(row["timestamp"])
+            if known:
+                row["promo"] = (np.arange(n) % 2).astype(np.bool_)
+                row["event"] = (["a", None, "None", "b"] * n)[:n]
+            if precise:
+                row["y0"] = 1e8 + np.arange(n, dtype=np.float64) * 0.01
+                row["y0"][0] = np.nan
+        task = inputs.SyntheticTask(rows, targets, cutoff=-8, known=known)
+        task.load_full_dataset = lambda: datasets.Dataset.from_list(rows).with_format(formatter)
         task.horizon = 3
         task.quantile_levels = [0.1, 0.5, 0.9]
         yaml = tmp_path / "task.yaml"
@@ -278,7 +291,10 @@ def test_actual_evaluation_and_adapter_parity(adapt, bundle, tiny_model, monkeyp
         for item in inner["items"]:
             block = item["model_input"][0]
             target = np.asarray(block["target"], dtype=np.float32)
-            known = block["known_covariates"]
+            known = {
+                c: block["known_covariates"][c]
+                for c in loaded.manifest["covariates"]["known_future"]
+            }
             length = target.shape[-1]
             items.append(
                 SimpleNamespace(
@@ -293,7 +309,13 @@ def test_actual_evaluation_and_adapter_parity(adapt, bundle, tiny_model, monkeyp
             tiny_model,
             [np.asarray(i["model_input"][0]["target"], dtype=np.float32) for i in inner["items"]],
             loaded.horizon,
-            future_covariates=[i["model_input"][0]["known_covariates"] for i in inner["items"]],
+            future_covariates=[
+                {
+                    c: np.asarray(i["model_input"][0]["known_covariates"][c], dtype=object)
+                    for c in loaded.manifest["covariates"]["known_future"]
+                }
+                for i in inner["items"]
+            ],
             shared_categories=False,
             past_covariates=None,
             batch_size=2,
@@ -399,12 +421,16 @@ def test_frozen_fallback_and_identity(adapt, bundle, base, tmp_path):
         adapt.run(bundle, base, out, recipe, seed=29)
 
 
-def test_checkpoint_nonce_and_export_parity(adapt, bundle, base, tmp_path, monkeypatch):
+@pytest.mark.parametrize("formatter", [None, "numpy"])
+def test_checkpoint_nonce_and_export_parity(
+    adapt, bundle_factory, base, tmp_path, monkeypatch, formatter
+):
     from simons import Simons
     from simons.training.adapt_data import Bundle
     from simons.training.adapt_eval import evaluate
     from simons.training.trainer import read_checkpoint
 
+    bundle = bundle_factory(formatter=formatter)
     force_gains(monkeypatch, adapt)
     output = tmp_path / "out"
     run_dir = tmp_path / "runner"
@@ -432,11 +458,18 @@ def test_checkpoint_nonce_and_export_parity(adapt, bundle, base, tmp_path, monke
     from simons import forecast_series
     from simons.training.adapt_data import raw_model
 
-    inner = Bundle(bundle).inners[0]
+    loaded = Bundle(bundle)
+    inner = loaded.inners[0]
     series = [
         np.asarray(item["model_input"][0]["target"], dtype=np.float32) for item in inner["items"]
     ]
-    known = [item["model_input"][0]["known_covariates"] for item in inner["items"]]
+    known = [
+        {
+            c: np.asarray(item["model_input"][0]["known_covariates"][c], dtype=object)
+            for c in loaded.manifest["covariates"]["known_future"]
+        }
+        for item in inner["items"]
+    ]
     predictions = []
     for model in (selected, in_memory):
         with raw_model(model):
@@ -468,6 +501,108 @@ def rewrite_bundle(bundle, mutate):
     manifest.pop("fingerprint")
     manifest["fingerprint"] = hashlib.sha256(json_bytes(manifest)).hexdigest()
     (bundle / "manifest.json").write_bytes(json_bytes(manifest))
+
+
+@pytest.mark.parametrize("version", [None, 1, 3, True, 2.0, "2"])
+@pytest.mark.parametrize("payload", ["manifest.json", "inner-0.json", "inner-1.json"])
+def test_bundle_refuses_other_schema_versions(adapt, bundle, version, payload):
+    from simons.training.adapt_data import Bundle
+
+    if payload == "manifest.json":
+        rewrite_bundle(bundle, lambda m: m.update(schema_version=version))
+    else:
+        path = bundle / payload
+        inner = json.loads(path.read_bytes())
+        inner["schema_version"] = version
+        path.write_text(json.dumps(inner))
+        rewrite_bundle(bundle, lambda m: None)
+    with pytest.raises(ValueError, match=r"schema_version.*2"):
+        Bundle(bundle)
+
+
+@pytest.mark.parametrize(
+    "folder,column",
+    [("univariate", "target"), ("covariates", "target"), ("covariates", "covariates")],
+)
+def test_native_schema_does_not_silently_cast_float64(adapt, bundle, tiny_model, folder, column):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from simons.training.adapt_data import Bundle
+
+    path = bundle / folder / "train-00000.parquet"
+    table = pq.read_table(path)
+    value = pa.list_(pa.float64())
+    dtype = value if (folder, column) == ("covariates", "target") else pa.list_(value)
+    schema = table.schema.set(table.schema.get_field_index(column), pa.field(column, dtype))
+    pq.write_table(table.cast(schema), path)
+    rewrite_bundle(bundle, lambda m: None)
+    with pytest.raises(ValueError, match="native.*schema"):
+        Bundle(bundle).sampler(tiny_model.config, 32)
+
+
+@pytest.mark.parametrize("formatter", [None, "numpy"])
+@pytest.mark.parametrize("known", [False, True])
+def test_schema2_evaluation_preserves_scorer_inputs_and_precision(
+    adapt, bundle_factory, tiny_model, monkeypatch, formatter, known
+):
+    import fev.metrics
+    from simons.covariates import prepare_covariates
+    from simons.training import adapt_eval
+    from simons.training.adapt_data import Bundle
+
+    loaded = Bundle(bundle_factory(formatter=formatter, known=known, precise=True))
+    sampler = loaded.sampler(tiny_model.config, 32)
+    assert sampler.sample(np.random.default_rng(11))[0].numpy().dtype == np.float32
+    if known:
+        # Native rows keep training-only codes, in the manifest's column order.
+        covs = sampler.items["item-0"][0][2]
+        np.testing.assert_array_equal(covs[0, :4], [0, 1, 0, 1])
+        np.testing.assert_equal(covs[1, :4], [1, np.nan, 0, 2])
+    forecasts = []
+    original = adapt_eval.forecast_series
+
+    def record(model, series, horizon, **kwargs):
+        assert all(s.dtype == np.float32 for s in series)
+        for target, cov in zip(series, kwargs["future_covariates"], strict=True):
+            if not known:
+                assert cov is None
+                continue
+            assert all(v.dtype == object for v in cov.values())
+            assert None in cov["event"] and "None" in cov["event"]
+            assert all(isinstance(v, bool) for v in cov["promo"])
+            # Simons must see a missing value, distinct from the literal category.
+            encoded = prepare_covariates(
+                target.shape[-1], horizon, future=cov, shared_categories=False
+            )
+            np.testing.assert_array_equal(encoded[0], np.asarray(cov["promo"], dtype=np.float32))
+            assert np.isnan(encoded[1]).any()
+        outputs = original(model, series, horizon, **kwargs)
+        forecasts.append(outputs)
+        return outputs
+
+    monkeypatch.setattr(adapt_eval, "forecast_series", record)
+    measured = adapt_eval.evaluate(tiny_model, loaded)
+    for inner, outputs, actual in zip(loaded.inners, forecasts, measured, strict=True):
+        items = inner["items"]
+        truth = np.stack([np.asarray(i["score_target"], dtype=np.float64).T for i in items])
+        past = [np.asarray(i["score_past"], dtype=np.float64).T for i in items]
+        # A float32 cast would erase this channel's seasonal scale completely.
+        observed = past[0][np.isfinite(past[0][:, 0]), 0]
+        assert np.ptp(observed) > 0
+        assert np.ptp(observed.astype(np.float32)) == 0
+        q = np.stack(
+            [np.sort(np.asarray(p), axis=-1)[..., [0, 4, 8]].transpose(1, 0, 2) for p in outputs]
+        )
+        expected = fev.metrics.SQL().compute(
+            y_true=truth,
+            y_pred=q[..., 1],
+            q_pred=q,
+            y_past=np.concatenate(past),
+            y_past_lengths=np.array([len(p) for p in past]),
+            quantile_levels=[0.1, 0.5, 0.9],
+            seasonality=2,
+        )
+        assert actual["score"] == pytest.approx(float(np.mean(expected)), rel=1e-14)
 
 
 def test_some_excluded_items_use_eligible_task_weights(

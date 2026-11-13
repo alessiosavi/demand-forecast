@@ -496,8 +496,8 @@ diff --git a/src/simons/training/adapt_data.py b/src/simons/training/adapt_data.
 new file mode 100644
 --- /dev/null
 +++ b/src/simons/training/adapt_data.py
-@@ -0,0 +1,214 @@
-+"""Verified AD1 bundles, native grouped-window sampling and horizon-only loss."""
+@@ -0,0 +1,235 @@
++"""Verified schema 2 bundles, native grouped-window sampling and horizon-only loss."""
 +
 +import hashlib
 +import json
@@ -533,6 +533,28 @@ new file mode 100644
 +    return digest.hexdigest()
 +
 +
++def require_schema2(value, source):
++    version = value.get("schema_version")
++    if type(version) is not int or version != 2:
++        raise ValueError(f"{source}: schema_version must be 2, found {version!r}")
++
++
++def native_rows(path, covariates=False):
++    import pyarrow as pa
++    import pyarrow.parquet as pq
++
++    vector = pa.list_(pa.float32())
++    matrix = pa.list_(vector)
++    fields = [("item_id", pa.string()), ("source", pa.string()), ("freq", pa.string())]
++    fields.append(("target", vector if covariates else matrix))
++    if covariates:
++        fields.append(("covariates", matrix))
++    table = pq.read_table(path)
++    if table.schema != pa.schema(fields):
++        raise ValueError(f"invalid schema 2 native Parquet schema: {path}")
++    return table.to_pylist()
++
++
 +@contextmanager
 +def raw_model(model):
 +    config = model.config
@@ -553,11 +575,10 @@ new file mode 100644
 +            raise ValueError("manifest path escapes bundle")
 +        self.manifest = json.loads(manifest_path.read_bytes())
 +        m = self.manifest
++        require_schema2(m, "manifest.json")
 +        unsigned = {k: v for k, v in m.items() if k != "fingerprint"}
-+        if m.get("schema_version") != 1 or hashlib.sha256(
-+            json_bytes(unsigned)
-+        ).hexdigest() != m.get("fingerprint"):
-+            raise ValueError("bundle fingerprint/schema mismatch")
++        if hashlib.sha256(json_bytes(unsigned)).hexdigest() != m.get("fingerprint"):
++            raise ValueError("bundle fingerprint mismatch")
 +        self.paths = {}
 +        for name, expected in m["files"].items():
 +            path = (self.root / name).resolve(strict=True)
@@ -567,6 +588,8 @@ new file mode 100644
 +                raise ValueError(f"bundle payload hash mismatch: {name}")
 +            self.paths[name] = path
 +        self.inners = [json.loads(self.paths[f"inner-{i}.json"].read_bytes()) for i in range(2)]
++        for i, inner in enumerate(self.inners):
++            require_schema2(inner, f"inner-{i}.json")
 +        if any(
 +            x["scoring"] != m["scoring"] or x["origin_number"] != i
 +            for i, x in enumerate(self.inners)
@@ -584,8 +607,6 @@ new file mode 100644
 +    """Uniform item, then eligible block, then valid origin; no augmentations or mixing."""
 +
 +    def __init__(self, bundle, config, context):
-+        import pyarrow.parquet as pq
-+
 +        self.horizon = bundle.horizon
 +        if self.horizon > config.prediction_length:
 +            raise ValueError("adaptation horizon exceeds the base native prediction length")
@@ -606,14 +627,14 @@ new file mode 100644
 +        cov_rows = {}
 +        for name, path in sorted(bundle.paths.items()):
 +            if name.startswith("covariates/train-") and name.endswith(".parquet"):
-+                for row in pq.read_table(path).to_pylist():
++                for row in native_rows(path, covariates=True):
 +                    cov_rows[row["item_id"]] = row
 +        self.items = {}
 +        self.ineligible_groups = []
 +        for name, path in sorted(bundle.paths.items()):
 +            if not (name.startswith("univariate/train-") and name.endswith(".parquet")):
 +                continue
-+            for row in pq.read_table(path).to_pylist():
++            for row in native_rows(path):
 +                group = mappings[row["item_id"]]
 +                if group["item_id"] in excluded:
 +                    continue
@@ -715,7 +736,7 @@ diff --git a/src/simons/training/adapt_eval.py b/src/simons/training/adapt_eval.
 new file mode 100644
 --- /dev/null
 +++ b/src/simons/training/adapt_eval.py
-@@ -0,0 +1,163 @@
+@@ -0,0 +1,173 @@
 +"""Raw scoring-adapter inference and fev-compatible SQL, without a fev dependency."""
 +
 +import warnings
@@ -781,11 +802,21 @@ new file mode 100644
 +                    windows.append(dict(score=None, groups=[], reason="empty_inner"))
 +                    continue
 +                blocks = [(item, block) for item in items for block in item["model_input"]]
++                # Canonical JSON sorts keys. Restore task column order (before
++                # Simons' 16-column cap) and object arrays, as SimonsAdapter does.
++                # A bare list would stringify None beside text, losing missingness.
++                columns = bundle.manifest["covariates"]["known_future"]
++                covariates = [
++                    {c: np.asarray(b["known_covariates"][c], dtype=object) for c in columns}
++                    if columns
++                    else None
++                    for _, b in blocks
++                ]
 +                outputs = forecast_series(
 +                    model,
 +                    [np.asarray(b["target"], dtype=np.float32) for _, b in blocks],
 +                    bundle.horizon,
-+                    future_covariates=[b["known_covariates"] for _, b in blocks],
++                    future_covariates=covariates,
 +                    past_covariates=None,
 +                    shared_categories=False,
 +                    batch_size=batch_size,

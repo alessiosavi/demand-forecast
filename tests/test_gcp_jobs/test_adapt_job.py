@@ -225,7 +225,7 @@ def machine(jobs, tmp_path):
             event('bundle', name)
             out.mkdir(parents=True)
             (out / 'train.parquet').write_bytes(os.environ.get('BUNDLE_CONTENT', 'bounded history').encode())
-            write(out / 'manifest.json', {'schema_version': int(os.environ.get('SCHEMA', '2')),
+            write(out / 'manifest.json', {'schema_version': json.loads(os.environ.get('SCHEMA', '2')),
                 'fingerprint': 'fingerprint-' + name + sha(out / 'train.parquet'), 'phase': 'development',
                 'task': {'name': name}, 'files': {'train.parquet': {'bytes': (out / 'train.parquet').stat().st_size, 'sha256': sha(out / 'train.parquet')}}})
             sys.exit(0)
@@ -364,6 +364,20 @@ def test_pipeline_reuse_and_identity(machine):
     assert before == {k: len(events(k)) for k in before}
     result = run({"max_updates": 100})
     assert result.returncode != 0 and "different inputs" in result.stderr
+
+
+@pytest.mark.parametrize("version", ["0", "1", "3", "true", "2.0", '"2"', "null"])
+def test_bundle_schema_rejected_before_frozen_scoring_or_fitting(machine, version):
+    run, state, events, _ = machine
+    result = run(SCHEMA=version)
+    assert result.returncode != 0
+    assert len(events("bundle")) == 2
+    assert not events("fit") and not events("score")
+    marker = json.loads((state / "completed.json").read_text())
+    assert all(
+        "schema_version" in b["error"] and "2" in b["error"] for b in marker["bundles"].values()
+    )
+    assert not list(state.glob("tasks/*/bundle-manifest.json"))
 
 
 def test_environment_and_task_order(machine):

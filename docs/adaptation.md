@@ -266,6 +266,15 @@ base and saved in the receipt. A different architecture has different counts.
 Frozen tensors are passed to the upstream optimizer with no gradients, so its
 weight decay cannot alter them.
 
+The trainer accepts **bundle schema 2 only**, checking the manifest and both
+inner-file versions separately. Other versions fail with an explicit
+`schema_version must be 2` error; regenerate older bundles. It verifies the
+manifest fingerprint and every payload's hash/size before consuming data, and
+checks the native Parquet field names and float32 list types before sampling.
+The trainer receipt remains `adaptation.json` schema 1; that is a separate format.
+Source/version hashes and precise `training_input_sha256` values remain covered
+by bundle identity even when a source change rounds to identical float32 rows.
+
 Training reads only hash-verified native Parquet rows inside the bundle. Each
 update samples 32 effective grouped windows: uniformly choose an eligible item,
 then one of its eligible contiguous target blocks, then a valid origin.
@@ -310,6 +319,16 @@ Per-group scores are diagnostics; they are never averaged to form task SQL.
 A wholly undefined channel invalidates the aggregate, matching fev. SQL is the
 registered metric; `SQL` and `{"name":"SQL","epsilon":...}` are supported.
 Other metrics/configurations are rejected explicitly before training.
+
+Model targets are restored as float32. Inner known covariates are restored as
+object arrays in the manifest's `known_future` column order before Simons applies
+its column cap and per-window conversion. This preserves booleans, numeric nulls,
+text nulls and literal strings such as `"None"`; it never substitutes the native
+training category codes. No-covariate blocks pass `None`. Scoring fields retain
+their float64 precision independently of model inputs and training material.
+Offline parity checks exercise both the default NumPy formatter and unformatted
+data, text nulls versus literal categories, NumPy boolean training values,
+float64 seasonal scales erased by float32, and reloaded selected exports.
 
 The registration overrides A5's earlier combined-gain draft: an adapted
 candidate needs **at least 2% gain on each inner window** relative to update 0.
@@ -489,12 +508,14 @@ completion hash or verified trainer receipt establishes its original exact hash;
 frozen scores alone cannot establish that bundle identity. Restore the original
 identity evidence or use a new name instead of rebinding surviving results.
 
-The job reads `schema_version` from each bundle manifest and preserves the exact
-manifest bytes. It requires the manifest's task/phase, fingerprint and file-hash
-fields, without assuming the version equals 1. The embedded trainer patch 0004
-currently accepts bundle schema 1 and emits `adaptation.json` schema 1; a builder
-change to schema 2 requires a compatible trainer before a real pilot. Unsupported
-bundles fail as fits rather than being relabelled. The caller must provide the
+The job requires bundle `schema_version` to be the integer **2** and preserves
+the exact manifest bytes. It checks the manifest's task/phase and payload hashes
+before frozen scoring or fitting. The embedded trainer patch 0004 independently
+checks schema 2, the manifest fingerprint, both inner-file versions and the native
+training representation. The job records bundle schema 2 separately from
+`adaptation.json` schema 1 and its own completion schema 1. Unsupported bundles
+fail the task before any scoring or fitting; remaining tasks are attempted.
+The caller must provide the
 registered shifted development windows: a supplied YAML hash authenticates its
 bytes, not its cohort declaration. The job never substitutes official task YAML
 or opens another task's dataset to establish that declaration. Offline tests
