@@ -8,6 +8,65 @@ from pathlib import Path
 
 REPOSITORY = "https://github.com/alessiosavi/demand-forecast.git"
 
+ENVIRONMENT = r"""# Preserve the image's CUDA-matched torch, including its local version suffix.
+scratch=$(mktemp -d "$RUN_DIR/corpus-install-XXXXXX")
+python3 - "$scratch/image-torch.json" "$scratch/torch-constraint.txt" <<'CORPUS_IMAGE'
+import json
+import sys
+from pathlib import Path
+
+import torch
+
+image = {"version": torch.__version__, "path": str(Path(torch.__file__).resolve())}
+Path(sys.argv[1]).write_text(json.dumps(image))
+Path(sys.argv[2]).write_text("torch==" + image["version"] + "\n")
+CORPUS_IMAGE
+if ! python3 -m venv --clear --system-site-packages "$RUN_DIR/corpus-venv"; then
+    # The image may lack ensurepip. uv seeds pip and clears any interrupted venv.
+    python3 -m pip install --target "$scratch/uv-bootstrap" uv
+    "$scratch/uv-bootstrap/bin/uv" venv --clear --seed --system-site-packages \
+        --python "$(command -v python3)" --no-python-downloads "$RUN_DIR/corpus-venv"
+fi
+source "$RUN_DIR/corpus-venv/bin/activate"
+python -m pip install --constraint "$scratch/torch-constraint.txt" -e '.[bench]'
+python -m pip freeze > "$RUN_DIR/state/environment.txt"
+python - "$CHECKOUT" "$REPO_SHA" "$scratch/image-torch.json" <<'CORPUS_ENVIRONMENT'
+import json
+import subprocess
+import sys
+from importlib import import_module, metadata
+from pathlib import Path
+from urllib.parse import unquote, urlparse
+
+# Include lazy imports used by the fetcher and audit, without loading any data.
+for name in (
+    "huggingface_hub", "datasets", "fev", "numpy", "pandas", "pyarrow.parquet", "yaml",
+    "scripts.corpus_v4.fetch_native", "scripts.corpus_v4.audit_fev_overlap",
+):
+    import_module(name)
+
+import demand_forecast
+import torch
+
+root = Path(sys.argv[1]).resolve()
+image = json.loads(Path(sys.argv[3]).read_text())
+if torch.__version__ != image["version"] or str(Path(torch.__file__).resolve()) != image["path"]:
+    raise RuntimeError("torch is not the image's CUDA-matched package")
+direct = json.loads(metadata.distribution("demand-forecast").read_text("direct_url.json") or "{}")
+url = urlparse(direct.get("url", ""))
+if (url.scheme != "file" or Path(unquote(url.path)).resolve() != root
+        or direct.get("dir_info", {}).get("editable") is not True
+        or Path(demand_forecast.__file__).resolve() != root / "demand_forecast/__init__.py"):
+    raise RuntimeError("installed demand-forecast is not the pinned editable checkout")
+for name in ("scripts.corpus_v4.fetch_native", "scripts.corpus_v4.audit_fev_overlap"):
+    if Path(import_module(name).__file__).resolve() != root / (name.replace(".", "/") + ".py"):
+        raise RuntimeError("corpus module is not from the pinned checkout: " + name)
+head = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
+if head != sys.argv[2]:
+    raise RuntimeError("installed checkout HEAD does not match REPO_SHA")
+CORPUS_ENVIRONMENT
+"""
+
 
 def render(repo_sha, corpus_prefix):
     """Generate a bash job that preserves incomplete work and uploads failure evidence."""
@@ -24,6 +83,11 @@ set -euo pipefail
 REPO_SHA='{repo_sha}'
 CORPUS_URI='{corpus_prefix.rstrip("/")}'
 mkdir -p "$RUN_DIR/state"
+export HOME="${{HOME:-$RUN_DIR/home}}"
+export HF_HOME="$RUN_DIR/hf-cache"
+export HF_HUB_CACHE="$HF_HOME/hub" HUGGINGFACE_HUB_CACHE="$HF_HOME/hub"
+export HF_DATASETS_CACHE="$HF_HOME/datasets"
+mkdir -p "$HOME" "$HF_HOME"
 CORPUS="$RUN_DIR/state/corpus"
 AUDIT="$RUN_DIR/state/audit"
 SYNC_PID=''
@@ -77,9 +141,7 @@ cd "$CHECKOUT"
 git fetch origin "$REPO_SHA"
 git checkout --detach "$REPO_SHA"
 test "$(git rev-parse HEAD)" = "$REPO_SHA"
-python3 -m venv "$RUN_DIR/corpus-venv"
-source "$RUN_DIR/corpus-venv/bin/activate"
-python -m pip install -e '.[bench]'
+{ENVIRONMENT}\
 export HF_HUB_DISABLE_IMPLICIT_TOKEN=1
 python -m scripts.corpus_v4.fetch_native "$CORPUS" --state "$RUN_DIR/state"
 # Each folder contains stats.json and a verified per-file receipt.

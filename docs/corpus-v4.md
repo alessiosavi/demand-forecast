@@ -191,12 +191,30 @@ python -m scripts.corpus_v4.make_corpus_job FULL_REPO_SHA \
 bash -n job.sh
 ```
 
-The generated job installs the repository at the full SHA into a venv with the
-existing `bench` extra. NumPy/pandas/PyYAML are base dependencies;
+The generated job installs the repository at the full SHA into an editable venv
+with the existing `bench` extra. The package requires Python >=3.10, so the
+`pytorch-2-9-cu129-ubuntu-2204-nvidia-580` image's Python 3.10 is sufficient.
+The venv inherits system site packages. If the image lacks `ensurepip`, the job
+bootstraps `uv` with the image's pip into scratch space and uses it to create and
+seed the venv without downloading another interpreter. Both paths clear a
+half-built or previous venv on restart. A constraint derived from the image's
+own `torch.__version__` preserves its CUDA-matched torch, including the local
+version suffix; the preflight also checks torch's version and file path.
+
+Before fetching data, the job imports the fetch/audit modules and their lazy
+dependencies, verifies editable-install metadata and module paths against the
+checkout, and rechecks its HEAD against `REPO_SHA`. It records `pip freeze` in
+`RUN_DIR/state/environment.txt`. NumPy/pandas/PyYAML are base dependencies;
 PyArrow/datasets are in `bench`, and datasets already depends on huggingface_hub.
-There is no new runtime dependency. The guest provides Python, Git, gcloud,
-application-default Google credentials, `RUN_DIR` and `STATE_URI`. No credentials
-are embedded. The SHA must contain this implementation and frozen manifest.
+The guest provides Python with pip and torch, Git, gcloud, application-default
+Google credentials, `RUN_DIR` and `STATE_URI`. No credentials are embedded.
+The SHA must contain this implementation and frozen manifest.
+
+If `HOME` is empty or unset, the job sets it to `RUN_DIR/home` for startup-script
+execution as root. Default Hugging Face caches are under `RUN_DIR/hf-cache`,
+outside the periodically uploaded state tree. The fetcher's explicit staging
+cache and the audit's explicit benchmark cache retain their existing resumable
+locations under state; these explicit paths override the default cache settings.
 
 The host restores `RUN_DIR/state` before invocation. The job syncs it every ten
 minutes and at exit; the host's final copy also covers guest preemption. Each attempt first invalidates the old final audit and publishes
