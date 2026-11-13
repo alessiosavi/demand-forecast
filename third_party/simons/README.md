@@ -23,6 +23,12 @@ The complete upstream change set is:
   screen clocks, corpus release receipts, full/screen identity separation with
   legacy full-run compatibility, and checkpointed scalar exposure/replay counters.
 
+- `0004-task-local-adaptation.patch`: add `training.adapt` (CLI/run loop),
+  `training.adapt_data` (verified AD1 bundles, native sampling/horizon loss) and
+  `training.adapt_eval` (raw inference, fev-compatible SQL and registered
+  selection). Reuses the earlier durable checkpoint helpers. The previous
+  three patches remain unchanged.
+
 `prepare.py TREE BUNDLE` verifies the exact upstream HEAD and rejects source or
 config drift. It checks and applies the ordered series to a temporary source copy before
 applying any patch to the supplied tree. This allows later patches to extend
@@ -31,3 +37,9 @@ embeds this installer, the pin, notice and patches into each standalone job.
 
 See [stage 2 operations](../../docs/stage2-simons.md) for job generation,
 state layout, qualification limits and measured versus unmeasured claims.
+
+See [task-local adaptation](../../docs/adaptation.md#per-task-simons-trainer-patch-0004)
+for the CLI, parameter sets, exact objective, checkpoint/nonce protocol and
+`adaptation.json` schema. Offline acceptance lives in
+`tests/test_gcp_jobs/test_adapt.py`; AD1 bundle integration uses fev and datasets.
+The trainer itself adds no fev runtime dependency.

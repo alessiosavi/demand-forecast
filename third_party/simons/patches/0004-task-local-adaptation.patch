@@ -1,0 +1,881 @@
+diff --git a/src/simons/training/adapt.py b/src/simons/training/adapt.py
+new file mode 100644
+--- /dev/null
++++ b/src/simons/training/adapt.py
+@@ -0,0 +1,489 @@
++"""One immutable task bundle + base export + recipe/seed -> selected raw-neural weights.
++
++Run `python -m simons.training.adapt --help`. No dataset/model downloads occur.
++Checkpoints use the legs' hashed, fsynced, alternating-slot protocol; optimizer,
++RNG, best candidate, selection history and exposure are one transaction.
++"""
++
++import argparse
++import hashlib
++import math
++import os
++import time
++from dataclasses import asdict, dataclass
++from pathlib import Path
++
++import numpy as np
++import torch
++
++from simons import Simons
++from simons.training.adapt_data import Bundle, horizon_loss, json_bytes, sha
++from simons.training.adapt_eval import evaluate, metric_config, select
++from simons.training.optim import NorMuonAdamW
++from simons.training.reliability import latest_checkpoint
++from simons.training.trainer import read_checkpoint, write_checkpoint
++
++
++@dataclass(frozen=True)
++class Recipe:
++    params: str = "head"
++    lr_multiplier: float = 0.02
++    max_updates: int = 500
++    eval_updates: tuple = (0, 50, 100, 250, 500)
++    batch_size: int = 32
++    microbatch_size: int = 4
++    eval_batch_size: int = 4
++    context: int = 2048
++    rewarm_updates: int = 50
++    checkpoint_updates: int = 50
++    checkpoint_seconds: float = 600.0
++
++    def __post_init__(self):
++        if self.params not in ("head", "all"):
++            raise ValueError("params must be head or all")
++        if not math.isfinite(self.lr_multiplier) or self.lr_multiplier <= 0:
++            raise ValueError("lr_multiplier must be finite and positive")
++        for key in (
++            "batch_size",
++            "microbatch_size",
++            "eval_batch_size",
++            "context",
++            "rewarm_updates",
++            "checkpoint_updates",
++        ):
++            if type(getattr(self, key)) is not int or getattr(self, key) < 1:
++                raise ValueError(f"{key} must be a positive integer")
++        if self.microbatch_size > 4:
++            raise ValueError("registered microbatch_size must be <=4")
++        if type(self.max_updates) is not int or self.max_updates < 0:
++            raise ValueError("max_updates must be a nonnegative integer")
++        if not math.isfinite(self.checkpoint_seconds) or self.checkpoint_seconds <= 0:
++            raise ValueError("checkpoint_seconds must be finite and positive")
++        if any(type(x) is not int or x < 0 for x in self.eval_updates):
++            raise ValueError("eval_updates must be nonnegative integers")
++        object.__setattr__(
++            self,
++            "eval_updates",
++            tuple(
++                sorted(
++                    {0, self.max_updates} | {x for x in self.eval_updates if x <= self.max_updates}
++                )
++            ),
++        )
++
++
++def parameters(model, arm):
++    for name, parameter in model.named_parameters():
++        parameter.requires_grad_(arm == "all" or name.startswith(("head.", "norm.")))
++    trainable = {n: p.numel() for n, p in model.named_parameters() if p.requires_grad}
++    frozen = {n: p.numel() for n, p in model.named_parameters() if not p.requires_grad}
++    return dict(
++        trainable_names=list(trainable),
++        frozen_names=list(frozen),
++        trainable_shapes={n: list(p.shape) for n, p in model.named_parameters() if p.requires_grad},
++        trainable_numel=trainable,
++        trainable_count=sum(trainable.values()),
++        frozen_count=sum(frozen.values()),
++    )
++
++
++def rate(update, recipe):
++    """1-based update: stage-4 0.1->1 rewarm (50 steps), then linear decay to zero."""
++    warm = min(recipe.rewarm_updates, recipe.max_updates)
++    if update <= warm:
++        return 0.1 + 0.9 * update / max(1, warm)
++    return max(0.0, (recipe.max_updates - update) / max(1, recipe.max_updates - warm))
++
++
++def atomic_bytes(path, data):
++    path = Path(path)
++    temporary = path.with_name(path.name + ".tmp")
++    with temporary.open("wb") as handle:
++        handle.write(data)
++        handle.flush()
++        os.fsync(handle.fileno())
++    temporary.replace(path)
++    descriptor = os.open(path.parent, os.O_RDONLY)
++    try:
++        os.fsync(descriptor)
++    finally:
++        os.close(descriptor)
++
++
++def cpu_state(model):
++    return {n: p.detach().cpu().clone() for n, p in model.state_dict().items()}
++
++
++class CostMeter:
++    """Synchronized wall clock and per-device allocated-memory high-water mark."""
++
++    def __init__(self, device):
++        self.device = torch.device(device)
++        if self.device.type == "cuda":
++            torch.cuda.reset_peak_memory_stats(self.device)
++
++    def now(self):
++        if self.device.type == "cuda":
++            torch.cuda.synchronize(self.device)
++        return time.monotonic()
++
++    def peak_bytes(self, previous):
++        if self.device.type != "cuda":
++            return None
++        return max(previous or 0, torch.cuda.max_memory_allocated(self.device))
++
++
++def train_update(model, optimizer, sampler, recipe, seed, update):
++    """One deterministic effective batch; globally weighted by observed horizon cells."""
++    # Deliberately independent of bundle fingerprint/inner scores: changing inner
++    # labels cannot change training samples. Bundle/base hashes still gate resume.
++    digest = hashlib.sha256(f"simons-adapt-1:{seed}:{update}".encode()).digest()
++    rng = np.random.default_rng(int.from_bytes(digest[:8], "little"))
++    samples = [sampler.sample(rng) for _ in range(recipe.batch_size)]
++    count = sum(x[2]["supervised_values"] for x in samples)
++    optimizer.zero_grad(set_to_none=True)
++    model.train()
++    device = next(model.parameters()).device
++    buckets = {}
++    for values, known, info in samples:
++        buckets.setdefault((values.shape[1], known.shape[1]), []).append((values, known, info))
++    loss_sum = 0.0
++    for rows in buckets.values():
++        for start in range(0, len(rows), recipe.microbatch_size):
++            chunk = rows[start : start + recipe.microbatch_size]
++            values = torch.cat([x[0] for x in chunk]).to(device)
++            known = torch.cat([x[1] for x in chunk]).to(device)
++            loss, n = horizon_loss(model, values, known, sampler.history, sampler.horizon)
++            if not bool(torch.isfinite(loss)):
++                return None
++            (loss * (n / count)).backward()
++            loss_sum += float(loss.detach()) * n / count
++    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
++    if not bool(torch.isfinite(norm)):
++        optimizer.zero_grad(set_to_none=True)
++        return None
++    for group in optimizer.param_groups:
++        group["lr"] = group["peak_lr"] * rate(update, recipe)
++    optimizer.step()
++    return dict(
++        loss=loss_sum,
++        gradient_norm=float(norm),
++        grouped_windows=len(samples),
++        history_values=sum(x[2]["history_values"] for x in samples),
++        supervised_values=count,
++        known_covariate_values=sum(x[2]["known_covariate_values"] for x in samples),
++    )
++
++
++def run(bundle, base, output, recipe=None, seed=11, device="cpu", *, observer=None):
++    """Resume automatically in `output`. `observer(event,state)` is an offline fault hook.
++
++    The only data reads are verified bundle payloads and the local two-file base.
++    Run identity includes software/device; bitwise resume requires the same runtime.
++    """
++    recipe = Recipe() if recipe is None else recipe
++    bundle = Bundle(bundle)
++    base, output = Path(base).resolve(strict=True), Path(output)
++    base_hashes = {n: sha(base / n) for n in ("config.json", "model.safetensors")}
++    metric_config(bundle.manifest["scoring"])
++    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
++    torch.use_deterministic_algorithms(True)
++    torch.manual_seed(seed)
++    cost = CostMeter(device)
++    model = Simons.from_pretrained(base, device=device)
++    param_info = parameters(model, recipe.params)
++    optimizer = NorMuonAdamW(
++        model,
++        muon_lr=0.002 * recipe.lr_multiplier,
++        adam_lr=0.0005 * recipe.lr_multiplier,
++        weight_decay=0.0697,
++        mup_base_width=704,
++    )
++    source = Path(__file__).parent.parent
++    identity = dict(
++        schema="simons-adapt-1",
++        bundle_fingerprint=bundle.manifest["fingerprint"],
++        base=base_hashes,
++        recipe=asdict(recipe),
++        seed=seed,
++        software={str(p.relative_to(source)): sha(p) for p in sorted(source.rglob("*.py"))},
++        runtime=dict(
++            torch=torch.__version__,
++            numpy=np.__version__,
++            device=str(next(model.parameters()).device),
++            threads=torch.get_num_threads(),
++            cuda=torch.version.cuda,
++        ),
++    )
++    # JSON round-trip ensures tuple/list and TorchVersion differences cannot affect identity.
++    import json
++
++    identity = json.loads(json_bytes(identity))
++    output.mkdir(parents=True, exist_ok=True)
++    state_dir = output / "checkpoints"
++    state_dir.mkdir(exist_ok=True)
++    checkpoint = latest_checkpoint(state_dir)
++    if checkpoint is None and any(p.name != "checkpoints" for p in output.iterdir()):
++        raise ValueError("nonempty output without a valid adaptation checkpoint")
++    started = time.monotonic()
++    state = dict(
++        step=0,
++        elapsed_seconds=0.0,
++        training_wall_seconds=0.0,
++        peak_cuda_memory_bytes=None,
++        evaluations=[],
++        best_model=None,
++        best_update=0,
++        finished=False,
++        forced_reason=None,
++        slot=0,
++        exposure=dict(
++            updates=0,
++            grouped_windows=0,
++            history_values=0,
++            supervised_values=0,
++            known_covariate_values=0,
++        ),
++        last_update=None,
++        acknowledged_nonce=None,
++        sampler_info=dict(ineligible_groups=[], unique_observed_values=0, history=None),
++    )
++    if checkpoint is not None:
++        restored = read_checkpoint(checkpoint)
++        if restored.get("job_identity") != identity:
++            raise ValueError("adaptation checkpoint identity mismatch")
++        model.load_state_dict(restored["model"])
++        optimizer.load_state_dict(restored["optimizer"])
++        state = restored["adaptation"]
++        torch.set_rng_state(restored["rng_cpu"])
++        if restored["rng_cuda"]:
++            torch.cuda.set_rng_state_all(restored["rng_cuda"])
++    elapsed_before = state["elapsed_seconds"]
++    last_save = time.monotonic()
++    run_dir = Path(os.environ.get("RUN_DIR", str(output)))
++
++    def elapsed():
++        return elapsed_before + time.monotonic() - started
++
++    def save(final=False):
++        nonlocal last_save
++        state["elapsed_seconds"] = elapsed()
++        state["peak_cuda_memory_bytes"] = cost.peak_bytes(state["peak_cuda_memory_bytes"])
++        name = "checkpoint-final.pt" if final else f"checkpoint-slot-{state['slot']}.pt"
++        if not final:
++            state["slot"] = 1 - state["slot"]
++        write_checkpoint(
++            state_dir / name,
++            dict(
++                format="simons-train-1",
++                step=state["step"],
++                elapsed_seconds=state["elapsed_seconds"],
++                model_config=model.config.to_dict(),
++                training=asdict(recipe),
++                job_identity=identity,
++                model=model.state_dict(),
++                optimizer=optimizer.state_dict(),
++                adaptation=state,
++                rng_cpu=torch.get_rng_state(),
++                rng_cuda=torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
++            ),
++        )
++        last_save = time.monotonic()
++        if observer:
++            observer("checkpoint", state)
++
++    def request_checkpoint():
++        request = run_dir / "checkpoint-request"
++        if request.is_file():
++            nonce = request.read_text().strip()
++            if nonce and nonce != state["acknowledged_nonce"]:
++                state["acknowledged_nonce"] = nonce
++                save()
++            if nonce:
++                # Also repair interruption after save but before acknowledgment.
++                atomic_bytes(run_dir / "checkpoint-done", (nonce + "\n").encode())
++
++    def evaluation():
++        started = cost.now()
++        windows = evaluate(model, bundle, recipe.eval_batch_size)
++        state["evaluations"].append(
++            dict(update=state["step"], windows=windows, wall_seconds=cost.now() - started)
++        )
++        return windows
++
++    def check():
++        windows = evaluation()
++        decision = select(state["evaluations"])
++        if decision["selected_update"] != state["best_update"]:
++            state["best_update"] = decision["selected_update"]
++            state["best_model"] = cpu_state(model) if state["best_update"] else None
++        state["finished"] = decision["stop"]
++        if decision["reason"] == "non_finite_evaluation":
++            state["forced_reason"] = next(
++                (w.get("reason") for w in windows if w.get("reason")), "non_finite_evaluation"
++            )
++        save()
++        if observer:
++            observer("evaluation", state)
++
++    sampler = None
++    if not state["finished"]:
++        if bundle.manifest["excluded_items"] and not any(
++            item["eligible"] for item in bundle.manifest["items"]
++        ):
++            state["forced_reason"] = "all_items_excluded"
++        else:
++            sampler = bundle.sampler(model.config, recipe.context)
++            state["sampler_info"] = dict(
++                ineligible_groups=sampler.ineligible_groups,
++                unique_observed_values=sampler.unique_observed_values,
++                history=sampler.history,
++            )
++            if not sampler.keys:
++                state["forced_reason"] = "empty_training_set"
++        if state["forced_reason"]:
++            state["finished"] = True
++            if not state["evaluations"]:
++                # Retain feasible baseline evidence, without selecting on empty training.
++                evaluation()
++            save()
++        elif not state["evaluations"]:
++            check()
++    request_checkpoint()
++    while not state["finished"] and state["step"] < recipe.max_updates:
++        update = state["step"] + 1
++        update_started = cost.now()
++        measured = train_update(model, optimizer, sampler, recipe, seed, update)
++        update_seconds = cost.now() - update_started
++        state["training_wall_seconds"] += update_seconds
++        if measured is None:
++            state["forced_reason"], state["finished"] = "non_finite_training", True
++            break
++        state["step"] = update
++        measured["wall_seconds"] = update_seconds
++        state["last_update"] = measured
++        for key in state["exposure"]:
++            state["exposure"][key] += 1 if key == "updates" else measured[key]
++        if update in recipe.eval_updates:
++            check()
++        elif (
++            update % recipe.checkpoint_updates == 0
++            or time.monotonic() - last_save >= recipe.checkpoint_seconds
++        ):
++            save()
++        request_checkpoint()
++        if observer:
++            observer("update", state)
++    state["finished"] = True
++    decision = (
++        select(state["evaluations"])
++        if state["evaluations"]
++        else dict(selected_update=0, reason="empty_training_set", stop=True)
++    )
++    if state["forced_reason"]:
++        decision = dict(selected_update=0, reason=state["forced_reason"], stop=True)
++    # Commit completion BEFORE publishing the export, so a killed publication is repairable.
++    save(final=True)
++    request_checkpoint()
++    selected = decision["selected_update"]
++    atomic_bytes(output / "config.json", (base / "config.json").read_bytes())
++    if selected:
++        from safetensors.torch import save
++
++        weights = {n: p.contiguous() for n, p in state["best_model"].items()}
++        atomic_bytes(output / "model.safetensors", save(weights))
++    else:
++        atomic_bytes(output / "model.safetensors", (base / "model.safetensors").read_bytes())
++    # Always recheck the immutability assumptions before publishing the receipt.
++    if any(sha(base / n) != h for n, h in base_hashes.items()):
++        raise ValueError("base export changed during adaptation")
++    report = dict(
++        schema_version=1,
++        identity=identity,
++        inputs=dict(
++            bundle_manifest_sha256=sha(bundle.root / "manifest.json"),
++            bundle_files=bundle.manifest["files"],
++            base=base_hashes,
++            task=bundle.manifest["task"],
++            phase=bundle.manifest["phase"],
++        ),
++        recipe=asdict(recipe),
++        seed=seed,
++        parameters=param_info,
++        evaluations=state["evaluations"],
++        decision={**decision, "selected": "adapted" if selected else "frozen_base"},
++        updates_run=state["step"],
++        wall_seconds=state["elapsed_seconds"],
++        training_wall_seconds=state["training_wall_seconds"],
++        peak_cuda_memory_bytes=state["peak_cuda_memory_bytes"],
++        exposure={
++            **state["exposure"],
++            "schema": "simons-adapt-exposure-1",
++            "history_loss_weight": 0,
++            "quantiles_per_label": 9,
++            "counts_include_replays": False,
++        },
++        excluded_items=bundle.manifest["excluded_items"],
++        ineligible_training_groups=state["sampler_info"]["ineligible_groups"],
++        sampling=dict(
++            history=state["sampler_info"]["history"],
++            min_observed_history=32,
++            order="uniform item, eligible block, valid origin",
++            unique_corpus_observed_values=state["sampler_info"]["unique_observed_values"],
++        ),
++        objective=dict(
++            name="masked_horizon_pinball",
++            quantiles=list(np.arange(1, 10) / 10),
++            history_weight=0,
++            horizon=bundle.horizon,
++            normalization="native causal scale/asinh",
++        ),
++        optimization=dict(
++            family="NorMuonAdamW",
++            muon_base_lr=0.002,
++            adam_base_lr=0.0005,
++            muon_weight_decay=0.0697,
++            mup_base_width=704,
++            gradient_clip=1,
++            peak_group_rates=[g["peak_lr"] for g in optimizer.param_groups],
++            schedule="0.1-to-1 rewarm then linear decay to zero",
++        ),
++        last_update=state["last_update"],
++        export={n: sha(output / n) for n in base_hashes},
++    )
++    atomic_bytes(output / "adaptation.json", json_bytes(report))
++    return report
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--bundle", type=Path, required=True)
++    parser.add_argument(
++        "--base", type=Path, required=True, help="local config.json + model.safetensors"
++    )
++    parser.add_argument(
++        "--output", type=Path, required=True, help="new output, or automatically resumed run"
++    )
++    parser.add_argument("--seed", type=int, required=True)
++    parser.add_argument("--device", default="cpu")
++    for name, field in Recipe.__dataclass_fields__.items():
++        flag = "--" + name.replace("_", "-")
++        if name == "eval_updates":
++            parser.add_argument(
++                flag, type=lambda s: tuple(int(x) for x in s.split(",")), default=field.default
++            )
++        else:
++            parser.add_argument(
++                flag,
++                type=type(field.default),
++                default=field.default,
++                **({"choices": ("head", "all")} if name == "params" else {}),
++            )
++    args = parser.parse_args()
++    recipe = Recipe(**{n: getattr(args, n) for n in Recipe.__dataclass_fields__})
++    report = run(args.bundle, args.base, args.output, recipe, args.seed, args.device)
++    print(json_bytes(report["decision"]).decode().strip())
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/src/simons/training/adapt_data.py b/src/simons/training/adapt_data.py
+new file mode 100644
+--- /dev/null
++++ b/src/simons/training/adapt_data.py
+@@ -0,0 +1,214 @@
++"""Verified AD1 bundles, native grouped-window sampling and horizon-only loss."""
++
++import hashlib
++import json
++from contextlib import contextmanager
++from dataclasses import replace
++from pathlib import Path
++
++import numpy as np
++import torch
++
++from simons.model import QUANTILES, future_steps
++from simons.training import network
++
++RAW = dict(
++    views=False, sign_clip=False, integer_snap=False, fit_row=False, xreg=False, xreg_guard=False
++)
++
++
++def json_bytes(value):
++    return (
++        json.dumps(
++            value, sort_keys=True, ensure_ascii=False, separators=(",", ":"), allow_nan=False
++        )
++        + "\n"
++    ).encode()
++
++
++def sha(path):
++    digest = hashlib.sha256()
++    with Path(path).open("rb") as handle:
++        for block in iter(lambda: handle.read(1 << 20), b""):
++            digest.update(block)
++    return digest.hexdigest()
++
++
++@contextmanager
++def raw_model(model):
++    config = model.config
++    model.config = replace(config, **RAW)
++    try:
++        yield
++    finally:
++        model.config = config
++
++
++class Bundle:
++    """Only manifest-listed, hash-verified payloads beneath the supplied bundle are read."""
++
++    def __init__(self, root):
++        self.root = Path(root).resolve(strict=True)
++        manifest_path = (self.root / "manifest.json").resolve(strict=True)
++        if not manifest_path.is_relative_to(self.root):
++            raise ValueError("manifest path escapes bundle")
++        self.manifest = json.loads(manifest_path.read_bytes())
++        m = self.manifest
++        unsigned = {k: v for k, v in m.items() if k != "fingerprint"}
++        if m.get("schema_version") != 1 or hashlib.sha256(
++            json_bytes(unsigned)
++        ).hexdigest() != m.get("fingerprint"):
++            raise ValueError("bundle fingerprint/schema mismatch")
++        self.paths = {}
++        for name, expected in m["files"].items():
++            path = (self.root / name).resolve(strict=True)
++            if Path(name).is_absolute() or not path.is_relative_to(self.root):
++                raise ValueError("bundle path escapes bundle")
++            if path.stat().st_size != expected["bytes"] or sha(path) != expected["sha256"]:
++                raise ValueError(f"bundle payload hash mismatch: {name}")
++            self.paths[name] = path
++        self.inners = [json.loads(self.paths[f"inner-{i}.json"].read_bytes()) for i in range(2)]
++        if any(
++            x["scoring"] != m["scoring"] or x["origin_number"] != i
++            for i, x in enumerate(self.inners)
++        ):
++            raise ValueError("inner scoring/origin mismatch")
++        self.horizon = m["task"]["horizon"]
++        if not isinstance(self.horizon, int) or self.horizon < 1:
++            raise ValueError("invalid task horizon")
++
++    def sampler(self, config, context=2048):
++        return NativeSampler(self, config, context)
++
++
++class NativeSampler:
++    """Uniform item, then eligible block, then valid origin; no augmentations or mixing."""
++
++    def __init__(self, bundle, config, context):
++        import pyarrow.parquet as pq
++
++        self.horizon = bundle.horizon
++        if self.horizon > config.prediction_length:
++            raise ValueError("adaptation horizon exceeds the base native prediction length")
++        hist = min(context, config.context_length)
++        if hist > config.near_context:
++            hist = config.near_context + (
++                (hist - config.near_context) // (config.patch_length * config.far_pool)
++            ) * (config.patch_length * config.far_pool)
++        else:
++            hist = hist // config.patch_length * config.patch_length
++        self.history = hist
++        self.length = hist + future_steps(config)
++        if hist < 32:
++            raise ValueError("base/recipe context cannot hold 32 observed history points")
++        m = bundle.manifest
++        mappings = {g["native_item_id"]: g for g in m["groups"]}
++        excluded = {x["item_id"] for x in m["excluded_items"]}
++        cov_rows = {}
++        for name, path in sorted(bundle.paths.items()):
++            if name.startswith("covariates/train-") and name.endswith(".parquet"):
++                for row in pq.read_table(path).to_pylist():
++                    cov_rows[row["item_id"]] = row
++        self.items = {}
++        self.ineligible_groups = []
++        for name, path in sorted(bundle.paths.items()):
++            if not (name.startswith("univariate/train-") and name.endswith(".parquet")):
++                continue
++            for row in pq.read_table(path).to_pylist():
++                group = mappings[row["item_id"]]
++                if group["item_id"] in excluded:
++                    continue
++                y = np.asarray(row["target"], dtype=np.float32)
++                if y.ndim != 2 or not 1 <= len(y) <= 32:
++                    raise ValueError("invalid native target shape")
++                covs = np.empty((0, y.shape[-1]), dtype=np.float32)
++                if m["covariates"]["known_future"]:
++                    first = None
++                    for j, index in enumerate(group["target_indices"]):
++                        key = json.dumps([group["item_id"], index], separators=(",", ":"))
++                        entry = cov_rows[key]
++                        if not np.array_equal(
++                            y[j], np.asarray(entry["target"], dtype=np.float32), equal_nan=True
++                        ):
++                            raise ValueError("native covariate/target rows disagree")
++                        if first is None:
++                            first = entry["covariates"]
++                    covs = np.asarray(first, dtype=np.float32)
++                    if covs.shape != (len(m["covariates"]["known_future"]), y.shape[-1]):
++                        raise ValueError("invalid native known-covariate shape")
++                # Count finite points, never impute labels or inspect inner targets.
++                n = y.shape[-1]
++                origins = np.arange(32, n - self.horizon + 1, dtype=np.int64)
++                cumulative = np.pad(np.isfinite(y).cumsum(-1), ((0, 0), (1, 0)))
++                past = cumulative[:, origins] - cumulative[:, np.maximum(0, origins - hist)]
++                future = cumulative[:, origins + self.horizon] - cumulative[:, origins]
++                origins = origins[(past >= 32).all(0) & (future.sum(0) > 0)]
++                if not len(origins):
++                    self.ineligible_groups.append(group)
++                    continue
++                self.items.setdefault(group["item_id"], []).append((group, y, covs, origins))
++        self.keys = sorted(self.items)
++        self.unique_observed_values = sum(
++            int(np.isfinite(y).sum()) for groups in self.items.values() for _, y, _, _ in groups
++        )
++
++    def sample(self, rng):
++        groups = self.items[self.keys[int(rng.integers(len(self.keys)))]]
++        group, y, covs, origins = groups[int(rng.integers(len(groups)))]
++        origin = int(origins[int(rng.integers(len(origins)))])
++        start = max(0, origin - self.history)
++        lo = self.history - (origin - start)
++        end = origin + self.horizon
++        values = np.full((1, len(y), self.length), np.nan, dtype=np.float32)
++        values[0, :, lo : self.history + self.horizon] = y[:, start:end]
++        cov = covs[:, start:end]
++        # Match upstream's cap after discarding constant/all-missing columns.
++        finite = np.isfinite(cov)
++        low = np.where(finite, cov, np.inf).min(-1)
++        high = np.where(finite, cov, -np.inf).max(-1)
++        cov = cov[high > low][:16]
++        known = np.full((1, len(cov), self.length), np.nan, dtype=np.float32)
++        known[0, :, lo : self.history + self.horizon] = cov
++        return (
++            torch.from_numpy(values),
++            torch.from_numpy(known),
++            {
++                "native_item_id": group["native_item_id"],
++                "origin": origin,
++                "history_values": int(np.isfinite(y[:, start:origin]).sum()),
++                "supervised_values": int(np.isfinite(y[:, origin:end]).sum()),
++                "known_covariate_values": int(np.isfinite(cov).sum()),
++            },
++        )
++
++
++def horizon_loss(model, values, covariates, history, horizon):
++    """Masked-horizon pinball in the model's own causal-scale/asinh units.
++
++    Values are [B,V,history+native_future]. Only [history,history+H) is a label;
++    all later target AND covariate slots are absent from the forward pass.
++    """
++    patch = model.config.patch_length
++    position = torch.arange(values.shape[-1], device=values.device)
++    future = position >= history
++    supervised = future & (position < history + horizon)
++    inputs = values.masked_fill(future, float("nan"))
++    covariates = covariates.masked_fill(position >= history + horizon, float("nan"))
++    ids = torch.zeros(values.shape[:2], dtype=torch.long, device=values.device)
++    with raw_model(model):
++        q, loc, scale = network.covariate_forward(model, inputs, ids, covariates)
++    # The last history token predicts the first future patch. No history term exists.
++    first = q.shape[2] - future_steps(model.config) // patch - 1
++    patches = (horizon + patch - 1) // patch
++    prediction = q[:, :, first : first + patches].flatten(2, 3)[..., :horizon, :]
++    loc = loc[:, :, first : first + patches].repeat_interleave(patch, -1)[..., :horizon]
++    scale = scale[:, :, first : first + patches].repeat_interleave(patch, -1)[..., :horizon]
++    target = values[..., supervised].double()
++    observed = torch.isfinite(target)
++    goal = torch.asinh((torch.where(observed, target, 0) - loc) / scale).float()
++    err = goal.unsqueeze(-1) - prediction
++    levels = prediction.new_tensor(QUANTILES)
++    losses = torch.maximum(levels * err, (levels - 1) * err)
++    total = torch.where(observed.unsqueeze(-1), losses, 0).sum()
++    count = int(observed.sum())
++    return total / max(1, count * len(QUANTILES)), count
+diff --git a/src/simons/training/adapt_eval.py b/src/simons/training/adapt_eval.py
+new file mode 100644
+--- /dev/null
++++ b/src/simons/training/adapt_eval.py
+@@ -0,0 +1,163 @@
++"""Raw scoring-adapter inference and fev-compatible SQL, without a fev dependency."""
++
++import warnings
++
++import numpy as np
++import torch
++
++from simons import forecast_series
++from simons.training.adapt_data import raw_model
++
++
++def nanmean(values, axis=None):
++    with warnings.catch_warnings():
++        warnings.simplefilter("ignore", RuntimeWarning)
++        return np.nanmean(values, axis=axis)
++
++
++def sql(y_true, q_pred, past, levels, seasonality, epsilon=0.0, per_item=False):
++    """fev SQL per channel/quantile; default reduces item/time BEFORE quantiles/channels.
++
++    `past` contains [D,T] histories. Nonfinite scaled losses are excluded exactly
++    as fev.Metric._safemean; zero seasonal scales are not silently replaced.
++    """
++    scales = np.stack([nanmean(np.abs(p[:, seasonality:] - p[:, :-seasonality]), -1) for p in past])
++    scales = np.clip(scales, epsilon, None)
++    truth = y_true[..., None]
++    levels = np.asarray(levels)
++    loss = 2 * np.abs((truth - q_pred) * ((truth <= q_pred) - levels))
++    with np.errstate(divide="ignore", invalid="ignore"):
++        scaled = loss / scales[:, None, :, None]
++    scaled = np.where(np.isfinite(scaled), scaled, np.nan)
++    return nanmean(scaled, axis=1 if per_item else (0, 1))
++
++
++def metric_config(scoring):
++    metric = scoring["eval_metric"]
++    spec = {"name": metric} if isinstance(metric, str) else dict(metric)
++    if str(spec.pop("name")).upper() != "SQL" or set(spec) - {"epsilon"}:
++        raise ValueError("registered adaptation supports SQL (optional epsilon) only")
++    epsilon = float(spec.get("epsilon", 0.0))
++    levels = scoring["quantile_levels"]
++    if not np.isfinite(epsilon) or epsilon < 0 or not levels or not all(0 < q < 1 for q in levels):
++        raise ValueError("invalid SQL configuration")
++    if scoring["seasonality"] < 1:
++        raise ValueError("SQL seasonality must be positive")
++    return epsilon
++
++
++@torch.inference_mode()
++def evaluate(model, bundle, batch_size=4):
++    """Same forecast_series, blocks, raw switches, sorting and interpolation as SimonsAdapter."""
++    scoring = bundle.manifest["scoring"]
++    epsilon = metric_config(scoring)
++    levels = scoring["quantile_levels"]
++    windows = []
++    was_training = model.training
++    model.eval()
++    try:
++        with raw_model(model):
++            for inner in bundle.inners:
++                items = inner["items"]
++                if not items:
++                    windows.append(dict(score=None, groups=[], reason="empty_inner"))
++                    continue
++                blocks = [(item, block) for item in items for block in item["model_input"]]
++                outputs = forecast_series(
++                    model,
++                    [np.asarray(b["target"], dtype=np.float32) for _, b in blocks],
++                    bundle.horizon,
++                    future_covariates=[b["known_covariates"] for _, b in blocks],
++                    past_covariates=None,
++                    shared_categories=False,
++                    batch_size=batch_size,
++                )
++                if len(outputs) != len(blocks):
++                    raise ValueError("forecast group count mismatch")
++                predictions, groups = {}, []
++                nonfinite = False
++                for (item, block), output in zip(blocks, outputs, strict=True):
++                    q = np.sort(np.asarray(output), axis=-1)
++                    indices = block["target_indices"]
++                    if q.shape != (len(indices), bundle.horizon, 9):
++                        raise ValueError("forecast shape mismatch")
++                    nonfinite |= not bool(np.isfinite(q).all())
++                    q = np.stack(
++                        [
++                            np.apply_along_axis(
++                                lambda a: np.interp(level, np.arange(1, 10) / 10, a), -1, q
++                            )
++                            for level in levels
++                        ],
++                        axis=-1,
++                    )
++                    n = len(scoring["target_columns"])
++                    predictions.setdefault(
++                        item["item_id"], np.full((n, bundle.horizon, len(levels)), np.nan)
++                    )[indices] = q
++                if nonfinite:
++                    windows.append(dict(score=None, groups=[], reason="non_finite_forecast"))
++                    continue
++                truth = np.stack([np.asarray(i["score_target"], dtype=np.float64).T for i in items])
++                past = [np.asarray(i["score_past"], dtype=np.float64) for i in items]
++                q = np.stack([predictions[i["item_id"]].transpose(1, 0, 2) for i in items])
++                if not np.isfinite(q).all():
++                    raise ValueError("incomplete inner target blocks")
++                scores = sql(truth, q, past, levels, scoring["seasonality"], epsilon)
++                per_item = sql(truth, q, past, levels, scoring["seasonality"], epsilon, True).mean(
++                    -1
++                )
++                for j, item in enumerate(items):
++                    for block in item["model_input"]:
++                        indices = block["target_indices"]
++                        groups.append(
++                            dict(
++                                item_id=item["item_id"],
++                                target_indices=indices,
++                                score=number(np.mean(per_item[j, indices])),
++                            )
++                        )
++                windows.append(
++                    dict(
++                        score=number(np.mean(scores.mean(-1))),
++                        groups=groups,
++                        per_channel=[number(x) for x in scores.mean(-1)],
++                    )
++                )
++    finally:
++        model.train(was_training)
++    return windows
++
++
++def number(value):
++    return float(value) if np.isfinite(value) else None
++
++
++def select(evaluations):
++    """Literal registered dual-window gate; patience uses the mean and significant best."""
++    base = np.array([w["score"] for w in evaluations[0]["windows"]], dtype=float)
++    best, significant, stale, selected = float("inf"), float(base.mean()), 0, 0
++    for i, evaluation in enumerate(evaluations):
++        pair = np.array([w["score"] for w in evaluation["windows"]], dtype=float)
++        if pair.shape != (2,) or not np.isfinite(pair).all():
++            return dict(
++                selected_update=0, reason="non_finite_evaluation", stop=True, stale_checks=stale
++            )
++        if i == 0:
++            continue
++        mean = float(pair.mean())
++        # A zero baseline has no positive percentage gain to offer.
++        if (base > 0).all() and (pair <= base * 0.98).all() and mean < best:
++            best, selected = mean, evaluation["update"]
++        if significant > 0 and mean <= significant * 0.995:
++            significant, stale = mean, 0
++        else:
++            stale += 1
++        if stale >= 2:
++            break
++    return dict(
++        selected_update=selected,
++        reason="inner_gain" if selected else "no_qualifying_gain",
++        stop=stale >= 2,
++        stale_checks=stale,
++    )
