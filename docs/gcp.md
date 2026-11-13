@@ -358,6 +358,9 @@ Any remaining instance or disk blocks settlement. `settlement_evidence` states
 the chosen rule, and sanitized operation evidence is retained as above. A changed
 start observed during polling, or a described stop earlier than a retained
 matching guest power-off event, also keeps the reservation held.
+When an instance is still present, automatic settlement checks operation history
+before trusting describe for every provisioning model (`SPOT`, `STANDARD`, and
+`FLEX_START`). Explicit `--settled-usd` with `--evidence` skips this lookup.
 
 Missing/expired operations, failed or unfinished operations, invalid timestamps,
 multiple inserts, or additional start/resume/reset operations retain the full

@@ -1330,14 +1330,9 @@ class Guard:
                     + json.dumps(session["reopened"]),
                     file=sys.stderr,
                 )
-        if (
-            resources["instances"]
-            and session.get("instance_id")
-            and session["launch"]["provisioning"] == "SPOT"
-            and args.settled_usd is None
-        ):
+        if resources["instances"] and session.get("instance_id") and args.settled_usd is None:
             self.operations_evidence(session)
-            if any(
+            if session["launch"]["provisioning"] == "SPOT" and any(
                 op.get("operationType") == "compute.instances.preempted"
                 for op in session.get("settlement_operations", [])
             ):
@@ -1473,7 +1468,7 @@ class Guard:
                 + Decimal(str(disk_seconds)) / 3600 * number(session["disk_hourly_usd"])
             )
             reason = evidence["source"]
-            if evidence.get("billing_rule") != "spot-preemption-end":
+            if evidence.get("billing_rule") not in {"spot-preemption-end", "guest-termination-end"}:
                 reason += "; boot disk through verified deletion (conservative)"
         else:
             session["status"] = "needs_settlement"

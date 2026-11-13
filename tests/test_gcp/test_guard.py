@@ -1054,7 +1054,10 @@ def test_deleted_instance_settles_from_zone_operations(cloud, terminal, recorded
         o["name"] for o in operations
     }
     assert session["runtime_evidence"]["deleted"] == "2026-11-12T01:20:00Z"
-    assert "operations" in session["settlement_evidence"]
+    assert session["settlement_evidence"] == (
+        "compute.operations.list targetId + zone; first boot/termination and completed delete; "
+        "boot disk through verified deletion (conservative)"
+    )
 
 
 @pytest.mark.parametrize(
@@ -1634,7 +1637,11 @@ def test_live_spot_preemption_history_settles_through_operation_end(cloud, fixtu
     end = next(o["endTime"] for o in ops if o["operationType"] == "compute.instances.preempted")
     assert saved["runtime_evidence"]["stop"] == saved["runtime_evidence"]["deleted"] == end
     assert saved["runtime_evidence"]["start"] == fixture["last_start"]
-    assert "preemption endTime" in saved["settlement_evidence"]
+    assert saved["settlement_evidence"] == (
+        "compute.operations.list targetId + zone; Spot DELETE: "
+        "machine from recorded start and disk from creation through preemption endTime; "
+        "two clean instance/disk absence reads"
+    )
     assert len(saved["settlement_inventory"]) == 2
 
     def instant(s):
@@ -1907,7 +1914,11 @@ def test_canary_w2_reserved_adoption_and_no_delete_settlement(cloud, observe_fir
     assert saved["runtime_evidence"]["start"] == inserted["insertTime"]
     assert saved["runtime_evidence"]["creation"] == inserted["insertTime"]
     assert saved["runtime_evidence"]["stop"] == "2026-11-13T11:53:13.001Z"
-    assert "insert request" in saved["settlement_evidence"]
+    assert saved["settlement_evidence"] == (
+        "compute.operations.list targetId + zone; Spot DELETE: "
+        "machine and disk charged from insert request (no instance start recorded) "
+        "through preemption endTime; two clean instance/disk absence reads"
+    )
     assert saved["settled_cost_usd"] == "0.038568"
     assert len(saved["settlement_inventory"]) == 2
 
@@ -2217,10 +2228,11 @@ LIVE_GUEST_SHUTDOWNS = json.loads(
 )
 
 
-def guest_shutdown_history(cloud, fixture=LIVE_GUEST_SHUTDOWNS[1]):
+def guest_shutdown_history(cloud, fixture=LIVE_GUEST_SHUTDOWNS[1], *, model="SPOT"):
     operations = deleted_operations(cloud)
     ledger = cloud.read()
     session = ledger["sessions"][0]
+    session["launch"]["provisioning"] = model
     for key in ("last_start", "instance_created_at", "hourly_usd", "disk_hourly_usd"):
         session[key] = fixture[key]
     cloud.ledger.write_text(json.dumps(ledger))
@@ -2255,8 +2267,28 @@ def close_in_process(cloud, monkeypatch, *, elapsed=None, frozen=None, extra=(),
     module["Guard"](cloud.ledger).close(args)
 
 
-@pytest.mark.parametrize("with_delete,expected", [(True, "3.749472"), (False, "3.727433")])
-def test_real_guest_shutdown_history_settles_conservatively(cloud, with_delete, expected):
+@pytest.mark.parametrize(
+    "with_delete,expected,expected_evidence",
+    [
+        (
+            True,
+            "3.749472",
+            "compute.operations.list targetId + zone; single guestTerminate: "
+            "machine from recorded start and disk from creation through "
+            "completed delete endTime (conservative); boot disk through verified deletion (conservative)",
+        ),
+        (
+            False,
+            "3.727433",
+            "compute.operations.list targetId + zone; single guestTerminate: "
+            "machine from recorded start and disk from creation through "
+            "guestTerminate endTime; two clean instance/disk absence reads",
+        ),
+    ],
+)
+def test_real_guest_shutdown_history_settles_conservatively(
+    cloud, with_delete, expected, expected_evidence
+):
     operations = guest_shutdown_history(cloud)
     if not with_delete:
         operations = [op for op in operations if op["operationType"] != "delete"]
@@ -2272,10 +2304,7 @@ def test_real_guest_shutdown_history_settles_conservatively(cloud, with_delete, 
     end = "2026-11-13T10:38:35.546-08:00" if with_delete else "2026-11-13T10:37:59.733-08:00"
     assert saved["runtime_evidence"]["stop"] == saved["runtime_evidence"]["deleted"] == end
     assert saved["runtime_evidence"]["start"] == LIVE_GUEST_SHUTDOWNS[1]["last_start"]
-    assert "guestTerminate" in saved["settlement_evidence"]
-    assert ("delete endTime" if with_delete else "guestTerminate endTime") in saved[
-        "settlement_evidence"
-    ]
+    assert saved["settlement_evidence"] == expected_evidence
     assert len(saved["settlement_inventory"]) == 2
     assert all(
         not read["instances"] and not read["disks"] for read in saved["settlement_inventory"]
@@ -2302,6 +2331,10 @@ def test_ad2_completed_describe_path_unchanged(cloud, monkeypatch):
     close_in_process(cloud, monkeypatch, frozen=datetime.fromisoformat(fixture["closed_at"]))
     saved = cloud.read()["sessions"][0]
     assert saved["runtime_evidence"] == fixture["runtime_evidence"]
+    assert saved["settlement_evidence"] == (
+        "instances.describe lastStartTimestamp/lastStopTimestamp; "
+        "boot disk through verified deletion (conservative)"
+    )
     assert abs(Decimal(saved["settled_cost_usd"]) - Decimal("2.505759")) < Decimal("0.01")
     assert sum(call[:3] == ["compute", "instances", "describe"] for call in cloud.calls()) == 1
 
@@ -2636,8 +2669,11 @@ def test_close_retains_reservation_after_contradictory_intermediate_start(cloud,
     assert any(call[:3] == ["compute", "instances", "delete"] for call in cloud.calls())
 
 
-def test_close_retains_reservation_when_terminal_stop_predates_guest_event(cloud, monkeypatch):
-    operations = guest_shutdown_history(cloud)
+@pytest.mark.parametrize("model", ["SPOT", "STANDARD", "FLEX_START"])
+def test_close_retains_reservation_when_terminal_stop_predates_guest_event(
+    cloud, monkeypatch, model
+):
+    operations = guest_shutdown_history(cloud, model=model)
     fixture = LIVE_GUEST_SHUTDOWNS[1]
     cloud.change(
         operations=[op for op in operations if op["operationType"] != "delete"],
@@ -2654,12 +2690,48 @@ def test_close_retains_reservation_when_terminal_stop_predates_guest_event(cloud
         ],
         describe_updates=[{}, dict(status="TERMINATED")],
     )
+    before = len(cloud.calls())
     module = runpy.run_path(str(GUARD))
     with pytest.raises(module["GuardError"], match="reservation retained"):
         close_in_process(cloud, monkeypatch, elapsed=[0.0], module=module)
     saved = cloud.read()["sessions"][0]
     assert saved["runtime_uncertain"]
     assert saved["settled_cost_usd"] is None and saved["status"] == "needs_settlement"
+    assert Decimal(json.loads(cloud.run("report").stdout)["committed_usd"]) == Decimal(
+        saved["reservation_usd"]
+    )
+    calls = [call[:3] for call in cloud.calls()[before:]]
+    assert calls.count(["compute", "operations", "list"]) == 2
+    assert calls.index(["compute", "operations", "list"]) < calls.index(
+        ["compute", "instances", "describe"]
+    )
+    assert ["compute", "instances", "delete"] in calls
+
+
+@pytest.mark.parametrize("model", ["SPOT", "STANDARD", "FLEX_START"])
+def test_close_manual_settlement_does_not_fetch_guest_operations(cloud, model):
+    guest_shutdown_history(cloud, model=model)
+    fixture = LIVE_GUEST_SHUTDOWNS[1]
+    cloud.change(
+        instances=[
+            dict(
+                name="run-a",
+                id="1",
+                zone="europe-west4-a",
+                status="TERMINATED",
+                lastStartTimestamp=fixture["last_start"],
+                creationTimestamp=fixture["instance_created_at"],
+                lastStopTimestamp="2026-11-13T18:00:00Z",
+            )
+        ],
+        operations_error=True,
+    )
+    before = len(cloud.calls())
+    cloud.run("close", "run-a", "--settled-usd", "4", "--evidence", "saved billing export")
+    saved = cloud.read()["sessions"][0]
+    assert saved["status"] == "closed" and saved["settled_cost_usd"] == "4.000000"
+    assert saved["settlement_evidence"] == "saved billing export"
+    assert not any(call[:3] == ["compute", "operations", "list"] for call in cloud.calls()[before:])
 
 
 def test_guest_shutdown_malformed_timestamp_is_a_clean_refusal(cloud):
