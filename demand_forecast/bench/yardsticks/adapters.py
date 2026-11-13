@@ -7,7 +7,9 @@
 
 Settings/preprocessing follow autogluon/fev@9cf943c models/{chronos-2,timestral}.
 Timestral batching and categorical typing are adapted from its Apache-2.0
-fev implementation. Model libraries are imported only when loading weights.
+fev implementation. The Simons adapter follows Abel-ai-lab/Simons@8e338e9
+benchmarks/fev_bench.py (Apache-2.0). Model libraries are imported only when
+loading weights.
 """
 
 from __future__ import annotations
