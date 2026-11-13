@@ -1,0 +1,538 @@
+diff --git a/src/simons/training/spot_job.py b/src/simons/training/spot_job.py
+new file mode 100644
+--- /dev/null
++++ b/src/simons/training/spot_job.py
+@@ -0,0 +1,418 @@
++"""One recipe-preserving, restartable leg under the RUN_DIR/state guest contract."""
++
++import argparse
++import json
++import os
++import pickle
++import re
++import shutil
++import subprocess
++import sys
++import tempfile
++from pathlib import Path
++
++import yaml
++
++from simons.training import config, schedule
++from simons.training.reliability import (
++    FINAL_NAME,
++    checkpoint_hash,
++    latest_checkpoint,
++    prune_checkpoints,
++    resume_record,
++)
++from simons.training.trainer import export, read_checkpoint, train
++
++LEGS = {
++    "stage1": None,
++    "stage2": "stage1",
++    "stage3": "stage2",
++    "stage4": "stage3",
++    "stage4-long": "stage3",
++}
++
++
++def atomic_json(path, value):
++    path = Path(path)
++    path.parent.mkdir(parents=True, exist_ok=True)
++    temporary = path.with_suffix(".json.tmp")
++    with temporary.open("w") as handle:
++        json.dump(value, handle, indent=2, sort_keys=True)
++        handle.write("\n")
++        handle.flush()
++        os.fsync(handle.fileno())
++    temporary.replace(path)
++
++
++def completed_checkpoint(directory):
++    marker = Path(directory) / "completed.json"
++    if not marker.is_file():
++        raise FileNotFoundError(f"missing completed predecessor {directory}")
++    record = json.loads(marker.read_text())
++    name = record["checkpoint"]
++    if name != FINAL_NAME:
++        raise ValueError(f"invalid checkpoint name in {marker}")
++    path = Path(directory) / name
++    if "bytes" in record and path.stat().st_size != record["bytes"]:
++        raise ValueError(f"incomplete checkpoint referenced by {marker}")
++    digest = checkpoint_hash(path)
++    if "sha256" in record and record["sha256"] != digest:
++        raise ValueError(f"checkpoint hash disagrees with {marker}")
++    read_checkpoint(path)
++    return path
++
++
++def predecessor(state, leg):
++    previous = LEGS[leg]
++    return None if previous is None else completed_checkpoint(Path(state) / previous)
++
++
++def corpus_paths(corpus, leg):
++    """Validate the public corpus layout before either fresh or resumed training."""
++    if leg not in ("stage3", "stage4", "stage4-long"):
++        return {}
++    if corpus is None:
++        raise ValueError(f"{leg} requires a corpus with univariate/ and covariates/ directories")
++    corpus = Path(corpus)
++    for name in ("univariate", "covariates"):
++        if not (corpus / name).is_dir():
++            raise FileNotFoundError(f"{leg}: missing corpus directory {corpus / name}")
++    return {"data": str(corpus / "univariate"), "covariate_data": str(corpus / "covariates")}
++
++
++def recipe(root, state, corpus, size, leg, seed, micro_batches):
++    """Copy the upstream YAML; width is the *only* model edit for 12m."""
++    raw = yaml.safe_load((Path(root) / f"configs/simons-25m-{leg}.yaml").read_text())
++    if size == "12m":
++        raw["model"]["width"] = 264
++    settings = raw["training"]
++    settings.update(seed=seed, micro_batches=micro_batches, **corpus_paths(corpus, leg))
++    previous = LEGS[leg]
++    settings["warm_start"] = None if previous is None else str(predecessor(state, leg))
++    return raw
++
++
++def origin(model, settings):
++    if settings["warm_start"] is None:
++        return 0
++    if settings["warm_start_step"] is not None:
++        return settings["warm_start_step"]
++    if settings["stage"] == "stage1":
++        return 0
++    phases = schedule.parse_schedule(
++        settings["context_schedule"], settings["steps"], model.context_length, model.patch_length
++    )
++    return phases[settings["warm_start_stage"]][1]
++
++
++def probe_start(model, settings, requested, updates):
++    start = origin(model, settings) if requested is None else requested
++    if start < origin(model, settings):
++        raise ValueError("qualification step precedes the leg's original origin")
++    if start + updates > settings["steps"]:
++        raise ValueError("not enough updates for warm-up plus 500 measured updates")
++    return start
++
++
++def write_recipe(raw, directory):
++    path = Path(directory) / "recipe.yaml"
++    path.write_text(yaml.safe_dump(raw, sort_keys=False))
++    return path
++
++
++def identity(args, raw):
++    """Freeze experiment inputs; microbatch/cadence may change between machines."""
++    raw = json.loads(json.dumps(raw))
++    raw["training"].pop("micro_batches", None)
++    for key in ("warm_start", "data", "covariate_data"):
++        raw["training"].pop(key, None)  # Machine-local paths differ across restores.
++    return {
++        "size": args.size,
++        "seed": args.seed,
++        "leg": args.leg,
++        "repo_sha": args.repo_sha,
++        "upstream_pin": args.upstream_pin,
++        "bundle_sha256": args.bundle_sha256,
++        "corpus_uri": args.corpus_uri,
++        "recipe": raw,
++    }
++
++
++def run_leg(args):
++    state = Path(args.run_dir) / "state"
++    directory = state / args.leg
++    # Completed jobs are no-ops even when local corpus/install scratch has disappeared.
++    if (directory / "completed.json").is_file():
++        try:
++            completed_checkpoint(directory)
++            prune_checkpoints(directory)
++            return 0
++        except (OSError, ValueError, KeyError, RuntimeError, EOFError, pickle.UnpicklingError):
++            pass  # A marker can arrive before its large checkpoint during an interrupted upload.
++    paths = corpus_paths(args.corpus, args.leg)
++    checkpoint = latest_checkpoint(directory)
++    # On resume no predecessor is required: the checkpoint owns model and optimizer.
++    # recipe() resolves the predecessor only for a new leg.
++    if checkpoint is not None:
++        saved_identity = read_checkpoint(checkpoint).get("job_identity")
++        manifest_path = directory / "identity.json"
++        if manifest_path.exists():
++            manifest = json.loads(manifest_path.read_text())
++            if saved_identity is not None and saved_identity != manifest:
++                raise ValueError("checkpoint and state experiment identities disagree")
++        elif saved_identity is not None:
++            manifest = saved_identity
++        else:
++            raise ValueError("checkpoint has no embedded identity and identity.json is missing")
++        raw = manifest["recipe"]
++        raw["training"]["micro_batches"] = args.micro_batches
++        previous = LEGS[args.leg]
++        raw["training"]["warm_start"] = None if previous is None else str(state / previous)
++        raw["training"].update(paths)
++    else:
++        raw = recipe(
++            args.root, state, args.corpus, args.size, args.leg, args.seed, args.micro_batches
++        )
++    expected = identity(args, raw)
++    directory.mkdir(parents=True, exist_ok=True)
++    manifest_path = directory / "identity.json"
++    if manifest_path.exists() and json.loads(manifest_path.read_text()) != expected:
++        raise ValueError("experiment identity changed; use a separate STATE_URI")
++    atomic_json(manifest_path, expected)
++    attempts = directory / "attempts"
++    attempts.mkdir(exist_ok=True)
++    attempt = Path(tempfile.mkdtemp(prefix="run-", dir=attempts))
++    if getattr(args, "environment_file", None):
++        shutil.copyfile(args.environment_file, attempt / "environment.txt")
++    path = write_recipe(raw, attempt)
++    model, settings = config.load(path)
++    if checkpoint is not None:
++        step = read_checkpoint(checkpoint)["step"]
++        resume_record(directory, step)
++        if step > settings["steps"]:
++            raise ValueError("checkpoint is beyond the leg's plan")
++        if step == settings["steps"]:
++            complete_leg(directory, checkpoint, step)
++            return 0
++    final = train(
++        path,
++        attempt / "output",
++        resume=checkpoint,
++        checkpoint_dir=directory,
++        checkpoint_minutes=args.checkpoint_minutes,
++        checkpoint_metadata=expected,
++    )
++    step = read_checkpoint(final)["step"]
++    if step != settings["steps"]:
++        return 75
++    complete_leg(directory, final, step)
++    return 0
++
++
++def complete_leg(directory, checkpoint, step):
++    """Publish a single stable final before its completion record; safe to repeat after restore."""
++    final = directory / FINAL_NAME
++    if checkpoint != final:
++        checkpoint.replace(final)
++    atomic_json(
++        directory / "completed.json",
++        {
++            "checkpoint": FINAL_NAME,
++            "step": step,
++            "bytes": final.stat().st_size,
++            "sha256": checkpoint_hash(final),
++        },
++    )
++    prune_checkpoints(directory)
++
++
++def run_export(args):
++    from simons.training import soup
++
++    state = Path(args.run_dir) / "state"
++    destination = state / "export"
++    if (destination / "completed.json").is_file():
++        try:
++            marker = json.loads((destination / "completed.json").read_text())
++            if all(
++                (destination / n).stat().st_size == marker["artifacts"][n] > 0
++                for n in ("config.json", "model.safetensors")
++            ):
++                return 0
++        except (OSError, KeyError, ValueError, TypeError):
++            pass
++    paths = [completed_checkpoint(state / leg) for leg in ("stage4", "stage4-long")]
++    temporary = Path(tempfile.mkdtemp(prefix="export-", dir=args.run_dir))
++    averaged = soup.write(paths, temporary / "checkpoint.pt")
++    export(averaged, temporary / "inference")
++    destination.mkdir(parents=True, exist_ok=True)
++    # Publish the marker last; an interrupted export is rebuilt on the next machine.
++    for name in ("config.json", "model.safetensors"):
++        (temporary / "inference" / name).replace(destination / name)
++    atomic_json(
++        destination / "completed.json",
++        {
++            "members": [str(p) for p in paths],
++            "artifacts": {
++                n: (destination / n).stat().st_size for n in ("config.json", "model.safetensors")
++            },
++        },
++    )
++    return 0
++
++
++def qualify_once(args):
++    """A child process isolates OOM retries from CUDA state and worker-prefetch queues."""
++    from simons.training.qualification import Measurement
++
++    directory = Path(args.run_dir)
++    state = directory / "state"
++    raw = recipe(
++        args.root, state, args.corpus, args.size, args.qualify_leg, args.seed, args.micro_batches
++    )
++    attempt = Path(tempfile.mkdtemp(prefix="qualify-attempt-", dir=directory))
++    path = write_recipe(raw, attempt)
++    # CUDA is mandatory here: a CPU smoke check must never masquerade as GPU qualification.
++    import torch
++
++    if not torch.cuda.is_available():
++        raise RuntimeError("qualification requires a CUDA GPU")
++    raw["training"]["device"] = "cuda"
++    path = write_recipe(raw, attempt)
++    model, settings = config.load(path)
++    updates = args.warmup + 500
++    start = probe_start(model, settings, args.qualify_step, updates)
++    measurement = Measurement(args.warmup, 500)
++    try:
++        train(
++            path,
++            attempt / "output",
++            max_steps=updates,
++            observer=measurement,
++            checkpoint_minutes=args.checkpoint_minutes,
++            probe_step=start,
++        )
++    except torch.OutOfMemoryError:
++        return 42
++    result = measurement.result()
++    result.update(
++        size=args.size,
++        leg=args.qualify_leg,
++        seed=args.seed,
++        micro_batches=args.micro_batches,
++        gpu=torch.cuda.get_device_name(0),
++        repo_sha=args.repo_sha,
++        upstream_pin=args.upstream_pin,
++        bundle_sha256=args.bundle_sha256,
++        corpus_uri=args.corpus_uri,
++        torch_version=str(torch.__version__),
++        probe_start_step=start,
++        status="completed",
++    )
++    atomic_json(args.result, result)
++    return 0
++
++
++def qualify(args):
++    directory = Path(args.run_dir) / "state" / "qualify"
++    directory.mkdir(parents=True, exist_ok=True)
++    result_path = directory / f"{args.name}.json"
++    attempts = []
++    micro = args.micro_batches
++    while micro <= args.max_micro_batches:
++        result = directory / f".{args.name}-attempt.json"
++        command = [
++            sys.executable,
++            "-m",
++            "simons.training.spot_job",
++            *sys.argv[1:],
++            "--qualify-child",
++            "--micro-batches",
++            str(micro),
++            "--result",
++            str(result),
++        ]
++        code = subprocess.run(command, check=False).returncode
++        attempts.append(
++            {
++                "micro_batches": micro,
++                "exit_code": code,
++                "status": "oom" if code == 42 else "ok" if code == 0 else "failed",
++            }
++        )
++        atomic_json(directory / f"{args.name}-attempts.json", attempts)
++        if code == 0:
++            metrics = json.loads(result.read_text())
++            metrics["attempts"] = attempts
++            atomic_json(result_path, metrics)
++            result.unlink()
++            return 0
++        if code != 42:
++            atomic_json(
++                result_path,
++                {
++                    "status": "failed",
++                    "attempts": attempts,
++                    "error": f"qualification child exited {code}",
++                },
++            )
++            return code
++        micro *= 2
++    atomic_json(
++        result_path,
++        {
++            "status": "oom",
++            "attempts": attempts,
++            "error": "microbatch limit exhausted; recipe unchanged",
++        },
++    )
++    print(
++        "qualification OOM: microbatch limit exhausted; preprocessing/pools/auxiliary "
++        "passes may require more memory than this card",
++        file=sys.stderr,
++    )
++    return 1
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--leg", required=True, choices=[*LEGS, "qualify", "export"])
++    parser.add_argument("--size", choices=["25m", "12m"], required=True)
++    parser.add_argument("--root", type=Path, required=True)
++    parser.add_argument("--run-dir", type=Path, default=os.environ.get("RUN_DIR"), required=False)
++    parser.add_argument("--corpus", type=Path)
++    parser.add_argument("--corpus-uri")
++    parser.add_argument("--seed", type=int, required=True)
++    parser.add_argument("--micro-batches", type=int, default=1)
++    parser.add_argument("--checkpoint-minutes", type=float, default=10)
++    parser.add_argument("--repo-sha", required=True)
++    parser.add_argument("--upstream-pin", required=True)
++    parser.add_argument("--bundle-sha256", required=True)
++    parser.add_argument("--qualify-leg", choices=LEGS, default="stage1")
++    parser.add_argument("--name", default="stage1")
++    parser.add_argument("--warmup", type=int, default=20)
++    parser.add_argument("--qualify-step", type=int)
++    parser.add_argument("--environment-file", type=Path)
++    parser.add_argument("--max-micro-batches", type=int, default=128)
++    parser.add_argument("--qualify-child", action="store_true", help=argparse.SUPPRESS)
++    parser.add_argument("--result", type=Path, help=argparse.SUPPRESS)
++    args = parser.parse_args()
++    if args.run_dir is None:
++        parser.error("RUN_DIR or --run-dir is required")
++    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", args.name):
++        parser.error(
++            "qualification name must start with a letter or digit; "
++            "then contain only letters, digits, underscore or hyphen"
++        )
++    if args.micro_batches < 1 or args.checkpoint_minutes <= 0 or args.warmup < 0:
++        parser.error("invalid microbatches, checkpoint interval or warm-up")
++    Path(args.run_dir).mkdir(parents=True, exist_ok=True)
++    if args.leg == "qualify":
++        return qualify_once(args) if args.qualify_child else qualify(args)
++    if args.leg == "export":
++        return run_export(args)
++    return run_leg(args)
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/src/simons/training/qualification.py b/src/simons/training/qualification.py
+new file mode 100644
+--- /dev/null
++++ b/src/simons/training/qualification.py
+@@ -0,0 +1,110 @@
++"""GPU qualification telemetry without changing batch, context or optimizer recipes."""
++
++import resource
++import sys
++import threading
++import time
++from pathlib import Path
++
++import torch
++
++
++def host_rss():
++    """Sample resident bytes for this process tree on Linux; self high-water elsewhere."""
++    proc = Path("/proc")
++    if not proc.is_dir():
++        value = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
++        return int(value if sys.platform == "darwin" else value * 1024)
++    import os
++
++    pending, total = [os.getpid()], 0
++    while pending:
++        pid = pending.pop()
++        try:
++            for line in (proc / str(pid) / "status").read_text().splitlines():
++                if line.startswith("VmRSS:"):
++                    total += int(line.split()[1]) * 1024
++            children = proc / str(pid) / "task" / str(pid) / "children"
++            pending.extend(int(p) for p in children.read_text().split())
++        except (OSError, ValueError):
++            continue
++    return total
++
++
++class Measurement:
++    """Measure exactly N complete updates after a warm-up, synchronizing CUDA boundaries."""
++
++    def __init__(self, warmup=20, updates=500):
++        self.warmup, self.updates = warmup, updates
++        self.done = self.measured = self.values = 0
++        self.seconds = self.wait = 0.0
++        self.peak_host = self.peak_gpu = self.peak_reserved = 0
++        self.stop = threading.Event()
++        self.monitor = None
++        self.first_step = self.last_step = None
++
++    @staticmethod
++    def sync(device):
++        if device.type == "cuda":
++            torch.cuda.synchronize(device)
++
++    def begin(self, device):
++        self.sync(device)
++        if self.done == self.warmup:
++            if device.type == "cuda":
++                torch.cuda.reset_peak_memory_stats(device)
++            self.monitor = threading.Thread(target=self.sample_host, daemon=True)
++            self.monitor.start()
++        self.started = time.perf_counter()
++
++    def generated(self, device):
++        self.sync(device)
++        self.generated_seconds = time.perf_counter() - self.started
++
++    def end(self, device, step, supervised, auxiliary_wait=0.0):
++        self.sync(device)
++        seconds = time.perf_counter() - self.started
++        if self.warmup <= self.done < self.warmup + self.updates:
++            self.measured += 1
++            self.seconds += seconds
++            self.wait += self.generated_seconds + auxiliary_wait
++            self.values += supervised
++            self.peak_host = max(self.peak_host, host_rss())
++            if device.type == "cuda":
++                self.peak_gpu = max(self.peak_gpu, torch.cuda.max_memory_allocated(device))
++                self.peak_reserved = max(self.peak_reserved, torch.cuda.max_memory_reserved(device))
++            self.first_step = step - 1 if self.first_step is None else self.first_step
++            self.last_step = step
++        self.done += 1
++
++    def sample_host(self):
++        while not self.stop.is_set():
++            self.peak_host = max(self.peak_host, host_rss())
++            self.stop.wait(0.05)
++
++    def close(self):
++        self.stop.set()
++        if self.monitor is not None:
++            self.monitor.join(timeout=1)
++
++    def result(self):
++        self.close()
++        if self.measured != self.updates:
++            raise ValueError(
++                f"qualification measured {self.measured}, expected {self.updates} updates"
++            )
++        return {
++            "measured_updates": self.measured,
++            "warmup_updates": self.warmup,
++            "first_step": self.first_step,
++            "last_step": self.last_step,
++            "peak_gpu_allocated_bytes": self.peak_gpu,
++            "peak_gpu_reserved_bytes": self.peak_reserved,
++            "peak_host_rss_bytes": self.peak_host,
++            "host_memory_method": "50ms sampled process-tree RSS on Linux; self high-water elsewhere",
++            "updates_per_second": self.measured / self.seconds,
++            "supervised_values_per_second": self.values / self.seconds,
++            "supervised_values": self.values,
++            "loader_generator_wait_share": self.wait / self.seconds,
++            "measured_seconds": self.seconds,
++        }

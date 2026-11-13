@@ -15,6 +15,21 @@ https://github.com/mistralai/timestral/blob/a534bdb/LICENSE.
 The Apache-2.0 license text reproduced in the fev section below also applies
 to this port.
 
+## Simons training patches
+
+`third_party/simons/patches/` holds patches against Simons at commit
+`8e338e915d26c8960713889ef12ab1cf5c08d591`, licensed under Apache-2.0,
+Copyright 2026 Abel AI Lab: https://github.com/Abel-ai-lab/Simons
+
+The patches contain modified upstream source lines (restartable training streams,
+durable checkpoints, a single-leg job runner with qualification) and are
+distributed under the same licence. The upstream `NOTICE` is retained verbatim as
+`third_party/simons/NOTICE`; it states: "This product includes software developed
+at Abel AI Lab (https://abel.ai)." `scripts/gcp/jobs/make_simons_job.py` embeds the
+patch set, the pin and that notice into the job scripts it generates. No upstream
+source tree, weights or training data are redistributed. The Apache-2.0 text at
+the end of this file applies.
+
 ## fev seasonal-naive baseline, weekly task definitions, and metrics
 
 `demand_forecast/bench/baselines.py` is adapted from fev's
