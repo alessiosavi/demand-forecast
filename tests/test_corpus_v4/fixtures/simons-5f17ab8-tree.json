@@ -1,0 +1,1622 @@
+[
+  {
+    "rfilename": ".gitattributes",
+    "size": 2504,
+    "blobId": "bed0738c7eeb449bca98b5d2f33c89a1ee56349a"
+  },
+  {
+    "rfilename": "NOTICE.md",
+    "size": 41525,
+    "blobId": "999f6763bd8e2e76ca9b2bf48b0f8a6163a79bb9"
+  },
+  {
+    "rfilename": "README.md",
+    "size": 3988,
+    "blobId": "797928035369a4d4e465bd7af95c850ac77dfbca"
+  },
+  {
+    "rfilename": "assets/training-data-dark.png",
+    "size": 56394,
+    "blobId": "46c049534b6260ca97c63aad5c942915b1ad031a",
+    "lfs": {
+      "sha256": "9f212c6fe1a113d74b76fd54283f0aa471c1b247282c6546ccc66d71e8003082",
+      "size": 56394,
+      "pointerSize": 130
+    }
+  },
+  {
+    "rfilename": "assets/training-data.png",
+    "size": 65930,
+    "blobId": "17ac41309b99d24f2966d9f1b3208a89e3a47783",
+    "lfs": {
+      "sha256": "9cc2167a959c6a38168332178ee8336c5a7a2ee2ad8fb1731f6af562b69e5c09",
+      "size": 65930,
+      "pointerSize": 130
+    }
+  },
+  {
+    "rfilename": "covariates/aemo_solar_farm_nwp/train-00000.parquet",
+    "size": 1588153,
+    "blobId": "46664f251b317b29ca1915a438cf7462e5b3925c",
+    "lfs": {
+      "sha256": "c8dc024180a5cab0ddb979fa09296518e400fdd383930597e2057a9f1a49ae0e",
+      "size": 1588153,
+      "pointerSize": 132
+    }
+  },
+  {
+    "rfilename": "covariates/aemo_wem_load_forecast/train-00000.parquet",
+    "size": 140427,
+    "blobId": "8e4943b339e79afb264b0981d964c12083a4a7a0",
+    "lfs": {
+      "sha256": "1b5936d5e0d6c9895203d311dd8cc90feb6029a5ad575dae35852a9dfeda09ff",
+      "size": 140427,
+      "pointerSize": 131
+    }
+  },
+  {
+    "rfilename": "covariates/aemo_wind_farm_nwp/train-00000.parquet",
+    "size": 4271526,
+    "blobId": "f3d0a090177d500f355b713478d9dc3533defc27",
+    "lfs": {
+      "sha256": "24dba241026acbf812eb99b4b1456d0403632bf6a2dc4249e4466825d71ecd77",
+      "size": 4271526,
+      "pointerSize": 132
+    }
+  },
+  {
+    "rfilename": "covariates/asos_temperature_mos/train-00000.parquet",
+    "size": 1089644,
+    "blobId": "f2223647957ccafa42d337dc5f332cb43be7736d",
+    "lfs": {
+      "sha256": "207c48e4ec1be342f83f401ff7c7b898eaddfdadadba8aafc41dce3a957a6a22",
+      "size": 1089644,
+      "pointerSize": 132
+    }
+  },
+  {
+    "rfilename": "covariates/battery_drive_cycles/train-00000.parquet",
+    "size": 1674303,
+    "blobId": "6cee67a2073aea9047d52931a4998c2c329461a1",
+    "lfs": {
+      "sha256": "52ddb96f0cf890c80a559165994cd48068540901fc3f0dfa363e2fad1a2717f9",
+      "size": 1674303,
+      "pointerSize": 132
+    }
+  },
+  {
+    "rfilename": "covariates/bcb_focus_inflation/LICENSE.md",
+    "size": 457,
+    "blobId": "32e0db25ef6d741312f7ff305395689ab9dd33e3"
+  },
+  {
+    "rfilename": "covariates/bcb_focus_inflation/train-00000.parquet",
+    "size": 4845,
+    "blobId": "19614188a766d56bf80b370d88573a0154cd306c",
+    "lfs": {
+      "sha256": "3d02598642d78f35d8825324948eda60f9235bc50da78aa1602d60ab300bfa94",
+      "size": 4845,
+      "pointerSize": 129
+    }
+  },
+  {
+    "rfilename": "covariates/bts_airport_schedule/train-00000.parquet",
+    "size": 475614,
+    "blobId": "f8eac2622b40946f1695eca35e8bc07f50325fdb",
+    "lfs": {
+      "sha256": "d82cd776df80babc557ebe5e4f8b3f080b2f684c951ef96dc0d35a17288629ca",
+      "size": 475614,
+      "pointerSize": 131
+    }
+  },
+  {
+    "rfilename": "covariates/cams_europe_air_quality/train-00000.parquet",
+    "size": 4375197,
+    "blobId": "ee014180f8b8cb4bc2e908ca812d0436f09dae24",
+    "lfs": {
+      "sha256": "504590f5c7f510f45b3cc07ec4ec2344e6baead61cb9b4f6a2052971ab391739",
+      "size": 4375197,
+      "pointerSize": 132
+    }
+  },
+  {
+    "rfilename": "covariates/city_load_weather_forecast/train-00000.parquet",
+    "size": 2255845,
+    "blobId": "de3a6ef8410133ae7360fa0dce813c245cae30c7",
+    "lfs": {
+      "sha256": "5d11caffafd223fb5e54feaf3e6a691b1e752a6351fbffbef2ee7e808913efc2",
+      "size": 2255845,
+      "pointerSize": 132
+    }
+  },
+  {
+    "rfilename": "covariates/covid_hub_admissions/train-00000.parquet",
+    "size": 168379,
+    "blobId": "72973841fb3847404feb935abd05f21605fdaecb",
+    "lfs": {
+      "sha256": "5d8ada9009689e531d61a0bf62dfbc626eeecb9903fe25a28397c705d000433b",
+      "size": 168379,
+      "pointerSize": 131
+    }
+  },
+  {
+    "rfilename": "covariates/cpc_monthly_outlook/train-00000.parquet",
+    "size": 813207,
+    "blobId": "1ec533602d93385eb996a91980c6a49289b2d262",
+    "lfs": {
+      "sha256": "ca0eaa256216766cdefee35a8d8d98c8a040d5556530f3ac7d0ca32ea619e8cc",
+      "size": 813207,
+      "pointerSize": 131
+    }
+  },
+  {
+    "rfilename": "covariates/dk_wind_solar_dayahead/train-00000.parquet",
+    "size": 142480,
+    "blobId": "ec97b089755b753a8ed309a113c8e340ca7e7da9",
+    "lfs": {
+      "sha256": "0e10b39f2c52c7176e067897c2854928c2053455df4a1ee14779cb71ff8c75ae",
+      "size": 142480,
+      "pointerSize": 131
+    }
+  },
+  {
+    "rfilename": "covariates/eia930_ba_load_weather/train-00000.parquet",
+    "size": 51056139,
+    "blobId": "f7a18c9482025882a55aed5ed613d6e7d3172416",
+    "lfs": {
+      "sha256": "30a991885ae9131569574a08afe16617550f10b9687c98760ac687973e5fe298",
+      "size": 51056139,
+      "pointerSize": 133
+    }
+  },
+  {
+    "rfilename": "covariates/eia930_ba_solar_weather/train-00000.parquet",
+    "size": 26955160,
+    "blobId": "c370da72e20f8e311784429eaf21600689a24beb",
+    "lfs": {
+      "sha256": "7503ca8a01d84fd205688b91639b8a75595fb0ccd064f62fd267d0e5a0a25777",
+      "size": 26955160,
+      "pointerSize": 133
+    }
+  },
+  {
+    "rfilename": "covariates/eia930_ba_wind_weather/train-00000.parquet",
+    "size": 25669974,
+    "blobId": "52c4cb8116cdcfd470678704e7946b6e016f00a5",
+    "lfs": {
+      "sha256": "8d7df8feacb89e4ff3c07d81117c4beec1aa550581a33b0fc16d8a27145cbebd",
+      "size": 25669974,
+      "pointerSize": 133
+    }
+  },
+  {
+    "rfilename": "covariates/eia930_demand_da/train-00000.parquet",
+    "size": 8345874,
+    "blobId": "79de50b613f7c9b261160a0d6ce7cb27dabd3791",
+    "lfs": {
+      "sha256": "4d952ba57af8cff5e39c825873c65b1318c126444c1b4fb271c3551ac9f2b9f6",
+      "size": 8345874,
+      "pointerSize": 132
+    }
+  },
+  {
+    "rfilename": "covariates/eia930_subregion_load_weather/train-00000.parquet",
+    "size": 62104956,
+    "blobId": "55976c887e326ac205913ba74e7b030187650a47",
+    "lfs": {
+      "sha256": "a7850fad84aba8e3af2470c09b7960aabd4ac18996e350bc01c55e87028d23bf",
+      "size": 62104956,
+      "pointerSize": 133
+    }
+  },
+  {
+    "rfilename": "covariates/eirgrid_ireland_demand_wind/train-00000.parquet",
+    "size": 217842,
+    "blobId": "ff0e8844b6b2b33acc11c7ca52e134fc5d6b4217",
+    "lfs": {
+      "sha256": "a30fa3569aeb28b288abd9212c35f815ca066b5c851956329990700554355948",
+      "size": 217842,
+      "pointerSize": 131
+    }
+  },
+  {
+    "rfilename": "covariates/elia_load_dayahead/train-00000.parquet",
+    "size": 324927,
+    "blobId": "d4f961b20259d5458dfd1bc843ff61eab92aa008",
+    "lfs": {
+      "sha256": "ec86ed575724f463402006e0c0ebc6df9b4322d7074eb744163e539dcb6c13c2",
+      "size": 324927,
+      "pointerSize": 131
+    }
+  },
+  {
+    "rfilename": "covariates/elia_wind_solar_dayahead/train-00000.parquet",
+    "size": 2273732,
+    "blobId": "1ad1cc16239d30e727d3a39d17be402a13f2e7d5",
+    "lfs": {
+      "sha256": "496e7630a24064c94014e5efee3cfc145a009da9cce2df9893a30260a1c6b220",
+      "size": 2273732,
+      "pointerSize": 132
+    }
+  },
+  {
+    "rfilename": "covariates/enso_forecast_plume/train-00000.parquet",
+    "size": 5220,
+    "blobId": "face61f72140ca392e791b64760fea03481180aa",
+    "lfs": {
+      "sha256": "7152b3ca55eccf01bb69ae4c91cd94f28eddd864ad84640b02f171286efbf899",
+      "size": 5220,
+      "pointerSize": 129
+    }
+  },
+  {
+    "rfilename": "covariates/eu_wind_farm_nwp/train-00000.parquet",
+    "size": 2346173,
+    "blobId": "d531a83b1f254e3d9ae57cc9b4f16f8b2e325bc5",
+    "lfs": {
+      "sha256": "500dcbbe1e9bccb53d0eec5e26c0fc011a749ca28f8fab474cd673fbb4c3230b",
+      "size": 2346173,
+      "pointerSize": 132
+    }
+  },
+  {
+    "rfilename": "covariates/eurostat_flash_hicp/train-00000.parquet",
+    "size": 77732,
+    "blobId": "3b477929f17a1d659e7c86919f87fbd1b9e75455",
+    "lfs": {
+      "sha256": "4b38c4b3968b07d98c2495be4116e948e7033bb03bb4b374ecd0d4d5ee25432c",
+      "size": 77732,
+      "pointerSize": 130
+    }
+  },
+  {
+    "rfilename": "covariates/fi_rail_timetable/train-00000.parquet",
+    "size": 559515,
+    "blobId": "b89b3902996bb606da8cefbb173911c0aa426360",
+    "lfs": {
+      "sha256": "8d60d2d224abe0efe19cc31f43b428edac3dcc6ce20c6e6b4120864ec4eae1df",
+      "size": 559515,
+      "pointerSize": 131
+    }
+  },
+  {
+    "rfilename": "covariates/gb_gsp_solar_nwp/train-00000.parquet",
+    "size": 4428648,
+    "blobId": "aa5808822cf2278f457a65d4173d3e62ca282678",
+    "lfs": {
+      "sha256": "2a8dc737ac8dd5d4b262b511594bea8643eb188d0e2d454fa5ad083c2180f4d7",
+      "size": 4428648,
+      "pointerSize": 132
+    }
+  },
+  {
+    "rfilename": "covariates/gb_unit_output_availability/train-00000.parquet",
+    "size": 973270,
+    "blobId": "eab3a5a19625a4f5704b0f57d0621eddf074c014",
+    "lfs": {
+      "sha256": "23f786e3edae819518327b136244844cc12fb018a97f62333b4e67db4a8cbf70",
+      "size": 973270,
+      "pointerSize": 131
+    }
+  },
+  {
+    "rfilename": "covariates/gb_wind_generation/train-00000.parquet",
+    "size": 20400,
+    "blobId": "f2d53af8ea78aa48fef27f690fd3046feff077ee",
+    "lfs": {
+      "sha256": "b85751e4c6c38ef2b0833efb76e2b2c7b6baa252d7c59cf47ab76427c94b7fd7",
+      "size": 20400,
+      "pointerSize": 130
+    }
+  },
+  {
+    "rfilename": "covariates/hai_setpoints/LICENSE.md",
+    "size": 449,
+    "blobId": "1f315fb27b9ece3a89a00f5472232458f24bede5"
+  },
+  {
+    "rfilename": "covariates/hai_setpoints/train-00000.parquet",
+    "size": 149676,
+    "blobId": "069c39c3336369be9d60e1e480519b6700999c2a",
+    "lfs": {
+      "sha256": "d2a91298fe5eb70733621e55dafb99b73ff104a9f499505e79cee2e5d990ccc0",
+      "size": 149676,
+      "pointerSize": 131
+    }
+  },
+  {
+    "rfilename": "covariates/hotel_bookings_otb64/train-00000.parquet",
+    "size": 16089,
+    "blobId": "20d3721bcd4e3cdee6889f37ae0e20c8cf297932",
+    "lfs": {
+      "sha256": "815ee2fa2a5792da3b133d9ebe53c0666fca769cde9b3595eef4e2414bf363de",
+      "size": 16089,
+      "pointerSize": 130
+    }
+  },
+  {
+    "rfilename": "covariates/london_dtou_tariff/train-00000.parquet",
+    "size": 10706453,
+    "blobId": "f93007de55b3e04b755b62f7e4f90cc174f70432",
+    "lfs": {
+      "sha256": "844297d3ebcf25cdd862bf4cf46f5580e94326a6c56afdf228d95c78cea27600",
+      "size": 10706453,
+      "pointerSize": 133
+    }
+  },
+  {
+    "rfilename": "covariates/mbta_planned_disruptions/train-00000.parquet",
+    "size": 102305,
+    "blobId": "61177838044da152f7d201c16919b0d5752dcf5e",
+    "lfs": {
+      "sha256": "a71f277739ea4a222012757a1ed9fc4e467a62521591b050464b349ac9c1fb91",
+      "size": 102305,
+      "pointerSize": 131
+    }
+  },
+  {
+    "rfilename": "covariates/mlb_attendance_schedule/train-00000.parquet",
+    "size": 46699,
+    "blobId": "cdbdf3244eeb16495efdd5184a668a04227e812b",
+    "lfs": {
+      "sha256": "2b8da467e8416e07275322ec255734d4bb4bdadaeb5b65d30fcb7185a4e3b52a",
+      "size": 46699,
+      "pointerSize": 130
+    }
+  },
+  {
+    "rfilename": "covariates/neso_demand_dayahead/train-00000.parquet",
+    "size": 213418,
+    "blobId": "0b253cea3a6262921316bc39e4b37818c67d5bab",
+    "lfs": {
+      "sha256": "672281921678113e38870274b5c0d5904577f3e729fdc2dfff717827993ebc89",
+      "size": 213418,
+      "pointerSize": 131
+    }
+  },
+  {
+    "rfilename": "covariates/nist_nzertf_house/train-00000.parquet",
+    "size": 16503,
+    "blobId": "f84f1ee75a31e4f65c318ff93724db614354477e",
+    "lfs": {
+      "sha256": "bed00065aa674452b6952f187968ad9f9b60bf80e8964bdc6589436c17a3beb1",
+      "size": 16503,
+      "pointerSize": 130
+    }
+  },
+  {
+    "rfilename": "covariates/noaa_tide_predictions/train-00000.parquet",
+    "size": 1833726,
+    "blobId": "9111ec61b7181dcf0e5effea1ff91350c327b1ec",
+    "lfs": {
+      "sha256": "258e69ac3e225fcd8ab4123068e966fbcafae0f423559ddb35d695f9c077f616",
+      "size": 1833726,
+      "pointerSize": 132
+    }
+  },
+  {
+    "rfilename": "covariates/nwm_streamflow_forecast/train-00000.parquet",
+    "size": 113383,
+    "blobId": "c61b870d5f8757a43eb215eee507df71a3168b4c",
+    "lfs": {
+      "sha256": "4fc3e376c0c3fca4f88038d01c7ce98c3f66af716cd8cd22fb4008e0ef64fcc7",
+      "size": 113383,
+      "pointerSize": 131
+    }
+  },
+  {
+    "rfilename": "covariates/nyc_subway_events/LICENSE.md",
+    "size": 684,
+    "blobId": "2ddde2482cc4de69dbcdfc5547b8f32bd32f011d"
+  },
+  {
+    "rfilename": "covariates/nyc_subway_events/articles.csv",
+    "size": 1894,
+    "blobId": "b6e2137608d4009c96675bd5ca417221c95a49f8"
+  },
+  {
+    "rfilename": "covariates/nyc_subway_events/train-00000.parquet",
+    "size": 154782,
+    "blobId": "a61990448b3619fceecd39829278fbc2557cfa71",
+    "lfs": {
+      "sha256": "3534d3f0e8b942c96514e61a7deca995279b666a53c694c237e8b3845fa16e18",
+      "size": 154782,
+      "pointerSize": 131
+    }
+  },
+  {
+    "rfilename": "covariates/nyc_taxi_permitted_events/train-00000.parquet",
+    "size": 1865820,
+    "blobId": "1490e946f6fe113fb55e500b0e79d573f0570594",
+    "lfs": {
+      "sha256": "2805d993b2d8bc0438210d03fe632f1d84f2023b3e2dc88c32622895dc68466c",
+      "size": 1865820,
+      "pointerSize": 132
+    }
+  },
+  {
+    "rfilename": "covariates/nz_node_price_schedule/train-00000.parquet",
+    "size": 4419752,
+    "blobId": "8f660823b59a00d9a3ed8a81c7c3c6e6eaba20a2",
+    "lfs": {
+      "sha256": "bda744d3ff08de6fb78bacf68acd47b40772f4fcddb32beec7c73256ae80cf4c",
+      "size": 4419752,
+      "pointerSize": 132
+    }
+  },
+  {
+    "rfilename": "covariates/ons_brazil_load_forecast/train-00000.parquet",
+    "size": 977165,
+    "blobId": "9d4307898c3cb86f9d85ec6e63a4a156e026cfa5",
+    "lfs": {
+      "sha256": "a7e218ba767db2933b320424e6a33cf5bc7fa0d57a7c6b40a5e5e404c9330026",
+      "size": 977165,
+      "pointerSize": 131
+    }
+  },
+  {
+    "rfilename": "covariates/ons_brazil_load_weather/train-00000.parquet",
+    "size": 4973867,
+    "blobId": "312991573886610afb60398ffafa6cc04f7e2663",
+    "lfs": {
+      "sha256": "76f7407fdf0fac90fd65e584411a18ac721f2f00da29185bf2c1608549eed020",
+      "size": 4973867,
+      "pointerSize": 132
+    }
+  },
+  {
+    "rfilename": "covariates/panasonic_battery_drive_cycles/train-00000.parquet",
+    "size": 1943140,
+    "blobId": "2232cf2c69092d4117995d4986c86dfc25aba442",
+    "lfs": {
+      "sha256": "7f6d63eba1f1ce784f395c3d4a26d8219e81765f22592675dc41055ae449117d",
+      "size": 1943140,
+      "pointerSize": 132
+    }
+  },
+  {
+    "rfilename": "covariates/pvdaq_site_solar_weather/train-00000.parquet",
+    "size": 2483110,
+    "blobId": "25c57cc6013fe37980b7ccd9e9985e9b01e8b95c",
+    "lfs": {
+      "sha256": "d98dcc1419042911d52bb2f593ee5c05bb4350fe9085ee1d70f37926d767764a",
+      "size": 2483110,
+      "pointerSize": 132
+    }
+  },
+  {
+    "rfilename": "covariates/rba_smp_forecasts/train-00000.parquet",
+    "size": 2816,
+    "blobId": "dcfc3cca9037f98667661420caec6055dec93aae",
+    "lfs": {
+      "sha256": "ec14424291135610564d16d74cc27a5a2782de0fceac2567565771aa39475bff",
+      "size": 2816,
+      "pointerSize": 129
+    }
+  },
+  {
+    "rfilename": "covariates/rfc_river_forecasts/train-00000.parquet",
+    "size": 5323,
+    "blobId": "35e3677749cf7348a81ba8d61f0d4348c6dd5975",
+    "lfs": {
+      "sha256": "cacab79569f550e8d41cfb36d2616f0fc3811fab1bdba05343bcb2e567090451",
+      "size": 5323,
+      "pointerSize": 129
+    }
+  },
+  {
+    "rfilename": "covariates/rsv_hub_admissions/train-00000.parquet",
+    "size": 4244,
+    "blobId": "6151a5a77b408c01d81ea293f34ad7b0415f23d8",
+    "lfs": {
+      "sha256": "d055d499299d161911df6bf67d19089b9819b3237957f5b7e920b9d2da8e7a47",
+      "size": 4244,
+      "pointerSize": 129
+    }
+  },
+  {
+    "rfilename": "covariates/rte_france_load_j1/train-00000.parquet",
+    "size": 77387,
+    "blobId": "4968bb9e78e7c4a8752a4f6db13f3d5ff04c0011",
+    "lfs": {
+      "sha256": "e3aae47f83633198c60852e79d02ecbbb88c3cd0008a4baf9224ce3464bb104e",
+      "size": 77387,
+      "pointerSize": 130
+    }
+  },
+  {
+    "rfilename": "covariates/sbb_rail_delays/train-00000.parquet",
+    "size": 425005,
+    "blobId": "11101ab976fe81fdb5c8aef253dd9b16b074b7a2",
+    "lfs": {
+      "sha256": "aab2a9a31607499210452039d8bd3a15f738cbfaeaa0654358486a97e27d7673",
+      "size": 425005,
+      "pointerSize": 131
+    }
+  },
+  {
+    "rfilename": "covariates/seoul_metro_kbo/train-00000.parquet",
+    "size": 1724138,
+    "blobId": "8110da6dc294befc0c665fd47cac0037d2fb2efc",
+    "lfs": {
+      "sha256": "ace5f7155b51f287a3711d401e0271e281303b32bb50ff7fd2d0f0283a142aed",
+      "size": 1724138,
+      "pointerSize": 132
+    }
+  },
+  {
+    "rfilename": "covariates/stofs_water_level_forecast/train-00000.parquet",
+    "size": 1188437,
+    "blobId": "90aefd58d66a01c38a30271d5df22420a6ffaf1f",
+    "lfs": {
+      "sha256": "5b07884a451f2838e8d2f68be88c108b17f7a35a821febca772a58e40fbf36c1",
+      "size": 1188437,
+      "pointerSize": 132
+    }
+  },
+  {
+    "rfilename": "covariates/surfrad_solar_hrrr/train-00000.parquet",
+    "size": 85893,
+    "blobId": "1b3da5716e12c8f877d769aeaf79123a5e1dd539",
+    "lfs": {
+      "sha256": "a89a476b87632ec49e13204c63706a261679cdededc6353ccbf3299a59614c72",
+      "size": 85893,
+      "pointerSize": 130
+    }
+  },
+  {
+    "rfilename": "covariates/swpc_f107_45day/train-00000.parquet",
+    "size": 37579,
+    "blobId": "154b6db1b2012fbe91861b325cf993e5df24d8de",
+    "lfs": {
+      "sha256": "d03e223b534196d6f0ba4c77ad53994c61e4c625b19deb8477373b79a7d3b907",
+      "size": 37579,
+      "pointerSize": 130
+    }
+  },
+  {
+    "rfilename": "covariates/swpc_kp_forecast/train-00000.parquet",
+    "size": 16466,
+    "blobId": "b0fdf4717da4b0acbec567e7faa0b9016c6beafc",
+    "lfs": {
+      "sha256": "ef44ebb36c4f779f195405fcab8a37bf1590df6d267e7af81bd342af324b30cf",
+      "size": 16466,
+      "pointerSize": 130
+    }
+  },
+  {
+    "rfilename": "covariates/tennessee_eastman_setpoints/train-00000.parquet",
+    "size": 773682,
+    "blobId": "6ff03e7522c8539ec5a62f569f57ab33c07825c9",
+    "lfs": {
+      "sha256": "6e3f8a43f43e00287f673b0b7b3fab0e10971aaa0751bef4d668148354ba33e6",
+      "size": 773682,
+      "pointerSize": 131
+    }
+  },
+  {
+    "rfilename": "covariates/transit_scheduled_service/train-00000.parquet",
+    "size": 49754,
+    "blobId": "f2d6da0257e7daea856daaae278dce8367ecbbda",
+    "lfs": {
+      "sha256": "3a9fc33a94cbcf8250a5007bc0a41a943cc31b874e09f7e2344562199756da41",
+      "size": 49754,
+      "pointerSize": 130
+    }
+  },
+  {
+    "rfilename": "covariates/uk_roadworks_traffic/train-00000.parquet",
+    "size": 549198,
+    "blobId": "f736e1f02fe458c51e4bd63ebb647bf15e6fee91",
+    "lfs": {
+      "sha256": "24f8e830b81364c7414d3acaef1a61f213a5c8b13ba8ec9330fe8d3d69eaf9d4",
+      "size": 549198,
+      "pointerSize": 131
+    }
+  },
+  {
+    "rfilename": "covariates/us_ba_load_mos/train-00000.parquet",
+    "size": 1743282,
+    "blobId": "eda3ce703961780f753cda38b7a8f6f48c8b80e7",
+    "lfs": {
+      "sha256": "d99dc1c5ce5544d8121c5d1e0294c090df1c750caa80c54eda8d97874f1bfb96",
+      "size": 1743282,
+      "pointerSize": 132
+    }
+  },
+  {
+    "rfilename": "covariates/wikipedia_sports_fixtures/LICENSE.md",
+    "size": 605,
+    "blobId": "8483e4368b96b3b28de858c03fdea4883aa6812c"
+  },
+  {
+    "rfilename": "covariates/wikipedia_sports_fixtures/articles.csv",
+    "size": 6359,
+    "blobId": "8615ade24c158a915c28a75938e37dac9324cfc1"
+  },
+  {
+    "rfilename": "covariates/wikipedia_sports_fixtures/train-00000.parquet",
+    "size": 56639,
+    "blobId": "26a64ba7c9d74aafd7d605ab365ee83a4d53f449",
+    "lfs": {
+      "sha256": "c10d227af78a00609f8f68dc02ca02bed7726b39ad224288583c2836efb02cf9",
+      "size": 56639,
+      "pointerSize": 130
+    }
+  },
+  {
+    "rfilename": "covariates/wikipedia_tv_episodes/LICENSE.md",
+    "size": 599,
+    "blobId": "269caf5c60b2d6d46ca729da87ae01ee35c81f81"
+  },
+  {
+    "rfilename": "covariates/wikipedia_tv_episodes/articles.csv",
+    "size": 6769,
+    "blobId": "d3e8c40568242079b7fb00764544356e90e24693"
+  },
+  {
+    "rfilename": "covariates/wikipedia_tv_episodes/train-00000.parquet",
+    "size": 58405,
+    "blobId": "05e534694763ae5acea2d4aadeccc7702f501e8c",
+    "lfs": {
+      "sha256": "cf61b3becf010388c7dcdb173ec98242b0579bc6f35416f940680b6a5026f84c",
+      "size": 58405,
+      "pointerSize": 130
+    }
+  },
+  {
+    "rfilename": "manifest.json",
+    "size": 62827,
+    "blobId": "0df36a316a9034ba77da26754bea652f428568b2"
+  },
+  {
+    "rfilename": "statistics/data_breakdown.csv",
+    "size": 3046,
+    "blobId": "f80e52dd8f5299f0c251bcb62e6d6198273b2fdf"
+  },
+  {
+    "rfilename": "statistics/frequency_breakdown.csv",
+    "size": 2177,
+    "blobId": "d5053444557fefff70870489b76c9d5600a35567"
+  },
+  {
+    "rfilename": "statistics/real_synthetic.csv",
+    "size": 2930,
+    "blobId": "ea21a25d08c31885cdbba9c16b737106db4a40cc"
+  },
+  {
+    "rfilename": "univariate/ajile/train-00000.parquet",
+    "size": 209889115,
+    "blobId": "6667dfbfa6cd799598db1f3d5123bbbe0c1f2959",
+    "lfs": {
+      "sha256": "9913800c7a3d4e3d9390958919600c2635961bbe8d4009893a884315b8e8e0f6",
+      "size": 209889115,
+      "pointerSize": 134
+    }
+  },
+  {
+    "rfilename": "univariate/arpa-e-perform/train-00000.parquet",
+    "size": 205280,
+    "blobId": "6107b1eb8dc313157929900953fcbf1c71216fc7",
+    "lfs": {
+      "sha256": "34335588905ec28f3ea9a62da2854b56664c165a99ef777a040fe48b14976c11",
+      "size": 205280,
+      "pointerSize": 131
+    }
+  },
+  {
+    "rfilename": "univariate/australian-electricity-demand/train-00000.parquet",
+    "size": 2604620,
+    "blobId": "23e3bf691f4a445c2677b06aacc3a24a7eb0bb52",
+    "lfs": {
+      "sha256": "399da46563db2d2e877f7c5cc0fd6b32e6dee6c43fb4f3353216d95c7c1b65dd",
+      "size": 2604620,
+      "pointerSize": 132
+    }
+  },
+  {
+    "rfilename": "univariate/azure-vm-traces-2017/train-00000.parquet",
+    "size": 503599921,
+    "blobId": "1377e2a1d13279e57c22cffa6a87f6d9c32171fd",
+    "lfs": {
+      "sha256": "92e8824912a1180db9344cf396afdd2281097e4f03505f9fe8abbc0b235a015b",
+      "size": 503599921,
+      "pointerSize": 134
+    }
+  },
+  {
+    "rfilename": "univariate/azure-vm-traces-2017/train-00001.parquet",
+    "size": 502777483,
+    "blobId": "e892b04fb37993aefac68a460aba712c9c317a22",
+    "lfs": {
+      "sha256": "9ab2f4bc82e144a920bcf5c42d0351623a26e76b9df0979f0211c7a3404522bf",
+      "size": 502777483,
+      "pointerSize": 134
+    }
+  },
+  {
+    "rfilename": "univariate/azure-vm-traces-2017/train-00002.parquet",
+    "size": 503274833,
+    "blobId": "8f4537bfadd019b57148c20db665e61de08a84ff",
+    "lfs": {
+      "sha256": "e21f21bbf2aca0d9868ac3919aaa5606d9e0ece1b14f451bb9cdc6aedfc8a4c4",
+      "size": 503274833,
+      "pointerSize": 134
+    }
+  },
+  {
+    "rfilename": "univariate/azure-vm-traces-2017/train-00003.parquet",
+    "size": 505329917,
+    "blobId": "99e00739cdfd8d9656a47a81822b6d0bcaab5c31",
+    "lfs": {
+      "sha256": "e2fede0e3a2f79fdf79377638caa579e11597e3647cc7fd4288d5c8e8ec48a02",
+      "size": 505329917,
+      "pointerSize": 134
+    }
+  },
+  {
+    "rfilename": "univariate/batch-distillation/train-00000.parquet",
+    "size": 4922387,
+    "blobId": "9b9ea2e91b90ebef1aa0532f4ac6cd40ffc525e0",
+    "lfs": {
+      "sha256": "3042adc5826e8ab7f193f83e34e1e414bff5f4eac20b4239a5a0a7842dd9febe",
+      "size": 4922387,
+      "pointerSize": 132
+    }
+  },
+  {
+    "rfilename": "univariate/bdg-2/LICENSE.md",
+    "size": 468,
+    "blobId": "600f1b196d89afd1b83eabe989ff62abeca4535a"
+  },
+  {
+    "rfilename": "univariate/bdg-2/train-00000.parquet",
+    "size": 15722316,
+    "blobId": "7c08e23991e051236813877e82bcb791835b03d8",
+    "lfs": {
+      "sha256": "b9afc6f75c6722b7e314ca74dbe2fd5d285ce915988f3e88ad301b195734017d",
+      "size": 15722316,
+      "pointerSize": 133
+    }
+  },
+  {
+    "rfilename": "univariate/bidmc32hr/train-00000.parquet",
+    "size": 6986949,
+    "blobId": "445a34b340dc86d5b233e377859427fde392c826",
+    "lfs": {
+      "sha256": "7e57531b61bd3325e9a1c090f983c230db3635b2e5bae1f1aaa5eb2e2554ee6f",
+      "size": 6986949,
+      "pointerSize": 132
+    }
+  },
+  {
+    "rfilename": "univariate/borealis/train-00000.parquet",
+    "size": 265406,
+    "blobId": "8fdce18caff2193465e706b93acb04b6ffa31257",
+    "lfs": {
+      "sha256": "3fc0a2f97af5ac09a52c74f12253eeb2e24e641e665e9794c621417fefc53d79",
+      "size": 265406,
+      "pointerSize": 131
+    }
+  },
+  {
+    "rfilename": "univariate/borg-cluster-data-2011/train-00000.parquet",
+    "size": 471670638,
+    "blobId": "390ff1b12d07ad91a7373688463d25f16e718dfe",
+    "lfs": {
+      "sha256": "ff27c0a17ef1aea13199a5eaa63b704f66bfe7c76128d8ca62dda6c4ab8e6825",
+      "size": 471670638,
+      "pointerSize": 134
+    }
+  },
+  {
+    "rfilename": "univariate/borg-cluster-data-2011/train-00001.parquet",
+    "size": 469482131,
+    "blobId": "6da4aa101d532a14136f52a12d1b55bd9c9b7f3a",
+    "lfs": {
+      "sha256": "8b62256b622f635395f2bfb65bc5f0b92fb6f2495bb37b1ca43faff0b4ecd078",
+      "size": 469482131,
+      "pointerSize": 134
+    }
+  },
+  {
+    "rfilename": "univariate/camels-de/train-00000.parquet",
+    "size": 101480106,
+    "blobId": "09cdeebe2758498c0c618420306749217d85844f",
+    "lfs": {
+      "sha256": "c97486915c2e00ac4fbf81a13af43b455bc595a5c31f6b83c888e63a42a96ac1",
+      "size": 101480106,
+      "pointerSize": 134
+    }
+  },
+  {
+    "rfilename": "univariate/cdc-fluview-who-nrevss/train-00000.parquet",
+    "size": 64422,
+    "blobId": "fd9e4a1264068d51dc92834c9b1461f87caf9e74",
+    "lfs": {
+      "sha256": "71934eb14fdeccf388b1279e87017cb76558d53ed89b1d24483b343d31c34c94",
+      "size": 64422,
+      "pointerSize": 130
+    }
+  },
+  {
+    "rfilename": "univariate/cesnet/train-00000.parquet",
+    "size": 400742372,
+    "blobId": "1eac15365ebe5091739894ede8501fe235093891",
+    "lfs": {
+      "sha256": "d44699f73876c8f603521846777d0627d1e415b22181699f1c96485226e55e95",
+      "size": 400742372,
+      "pointerSize": 134
+    }
+  },
+  {
+    "rfilename": "univariate/eia930/train-00000.parquet",
+    "size": 19822634,
+    "blobId": "f9de43d0fb51bf211d3069fbf3511c64c47fd599",
+    "lfs": {
+      "sha256": "e93c5c769f68b887d192e6d09417b79d7b960d2f145a8e7d41943c3e05e84c0d",
+      "size": 19822634,
+      "pointerSize": 133
+    }
+  },
+  {
+    "rfilename": "univariate/eigenworms/train-00000.parquet",
+    "size": 51752132,
+    "blobId": "4bf32fa91f21376840aa72a168524dd2e7b836db",
+    "lfs": {
+      "sha256": "aa618dd15f4ecf0e345aba00eca1454de11298d3b37044f04a4dc07dc6358ae1",
+      "size": 51752132,
+      "pointerSize": 133
+    }
+  },
+  {
+    "rfilename": "univariate/elecdemand/train-00000.parquet",
+    "size": 74071,
+    "blobId": "3df3eb7a15cda15437c74a74f40e9dea24535ca8",
+    "lfs": {
+      "sha256": "5db6e41c78781f782be496172b8d861eb7ac0a1c19a6ec93314f84df301c3c39",
+      "size": 74071,
+      "pointerSize": 130
+    }
+  },
+  {
+    "rfilename": "univariate/era5/train-00000.parquet",
+    "size": 3330917409,
+    "blobId": "8d15743ac445475c376189d597a5475c180a5ab5",
+    "lfs": {
+      "sha256": "cfb229f9f62b72f8145bf6614f3db6233cf2682ba046a2fe8f81271743a01dba",
+      "size": 3330917409,
+      "pointerSize": 135
+    }
+  },
+  {
+    "rfilename": "univariate/era5/train-00001.parquet",
+    "size": 266544529,
+    "blobId": "b01c4a4c47bd9119d1aecd4c54526c3c3230141f",
+    "lfs": {
+      "sha256": "42eb98d9db16069de85d306914b884dc9d1bc49089c994fea9af7ce6ea205dcf",
+      "size": 266544529,
+      "pointerSize": 134
+    }
+  },
+  {
+    "rfilename": "univariate/era5/train-00002.parquet",
+    "size": 296318405,
+    "blobId": "f623a55d6c408d2014ff3dc98fa8c97db35d0ad1",
+    "lfs": {
+      "sha256": "b3220354317ecf90b2ee5de299d51ff4778f5e22d3bfd76f2039afb13ecdae3a",
+      "size": 296318405,
+      "pointerSize": 134
+    }
+  },
+  {
+    "rfilename": "univariate/era5/train-00003.parquet",
+    "size": 296096248,
+    "blobId": "f18020d92e19764e262275033d83c1b71e34c658",
+    "lfs": {
+      "sha256": "19acd08b87618516da369e33a01adcb442b3ca63d6577446128a11d35f6023b5",
+      "size": 296096248,
+      "pointerSize": 134
+    }
+  },
+  {
+    "rfilename": "univariate/era5/train-00004.parquet",
+    "size": 296181948,
+    "blobId": "5c8eeb694667a6709344f4244e4e62e11db95d2c",
+    "lfs": {
+      "sha256": "b91f73c3cc938025733a487416d273a35354b29820e881557daa246fe78e8872",
+      "size": 296181948,
+      "pointerSize": 134
+    }
+  },
+  {
+    "rfilename": "univariate/era5/train-00005.parquet",
+    "size": 296091691,
+    "blobId": "9be3539f16f7e4f8e19367094772c7c608981488",
+    "lfs": {
+      "sha256": "a1c0d50568d0146cf8cb5ae43802655b28330f1d6398a2010ca9082a5b5474af",
+      "size": 296091691,
+      "pointerSize": 134
+    }
+  },
+  {
+    "rfilename": "univariate/era5/train-00006.parquet",
+    "size": 296122757,
+    "blobId": "425589c0571600ff4c04a1fbb451e1e6e205833a",
+    "lfs": {
+      "sha256": "a4697d6404847963b7ce0f5632eceb46ccd4fb9c1bb3bb95bad0346fe5d9c4f2",
+      "size": 296122757,
+      "pointerSize": 134
+    }
+  },
+  {
+    "rfilename": "univariate/era5/train-00007.parquet",
+    "size": 295404058,
+    "blobId": "54fc0b00d9dbc51121161dc142ff71cf8ae46e6a",
+    "lfs": {
+      "sha256": "409f9c574bf33d18bc887c458625e531b92c76afc2d2829d8d4eb22bb8ae9d98",
+      "size": 295404058,
+      "pointerSize": 134
+    }
+  },
+  {
+    "rfilename": "univariate/era5/train-00008.parquet",
+    "size": 295520147,
+    "blobId": "c645cdd740f3c9df1ab4c0927f133b94c580dbea",
+    "lfs": {
+      "sha256": "4644c0aeeaae030c7dedd162b2da5f37883a86409b86f434321946d942430ed5",
+      "size": 295520147,
+      "pointerSize": 134
+    }
+  },
+  {
+    "rfilename": "univariate/era5/train-00009.parquet",
+    "size": 296187194,
+    "blobId": "b593f0cd855348f5f3215f77f585f8ea1aa13e5c",
+    "lfs": {
+      "sha256": "ae31cebe623101e7116620256c56fda4075ead1883a3f41a35013bf1cab8b600",
+      "size": 296187194,
+      "pointerSize": 134
+    }
+  },
+  {
+    "rfilename": "univariate/era5/train-00010.parquet",
+    "size": 296567665,
+    "blobId": "c6c235fa8059a9a0edfd5f0b32004ce8306436f4",
+    "lfs": {
+      "sha256": "4752837a496ea0bcc383f64646f5dc9c42a303de14dbe4fc34799336d657f708",
+      "size": 296567665,
+      "pointerSize": 134
+    }
+  },
+  {
+    "rfilename": "univariate/era5/train-00011.parquet",
+    "size": 295525319,
+    "blobId": "a28c15e04aed43d0b6fff2f586501df5ef3613ea",
+    "lfs": {
+      "sha256": "ec0e537bc54e843d393910f6299b73a4221d99cf0d6553609184b0d564ead390",
+      "size": 295525319,
+      "pointerSize": 134
+    }
+  },
+  {
+    "rfilename": "univariate/era5/train-00012.parquet",
+    "size": 295499838,
+    "blobId": "7013283ad1bb2e18c0aa0983a4930484f5659167",
+    "lfs": {
+      "sha256": "c14f640b8ce7d6bc6de31bc38cdfdd0f9d591712421a34782e224d32d4a54e85",
+      "size": 295499838,
+      "pointerSize": 134
+    }
+  },
+  {
+    "rfilename": "univariate/factorynet-aursad/train-00000.parquet",
+    "size": 644100262,
+    "blobId": "dca79597beea99597e7b70071fb4181386d0e46c",
+    "lfs": {
+      "sha256": "cf573f84183ac79cac2bd17cc4b36c3d7d84250d567d7b17f7ccf83740655d4c",
+      "size": 644100262,
+      "pointerSize": 134
+    }
+  },
+  {
+    "rfilename": "univariate/factorynet-cnc/train-00000.parquet",
+    "size": 660543,
+    "blobId": "7fd2a75941636d62a86b5da4ae691dd16162d2fc",
+    "lfs": {
+      "sha256": "41f6c85eaec423dabe61b49498f520ffa8090dd985441b38b6853c16770ee401",
+      "size": 660543,
+      "pointerSize": 131
+    }
+  },
+  {
+    "rfilename": "univariate/freshretailnet/train-00000.parquet",
+    "size": 3167534,
+    "blobId": "6ff6305d48cec51e87aa8859d7062d3593f88165",
+    "lfs": {
+      "sha256": "d401eb5f3b6b19c3ddb3e6b71eb6128937e2c3aeb5948e80d90cb744f3b679d6",
+      "size": 3167534,
+      "pointerSize": 132
+    }
+  },
+  {
+    "rfilename": "univariate/gpm-mergir/train-00000.parquet",
+    "size": 502991505,
+    "blobId": "db4c32aaca78ada1b6e6c046045b4112f99e8ac1",
+    "lfs": {
+      "sha256": "e20abfce25534a990bbef070468a999888964d7c2322c23a89a73601532e078c",
+      "size": 502991505,
+      "pointerSize": 134
+    }
+  },
+  {
+    "rfilename": "univariate/gpm-mergir/train-00001.parquet",
+    "size": 502970575,
+    "blobId": "224a95a3c4a9b0c4ab723b405871dd3c04f85a1c",
+    "lfs": {
+      "sha256": "df093332c5b9cfb6729f3a2d01f1d551178c1948a5b52dac8fa00b3e4a51d02b",
+      "size": 502970575,
+      "pointerSize": 134
+    }
+  },
+  {
+    "rfilename": "univariate/gpm-mergir/train-00002.parquet",
+    "size": 502959327,
+    "blobId": "25277ce8d18b659deabf15a9a450e6a811c292cd",
+    "lfs": {
+      "sha256": "b5c5001e5ec38a10be7902065e99ddec4dcfcd2173ab45aee23564a118be33e9",
+      "size": 502959327,
+      "pointerSize": 134
+    }
+  },
+  {
+    "rfilename": "univariate/ideal-hourly/train-00000.parquet",
+    "size": 2807602,
+    "blobId": "8eb44c97ed4e8430478fe88e166cb6b8cc672084",
+    "lfs": {
+      "sha256": "2dcd77936b828cba1b6d3df39cc50dc27bbe25641553cca22f3d238b2249117a",
+      "size": 2807602,
+      "pointerSize": 132
+    }
+  },
+  {
+    "rfilename": "univariate/ideal/train-00000.parquet",
+    "size": 2339527,
+    "blobId": "9091c9b607db35091fc9f7fcb553b1993c087a64",
+    "lfs": {
+      "sha256": "5dd696e1cba2543cb2dda72a3f3ff86f174fe747aedae7e6c53d13048d7cc596",
+      "size": 2339527,
+      "pointerSize": 132
+    }
+  },
+  {
+    "rfilename": "univariate/lcl/train-00000.parquet",
+    "size": 8059362,
+    "blobId": "2005007119423b147bb48ddd72da3ef43d176601",
+    "lfs": {
+      "sha256": "20311c848c852f32da2fe19dd366bd74289451bff85297620c4b7d8ddd61b1ff",
+      "size": 8059362,
+      "pointerSize": 132
+    }
+  },
+  {
+    "rfilename": "univariate/london-smart-meters/train-00000.parquet",
+    "size": 143965217,
+    "blobId": "04e17a82d303dfddfb90cf9faf1b2d803f166935",
+    "lfs": {
+      "sha256": "0a9fb515ced30dd72ae1576e0931e0ed3a92b65c73b3dac52710bda3b4c422b2",
+      "size": 143965217,
+      "pointerSize": 134
+    }
+  },
+  {
+    "rfilename": "univariate/m100-ipmi/train-00000.parquet",
+    "size": 720211655,
+    "blobId": "a07cbdeb42cb24b6d79da271130f0af1cfee440a",
+    "lfs": {
+      "sha256": "b06b6011a8c2df82ed84433f1d3e3ff1fe3848742d43ca47f7646bc41e68ad7c",
+      "size": 720211655,
+      "pointerSize": 134
+    }
+  },
+  {
+    "rfilename": "univariate/metro-traffic/train-00000.parquet",
+    "size": 70761,
+    "blobId": "e25b5851a7f9966a7cb079f4f5a68af7bf2acf50",
+    "lfs": {
+      "sha256": "46c0845b098b8aa4073ed9b287e4d0d64e4ad848d5c7bd197ac667f23b2f0901",
+      "size": 70761,
+      "pointerSize": 130
+    }
+  },
+  {
+    "rfilename": "univariate/museval-austin-water/train-00000.parquet",
+    "size": 2875,
+    "blobId": "9505d47fcbb52dd33297c3526a73b9f3c77cbff2",
+    "lfs": {
+      "sha256": "04e9739530821786c01e671b3d8d7bea859f704c5f97e77e01895c57affa0ad8",
+      "size": 2875,
+      "pointerSize": 129
+    }
+  },
+  {
+    "rfilename": "univariate/museval-beijing-embassy/train-00000.parquet",
+    "size": 44078,
+    "blobId": "31646db4502054d6278407f55683de138c10b2a0",
+    "lfs": {
+      "sha256": "6b345ac899aff48eb30fd509c481d790749dd520e993970eb52c976ca6c11a06",
+      "size": 44078,
+      "pointerSize": 130
+    }
+  },
+  {
+    "rfilename": "univariate/museval-causalrivers/train-00000.parquet",
+    "size": 1320678,
+    "blobId": "f45fbed5d6fb1b9b3a3001e7553194e7cc23baf6",
+    "lfs": {
+      "sha256": "f47adf41cfb4a8bc0e158309cef7b8ac07c7db8668387ba82785398781bf3e5c",
+      "size": 1320678,
+      "pointerSize": 132
+    }
+  },
+  {
+    "rfilename": "univariate/museval-cgm/LICENSE.md",
+    "size": 455,
+    "blobId": "ef4c8daacddf34fda81bd060323d2fd8c4ab8b50"
+  },
+  {
+    "rfilename": "univariate/museval-cgm/train-00000.parquet",
+    "size": 4277,
+    "blobId": "1e178b99487ff155e25cbfed02015178820ff87d",
+    "lfs": {
+      "sha256": "985e35a705e8cb03ac6717668cd6ef860db99ca9fdebe28944eac94a8d8f650f",
+      "size": 4277,
+      "pointerSize": 129
+    }
+  },
+  {
+    "rfilename": "univariate/museval-mn-interstate/train-00000.parquet",
+    "size": 21320,
+    "blobId": "2ad01625406830f7274e169c7abe636376ca6e2e",
+    "lfs": {
+      "sha256": "b3f78299b81214cc87462fd5d6babfe18304260ca73ac439a0afe78f0578545e",
+      "size": 21320,
+      "pointerSize": 130
+    }
+  },
+  {
+    "rfilename": "univariate/museval-mta-ridership/train-00000.parquet",
+    "size": 6252,
+    "blobId": "84bccf110ac5aefdd60d03197fdf29759cab4e00",
+    "lfs": {
+      "sha256": "1daa73d20c5f4ddc519fa9da517d99af4620e8f934e38d6161b2430584466631",
+      "size": 6252,
+      "pointerSize": 129
+    }
+  },
+  {
+    "rfilename": "univariate/museval-traffic-pems/train-00000.parquet",
+    "size": 49461,
+    "blobId": "062552e494f00865de4f38fe7e706b3fa374c953",
+    "lfs": {
+      "sha256": "b794df37f60dd89f847819ea5a5fe8e4e196962159050c91135672e75d860ea4",
+      "size": 49461,
+      "pointerSize": 130
+    }
+  },
+  {
+    "rfilename": "univariate/national-illness/train-00000.parquet",
+    "size": 26822,
+    "blobId": "4e3645d490e3039e68b68d46c980f7f9eed86254",
+    "lfs": {
+      "sha256": "b70b12efb296808b5a5da3fdcea0410e20481ddc43d36bb894a6c385b3f12845",
+      "size": 26822,
+      "pointerSize": 130
+    }
+  },
+  {
+    "rfilename": "univariate/nhanes-pax80/train-00000.parquet",
+    "size": 128134366,
+    "blobId": "75d702480a3da55d939744bc8b7db494e3d38854",
+    "lfs": {
+      "sha256": "68cb9d0e0fa036435f59202029a5e35faab2856d1e7220e744112b4a1770dc94",
+      "size": 128134366,
+      "pointerSize": 134
+    }
+  },
+  {
+    "rfilename": "univariate/nmt-eeg/LICENSE.md",
+    "size": 453,
+    "blobId": "ffdf9bf1a5297e2760abdd96b7f9f602c0920e7d"
+  },
+  {
+    "rfilename": "univariate/nmt-eeg/train-00000.parquet",
+    "size": 202635219,
+    "blobId": "8e03235a49e749004b05f7c6bb7dffc12b613e40",
+    "lfs": {
+      "sha256": "7bf8220b248db6cd515808e88fbe01996a735bb142f8653e8d32daa4d21462ef",
+      "size": 202635219,
+      "pointerSize": 134
+    }
+  },
+  {
+    "rfilename": "univariate/ntu-fi-humanid-csi-amplitude/train-00000.parquet",
+    "size": 313066190,
+    "blobId": "3f651a965446544750e93d865a1ad01a9d807096",
+    "lfs": {
+      "sha256": "7fce20ca60832d0ff92f53d02f8fe00e3c05cfaca8b194d6d3288bb364e21813",
+      "size": 313066190,
+      "pointerSize": 134
+    }
+  },
+  {
+    "rfilename": "univariate/nyc-taxi/train-00000.parquet",
+    "size": 24671897,
+    "blobId": "6633391707f3be7f0a10ec893f7b26dd66094448",
+    "lfs": {
+      "sha256": "700830b3c1b9b83376f179aa3bcfbb1c1c5b3c9d878fbd89e4c8522942d94845",
+      "size": 24671897,
+      "pointerSize": 133
+    }
+  },
+  {
+    "rfilename": "univariate/pedestrian-counts/train-00000.parquet",
+    "size": 2891142,
+    "blobId": "f84f74e259018a3c220e98a4c220a9a4d77a9f6b",
+    "lfs": {
+      "sha256": "4f28e72e6fb825bd8d99153ac7daed3abe86c73511ffddf572527597d78386c8",
+      "size": 2891142,
+      "pointerSize": 132
+    }
+  },
+  {
+    "rfilename": "univariate/pems-bay/train-00000.parquet",
+    "size": 16707138,
+    "blobId": "cc183008e747d4d41fe8e50c7756b4cee0d49572",
+    "lfs": {
+      "sha256": "828db5caa46127d2ed654e812dd08c64b39d9b788539747e19bc81c9613e2e93",
+      "size": 16707138,
+      "pointerSize": 133
+    }
+  },
+  {
+    "rfilename": "univariate/pems-districts/train-00000.parquet",
+    "size": 52994459,
+    "blobId": "656701c118ff333cc6ee4f3a1181061c540d211b",
+    "lfs": {
+      "sha256": "d43e3e352659933cd62eab46e24668ac6dfea28340c6b19504c38c09aac42c4c",
+      "size": 52994459,
+      "pointerSize": 133
+    }
+  },
+  {
+    "rfilename": "univariate/project-tycho/train-00000.parquet",
+    "size": 546692,
+    "blobId": "c5f167e733ae90670caa6d08f691b969c4f43b78",
+    "lfs": {
+      "sha256": "ad83134f57b9ad32ed7dddec63e4704ee1f246a2e66d22e30347854c1c4e3c7d",
+      "size": 546692,
+      "pointerSize": 131
+    }
+  },
+  {
+    "rfilename": "univariate/residential-load-power/train-00000.parquet",
+    "size": 727415901,
+    "blobId": "718ce67a1d4a00d4767d3e3322b62293fd6300f4",
+    "lfs": {
+      "sha256": "72430e22b2b79214effc41c5e9a98a7904134e422b0d6cee41536f62a7a347fd",
+      "size": 727415901,
+      "pointerSize": 134
+    }
+  },
+  {
+    "rfilename": "univariate/residential-pv-power/train-00000.parquet",
+    "size": 317165154,
+    "blobId": "68d84cbe3a9dfc3782f57d320373aba95b03f8b3",
+    "lfs": {
+      "sha256": "8097d16b542805ab3017dad2e6068d5c7c55cd4f8921843fea2bb3765bb96c9c",
+      "size": 317165154,
+      "pointerSize": 134
+    }
+  },
+  {
+    "rfilename": "univariate/smart/train-00000.parquet",
+    "size": 272274,
+    "blobId": "0aef8a372284fe22b559488c8bfebf1f7a591982",
+    "lfs": {
+      "sha256": "4b0fca0b3222c02b85bf0a185083f3a702a8df75a5901f1df47ab98bc56ecc80",
+      "size": 272274,
+      "pointerSize": 131
+    }
+  },
+  {
+    "rfilename": "univariate/solar-power/train-00000.parquet",
+    "size": 715843,
+    "blobId": "f7c675f0d445ee9c1c3b5733c3aeadb6fdc66220",
+    "lfs": {
+      "sha256": "e63bf8939fb189ed0cb399d5007e882826cd998e244870782a99abd5d4d7bceb",
+      "size": 715843,
+      "pointerSize": 131
+    }
+  },
+  {
+    "rfilename": "univariate/subseasonal-precip/train-00000.parquet",
+    "size": 14495999,
+    "blobId": "efc6137b94af1948e042d2f6a0dd81ef4da9d2da",
+    "lfs": {
+      "sha256": "0c29c87be734624c350673ae978d80e24404108bfdeee8beceff193bbffd3d77",
+      "size": 14495999,
+      "pointerSize": 133
+    }
+  },
+  {
+    "rfilename": "univariate/subseasonal/train-00000.parquet",
+    "size": 106447200,
+    "blobId": "6716091576a1f7ff98d5bb0a2f3c66ed7ce5249c",
+    "lfs": {
+      "sha256": "f8b023ba281fdca0469fae3e0ae3c49654de540561b31734cbb0c70d26060604",
+      "size": 106447200,
+      "pointerSize": 134
+    }
+  },
+  {
+    "rfilename": "univariate/telecomts-real/LICENSE.md",
+    "size": 1313,
+    "blobId": "63514622139e80d65ae9365468020d2a315c152f"
+  },
+  {
+    "rfilename": "univariate/telecomts-real/train-00000.parquet",
+    "size": 18441433,
+    "blobId": "d6403e690808ccb82b18ffce398c2a47370e35a8",
+    "lfs": {
+      "sha256": "7a3b0ef3bf0bd2c345732be2b49c66f5c9c9c9c1fd3c46b822ef4217e5d7c988",
+      "size": 18441433,
+      "pointerSize": 133
+    }
+  },
+  {
+    "rfilename": "univariate/traffic/train-00000.parquet",
+    "size": 11376213,
+    "blobId": "4ba283ab0366c491e4f14ff6a149a4a28499c2bc",
+    "lfs": {
+      "sha256": "c184840803c85f966ab24010914ad8727f4e9386b7d50c25688700d9e1ffc8c8",
+      "size": 11376213,
+      "pointerSize": 133
+    }
+  },
+  {
+    "rfilename": "univariate/umass-sundance/train-00000.parquet",
+    "size": 3966126,
+    "blobId": "0d1ba1bccd10d5b6d7caa24f82960d6a3439f806",
+    "lfs": {
+      "sha256": "c4c30c06f3fe0b17777632778f3d72b6af52be61d1743051bd0dff55af5193d5",
+      "size": 3966126,
+      "pointerSize": 132
+    }
+  },
+  {
+    "rfilename": "univariate/urbangpt-chicago-taxi/train-00000.parquet",
+    "size": 662401,
+    "blobId": "b94c7d7dcece6d659b3d71640bc1a366fb917973",
+    "lfs": {
+      "sha256": "f283c796184de6c856d40fc6a945045e47c4a10a0e7fa82d5df18eb63425f01b",
+      "size": 662401,
+      "pointerSize": 131
+    }
+  },
+  {
+    "rfilename": "univariate/urbangpt-nyc-crime/train-00000.parquet",
+    "size": 169428,
+    "blobId": "a3324e9a06568052bd83d6730d92fc6e469d2678",
+    "lfs": {
+      "sha256": "20b207772e5dc048d7380a3c73430ab70f552d5e28200800c45f13b4b87f5ed6",
+      "size": 169428,
+      "pointerSize": 131
+    }
+  },
+  {
+    "rfilename": "univariate/ushcn-daily/train-00000.parquet",
+    "size": 67609621,
+    "blobId": "747f086228320dd371b8a71d7059be3ea9656ecc",
+    "lfs": {
+      "sha256": "4b0bc76cd4780a1a2d9859144514e1dfd47e72a2392ebb9ae687ad38bcd4b8f1",
+      "size": 67609621,
+      "pointerSize": 133
+    }
+  },
+  {
+    "rfilename": "univariate/wiki-daily-100k/train-00000.parquet",
+    "size": 151966055,
+    "blobId": "2de6811993408be2a1502e48a03d74b4bdcc83e9",
+    "lfs": {
+      "sha256": "0bb868fcf16dd0023eb47c5665230a984e0407765241bfd765af133ce50952dd",
+      "size": 151966055,
+      "pointerSize": 134
+    }
+  },
+  {
+    "rfilename": "univariate/wiki-daily-100k/train-00001.parquet",
+    "size": 98176109,
+    "blobId": "f1d6c7a7f366e069e350332142be1cfa295f6332",
+    "lfs": {
+      "sha256": "3eeb767b398ffc3fa4e258b1a68e76711182d180b5f91959c309d41a5336ccec",
+      "size": 98176109,
+      "pointerSize": 133
+    }
+  },
+  {
+    "rfilename": "univariate/wiki-rolling-nips/train-00000.parquet",
+    "size": 11806662,
+    "blobId": "8345f4e644f48caee1b893789d08b8e061fd3283",
+    "lfs": {
+      "sha256": "41838c18aaa2818a8bfa06464412f7e0c177af61a9e64aa2385b75d62cde3583",
+      "size": 11806662,
+      "pointerSize": 133
+    }
+  },
+  {
+    "rfilename": "univariate/wikipedia/train-00000.parquet",
+    "size": 213796753,
+    "blobId": "a89aca4f68e9e79f8a8bd58768107cbeb3279ec0",
+    "lfs": {
+      "sha256": "8a795dec6fb4122f06a056120e208379737ae81e64b29d548ede2f0b14db813b",
+      "size": 213796753,
+      "pointerSize": 134
+    }
+  },
+  {
+    "rfilename": "univariate/wind-farms/train-00000.parquet",
+    "size": 40439203,
+    "blobId": "b64d135fe6b19bed5c49a9a0e0deded11e5f93de",
+    "lfs": {
+      "sha256": "8ccfaa39f6bc93c90e0d1bf632911ae3488efcfc6119fdea979913b1e500d18a",
+      "size": 40439203,
+      "pointerSize": 133
+    }
+  },
+  {
+    "rfilename": "univariate/wind-power/train-00000.parquet",
+    "size": 3148912,
+    "blobId": "3266646f6a89389c508574500a73cf19c00d7b23",
+    "lfs": {
+      "sha256": "bb5ce82f174d04672c91f387fddf61c600ca336960bc824b898e007abb17cbf3",
+      "size": 3148912,
+      "pointerSize": 132
+    }
+  },
+  {
+    "rfilename": "univariate/worldtrace/LICENSE.md",
+    "size": 445,
+    "blobId": "9fbd9fd3c177b555bd67d5c38212c532cc1a14f9"
+  },
+  {
+    "rfilename": "univariate/worldtrace/train-00000.parquet",
+    "size": 550852592,
+    "blobId": "c53c871a61f2db845c42b1526f3beb03dc4f214f",
+    "lfs": {
+      "sha256": "07aa7e464a29ce961bcd1d5cb480882e5c35d6a28d3bd09778ff7ba85f1cc9dd",
+      "size": 550852592,
+      "pointerSize": 134
+    }
+  },
+  {
+    "rfilename": "univariate/worldtrace/train-00001.parquet",
+    "size": 551115199,
+    "blobId": "8abe3efca99f1d7db9216b05662375082e2ec82a",
+    "lfs": {
+      "sha256": "e4d83de566eef810258dac736d2ff9faf233d7228436b4070c55347ae5b8de99",
+      "size": 551115199,
+      "pointerSize": 134
+    }
+  },
+  {
+    "rfilename": "univariate/worldtrace/train-00002.parquet",
+    "size": 552686777,
+    "blobId": "f1c83f14f9fd2b14a1230d34ab45ee09d9893f4b",
+    "lfs": {
+      "sha256": "76e5981d45da8feb59b8c147019c1f68dae07ee4faca1f66907da2ec57c9347f",
+      "size": 552686777,
+      "pointerSize": 134
+    }
+  },
+  {
+    "rfilename": "univariate/worldtrace/train-00003.parquet",
+    "size": 549946057,
+    "blobId": "e6a6f983bdbab629f802d6b111b9a84e46b96150",
+    "lfs": {
+      "sha256": "7a0995c71abfaa49c9c7d11aeddfe4f8932e6e8dc9df9143cfcc2a1142592295",
+      "size": 549946057,
+      "pointerSize": 134
+    }
+  },
+  {
+    "rfilename": "univariate/worldtrace/train-00004.parquet",
+    "size": 550476255,
+    "blobId": "46e9a5c1c25ed40729048fe29df6a861c007b1bc",
+    "lfs": {
+      "sha256": "38cd900b4bb38276643a67c0e04c96ba4c08df6e245343ce0a2118d6431be83a",
+      "size": 550476255,
+      "pointerSize": 134
+    }
+  },
+  {
+    "rfilename": "univariate/worldtrace/train-00005.parquet",
+    "size": 549828220,
+    "blobId": "1a43bbff56c5c4f107ae93a26bae500da5623e3c",
+    "lfs": {
+      "sha256": "9b80eb36a9c1acac8e0caf9480ea7d4d855d16fdc6a932d18f6fc13825c2fe49",
+      "size": 549828220,
+      "pointerSize": 134
+    }
+  },
+  {
+    "rfilename": "univariate/worldtrace/train-00006.parquet",
+    "size": 553906291,
+    "blobId": "94946f6379201e86d5f6288177400fe3cba4f384",
+    "lfs": {
+      "sha256": "e52968b255915871a79fb238930eee18bdad05001cc71b4360b153d09df8f020",
+      "size": 553906291,
+      "pointerSize": 134
+    }
+  },
+  {
+    "rfilename": "univariate/worldtrace/train-00007.parquet",
+    "size": 548502325,
+    "blobId": "0d9f96edc1853da4f008c0ee8e8429abacb7e868",
+    "lfs": {
+      "sha256": "47fc54981c1c299d3f48e9e5f32c1f17c1411fdeb3a93f70fabff3d12a8f5126",
+      "size": 548502325,
+      "pointerSize": 134
+    }
+  },
+  {
+    "rfilename": "univariate/worldtrace/train-00008.parquet",
+    "size": 553477321,
+    "blobId": "6ca57b9efc599d0e9db671cbbb456df1b384e994",
+    "lfs": {
+      "sha256": "e60cbb2447a85f4ec32e57652f225fb799875620e20f4e45fc3622a751062706",
+      "size": 553477321,
+      "pointerSize": 134
+    }
+  },
+  {
+    "rfilename": "univariate/worldtrace/train-00009.parquet",
+    "size": 552174135,
+    "blobId": "b8e0af8953a9b9c219be5c769a8931a081aeec74",
+    "lfs": {
+      "sha256": "662ed32657b979c1cf355434d64f8835399722a20adc6a02be4bf810936a72ae",
+      "size": 552174135,
+      "pointerSize": 134
+    }
+  },
+  {
+    "rfilename": "univariate/worldtrace/train-00010.parquet",
+    "size": 550730417,
+    "blobId": "f7af636c6773f2fa9e830306eb62c28c5c7a4986",
+    "lfs": {
+      "sha256": "e9790130f9dd2071d467222d2219e0efd75256dedff01ac493e9951c475c793a",
+      "size": 550730417,
+      "pointerSize": 134
+    }
+  },
+  {
+    "rfilename": "univariate/worms/train-00000.parquet",
+    "size": 447732,
+    "blobId": "e690967a7e38649cb5c9ae1709289bb31f91db3a",
+    "lfs": {
+      "sha256": "02ed957a8872d0ead764597dda2f237df384c0842f4af2c204d68d30d0c61ee9",
+      "size": 447732,
+      "pointerSize": 131
+    }
+  },
+  {
+    "rfilename": "univariate/zhou2016/train-00000.parquet",
+    "size": 98173181,
+    "blobId": "eb24f9265b4f5c5e4dd840760c30903935b24da7",
+    "lfs": {
+      "sha256": "14a0778ff4656f41e53077b928da9c93913e9916ac047003900df331e03af348",
+      "size": 98173181,
+      "pointerSize": 133
+    }
+  }
+]

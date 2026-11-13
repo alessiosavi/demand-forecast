@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from types import FunctionType
 
 import numpy as np
 import pandas as pd
@@ -85,10 +86,52 @@ def identifying_parent(values):
     return bool(np.max(np.abs(v - line)) > tolerance)
 
 
-def _posting_budget(x, index):
+class QueryHashes:
+    """Reuse exact legacy hash results across indices, without changing its globals.
+
+    The private function copies execute the original bytecode and globals except
+    for the four memoized hash functions. Only views of this immutable query are
+    cached; index series are never retained. A cache lives for one chunk only.
+    """
+
+    def __init__(self, values):
+        self.values = np.asarray(values, np.float64)
+        self.cache = {}
+        cache = self.cache
+        low, high = (
+            np.byte_bounds(self.values)
+            if hasattr(np, "byte_bounds")
+            else np.lib.array_utils.byte_bounds(self.values)
+        )
+
+        def memoize(family, fn):
+            def hashes(x):
+                pointer = x.__array_interface__["data"][0]
+                if not low <= pointer < high:
+                    return fn(x)
+                key = (family, pointer, x.shape, x.strides)
+                if key not in cache:
+                    cache[key] = fn(x)
+                return cache[key]
+
+            return hashes
+
+        self.families = {family: memoize(family, fn) for family, fn in old.FAMILIES.items()}
+        scope = dict(vars(old), FAMILIES=self.families)
+        row = old._scan_row
+        row_copy = FunctionType(row.__code__, scope, row.__name__, row.__defaults__)
+        row_copy.__kwdefaults__ = row.__kwdefaults__
+        scan = old.scan_group
+        self.scan_group = FunctionType(
+            scan.__code__, dict(scope, _scan_row=row_copy), scan.__name__, scan.__defaults__
+        )
+        self.scan_group.__kwdefaults__ = scan.__kwdefaults__
+
+
+def _posting_budget(x, index, families=None):
     """Count ALL postings before the old Python expansion, including fallback hits."""
     total = 0
-    for family, fn in old.FAMILIES.items():
+    for family, fn in (old.FAMILIES if families is None else families).items():
         hashes, _, _ = fn(x)
         indexed = index.by[family][0]
         total += int(
@@ -102,7 +145,15 @@ def _posting_budget(x, index):
     return True
 
 
-def find_index_matches(x, index, *, opportunities=1 << 60, calendar_dimensions=None):
+def find_index_matches(
+    x,
+    index,
+    *,
+    opportunities=1 << 60,
+    calendar_dimensions=None,
+    query_hashes=None,
+    stride_indices=None,
+):
     """Search a bounded multi-series index with positional missingness seed strides."""
     x = np.asarray(x, np.float64)
     coverage = dict(
@@ -119,18 +170,27 @@ def find_index_matches(x, index, *, opportunities=1 << 60, calendar_dimensions=N
     missing = not np.isfinite(x).all() or any(not np.isfinite(y).all() for y in index.series)
     for stride in (1, 2, 3, 4) if missing else (1,):
         for yp in range(stride):
-            idx = (
-                index
-                if stride == 1
-                else old.Index([y[yp::stride] for y in index.series], index.ids)
-            )
+            if stride == 1:
+                idx = index
+            elif stride_indices is None:
+                idx = old.Index([y[yp::stride] for y in index.series], index.ids)
+            else:
+                key = (stride, yp)
+                if key not in stride_indices:
+                    stride_indices[key] = old.Index(
+                        [y[yp::stride] for y in index.series], index.ids
+                    )
+                idx = stride_indices[key]
             for xp in range(stride):
                 xx = x[xp::stride]
-                if not _posting_budget(xx, idx):
+                if not _posting_budget(
+                    xx, idx, None if query_hashes is None else query_hashes.families
+                ):
                     coverage["unresolved_rows"] += 1
                     coverage["posting_budget_exceeded"] += 1
                     continue
-                result = old.scan_group("native", "values", 0, [0], [xx], idx)
+                scanner = old.scan_group if query_hashes is None else query_hashes.scan_group
+                result = scanner("native", "values", 0, [0], [xx], idx)
                 counts = result["counters"]
                 for key in ("unresolved_rows", "groups_dropped", "offsets_dropped"):
                     coverage[key] += counts[key]
