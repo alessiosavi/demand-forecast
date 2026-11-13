@@ -748,7 +748,7 @@ class _UnitJournal:
         if self.unit and self.identity:
             while True:
                 marker = self._marker(len(self.parts))
-                saved = _saved_result(marker, self.identity, path.parent)
+                saved = _saved_result(marker, self.identity, path.parent, last_row=True)
                 if saved is None:
                     break
                 self.parts.append(saved)
@@ -827,12 +827,15 @@ class _UnitJournal:
         else:
             self._close_stream()
             self.temporary.replace(self.path)
-        return dict(
+        result = dict(
             counts=dict(sorted(self.counts.items())),
             corpus_frequencies=sorted(self.aliases),
             corpus_sources=sorted(self.sources),
             evidence=dict(file=self.path.name, sha256=digest(self.path)),
         )
+        if self.unit:
+            result["last_row"] = self.resume_row
+        return result
 
     def close(self):
         self._close_stream()
@@ -1144,23 +1147,57 @@ def _execute(request):
     return json.loads(result.stdout)
 
 
-def _saved_result(marker, identity, directory):
+def _valid_result(result, *, last_row=False):
+    """Validate restored JSON before any consumer uses counts or evidence."""
+    if not isinstance(result, dict) or not isinstance(result.get("counts"), dict):
+        return False
+    if any(
+        not isinstance(key, str) or type(value) is not int or value < 0
+        for key, value in result["counts"].items()
+    ):
+        return False
+    for field in ("corpus_frequencies", "corpus_sources"):
+        items = result.get(field)
+        if not isinstance(items, list) or any(not isinstance(item, str) for item in items):
+            return False
+    if last_row and (type(result.get("last_row")) is not int or result["last_row"] < -1):
+        return False
+    evidence = result.get("evidence")
+    if not isinstance(evidence, dict):
+        return False
+    units = evidence.get("units", [])
+    if not isinstance(units, list):
+        return False
+    for item in [evidence, *units]:
+        if not isinstance(item, dict):
+            return False
+        name = item.get("file")
+        if (
+            not isinstance(name, str)
+            or not name
+            or Path(name).is_absolute()
+            or ".." in Path(name).parts
+            or not isinstance(item.get("sha256"), str)
+        ):
+            return False
+    return True
+
+
+def _saved_result(marker, identity, directory, *, last_row=False):
     saved = _saved_json(marker)
     result = saved.get("result")
     if (
         not isinstance(saved.get("identity"), str)
         or not saved["identity"]
         or saved["identity"] != identity
-        or not isinstance(result, dict)
+        or not _valid_result(result, last_row=last_row)
         or saved.get("result_digest") != _fingerprint(result)
     ):
         return None
-    evidence = result.get("evidence", {})
+    evidence = result["evidence"]
     for item in [evidence, *evidence.get("units", [])]:
         name = item.get("file", "")
         path = Path(directory) / name
-        if not name or Path(name).is_absolute() or ".." in Path(name).parts:
-            return None
         if not path.is_file() or digest(path) != item.get("sha256"):
             return None
     return result
@@ -1172,7 +1209,7 @@ def _checkpoint(request, identity):
     if request.get("unit"):
         name += "--" + request["unit"]["id"]
     marker = directory / (name + ".json")
-    result = _saved_result(marker, identity, directory)
+    result = _saved_result(marker, identity, directory, last_row=bool(request.get("unit")))
     if result is None:
         result = _execute(dict(request, checkpoint_identity=identity))
         atomic_json(
@@ -1206,9 +1243,11 @@ class _Progress:
                 for marker in Path(directory).glob(prefix + "-part*.json"):
                     saved = _saved_json(marker)
                     result = saved.get("result", {})
-                    if saved.get("identity") != identity or saved.get(
-                        "result_digest"
-                    ) != _fingerprint(result):
+                    if (
+                        saved.get("identity") != identity
+                        or not _valid_result(result, last_row=True)
+                        or saved.get("result_digest") != _fingerprint(result)
+                    ):
                         continue
                     for metric in ("values", "channels"):
                         amount = result.get("counts", {}).get(metric, 0)
@@ -1502,12 +1541,10 @@ def _run_units(
     for entry in entries:
         folder = entry["folder"]
         marker = evidence_dir / (_journal_name(entry) + ".json")
-        finished = (
-            _saved_result(marker, key, evidence_dir)
-            if skip_finished or only_folders is None
-            else None
-        )
-        if finished is not None:
+        finished = _saved_result(marker, key, evidence_dir)
+        if finished is not None and (
+            only_folders is None or skip_finished or folder not in selected
+        ):
             completed[folder] = finished
             advance(folder, finished, len(plans[folder]))
             continue
@@ -1515,6 +1552,15 @@ def _run_units(
             raise ValueError(
                 f"unselected folder {folder}: no reusable finished summary with matching identity/evidence"
             )
+        if finished is not None:
+            # Explicitly rescan a completed selection, including its fragments.
+            # Incomplete folders retain bounded-unit resume behavior.
+            marker.unlink(missing_ok=True)
+            for unit in plans[folder]:
+                prefix = _journal_name(entry) + "--" + unit["id"]
+                (unit_dir / (prefix + ".json")).unlink(missing_ok=True)
+                for part in unit_dir.glob(prefix + "-part*.json"):
+                    part.unlink()
         results[folder] = {}
         for unit in plans[folder]:
             request = dict(
@@ -1528,7 +1574,10 @@ def _run_units(
                 dict(identity=identity, unit=unit, shortcut=nonidentifying_shortcut)
             )
             saved = _saved_result(
-                unit_dir / (_journal_name(entry) + "--" + unit["id"] + ".json"), unit_key, unit_dir
+                unit_dir / (_journal_name(entry) + "--" + unit["id"] + ".json"),
+                unit_key,
+                unit_dir,
+                last_row=True,
             )
             if saved is not None:
                 results[folder][unit["id"]] = saved
@@ -1553,7 +1602,7 @@ def _run_units(
         number, reused = 0, 0
         while True:
             marker = Path(request["directory"]) / (prefix + f"-part{number:06d}.json")
-            saved = _saved_result(marker, unit_key, request["directory"])
+            saved = _saved_result(marker, unit_key, request["directory"], last_row=True)
             if saved is None:
                 break
             reused += saved["counts"].get("values", 0)
@@ -1644,6 +1693,12 @@ def run_sketch(
             raise ValueError("sidecars, state and reports must stay outside the corpus tree")
     state.mkdir(parents=True, exist_ok=True)
     out.mkdir(parents=True, exist_ok=True)
+    scratch = _workspace(state)
+    evidence = out / "evidence"
+    units = evidence / "units"
+    units.mkdir(parents=True, exist_ok=True)
+    if len({path.stat().st_dev for path in (state, out, scratch, evidence, units)}) != 1:
+        raise ValueError("sketch scratch, state and out/evidence must share the same filesystem")
     # Remove stale final reports even if preparation or a worker fails.
     for name in ("sketch-report.json", "sketch-report.md"):
         (out / name).unlink(missing_ok=True)

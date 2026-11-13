@@ -650,7 +650,10 @@ are rehashed before reuse. Corrupt folder references can be rebuilt from valid
 unit checkpoints. Corrupt/missing unit evidence replays that unit or its valid
 fragments. Growing output, controls, benchmark downloads/spool and index builds
 live in a sibling scratch directory **outside state** and enter state only after
-closing and atomic rename. Scratch and state must be on the same filesystem.
+closing and atomic rename. Scratch, state and output (including evidence/unit
+directories) must be on the same filesystem. Startup checks their devices before
+preparation or workers and rejects a different device with a clear error; separate
+filesystems are not supported.
 
 Controls select numerically eligible benchmark histories of 96–65,536 positions,
 without screening for retrieval success. Whole, positive/negative affine, shift,
@@ -706,7 +709,9 @@ bash -n sketch-job.sh
 Start this run with its own state URI and scan all folders. Subsequent resumes
 restore its complete state, including closed evidence files, as the host
 normally does. `--only-folders` selects folders eligible for scanning; every other folder must
-have a valid completed summary. `--skip-finished` also reuses valid selected
+have a valid completed summary. Without `--skip-finished`, completed selected
+folders are rescanned, including their units and fragments; interrupted folders
+retain bounded-unit resume behavior. `--skip-finished` also reuses valid selected
 summaries. Ordinary invocations retain resume behavior for all folders. All
 folders remain in the assembled report and global opportunity bound. Selection
 does not authorize a partial corpus download or a smaller statistical bound.
