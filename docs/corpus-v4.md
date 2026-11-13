@@ -784,3 +784,104 @@ preemption can exceed these ranges. Budget at least 500 GiB disk pending measure
 compressed evidence volume. The full cloud run must establish index build time,
 per-shape throughput, compressed evidence bytes, decoder RSS, controls against
 the full index, ETA calibration and interruption recovery/upload behavior.
+
+### Crowded fingerprint profile (W4s5)
+
+The small-index timings and completion estimates above are superseded by the
+subsequent cloud observation: 150,974 channels completed in 2,372 seconds with
+48 workers. That is 0.75 worker-seconds per channel if the whole time is counted;
+the time includes start-up (index loading was still in progress 450 seconds in),
+so the scanning cost alone was about 0.6 worker-seconds per channel.
+They did not establish a six-hour full-corpus finish. The following offline
+profile measures the discovered overhead; it does not establish cloud scaling.
+
+Save the pre-change scanner and run the synthetic harness from the repo root:
+
+```bash
+git show b1e07de:scripts/corpus_v4/audit_sketch.py > /private/tmp/sketch-baseline.py
+OPENBLAS_NUM_THREADS=1 python -m scripts.corpus_v4.profile_sketch \
+  /private/tmp/sketch-profile --baseline /private/tmp/sketch-baseline.py
+```
+
+Use a new output directory. Defaults are seed 405, two fresh-process repetitions,
+10,240 synthetic benchmark histories spanning 100–100,000 points, and channels
+of 400/800/3,000/8,000 points. Step prices share 24-point endpoints; a separate
+0/1-flag case collides with constant controls. Skewed informative histories crowd
+summary keys. Unqueried sorted postings pad the index to 20 million entries
+(640 MB), reproducing the old index-wide packing cost without building a million
+histories. Padding is confined to this disposable fixture; it does not model
+full-index page locality, a million owners' numerical working set or enable
+production index reuse. Fixture preparation and imports are excluded from
+channel timings.
+
+`measurements.json` records seconds per channel and separate sketch, lookup,
+benchmark-series load, shortcut, numerical-fit, memory-check, journal-write and
+remaining time. Explicit wall timers avoid cross-thread cProfile attribution
+observed with the RSS watchdog on this Python 3.13 build. Shortcut time includes
+the precheck and post-fit gates; numerical-fit time includes the original fit's
+own degeneracy/information gates. Remaining time includes decoding, index setup,
+ranking, final compression, hashing and assembly.
+
+On this laptop, median worker-seconds/channel over two repetitions were
+0.322054 → 0.002096 for 400 points (153.7×, below the 0.05 target),
+0.301515 → 0.007400 for 800 points, 0.418892 → 0.005321 for 3,000 points,
+and 0.281681 → 0.009237 for 8,000 points. The 400-point breakdown is:
+
+| Stage | Before seconds/channel | After seconds/channel |
+|---|---:|---:|
+| Sketch | 0.000390 | 0.000293 |
+| Lookup | 0.214362 | 0.000066 |
+| Benchmark series load | 0.103844 | 0.000229 |
+| Shortcut/precheck and post-fit gates | 0.000910 | 0.000220 |
+| Numerical fit | 0.000951 | 0.000514 |
+| Memory check | 0.000010 | 0.000005 |
+| Journal write | 0.000293 | 0.000114 |
+| Everything else | 0.001294 | 0.000654 |
+
+All ten before/after comparisons (four lengths and controls, twice each) matched
+compressed journals, assembled evidence and folder results byte for byte. The
+19 control cases passed, including 14 verified plants; their outcome reports
+also matched exactly. Measurements ran alongside the offline test suite, so
+these are local wall times with competing CPU activity, not a cloud forecast.
+
+The 400-point fixture emits 6.979 records/channel versus the supplied worldtrace
+part's 6.078 (+14.8%); numerical fits are 3.458 versus 2.895 (+19.5%), shortcuts
+2.542 versus 2.108 (+20.6%), and posting-cap records 0.979 versus 1.064 (-8.0%).
+Median capped postings are 9,011 versus 9,632. Endpoint proposals are predominantly
+24-point hits, underrepresenting the real 64/256-point families. Other fixture
+names describe channel lengths, rather than calibrated folder distributions.
+
+Two result-preserving changes remove the measured costs:
+
+- The old structured `hi/lo` view retained the 32-byte posting stride with
+  16 bytes of padding. NumPy packed the entire index on each of two searches
+  per channel. Scalar high-word searches followed by low-word searches inside
+  the equal-high range return exactly the same 128-bit boundaries. Posting
+  order, cap, duplicate alignment precedence and summary selection are unchanged.
+- A 64-owner cache repeatedly opened and mapped benchmark files. Persistent
+  read-only descriptors now read arrays of at most 8 MiB; an LRU retains at most
+  1,024 owners and 64 MiB of accounted arrays, dimensions and metadata. Longer
+  histories retain disposable read-only mappings. Values, masks, calendar
+  dimensions and all numerical gates remain unchanged. Each cache miss reads
+  the complete small history, up to 8 MiB; cold random I/O remains unmeasured.
+
+Worker admission reserves another 88 MiB: the 64 MiB cache and three 8 MiB
+read/calendar temporaries. Forty-eight caches total at most 3 GiB; those reserves
+total 4.125 GiB. With a 320 GiB job budget and the existing 8 GiB supervisor
+reserve, 48 admitted workers still have 6.5 GiB each. High/low views allocate no
+index-sized arrays. Existing degeneracy caches remain bounded at 1,024 joint-mask
+entries (at most 8 KiB of mask each, approximately 8.3 MiB plus object overhead);
+the per-channel query cache has at most 1,217 entries of that mask size (under
+10 MiB of mask bytes, plus object overhead). SQLite's
+page cache remains 8 MiB. Indivisible large histories and decoder allocations
+still face the unchanged RSS budget checks/watchdog.
+
+The harness compares compressed journals, assembled evidence and complete folder
+results byte for byte. A separate masked/monthly control fixture checks verified
+plants and negative controls, including their full evidence and outcome reports.
+Source-bound production reuse identities still change with the implementation;
+old state must rebuild/replay, and production report fingerprints consequently
+change. No proposal family, posting cap, shortcut policy or verifier gate changes.
+Cold storage, real owner/mask distributions, long numerical fits and 48-worker
+memory-bandwidth contention require a fresh cloud measurement before forecasting
+the full run.

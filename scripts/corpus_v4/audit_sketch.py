@@ -21,10 +21,9 @@ import sys
 import tempfile
 import threading
 import time
-from collections import Counter
+from collections import Counter, OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -57,6 +56,9 @@ CHECKPOINT_VALUES = 2_000_000
 UNIT_VALUES = 16_000_000
 UNIT_ROWS = 8192
 FEATURES = 11
+SERIES_CACHE_BYTES = 64 * 1024**2
+SERIES_READ_BYTES = 8 * 1024**2
+SERIES_CACHE_ENTRIES = 1024
 POSTING = np.dtype([("hi", "<u8"), ("lo", "<u8"), ("owner", "<i8"), ("pos", "<i8")])
 LIMITATIONS = [
     "Provisional triage only; a negative result is NOT corpus clearance.",
@@ -441,25 +443,32 @@ def _open_spool(path):
     return db
 
 
-def _series(db, path, owner, *, calendar_dimensions=True):
+def _series(db, path, owner, *, calendar_dimensions=True, values_file=None, stamps_file=None):
     encoded, start, length, timed = db.execute(
         "SELECT meta, start, length, timed FROM series WHERE rowid=?", (int(owner),)
     ).fetchone()
     meta = json.loads(encoded)
-    values = (
-        np.memmap(
-            Path(path).with_suffix(".values"), dtype="<f8", mode="r", offset=start, shape=(length,)
+
+    def read(suffix, dtype, stream):
+        if not length:
+            return np.empty(0, dtype=dtype)
+        if stream is not None and length * 8 <= SERIES_READ_BYTES:
+            stream.seek(start)
+            array = np.fromfile(stream, dtype=dtype, count=length)
+            if len(array) != length:
+                raise ValueError("truncated benchmark spool")
+            array.flags.writeable = False
+            return array
+        return np.memmap(
+            Path(path).with_suffix(suffix), dtype=dtype, mode="r", offset=start, shape=(length,)
         )
-        if length
-        else np.empty(0)
-    )
+
+    values = read(".values", "<f8", values_file)
     dimensions = None
     if calendar_dimensions and timed and frequency(meta["freq"]) == ("calendar", "1ME"):
         import pandas as pd
 
-        stamps = np.memmap(
-            Path(path).with_suffix(".stamps"), dtype="<i8", mode="r", offset=start, shape=(length,)
-        )
+        stamps = read(".stamps", "<i8", stamps_file)
         dimensions = pd.DatetimeIndex(stamps).days_in_month.to_numpy()
     return meta, values, dimensions
 
@@ -530,26 +539,67 @@ class SketchIndex:
     def __init__(self, directory, spool):
         directory = Path(directory)
         self.rows = np.memmap(directory / "postings.bin", dtype=POSTING, mode="r")
-        self.keys = self.rows[["hi", "lo"]]
+        self.highs, self.lows = self.rows["hi"], self.rows["lo"]
         self.features = np.memmap(directory / "features.bin", dtype="<f4", mode="r").reshape(
             -1, FEATURES
         )
         self.degeneracy = {}
         self.spool = Path(spool)
         self.db = _open_spool(spool)
+        # Read short histories through persistent descriptors rather than
+        # opening/mapping/closing a file on every miss of a 64-owner cache.
+        # Oversized histories still use a disposable read-only mapping.
+        self.values_file = self.spool.with_suffix(".values").open("rb", buffering=0)
+        self.stamps_file = self.spool.with_suffix(".stamps").open("rb", buffering=0)
+        self.series_cache, self.series_cache_bytes = OrderedDict(), 0
 
-    @lru_cache(maxsize=64)
     def series(self, owner):
-        return _series(self.db, self.spool, owner)
+        if owner in self.series_cache:
+            self.series_cache.move_to_end(owner)
+            return self.series_cache[owner][0]
+        result = _series(
+            self.db, self.spool, owner, values_file=self.values_file, stamps_file=self.stamps_file
+        )
+        meta, values, dimensions = result
+        if isinstance(values, np.memmap):
+            return result
+        size = (
+            sys.getsizeof(meta)
+            + sum(sys.getsizeof(k) + sys.getsizeof(v) for k, v in meta.items())
+            + sys.getsizeof(values)
+            + (0 if dimensions is None else sys.getsizeof(dimensions) + dimensions.nbytes)
+            + 512  # owner, tuple, size integer and OrderedDict node allowance
+        )
+        if size <= SERIES_CACHE_BYTES:
+            while self.series_cache and (
+                self.series_cache_bytes + size > SERIES_CACHE_BYTES
+                or len(self.series_cache) >= SERIES_CACHE_ENTRIES
+            ):
+                _, (_, removed) = self.series_cache.popitem(last=False)
+                self.series_cache_bytes -= removed
+            self.series_cache[owner] = result, size
+            self.series_cache_bytes += size
+        return result
 
     def lookup(self, rec):
-        targets = np.zeros(len(rec.keys), dtype=self.keys.dtype)
-        targets["hi"] = [int(k[:16], 16) for k, _, _ in rec.keys]
-        targets["lo"] = [int(k[16:], 16) for k, _, _ in rec.keys]
-        left = np.searchsorted(self.keys, targets, side="left")
-        right = np.searchsorted(self.keys, targets, side="right")
+        # Selecting hi/lo together leaves 16 bytes of tail padding in each
+        # 32-byte posting. NumPy packs that structured view on EVERY search,
+        # copying the full index twice per channel. Search scalar-word views
+        # instead: first the high-word range, then the low word within it.
+        # The file is sorted lexicographically by (hi, lo, owner, pos), so these
+        # are exactly the same 128-bit equal-key bounds, without an index copy.
+        highs = np.asarray([int(k[:16], 16) for k, _, _ in rec.keys], dtype="<u8")
+        lows = np.asarray([int(k[16:], 16) for k, _, _ in rec.keys], dtype="<u8")
+        left = np.searchsorted(self.highs, highs, side="left")
+        right = np.searchsorted(self.highs, highs, side="right")
         candidates, summaries, heavy = {}, [], []
-        for (token, pos, label), a, b in zip(rec.keys, left, right):
+        for (token, pos, label), low, a, b in zip(rec.keys, lows, left, right):
+            if a != b:
+                low_words = self.lows[a:b]
+                a, b = (
+                    a + np.searchsorted(low_words, low, side="left"),
+                    a + np.searchsorted(low_words, low, side="right"),
+                )
             if b - a > POSTING_CAP:
                 heavy.append(
                     dict(
@@ -570,7 +620,10 @@ class SketchIndex:
         return sorted(candidates.items()), sorted(set(summaries)), heavy
 
     def close(self):
-        self.series.cache_clear()
+        self.series_cache.clear()
+        self.series_cache_bytes = 0
+        self.values_file.close()
+        self.stamps_file.close()
         self.db.close()
 
 
@@ -1452,7 +1505,7 @@ def _run_units(
     unit_dir.mkdir(parents=True, exist_ok=True)
     scratch = _workspace(state)
     reserve = min(8 * 1024**3, memory_budget_bytes // 4)
-    minimum = built["bytes"] + 256 * 1024**2
+    minimum = built["bytes"] + 256 * 1024**2 + SERIES_CACHE_BYTES + 3 * SERIES_READ_BYTES
     active = min(workers, max(1, (memory_budget_bytes - reserve) // minimum))
     quota = (memory_budget_bytes - reserve) // active
     if quota < minimum:
