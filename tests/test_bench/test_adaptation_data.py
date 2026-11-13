@@ -235,7 +235,8 @@ def test_adaptation_deterministic_and_sensitive_to_permitted_input(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "fault", ["duplicate", "descending", "offgrid", "ragged_target", "ragged_known", "infinity"]
+    "fault",
+    ["duplicate", "descending", "invalid_date", "ragged_target", "ragged_known", "infinity"],
 )
 def test_adaptation_rejects_invalid_requests_without_partial_output(tmp_path, fault):
     rows, targets = task_rows(lengths=(24,), starts=(0,))
@@ -244,8 +245,8 @@ def test_adaptation_rejects_invalid_requests_without_partial_output(tmp_path, fa
         rows[0]["timestamp"][1] = rows[0]["timestamp"][0]
     elif fault == "descending":
         rows[0]["timestamp"] = rows[0]["timestamp"][::-1]
-    elif fault == "offgrid":
-        cutoff = "2020-01-15T12:00:00"
+    elif fault == "invalid_date":
+        cutoff = "not-a-date"
     elif fault == "ragged_target":
         rows[0]["y0"] = rows[0]["y0"][:-1]
     elif fault == "ragged_known":
@@ -254,6 +255,160 @@ def test_adaptation_rejects_invalid_requests_without_partial_output(tmp_path, fa
         rows[0]["y0"][0] = np.inf
     with pytest.raises(ValueError):
         build(tmp_path, rows, targets, cutoff=cutoff)
+    assert not (tmp_path / "out").exists()
+
+
+def cutoff_task(tmp_path, rows, cutoff, step, *, timestamp_type=None):
+    """Load synthetic Parquet through the real fev validation/window path."""
+    parquet = tmp_path / "source.parquet"
+    dataset = datasets.Dataset.from_list(rows)
+    if timestamp_type:
+        dataset = dataset.cast_column(
+            "timestamp", datasets.Sequence(datasets.Value(timestamp_type))
+        )
+    dataset.to_parquet(parquet)
+    return fev.Task(
+        dataset_path=str(parquet),
+        task_name="cutoff/parity",
+        target="target",
+        horizon=2,
+        initial_cutoff=cutoff,
+        num_windows=2,
+        window_step_size=step,
+        min_context_length=2,
+        max_context_length=5,
+    )
+
+
+@pytest.mark.parametrize(
+    "freq,date",
+    [
+        ("W-SUN", "2020-05-08"),  # Friday between weekly observations, as in the pilot.
+        ("ME", "2021-07-15"),  # An anchored monthly offset must not shift window zero.
+        ("D", "2020-01-19"),
+        ("6h", "2020-01-05T13:00:00"),
+    ],
+)
+@pytest.mark.parametrize(
+    "cutoff_form,step",
+    [
+        ("positive", None),
+        ("positive", 2),
+        ("negative", None),
+        ("negative", 2),
+        ("date", None),
+        ("date", 2),
+        ("date", "2D"),
+        ("date", "2ME"),
+    ],
+)
+def test_adaptation_first_origin_matches_real_fev(tmp_path, freq, date, cutoff_form, step):
+    times = pd.date_range("2020-01-01", periods=36, freq=freq)
+    rows = [
+        {"id": key, "timestamp": ts, "target": np.arange(len(ts), dtype=float)}
+        for key, ts in [
+            ("full", times),
+            ("ragged", times[3:32]),
+            ("ended", times[:8]),
+            ("late", times[28:]),
+        ]
+    ]
+    cutoff = {"positive": 19, "negative": -6, "date": date}[cutoff_form]
+    task = cutoff_task(tmp_path, rows, cutoff, step)
+    full = {r["id"]: pd.DatetimeIndex(r["timestamp"]) for r in task.load_full_dataset()}
+    window = next(iter(task.iter_windows()))
+    past, future = window.get_input_data()
+    # Derive T independently from fev's first forecast timestamp, even when
+    # max_context_length makes the returned history shorter than T.
+    expected = {
+        row["id"]: int(full[row["id"]].get_loc(pd.Timestamp(row["timestamp"][0]))) for row in future
+    }
+    assert {row["id"]: len(row["timestamp"]) for row in past} == {
+        key: min(origin, 5) for key, origin in expected.items()
+    }
+    yaml = tmp_path / "tasks.yaml"
+    yaml.write_text("tasks: []\n")
+    manifest = build_manifest(task, task_yaml=yaml, output=tmp_path / "out")
+    for item in manifest["items"]:
+        key, origin = item["item_id"], item["outer_origin"]
+        if key in expected:
+            assert origin == {
+                "index": expected[key],
+                "timestamp": full[key][expected[key]].isoformat(),
+            }
+            assert [o["index"] for o in item["inner_origins"]] == [
+                expected[key] - 4,
+                expected[key] - 2,
+            ]
+    excluded_outer = {
+        row["item_id"]
+        for row in manifest["excluded_items"]
+        if row["reason"] == "insufficient_outer_history"
+    }
+    assert excluded_outer == set(full) - set(expected)
+    if cutoff_form == "date":
+        assert excluded_outer == {"ended", "late"}
+        origins = {row["item_id"]: row["outer_origin"]["index"] for row in manifest["items"]}
+        assert origins["ended"] == 8
+        assert origins["late"] == 0
+
+
+@pytest.mark.parametrize(
+    "cutoff,expected", [(100, 24), (-100, 0), ("2100-01-01", 24), ("1900-01-01", 0)]
+)
+def test_adaptation_out_of_range_cutoff_matches_real_fev(tmp_path, cutoff, expected):
+    rows = [
+        {"id": "item", "timestamp": pd.date_range("2020-01-01", periods=24), "target": [1.0] * 24}
+    ]
+    task = cutoff_task(tmp_path, rows, cutoff, 2)
+    with pytest.raises(ValueError, match="All time series.*too short"):
+        next(iter(task.iter_windows())).get_input_data()
+    yaml = tmp_path / "tasks.yaml"
+    yaml.write_text("tasks: []\n")
+    manifest = build_manifest(task, task_yaml=yaml, output=tmp_path / "out")
+    assert manifest["items"][0]["outer_origin"]["index"] == expected
+    assert manifest["status"] == "frozen_fallback"
+    assert manifest["excluded_items"] == [
+        {"item_id": "item", "reason": "insufficient_outer_history", "fallback": "frozen_model"}
+    ]
+
+
+@pytest.mark.parametrize("irregular_item", [0, 1])
+def test_adaptation_irregular_timestamps_rejected_by_real_fev(tmp_path, irregular_item):
+    times = pd.date_range("2020-01-01", periods=24).delete(10)
+    rows = [
+        {"id": "a", "timestamp": pd.date_range("2020-01-01", periods=24), "target": [1.0] * 24},
+        {"id": "b", "timestamp": pd.date_range("2020-01-01", periods=24), "target": [1.0] * 24},
+    ]
+    rows[irregular_item].update(timestamp=times, target=[1.0] * len(times))
+    task = cutoff_task(tmp_path, rows, "2020-01-15T12:00:00", "2D")
+    with pytest.raises(AssertionError, match="infer.*frequency"):
+        next(iter(task.iter_windows())).get_input_data()
+    yaml = tmp_path / "tasks.yaml"
+    yaml.write_text("tasks: []\n")
+    with pytest.raises(AssertionError, match="infer.*frequency"):
+        build_manifest(task, task_yaml=yaml, output=tmp_path / "out")
+    assert not (tmp_path / "out").exists()
+
+
+@pytest.mark.parametrize(
+    "timestamp_type,cutoff",
+    [
+        ("timestamp[us]", "2020-01-19T00:00:00+01:00"),  # Arrow rejects zone mismatch.
+        ("timestamp[us]", "2020-01-19T00:00:00.000000001"),  # Not representable in source units.
+    ],
+)
+def test_adaptation_unresolvable_date_only_when_real_fev_rejects(tmp_path, timestamp_type, cutoff):
+    rows = [
+        {"id": "item", "timestamp": pd.date_range("2020-01-01", periods=24), "target": [1.0] * 24}
+    ]
+    task = cutoff_task(tmp_path, rows, cutoff, "2D", timestamp_type=timestamp_type)
+    with pytest.raises(pa.ArrowInvalid):
+        next(iter(task.iter_windows())).get_input_data()
+    yaml = tmp_path / "tasks.yaml"
+    yaml.write_text("tasks: []\n")
+    with pytest.raises(ValueError, match="unresolvable date cut-off"):
+        build_manifest(task, task_yaml=yaml, output=tmp_path / "out")
     assert not (tmp_path / "out").exists()
 
 
@@ -618,12 +773,6 @@ def test_adaptation_missing_values_encodings_and_file_hashes(tmp_path):
     ).encode()
     assert hashlib.sha256(encoded).hexdigest() == fingerprint
     assert b"outer-secret" not in b"".join(files(root).values())
-
-
-@pytest.mark.parametrize("cutoff", ["2019-01-01", "2022-01-01"])
-def test_adaptation_out_of_range_date_is_an_error(tmp_path, cutoff):
-    with pytest.raises(ValueError, match="unresolvable date"):
-        build(tmp_path, cutoff=cutoff)
 
 
 @pytest.mark.parametrize(

@@ -39,14 +39,25 @@ to the later selection workflow.
 
 H is the task horizon. Each item's T is its first outer **forecast observation**.
 Integer fev cut-offs are Python slice indices (negative indices resolve against
-that item's length). A fev timestamp cut-off includes that timestamp in history;
-T is the following observation. Date requests must exactly match an observed
-item timestamp. Missing/off-grid dates fail rather than silently snapping.
+that item's length), clipped to `[0, item_length]` as in fev. For a date cut-off,
+T is the number of observations with timestamp **at or before** the requested
+date. An off-grid date is valid: a Friday cut-off in a Sunday weekly series
+leaves the preceding Sunday in history and forecasts from the following Sunday.
+The builder uses pinned fev 0.10.0's Arrow cut-off calculation, including its
+source timestamp precision and timezone checks. Only dates fev cannot cast or
+resolve raise `unresolvable date cut-off`.
+
+The first cut-off is `task.cutoffs[0]`, unchanged. Integer steps (including the
+default horizon) and frequency-string steps do not shift this first cut-off,
+even for anchored monthly offsets. fev rejects frequency-string steps paired
+with integer cut-offs. Date cut-offs support either step form.
 
 The inner forecast indices are T−2H and T−H. All indices are zero-based and all
 end indices are exclusive. Splits use each item's validated timestamp grid;
 calendar frequencies such as months use observed steps, not fixed timedeltas.
-Null, duplicate, decreasing or irregular timestamps fail. Target and declared
+Null, duplicate, decreasing or irregular timestamps fail. Native fev validates
+each item's frequency when loading and rejects an irregular dataset before any
+window or bundle is built. Target and declared
 known-covariate lengths must equal the timestamp length.
 
 An item needs the task's minimum context before T and T−2H and a full outer
@@ -59,10 +70,29 @@ An empty/too-short shared prefix excludes that item as well.
 Excluded items have no payload rows, retain their cut-off metadata and receive
 `fallback: frozen_model`. Reasons are `insufficient_outer_history`,
 `insufficient_inner_history` and `insufficient_shared_training_history`.
+An item ending at/before a date cut-off has T equal to its length; one starting
+after it has T=0. Both are excluded as `insufficient_outer_history`, matching
+fev's first-window context/horizon filter. The same reason covers too little
+history or an incomplete outer horizon in other items.
 An entirely infeasible task is a valid `frozen_fallback` manifest with empty
-training and inner rows. These are structural checks, not sampler eligibility:
+training and inner rows; fev's window raises when all items are filtered out.
+These are structural checks, not sampler eligibility:
 the adaptation trainer must still enforce its registered minimum observed
 history (32 points), valid gradient windows and any model context limits.
+
+The 96-task shifted pilot cohort was inspected from YAML only:
+
+| Tasks | Count | Cut-off form | Step form | Supported |
+|---|---:|---|---|---|
+| All remaining tasks | 92 | Negative integer | Omitted; defaults to integer H | Yes |
+| `rohlik_sales_1D` | 1 | Date `2023-10-20` | Frequency string `14D` | Yes |
+| `rohlik_orders_1D` | 1 | Date `2022-06-30` | Frequency string `61D` | Yes |
+| `rohlik_sales_1W` | 1 | Date `2023-05-05` | Frequency string `56D` | Yes |
+| `rohlik_orders_1W` | 1 | Date `2022-07-25` | Frequency string `56D` | Yes |
+
+No unsupported cut-off/step forms were found. This checks input forms;
+dataset feasibility requires loading each task and remains unverified by this
+YAML-only inventory.
 
 ## Files and arrays (schema version 2)
 
@@ -196,6 +226,12 @@ and raw known-covariate prefix before float32 conversion, so rounding cannot
 hide a source-value change; excluded items have a null training hash. Changes to dropped values or data values at/after T do not.
 Byte identity is guaranteed for repeated builds in the same software environment;
 writer/source changes are explicitly part of the fingerprint.
+The date cut-off fix keeps schema 2 and preserves in-range integer cut-off
+origins, payload bytes and input hashes. Rebuilding an old integer bundle still
+changes its fingerprint because `versions.builder_sha256` records the changed
+builder source. Preserving that old fingerprint would discard existing source
+provenance. Out-of-range integer origins now record fev's clipped index;
+those items remain excluded.
 
 ## Reproduce fev scores
 
@@ -228,8 +264,9 @@ first file would violate exact scoring-adapter input parity. The fingerprint
 therefore describes permitted effective inputs, not every value in the source.
 
 Offline tests in `tests/test_bench/test_adaptation_data.py` cover native shapes,
-short/ragged items, calendar boundaries, slash names, integer/inclusive date
-cut-offs, covariate roles, causal perturbations, byte determinism, adapter calls,
+short/ragged items, calendar boundaries, slash names, integer/inclusive off-grid
+date cut-offs and step forms against real fev first windows, rejected irregular
+timestamps, covariate roles, causal perturbations, byte determinism, adapter calls,
 and real fev SQL parity. No weights, cloud services or benchmark downloads are
 needed. Real cohort feasibility and model-training behavior require separate
 verification by the subsequent tasks.
