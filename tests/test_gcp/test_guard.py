@@ -6,6 +6,7 @@ import os
 import runpy
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -55,7 +56,6 @@ if args[:3] == ['compute', 'instances', 'create']:
     session = ledger['sessions'][-1]
     assert session['status'] == 'reserved' and session['settled_cost_usd'] is None
     assert Decimal(session['reservation_usd']) > 0
-    time.sleep(state.get('create_delay', 0))
     if state.get('create_error'):
         state['create_failed'] = dict(instance=args[3], disk=session['boot_disk'])
         end(error=state['create_error'])
@@ -131,7 +131,7 @@ if args[:3] == ['compute', 'disks', 'delete']:
     state['disks'] = [d for d in state.get('disks', []) if d['name'] != args[3]]
     end({})
 if args[:3] == ['compute', 'operations', 'list']:
-    assert opt('--zones') == 'europe-west4-a', args
+    assert opt('--zones'), args
     target = opt('--filter')
     if state.get('operations_error'): end(error='403 Permission denied')
     if state.get('operations_warning'): print(state['operations_warning'], file=sys.stderr)
@@ -140,7 +140,7 @@ if args[:3] == ['compute', 'operations', 'list']:
     if target.startswith('targetId='):
         end([o for o in state.get('operations', []) if str(o.get('targetId')) == target.split('=', 1)[1]
              and o.get('zone', '').rsplit('/', 1)[-1] == opt('--zones')])
-    assert target.startswith("targetLink~'/projects/test-project/zones/europe-west4-a/instances/") and target.endswith("$' AND operationType=insert"), args
+    assert target.startswith("targetLink~'/projects/") and target.endswith("$' AND operationType=insert"), args
     link = target.removeprefix("targetLink~'").removesuffix("$' AND operationType=insert")
     end([o for o in state.get('operations', []) if o.get('targetLink', '').endswith(link)
          and o.get('operationType') == 'insert' and o.get('zone', '').rsplit('/', 1)[-1] == opt('--zones')])
@@ -416,7 +416,6 @@ def test_every_create_and_resume_has_server_limit_and_delete(cloud, model):
 
 def test_concurrent_launches_cannot_both_pass_cap(cloud):
     cloud.setup(cap="6")
-    cloud.change(create_delay=0.2)
     base = cloud.command(
         "launch",
         "first",
@@ -437,13 +436,49 @@ def test_concurrent_launches_cannot_both_pass_cap(cloud):
         "--job-uri",
         "gs://test-bucket/job.sh",
     )
-    a = subprocess.Popen(base, env=cloud.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    base[base.index("first")] = "second"
-    b = subprocess.Popen(base, env=cloud.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    a.communicate(timeout=20)
-    b.communicate(timeout=20)
-    assert sorted([a.returncode, b.returncode]) == [0, 2]
-    assert len(cloud.read()["sessions"]) == 1
+    announce_lock = """
+import fcntl, os, runpy, sys
+from pathlib import Path
+original = fcntl.flock
+def flock(stream, operation):
+    Path(os.environ['LOCK_ATTEMPT']).touch()
+    return original(stream, operation)
+fcntl.flock = flock
+sys.argv = sys.argv[1:]
+runpy.run_path(sys.argv[0], run_name='__main__')
+"""
+    processes, attempts = [], []
+    try:
+        # Hold the real ledger lock until both launches reach flock. The old
+        # create_delay merely hoped the second process started within 0.2 s.
+        with cloud.ledger.with_suffix(".json.lock").open("rb") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            for label in ("first", "second"):
+                attempt = cloud.ledger.with_name(label + ".lock-attempt")
+                attempts.append(attempt)
+                base[base.index("first")] = label
+                processes.append(
+                    subprocess.Popen(
+                        [sys.executable, "-c", announce_lock, *base[1:]],
+                        env=dict(cloud.env, LOCK_ATTEMPT=str(attempt)),
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                    )
+                )
+            deadline = time.monotonic() + 60
+            while not all(p.exists() for p in attempts) and time.monotonic() < deadline:
+                assert all(p.poll() is None for p in processes), "launch exited before locking"
+                time.sleep(0.01)
+            assert all(p.exists() for p in attempts), "both launches must contend for the lock"
+        for process in processes:
+            process.communicate(timeout=60)
+        assert sorted(p.returncode for p in processes) == [0, 2]
+        assert len(cloud.read()["sessions"]) == 1
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+                process.communicate(timeout=60)
 
 
 def test_close_already_deleted_keeps_reservation_until_evidence(cloud):
@@ -460,20 +495,33 @@ def test_close_already_deleted_keeps_reservation_until_evidence(cloud):
     assert Decimal(cloud.read()["sessions"][0]["settled_cost_usd"]) == 1
 
 
-def test_close_uses_real_timestamps_and_checks_disk_removal(cloud):
+def test_close_uses_real_timestamps_and_checks_disk_removal(cloud, monkeypatch):
     cloud.setup()
-    cloud.change(start_age=1800, creation_age=3600)
     cloud.launch()
+    module = runpy.run_path(str(GUARD))
+    frozen = datetime(2026, 11, 13, 1, tzinfo=timezone.utc)
+    monkeypatch.setitem(module["Guard"].close.__globals__, "now", lambda: frozen)
+    for key, value in cloud.env.items():
+        monkeypatch.setenv(key, value)
+    ledger = cloud.read()
+    session = ledger["sessions"][0]
+    session.update(last_start="2026-11-13T00:30:00Z", instance_created_at="2026-11-13T00:00:00Z")
+    cloud.ledger.write_text(json.dumps(ledger))
     state = json.loads(cloud.state.read_text())
-    now = datetime.now(timezone.utc)
-    state["instances"][0].update(status="TERMINATED", lastStopTimestamp=now.isoformat())
+    state["instances"][0].update(
+        status="TERMINATED",
+        lastStopTimestamp=frozen.isoformat(),
+        lastStartTimestamp=session["last_start"],
+        creationTimestamp=session["instance_created_at"],
+    )
     cloud.change(**state, orphan_disk=True)
-    assert cloud.run("close", "run-a", ok=False).returncode != 0
+    args = module["parser"]().parse_args(["--ledger", str(cloud.ledger), "close", "run-a"])
+    with pytest.raises(module["GuardError"], match="disk remains"):
+        module["Guard"](cloud.ledger).close(args)
     assert cloud.read()["sessions"][0]["settled_cost_usd"] is None
     cloud.change(disks=[])
-    cloud.run("close", "run-a")
-    cost = Decimal(cloud.read()["sessions"][0]["settled_cost_usd"])
-    assert Decimal("2.013") < cost < Decimal("2.02")
+    module["Guard"](cloud.ledger).close(args)
+    assert cloud.read()["sessions"][0]["settled_cost_usd"] == "2.013699"
 
 
 def test_shell_metacharacters_never_execute(cloud, tmp_path):
@@ -697,10 +745,49 @@ def test_sweep_names_stopped_vm_that_still_has_billable_disk(cloud):
         "Polling operation failed: quota for read requests exceeded",
     ],
 )
-def test_returned_create_error_cancels_after_two_absence_reads(cloud, error):
+def test_returned_create_error_cancels_after_two_absence_reads(cloud, error, monkeypatch):
     cloud.setup()
     cloud.change(create_error=error)
-    assert cloud.launch(ok=False).returncode == 2
+    from datetime import timedelta
+    from types import SimpleNamespace
+
+    module = runpy.run_path(str(GUARD))
+    clock = [datetime(2026, 11, 13, 1, tzinfo=timezone.utc)]
+
+    def advance(seconds):
+        clock[0] += timedelta(seconds=seconds)
+
+    namespace = module["Guard"].launch.__globals__
+    monkeypatch.setitem(namespace, "now", lambda: clock[0])
+    monkeypatch.setitem(namespace, "time", SimpleNamespace(sleep=advance))
+    for key, value in cloud.env.items():
+        monkeypatch.setenv(key, value)
+    args = module["parser"]().parse_args(
+        [
+            "--ledger",
+            str(cloud.ledger),
+            "launch",
+            "run-a",
+            "--machine-type",
+            "g2-standard-8",
+            "--zone",
+            "europe-west4-a",
+            "--provisioning",
+            "SPOT",
+            "--hours",
+            "1",
+            "--boot-disk-size",
+            "100",
+            "--image-family",
+            "fixture",
+            "--image-project",
+            "fixture",
+            "--job-uri",
+            "gs://test-bucket/jobs/job.sh",
+        ]
+    )
+    with pytest.raises(module["GuardError"], match="create failed"):
+        module["Guard"](cloud.ledger).launch(args)
     session = cloud.read()["sessions"][0]
     assert session["status"] == "cancelled"
     assert Decimal(session["settled_cost_usd"]) == 0
@@ -709,7 +796,7 @@ def test_returned_create_error_cancels_after_two_absence_reads(cloud, error):
     assert len(reads) == 2
     assert all(read["instances"] == read["disks"] == [] for read in reads)
     times = [datetime.fromisoformat(read["observed_at"].replace("Z", "+00:00")) for read in reads]
-    assert (times[1] - times[0]).total_seconds() >= 3
+    assert (times[1] - times[0]).total_seconds() == 3
     assert Decimal(json.loads(cloud.run("report").stdout)["committed_usd"]) == 0
     assert cloud.launch(ok=False).returncode == 2
 
@@ -987,6 +1074,7 @@ def test_deleted_ambiguous_operations_keep_full_reservation(cloud, fault):
         operations.append(dict(operations[0], name="insert-again"))
     elif fault == "no-delete":
         operations = [o for o in operations if o["operationType"] != "delete"]
+        operations[-1]["operationType"] = "stop"
     elif fault == "failed-delete":
         operations[1]["error"] = {"errors": [{"code": "RESOURCE_IN_USE"}]}
     elif fault == "pending-delete":
@@ -1092,16 +1180,13 @@ def test_invalid_flex_wait_is_rejected_before_reserving(cloud, model, duration):
 def test_create_timeout_keeps_reservation(cloud, monkeypatch):
     cloud.setup()
     cloud.price("FLEX_START")
-    cloud.change(create_delay=2)
     real_run = subprocess.run
     budgets = []
 
     def run(command, **kwargs):
         if command[:4] == ["gcloud", "compute", "instances", "create"]:
             budgets.append(kwargs["timeout"])
-            kwargs["timeout"] = (
-                0.2  # Exercise a real subprocess timeout without waiting 390 seconds.
-            )
+            raise subprocess.TimeoutExpired(command, kwargs["timeout"])
         return real_run(command, **kwargs)
 
     monkeypatch.setattr(subprocess, "run", run)
@@ -1448,7 +1533,12 @@ def test_wait_releases_lock_and_observes_pending_to_running_without_extending_de
     cloud.launch(model="FLEX_START")
     original_end = cloud.read()["sessions"][0]["reserved_end"]
 
-    def advance(_seconds):
+    from types import SimpleNamespace
+
+    clock = [0.0]
+
+    def advance(seconds):
+        clock[0] += seconds
         with cloud.ledger.with_suffix(".json.lock").open("rb") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         cloud.change(
@@ -1468,7 +1558,11 @@ def test_wait_releases_lock_and_observes_pending_to_running_without_extending_de
     for key, value in cloud.env.items():
         monkeypatch.setenv(key, value)
     module = runpy.run_path(str(GUARD))
-    monkeypatch.setattr(module["time"], "sleep", advance)
+    monkeypatch.setitem(
+        module["wait_for_session"].__globals__,
+        "time",
+        SimpleNamespace(monotonic=lambda: clock[0], sleep=advance),
+    )
     args = module["parser"]().parse_args(
         [
             "--ledger",
@@ -1485,3 +1579,417 @@ def test_wait_releases_lock_and_observes_pending_to_running_without_extending_de
     output = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     assert [item["queue"]["state"] for item in output] == ["pending", "running"]
     assert cloud.read()["sessions"][0]["reserved_end"] == original_end
+
+
+@pytest.mark.parametrize("seconds", [60, 600, 3600])
+def test_copy_interval_stored_in_metadata_and_preserved_by_resume(cloud, seconds):
+    cloud.setup()
+    cloud.launch("run-a", "--copy-interval", str(seconds))
+    assert cloud.read()["sessions"][0]["launch"]["copy_interval"] == seconds
+    create = next(c for c in cloud.calls() if c[:3] == ["compute", "instances", "create"])
+    assert f"guard-copy-interval={seconds}" in next(
+        a for a in create if a.startswith("--metadata=")
+    )
+    cloud.change(instances=[], disks=[])
+    cloud.run("resume", "run-a", "run-b")
+    assert cloud.read()["sessions"][1]["launch"]["copy_interval"] == seconds
+
+
+@pytest.mark.parametrize("seconds", ["59", "3601", "1.5", "oops"])
+def test_invalid_copy_interval_never_creates_resources(cloud, seconds):
+    cloud.setup()
+    assert cloud.launch("run-a", "--copy-interval", seconds, ok=False).returncode == 2
+    assert cloud.read()["sessions"] == []
+
+
+LIVE_PREEMPTIONS = json.loads((ROOT / "tests/test_gcp/fixtures/spot_preemptions.json").read_text())
+
+
+@pytest.mark.parametrize("fixture", LIVE_PREEMPTIONS, ids=lambda f: f["label"])
+def test_live_spot_preemption_history_settles_through_operation_end(cloud, fixture):
+    operations = deleted_operations(cloud)
+    ledger = cloud.read()
+    session = ledger["sessions"][0]
+    session.update(
+        last_start=fixture["last_start"], instance_created_at=fixture["instance_created_at"]
+    )
+    cloud.ledger.write_text(json.dumps(ledger))
+    base = operations[0]
+    ops = [
+        dict(o, **{k: base[k] for k in ("targetId", "targetLink", "zone")})
+        for o in fixture["operations"]
+    ]
+    cloud.change(operations=ops)
+    cloud.run("close", "run-a")
+    saved = cloud.read()["sessions"][0]
+    end = next(o["endTime"] for o in ops if o["operationType"] == "compute.instances.preempted")
+    assert saved["runtime_evidence"]["stop"] == saved["runtime_evidence"]["deleted"] == end
+    assert saved["runtime_evidence"]["start"] == fixture["last_start"]
+    assert "preemption endTime" in saved["settlement_evidence"]
+    assert len(saved["settlement_inventory"]) == 2
+
+    def instant(s):
+        return datetime.fromisoformat(s)
+
+    machine = (
+        Decimal(str((instant(end) - instant(fixture["last_start"])).total_seconds()))
+        / 3600
+        * Decimal("4")
+    )
+    disk = (
+        Decimal(str((instant(end) - instant(fixture["instance_created_at"])).total_seconds()))
+        / 3600
+        * Decimal(saved["disk_hourly_usd"])
+    )
+    assert Decimal(saved["settled_cost_usd"]) >= machine + disk
+    assert Decimal(saved["settled_cost_usd"]) < machine + disk + Decimal("0.000001")
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "unknown",
+        "duplicate",
+        "failed",
+        "pending",
+        "stop",
+        "malformed",
+        "disk",
+        "second-instance",
+        "second-disk",
+    ],
+)
+def test_ambiguous_spot_preemption_keeps_reservation(cloud, fault):
+    operations = deleted_operations(cloud)
+    operations = [o for o in operations if o["operationType"] != "delete"]
+    if fault == "unknown":
+        operations.append(dict(operations[0], operationType="setMetadata"))
+    if fault == "duplicate":
+        operations.append(dict(operations[0]))
+    if fault == "failed":
+        operations[-1]["error"] = {"errors": [{"code": "FAILED"}]}
+    if fault == "pending":
+        operations[-1]["status"] = "RUNNING"
+    if fault == "stop":
+        operations.append(dict(operations[-1], operationType="stop"))
+    if fault == "malformed":
+        operations.append(None)
+    cloud.change(operations_response=operations)
+    if fault == "disk":
+        cloud.change(
+            disks=[{"name": cloud.read()["sessions"][0]["boot_disk"], "zone": "europe-west4-a"}]
+        )
+    if fault.startswith("second-"):
+        kind = "instances" if fault.endswith("instance") else "disks"
+        cloud.change(
+            create_failed={"instance": "run-a", "disk": cloud.read()["sessions"][0]["boot_disk"]},
+            failure_inventory=[
+                {},
+                {
+                    kind: [
+                        {
+                            "name": "instance" if kind == "instances" else "disk",
+                            "zone": "europe-west4-a",
+                        }
+                    ]
+                },
+            ],
+        )
+    result = cloud.run("close", "run-a", ok=False)
+    assert result.returncode == 2, result.stdout + result.stderr
+    session = cloud.read()["sessions"][0]
+    assert session["settled_cost_usd"] is None
+    assert session["status"] == "needs_settlement"
+
+
+def test_status_reports_preemption_source(cloud):
+    cloud.setup()
+    cloud.launch()
+    cloud.change(
+        markers=["PREEMPTED"],
+        marker_bodies={"PREEMPTED": "job_uri=gs://test-bucket/jobs/job.sh\nsource=watcher\n"},
+    )
+    assert (
+        json.loads(cloud.run("status", "run-a").stdout)[0]["markers"]["PREEMPTED"]["source"]
+        == "watcher"
+    )
+
+
+@pytest.mark.parametrize("present", ["instance", "unknown-delete-op"])
+def test_contradictory_preemption_or_unknown_delete_history_keeps_money(cloud, present):
+    operations = deleted_operations(cloud)
+    if present == "instance":
+        operations = [o for o in operations if o["operationType"] != "delete"]
+        # Same ID as the supposedly preempted VM; normal close must not hide the contradiction.
+        cloud.change(
+            instances=[
+                dict(
+                    name="run-a",
+                    id="1",
+                    zone="europe-west4-a",
+                    status="RUNNING",
+                    lastStartTimestamp="2026-11-12T00:10:00Z",
+                    creationTimestamp="2026-11-12T00:00:00Z",
+                    disks=[],
+                )
+            ]
+        )
+    else:
+        operations.append(dict(operations[0], name="unknown-op", operationType="setMetadata"))
+    cloud.change(operations=operations)
+    assert cloud.run("close", "run-a", ok=False).returncode == 2
+    assert cloud.read()["sessions"][0]["settled_cost_usd"] is None
+
+
+@pytest.mark.parametrize(
+    "fault",
+    ["partial-operations", "missing-recorded-start", "second-preemption", "start-before-insert"],
+)
+def test_preemption_incomplete_evidence_keeps_full_reservation(cloud, fault):
+    operations = deleted_operations(cloud)
+    operations = [o for o in operations if o["operationType"] != "delete"]
+    if fault == "partial-operations":
+        cloud.change(operations_warning="WARNING: partial operation history")
+    if fault == "missing-recorded-start":
+        ledger = cloud.read()
+        ledger["sessions"][0]["last_start"] = None
+        cloud.ledger.write_text(json.dumps(ledger))
+    if fault == "second-preemption":
+        operations.append(dict(operations[-1], name="second-preemption"))
+    if fault == "start-before-insert":
+        ledger = cloud.read()
+        ledger["sessions"][0]["last_start"] = "2026-11-12T00:00:00Z"
+        cloud.ledger.write_text(json.dumps(ledger))
+    cloud.change(operations=operations)
+    assert cloud.run("close", "run-a", ok=False).returncode == 2
+    assert cloud.read()["sessions"][0]["settled_cost_usd"] is None
+
+
+def test_preemption_set_labels_is_the_only_additional_harmless_type(cloud):
+    operations = deleted_operations(cloud)
+    operations = [o for o in operations if o["operationType"] != "delete"]
+    operations.append(dict(operations[0], name="labels", operationType="setLabels"))
+    cloud.change(operations=operations)
+    cloud.run("close", "run-a")
+    assert cloud.read()["sessions"][0]["status"] == "closed"
+
+
+def test_cancelled_session_reopens_money_before_preemption_history_errors(cloud):
+    deleted_operations(cloud)
+    ledger = cloud.read()
+    session = ledger["sessions"][0]
+    session.update(status="cancelled", settled_cost_usd="0.000000")
+    cloud.ledger.write_text(json.dumps(ledger))
+    cloud.change(
+        instances=[dict(name="run-a", id="1", zone="europe-west4-a", status="RUNNING")],
+        operations_warning="partial operation history",
+    )
+    assert cloud.run("close", "run-a", ok=False).returncode == 2
+    saved = cloud.read()["sessions"][0]
+    assert saved["status"] == "needs_settlement" and saved["settled_cost_usd"] is None
+
+
+@pytest.mark.parametrize("command", ["status", "wait", "close"])
+@pytest.mark.parametrize("vm_status", ["STAGING", "RUNNING"])
+def test_reserved_session_adopts_owned_live_instance(cloud, command, vm_status):
+    cloud.setup()
+    cloud.launch()
+    ledger = cloud.read()
+    session = ledger["sessions"][0]
+    session.update(status="reserved")
+    for key in ("instance_id", "last_start", "instance_created_at"):
+        session.pop(key, None)
+    original_end = session["reserved_end"]
+    cloud.ledger.write_text(json.dumps(ledger))
+    state = json.loads(cloud.state.read_text())
+    vm = state["instances"][0]
+    vm["status"] = vm_status
+    operation = insert_operation(
+        "RUNNING" if vm_status == "STAGING" else "DONE",
+        targetId=vm["id"],
+        insertTime=vm["creationTimestamp"],
+        startTime=vm["creationTimestamp"],
+        endTime=vm["lastStartTimestamp"],
+    )
+    cloud.change(instances=[vm], operations=[operation])
+    args = (command, "run-a", "--timeout", "0") if command == "wait" else (command, "run-a")
+    result = cloud.run(*args, ok=False)
+    saved = cloud.read()["sessions"][0]
+    assert saved["instance_id"] == vm["id"], result.stderr
+    assert saved["instance_created_at"] == vm["creationTimestamp"]
+    assert saved["last_start"] == vm["lastStartTimestamp"]
+    assert saved["reserved_end"] == original_end
+    assert saved["adoption"]["source"] == "owned instance + insert operation"
+    expected = (
+        2
+        if command == "close" and vm_status == "STAGING"
+        else 1
+        if command == "wait" and vm_status != "RUNNING"
+        else 0
+    )
+    assert result.returncode == expected
+
+
+@pytest.mark.parametrize("command", ["status", "wait", "close"])
+@pytest.mark.parametrize("fault", ["token", "label", "disk-token", "operation-id", "failed-insert"])
+def test_reserved_adoption_refuses_unproven_ownership(cloud, command, fault):
+    cloud.setup()
+    cloud.launch()
+    ledger = cloud.read()
+    session = ledger["sessions"][0]
+    session["status"] = "reserved"
+    for key in ("instance_id", "last_start", "instance_created_at"):
+        session.pop(key, None)
+    state = json.loads(cloud.state.read_text())
+    vm = state["instances"][0]
+    op = insert_operation(
+        "DONE",
+        targetId=vm["id"],
+        insertTime=vm["creationTimestamp"],
+        startTime=vm["creationTimestamp"],
+        endTime=vm["lastStartTimestamp"],
+    )
+    if fault == "token":
+        vm["labels"]["guard-ledger"] = "foreign"
+    if fault == "label":
+        vm["labels"]["guard-session"] = "foreign"
+    if fault == "disk-token":
+        session["boot_disk"] = "gcp-foreign-run-a"
+    if fault == "operation-id":
+        op["targetId"] = "foreign"
+    if fault == "failed-insert":
+        op["error"] = {"errors": [{"code": "FAILED"}]}
+    cloud.ledger.write_text(json.dumps(ledger))
+    cloud.change(instances=[vm], operations=[op])
+    args = (command, "run-a", "--timeout", "0") if command == "wait" else (command, "run-a")
+    cloud.run(*args, ok=False)
+    saved = cloud.read()["sessions"][0]
+    assert not saved.get("instance_id")
+    assert saved["settled_cost_usd"] is None
+    assert not any(
+        c[:3] in (["compute", "instances", "stop"], ["compute", "instances", "delete"])
+        for c in cloud.calls()
+    )
+
+
+@pytest.mark.parametrize("observe_first", [None, "status", "wait"])
+def test_canary_w2_reserved_adoption_and_no_delete_settlement(cloud, observe_first):
+    cloud.setup()
+    fixture = json.loads((ROOT / "tests/test_gcp/fixtures/canary_w2.json").read_text())
+    ledger = cloud.read()
+    ledger["config"]["project"] = fixture["project"]
+    session = fixture["session"]
+    session["boot_disk"] = session["boot_disk"].replace("<ledger-token>", ledger["config"]["token"])
+    ledger["sessions"] = [session]
+    cloud.ledger.write_text(json.dumps(ledger))
+    cloud.change(instances=[], disks=[], operations=fixture["operations"])
+    if observe_first:
+        args = (
+            (observe_first, "canary-w2", "--timeout", "0")
+            if observe_first == "wait"
+            else (observe_first, "canary-w2")
+        )
+        cloud.run(*args, ok=observe_first != "wait")
+        assert cloud.read()["sessions"][0]["status"] == "open"
+    cloud.run("close", "canary-w2")
+    saved = cloud.read()["sessions"][0]
+    inserted = fixture["operations"][0]
+    assert saved["instance_id"] == inserted["targetId"]
+    assert saved["runtime_evidence"]["start"] == inserted["insertTime"]
+    assert saved["runtime_evidence"]["creation"] == inserted["insertTime"]
+    assert saved["runtime_evidence"]["stop"] == "2026-11-13T11:53:13.001Z"
+    assert "insert request" in saved["settlement_evidence"]
+    assert saved["settled_cost_usd"] == "0.038568"
+    assert len(saved["settlement_inventory"]) == 2
+
+
+@pytest.mark.parametrize(
+    "fault", ["no-retained-insert", "token", "old-insert", "duplicate", "mismatched-retained"]
+)
+def test_gone_reserved_session_without_ownership_proof_stays_held(cloud, fault):
+    cloud.setup()
+    fixture = json.loads((ROOT / "tests/test_gcp/fixtures/canary_w2.json").read_text())
+    ledger = cloud.read()
+    ledger["config"]["project"] = fixture["project"]
+    session = fixture["session"]
+    session["boot_disk"] = session["boot_disk"].replace("<ledger-token>", ledger["config"]["token"])
+    if fault == "token":
+        session["boot_disk"] = "gcp-foreign-canary-w2"
+    if fault == "no-retained-insert":
+        session.pop("create_failure_operations")
+    if fault == "old-insert":
+        session["created_at"] = "2026-11-13T11:50:00Z"
+    if fault == "duplicate":
+        fixture["operations"].append(dict(fixture["operations"][0], name="another-insert"))
+    if fault == "mismatched-retained":
+        session["create_failure_operations"]["operations"][0]["targetId"] = "foreign"
+    ledger["sessions"] = [session]
+    cloud.ledger.write_text(json.dumps(ledger))
+    cloud.change(instances=[], disks=[], operations=fixture["operations"])
+    result = cloud.run("close", "canary-w2", ok=False)
+    assert result.returncode == 2
+    assert cloud.read()["sessions"][0]["settled_cost_usd"] is None
+
+
+def test_reserved_staging_adoption_updates_start_from_later_instance_read(cloud):
+    cloud.setup()
+    cloud.launch()
+    ledger = cloud.read()
+    session = ledger["sessions"][0]
+    session["status"] = "reserved"
+    for key in ("instance_id", "last_start", "instance_created_at"):
+        session.pop(key, None)
+    cloud.ledger.write_text(json.dumps(ledger))
+    state = json.loads(cloud.state.read_text())
+    vm = state["instances"][0]
+    actual_start = vm.pop("lastStartTimestamp")
+    vm["status"] = "STAGING"
+    op = insert_operation(
+        "RUNNING",
+        targetId=vm["id"],
+        insertTime=vm["creationTimestamp"],
+        startTime=vm["creationTimestamp"],
+    )
+    cloud.change(instances=[vm], operations=[op])
+    cloud.run("status")
+    saved = cloud.read()["sessions"][0]
+    assert saved["adoption"]["charge_from_insert_request"]
+    assert saved["last_start"] == op["insertTime"]
+    vm.update(lastStartTimestamp=actual_start, status="RUNNING")
+    op.update(status="DONE", endTime=actual_start)
+    cloud.change(instances=[vm], operations=[op])
+    cloud.run("status")
+    saved = cloud.read()["sessions"][0]
+    assert saved["last_start"] == actual_start
+    assert not saved["adoption"]["charge_from_insert_request"]
+    assert saved["reserved_end"] == session["reserved_end"]
+
+
+def test_adopted_session_repeated_start_cannot_hide_earlier_runtime(cloud):
+    cloud.setup()
+    cloud.launch()
+    ledger = cloud.read()
+    session = ledger["sessions"][0]
+    session.update(status="reserved", created_at="2026-11-12T00:00:00Z")
+    for key in ("instance_id", "last_start", "instance_created_at"):
+        session.pop(key, None)
+    cloud.ledger.write_text(json.dumps(ledger))
+    vm = json.loads(cloud.state.read_text())["instances"][0]
+    vm.update(creationTimestamp="2026-11-12T00:00:00Z", lastStartTimestamp="2026-11-12T00:10:00Z")
+    op = insert_operation(
+        "DONE",
+        targetId=vm["id"],
+        insertTime=vm["creationTimestamp"],
+        startTime=vm["creationTimestamp"],
+        endTime=vm["lastStartTimestamp"],
+    )
+    cloud.change(instances=[vm], operations=[op])
+    cloud.run("status", "run-a")
+    vm["lastStartTimestamp"] = "2026-11-12T00:20:00Z"
+    cloud.change(instances=[vm])
+    cloud.run("status", "run-a")
+    saved = cloud.read()["sessions"][0]
+    assert saved["last_start"] == "2026-11-12T00:10:00Z"
+    assert saved["runtime_uncertain"]
+    assert cloud.run("close", "run-a", ok=False).returncode == 2
+    assert cloud.read()["sessions"][0]["settled_cost_usd"] is None
