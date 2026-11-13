@@ -247,7 +247,12 @@ def machine(jobs, tmp_path):
                         (control / 'checkpoint-done').write_bytes(req.read_bytes())
                         break
                     time.sleep(0.01)
-            if os.environ.get('FAIL_FIT') == arm + str(seed): sys.exit(3)
+            if os.environ.get('FAIL_FIT') == arm + str(seed):
+                if not os.environ.get('QUIET_FIT'):
+                    print('Traceback (most recent call last):', file=sys.stderr)
+                    print('RuntimeError: median CUDA with indices output does not have a deterministic implementation', file=sys.stderr)
+                    print('', file=sys.stderr)
+                sys.exit(3)
             selected = arm == 'all'
             for n in ('config.json', 'model.safetensors'):
                 shutil.copyfile(P(val('--base')) / n, out / n)
@@ -559,6 +564,17 @@ def test_failure_continues_and_remote_resume(machine):
     assert not marker["success"]
     rows = list(csv.DictReader((state / "results.csv").open()))
     assert sum(r["status"] == "failed" for r in rows) == 2
+    for row in rows:
+        if row["status"] == "failed":
+            assert "trainer exit 3" in row["error"]
+            assert "RuntimeError: median CUDA with indices output" in row["error"]
+            assert "Traceback" not in row["error"]
+    # An output-free retry must not attribute the previous attempt's exception to it.
+    assert run(FAIL_FIT="all11", QUIET_FIT="1").returncode != 0
+    rows = list(csv.DictReader((state / "results.csv").open()))
+    assert all(
+        r["error"] == "trainer exit 3; see train.log" for r in rows if r["status"] == "failed"
+    )
     # Simulate a replacement guest: only state and uploaded objects remain.
     for event in events("fit"):
         work = next(
@@ -567,7 +583,7 @@ def test_failure_continues_and_remote_resume(machine):
         shutil.rmtree(work, ignore_errors=True)
     assert run().returncode == 0
     fits = events("fit")
-    assert len(fits) == 10 and all(e[3] for e in fits[-2:])
+    assert len(fits) == 12 and all(e[3] for e in fits[-2:])
     assert len(events("bundle")) == 4  # rebuild disposable data, verify saved manifest
     assert len(events("score")) == 12
 

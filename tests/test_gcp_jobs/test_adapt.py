@@ -227,6 +227,48 @@ def report_equal(left, right):
     assert left == right
 
 
+@pytest.mark.parametrize("device,strict", [("cpu", True), ("cuda", False), ("cuda:1", False)])
+def test_runtime_configuration_does_not_require_deterministic_cuda(adapt, device, strict):
+    import torch
+
+    previous = torch.are_deterministic_algorithms_enabled()
+    warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    try:
+        # Exercise the actual configuration path without allocating on CUDA.
+        torch.use_deterministic_algorithms(True)
+        with torch.random.fork_rng(devices=[]):
+            settings = adapt.configure_runtime(29, device)
+            assert torch.are_deterministic_algorithms_enabled() is strict
+            assert settings["deterministic_algorithms"] is strict
+            first = torch.rand(4)
+            adapt.configure_runtime(29, device)
+            torch.testing.assert_close(torch.rand(4), first, rtol=0, atol=0)
+    finally:
+        torch.use_deterministic_algorithms(previous, warn_only=warn_only)
+
+
+def test_optimizer_nonfinite_weights_force_frozen_fallback(
+    adapt, bundle, base, tmp_path, monkeypatch
+):
+    import torch
+
+    step = adapt.NorMuonAdamW.step
+
+    def corrupt_weights(optimizer):
+        step(optimizer)
+        with torch.no_grad():
+            optimizer.param_groups[-1]["params"][0].fill_(float("nan"))
+
+    monkeypatch.setattr(adapt.NorMuonAdamW, "step", corrupt_weights)
+    result = adapt.run(bundle, base, tmp_path / "out", short_recipe(adapt, max_updates=1))
+    assert result["decision"]["reason"] == "non_finite_training"
+    assert result["updates_run"] == 0
+    assert result["decision"]["selected"] == "frozen_base"
+    assert (tmp_path / "out/model.safetensors").read_bytes() == (
+        base / "model.safetensors"
+    ).read_bytes()
+
+
 def test_native_sampling_deterministic_and_causal(adapt, bundle, tiny_model):
     import torch
     from simons.training.adapt_data import Bundle
@@ -659,6 +701,13 @@ def test_cost_receipt_separates_training_and_evaluations(adapt, bundle, base, tm
 
     output = tmp_path / "out"
     result = adapt.run(bundle, base, output, short_recipe(adapt, max_updates=2))
+    assert result["reproducibility"] == result["identity"]["reproducibility"]
+    assert result["reproducibility"]["deterministic_algorithms"] is True
+    assert result["precision"]["training_autocast"] is False
+    assert (
+        result["precision"]["inner_inference"]
+        == "float32 on CPU; upstream bfloat16 autocast on CUDA"
+    )
     assert result["training_wall_seconds"] > 0
     assert 0 < result["last_update"]["wall_seconds"] <= result["training_wall_seconds"]
     assert all(e["wall_seconds"] > 0 for e in result["evaluations"])

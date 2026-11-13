@@ -304,8 +304,14 @@ matrices, muP base width 704 and global gradient clip 1. The multiplier scales
 both base rates before upstream width/head scaling. Rewarm rises from 0.1 to 1
 for 50 updates, then decays linearly to zero at the last planned update. A run
 shorter than 50 updates consists only of the shortened rewarm. There is no
-pretraining warm-start rate doubling. GPU mixed precision is not enabled by
-this trainer; task-batch memory and update speed must be qualified on the GPU.
+pretraining warm-start rate doubling. Training forwards use float32 weights and
+inputs without autocast, with native float64 normalization. The upstream NorMuon
+optimizer still uses bf16 internally for the `all` arm; the `head` arm uses AdamW
+only. Loss and gradient checks precede the optimizer step, and a finite-weight
+check follows it before committing the update. Inner inference retains the
+scorer's upstream CUDA bf16 autocast (float32 on CPU). This differs from
+pretraining, which enables training bf16 autocast on supported CUDA hardware.
+Task-batch memory and update speed must be qualified on the GPU.
 
 Inner evaluation defaults to updates 0/50/100/250/500. `--eval-updates 0,2,4`
 changes the list; zero and the planned final update are always included, and
@@ -337,8 +343,8 @@ scores; ties keep the earliest update. Early stopping counts two consecutive
 checks without at least 0.5% mean-SQL gain over the last significant best mean.
 Smaller gains accumulate against that best until the threshold is reached.
 A zero baseline cannot qualify an adapted candidate by percentage gain.
-Any non-finite forecast, non-finite overall score or non-finite loss/gradient
-selects the frozen base, even if an earlier candidate qualified. Selection is
+Any non-finite forecast, overall score, loss, gradient or updated weight selects
+the frozen base, even if an earlier candidate qualified. Selection is
 **per task**: items too short for the two inner windows contribute neither
 training material nor inner scores, and every item uses the task's single set
 of selected weights. Excluded IDs and their exact reasons remain in the receipt;
@@ -358,7 +364,15 @@ in the preserved config for a separate system experiment.
 `adaptation.json` schema version 1 records:
 
 - `identity`: bundle fingerprint, base file hashes, full effective recipe, seed,
-  hashes of patched Simons Python sources and Torch/NumPy/device/thread runtime;
+  hashes of patched Simons Python sources, reproducibility settings and
+  Torch/NumPy/device/thread runtime;
+- `reproducibility`: effective `deterministic_algorithms`, seeded Torch CPU/all-CUDA
+  RNGs, stateless NumPy sampling and fixed bundle order, bitwise replay limits,
+  CUDA kernel limitation and effective `CUBLAS_WORKSPACE_CONFIG`; also included in
+  `identity` so settings participate in resume validation;
+- `precision`: float32 weights, disabled training autocast, native float64
+  normalization, CPU/CUDA inner-inference precision, and whether the optimizer's
+  internal bf16 path is active;
 - `inputs`: manifest hash, every payload hash/size, base hashes, task and phase;
 - `recipe`, `seed`, `parameters`, `sampling`, `objective`, `optimization`:
   actual settings, parameter names/counts, sampling eligibility, peak group rates;
@@ -372,7 +386,7 @@ in the preserved config for a separate system experiment.
   divide by `updates_run` for mean update cost when all attempts succeeded;
 - `peak_cuda_memory_bytes`: peak Torch allocated memory on the selected CUDA
   device, reset before loading the base and retained as a maximum across resumed
-  segments; JSON null on CPU. This is allocated tensor memory, not reserved
+  segments; JSON null on non-CUDA devices. This is allocated tensor memory, not reserved
   allocator memory or total device usage. CUDA synchronization brackets training
   updates and evaluations so their wall times include completed device work;
 - `updates_run`, `wall_seconds`, `last_update`, `exposure`: successful committed
@@ -393,10 +407,20 @@ optimizer, current model, best candidate, selection history, counters and RNG
 state. Sampling is stateless per (seed, update), independent of inner labels;
 changing inner targets can affect selection, never the gradients at a given
 update. Resume requires the same verified bundle/base/recipe/software/runtime.
-Replayed updates and evaluation scores match in the same runtime. Export bytes
-and deterministic receipt fields match uninterrupted execution; measured times
-and peak memory naturally differ. CUDA determinism is requested explicitly and
-must be qualified on the actual hardware/software stack.
+CPU tests verify that replayed updates, evaluation scores, export bytes and
+deterministic receipt fields match uninterrupted execution in the same runtime;
+measured times and peak memory naturally differ. CPU runs enable strict Torch
+deterministic algorithms. CUDA runs explicitly disable that mode, including an
+inherited setting: native `sliding_scale` uses `nanmedian` with indices, which
+has no deterministic CUDA implementation. The model forward path and scorer are
+unchanged. Torch seeds and saved CPU/CUDA RNG states, stateless per-update NumPy
+sampling, and bundle item/block/origin order remain reproducible. The cuBLAS
+workspace setting is retained but does not make other CUDA kernels deterministic.
+CUDA training, inner scores, selection decisions, adapted weights and export
+bytes are **not guaranteed bitwise reproducible**, even after resume on the same
+hardware/software stack; CPU-versus-CUDA numerical parity is not guaranteed
+either. Frozen fallback exports still copy the immutable base bytes exactly.
+No cross-version or cross-device numerical reproducibility is promised.
 
 If `$RUN_DIR/checkpoint-request` contains a new nonempty nonce, the next update
 boundary saves state before atomically writing `checkpoint-done` with that

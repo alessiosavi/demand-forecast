@@ -392,6 +392,7 @@ class Job:
         control.mkdir(parents=True, exist_ok=True)
         env = dict(os.environ, RUN_DIR=str(control))
         with (state / "train.log").open("a") as f:
+            log_start = f.tell()
             process = subprocess.Popen(command, stdout=f, stderr=subprocess.STDOUT, env=env)
             try:
                 while process.poll() is None:
@@ -414,7 +415,14 @@ class Job:
                 self.checkpoints(output, state)
                 self.acknowledge(output, state, control)
         if process.returncode:
-            raise ValueError("trainer exit " + str(process.returncode) + "; see train.log")
+            last_line = ""
+            with (state / "train.log").open(errors="replace") as log:
+                log.seek(log_start)
+                for line in log:
+                    if line.strip():
+                        last_line = line.strip()
+            detail = ": " + last_line if last_line else ""
+            raise ValueError("trainer exit " + str(process.returncode) + detail + "; see train.log")
 
     def fit(self, bundle, manifest, state, output, params, lr, seed):
         state.mkdir(parents=True, exist_ok=True)

@@ -2,7 +2,7 @@ diff --git a/src/simons/training/adapt.py b/src/simons/training/adapt.py
 new file mode 100644
 --- /dev/null
 +++ b/src/simons/training/adapt.py
-@@ -0,0 +1,489 @@
+@@ -0,0 +1,518 @@
 +"""One immutable task bundle + base export + recipe/seed -> selected raw-neural weights.
 +
 +Run `python -m simons.training.adapt --help`. No dataset/model downloads occur.
@@ -119,6 +119,23 @@ new file mode 100644
 +    return {n: p.detach().cpu().clone() for n, p in model.state_dict().items()}
 +
 +
++def configure_runtime(seed, device):
++    """Seed streams without rejecting native nondeterministic CUDA operations."""
++    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
++    # CUDA nanmedian-with-indices in native sliding_scale has no deterministic kernel.
++    # Explicitly clear inherited strict mode as well as the default CLI setting.
++    torch.use_deterministic_algorithms(torch.device(device).type == "cpu")
++    torch.manual_seed(seed)
++    return dict(
++        deterministic_algorithms=torch.are_deterministic_algorithms_enabled(),
++        seeded_rngs=["torch_cpu", "torch_cuda_all_devices"],
++        sampling="stateless NumPy per (seed, update); fixed bundle order",
++        bitwise_replay="same-runtime CPU only; not guaranteed on CUDA",
++        cuda_limitation="native nanmedian with indices and other CUDA kernels may be nondeterministic",
++        cublas_workspace_config=os.environ["CUBLAS_WORKSPACE_CONFIG"],
++    )
++
++
 +class CostMeter:
 +    """Synchronized wall clock and per-device allocated-memory high-water mark."""
 +
@@ -170,6 +187,11 @@ new file mode 100644
 +    for group in optimizer.param_groups:
 +        group["lr"] = group["peak_lr"] * rate(update, recipe)
 +    optimizer.step()
++    # NorMuon uses bf16 internally even without training autocast. Finite inputs
++    # do not guarantee a finite optimizer result; never commit/export bad weights.
++    finite = torch.stack([torch.isfinite(p).all() for p in model.parameters() if p.requires_grad])
++    if not bool(finite.all()):
++        return None
 +    return dict(
 +        loss=loss_sum,
 +        gradient_norm=float(norm),
@@ -184,16 +206,14 @@ new file mode 100644
 +    """Resume automatically in `output`. `observer(event,state)` is an offline fault hook.
 +
 +    The only data reads are verified bundle payloads and the local two-file base.
-+    Run identity includes software/device; bitwise resume requires the same runtime.
++    Run identity includes software/device; CUDA replay is not guaranteed bitwise.
 +    """
 +    recipe = Recipe() if recipe is None else recipe
 +    bundle = Bundle(bundle)
 +    base, output = Path(base).resolve(strict=True), Path(output)
 +    base_hashes = {n: sha(base / n) for n in ("config.json", "model.safetensors")}
 +    metric_config(bundle.manifest["scoring"])
-+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
-+    torch.use_deterministic_algorithms(True)
-+    torch.manual_seed(seed)
++    reproducibility = configure_runtime(seed, device)
 +    cost = CostMeter(device)
 +    model = Simons.from_pretrained(base, device=device)
 +    param_info = parameters(model, recipe.params)
@@ -211,6 +231,7 @@ new file mode 100644
 +        base=base_hashes,
 +        recipe=asdict(recipe),
 +        seed=seed,
++        reproducibility=reproducibility,
 +        software={str(p.relative_to(source)): sha(p) for p in sorted(source.rglob("*.py"))},
 +        runtime=dict(
 +            torch=torch.__version__,
@@ -405,6 +426,14 @@ new file mode 100644
 +    report = dict(
 +        schema_version=1,
 +        identity=identity,
++        reproducibility=reproducibility,
++        precision=dict(
++            weights="float32",
++            training_autocast=False,
++            normalization="native float64",
++            inner_inference="float32 on CPU; upstream bfloat16 autocast on CUDA",
++            normuon_internal="bfloat16" if recipe.params == "all" else "inactive (head arm)",
++        ),
 +        inputs=dict(
 +            bundle_manifest_sha256=sha(bundle.root / "manifest.json"),
 +            bundle_files=bundle.manifest["files"],
