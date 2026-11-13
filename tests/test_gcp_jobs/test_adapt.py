@@ -77,16 +77,12 @@ def test_metric_fev_source_parity(adapt):
     from conftest import module_at
     from simons.training.adapt_eval import sql
 
-    # The supplied reference clone needs only NumPy, even when fev is not installed.
-    source = Path(
-        os.environ.get(
-            "FEV_METRICS_SOURCE", "/Users/asavi/df-wins-2026-11-11/published/fev/src/fev/metrics.py"
-        )
-    )
-    if source.is_file():
-        fev = module_at("reference_fev_metrics", source)
+    # An explicit source override needs only NumPy; otherwise use the installed package.
+    source = os.environ.get("FEV_METRICS_SOURCE")
+    if source is not None:
+        fev = module_at("reference_fev_metrics", Path(source))
     else:
-        fev = pytest.importorskip("fev.metrics", reason="fev source/package unavailable")
+        fev = pytest.importorskip("fev.metrics", reason="installed fev.metrics unavailable")
     rng = np.random.default_rng(9)
     truth = rng.normal(size=(3, 5, 2))
     prediction = rng.normal(size=(3, 5, 2, 3))

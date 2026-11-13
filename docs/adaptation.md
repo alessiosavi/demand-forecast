@@ -526,6 +526,9 @@ artifacts. A successful, fully verified completion exits before environment
 installation or downloads. A changed input identity or changed base/bundle content
 under the same name is refused. A damaged completion is rebuilt from independently
 verified evidence; finished fits and scores are reused.
+Every frozen and adapted score receipt binds its measurement to the SHA-256 hashes
+of the export's config and weights; missing or mismatched bindings restore the
+export and rerun scoring, and completion preflight verifies these bindings.
 If both base identity records are absent while task evidence survives, the job
 refuses reuse. A missing bundle manifest is recoverable only when a surviving
 completion hash or verified trainer receipt establishes its original exact hash;

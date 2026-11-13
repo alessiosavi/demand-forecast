@@ -102,6 +102,11 @@ def valid(path):
         return None
 
 
+def valid_score(path, weights_sha256):
+    record = valid(path)
+    return record if record and record.get("weights_sha256") == weights_sha256 else None
+
+
 def copy_cloud(source, destination):
     subprocess.run(["gcloud", "storage", "cp", str(source), str(destination)], check=True, timeout=120)
 
@@ -141,35 +146,54 @@ class Job:
                 return 10
             hashes = marker["artifacts"]
             required = {"inputs.json", "environment.txt", "checkpoint-sha256.json", "tasks.yaml", "results.csv"}
+            base_hashes = read(self.root / "checkpoint-sha256.json")
+            if set(base_hashes) != set(FILES) or marker["checkpoint_sha256"] != base_hashes:
+                return 10
             expected = set()
             for name in self.c["names"]:
                 prefix = "tasks/" + slug(name)
                 required.add(prefix + "/bundle-manifest.json")
+                frozen = {}
                 for mode in self.c["modes"]:
                     relative = prefix + "/frozen/" + mode
-                    score = valid(self.root / relative / "status.json")
+                    score = valid_score(self.root / relative / "status.json", base_hashes)
                     if not score:
                         return 10
+                    frozen[mode] = score
                     required.add(relative + "/status.json")
                     required.update(relative + "/" + p for p in score["hashes"])
                 for params, lr, seed in itertools.product(self.c["params"], self.c["lr_multipliers"], self.c["seeds"]):
                     key = params + "-lr" + str(lr) + "-seed" + str(seed)
-                    expected.add(slug(name) + "/" + key)
+                    fit_key = slug(name) + "/" + key
+                    expected.add(fit_key)
                     relative = prefix + "/fits/" + key
                     fit = valid(self.root / relative / "fit.json")
                     if not fit:
                         return 10
                     required.update((relative + "/fit.json", relative + "/adaptation.json"))
                     report = read(self.root / relative / "adaptation.json")
+                    completed_fit = marker["fits"][fit_key]
+                    if completed_fit["fit"] != fit or set(report["export"]) != set(FILES):
+                        return 10
+                    if report["decision"]["selected"] == "frozen_base":
+                        if report["export"] != base_hashes:
+                            return 10
+                    elif {n: ref["sha256"] for n, ref in fit["exports"].items()} != report["export"]:
+                        return 10
                     for mode in self.c["modes"]:
                         if report["decision"]["selected"] == "frozen_base":
                             required.add(relative + "/" + mode + "-reuse.json")
+                            score = read(self.root / relative / (mode + "-reuse.json"))
+                            if score != dict(frozen[mode], reused_frozen=True):
+                                return 10
                         else:
-                            score = valid(self.root / relative / mode / "status.json")
+                            score = valid_score(self.root / relative / mode / "status.json", report["export"])
                             if not score:
                                 return 10
                             required.add(relative + "/" + mode + "/status.json")
                             required.update(relative + "/" + mode + "/" + p for p in score["hashes"])
+                        if completed_fit["scores"][mode] != score:
+                            return 10
             with (self.root / "results.csv").open() as f:
                 rows = list(csv.DictReader(f))
             if (marker["schema"] == 1 and marker["success"] is True
@@ -280,11 +304,25 @@ class Job:
 
     def bundle(self, name, state, work):
         output = work / "bundle"
-        if not output.exists():
-            command = [self.python, "-m", "demand_forecast.bench.adaptation", "--tasks",
-                       str(self.root / "tasks.yaml"), "--task", name, "--phase", "development",
-                       "--output", str(output)]
-            self.command(command, state / "bundle.log")
+        manifest = None
+        if output.exists():
+            try:
+                manifest = self.bundle_manifest(name, state, output)
+            except (OSError, ValueError, KeyError, TypeError, AttributeError):
+                shutil.rmtree(output)
+        if manifest is None:
+            with tempfile.TemporaryDirectory(prefix=".bundle-", dir=work) as temporary:
+                candidate = pathlib.Path(temporary) / "bundle"
+                command = [self.python, "-m", "demand_forecast.bench.adaptation", "--tasks",
+                           str(self.root / "tasks.yaml"), "--task", name, "--phase", "development",
+                           "--output", str(candidate)]
+                self.command(command, state / "bundle.log")
+                manifest = self.bundle_manifest(name, state, candidate)
+                candidate.rename(output)
+        copy_atomic(output / "manifest.json", state / "bundle-manifest.json")
+        return output, manifest
+
+    def bundle_manifest(self, name, state, output):
         manifest = read(output / "manifest.json")
         version = manifest.get("schema_version")
         if type(version) is not int or version != 2:
@@ -310,8 +348,7 @@ class Job:
         if not expected and any(p.is_file() for folder in ("frozen", "fits")
                                 for p in (state / folder).rglob("*")):
             raise ValueError("bundle identity missing from restored state; refusing to rebind existing results")
-        copy_atomic(output / "manifest.json", saved)
-        return output, manifest
+        return manifest
 
     def command(self, command, log, env=None):
         log.parent.mkdir(parents=True, exist_ok=True)
@@ -320,14 +357,23 @@ class Job:
         if result.returncode:
             raise ValueError("command exit " + str(result.returncode) + "; see " + str(log))
 
-    def score(self, name, mode, checkpoint, state, work, label):
+    def score(self, name, mode, checkpoint, state, work, label, weights_sha256, exports=None):
+        if exports is not None and {n: ref["sha256"] for n, ref in exports.items()} != weights_sha256:
+            raise ValueError("score export identity mismatch")
         status = state / "status.json"
-        cached = valid(status)
+        cached = valid_score(status, weights_sha256)
         if cached:
             return cached
         state.mkdir(parents=True, exist_ok=True)
         started = time.monotonic()
         try:
+            if exports is not None:
+                for n in FILES:
+                    self.restore(exports[n], checkpoint / n)
+            if {n: sha(checkpoint / n) for n in FILES} != weights_sha256:
+                raise ValueError("score checkpoint does not match expected export")
+            # The scorer refuses changed weights in an existing output directory.
+            work = work / hashlib.sha256(json.dumps(weights_sha256, sort_keys=True).encode()).hexdigest()
             command = [self.python, str(self.repo / "scripts/fev_yardstick.py"), "--model", "simons",
                        "--checkpoint", str(checkpoint), "--processing", mode, "--tasks",
                        str(self.root / "tasks.yaml"), "--names", name, "--model-name", label,
@@ -350,6 +396,7 @@ class Job:
                                      ("summaries.csv", work / "summaries.csv")):
                 copy_atomic(source, state / filename)
             report = dict(status="ok", sql=float(summary["SQL"]), wall_seconds=time.monotonic() - started,
+                          weights_sha256=weights_sha256,
                           hashes={n: sha(state / n) for n in ("run.json", "summaries.csv")})
         except Exception as error:
             report = dict(status="failed", error=str(error), wall_seconds=time.monotonic() - started)
@@ -468,6 +515,7 @@ class Job:
 
     def execute(self):
         self.inputs()
+        base_hashes = read(self.root / "checkpoint-sha256.json")
         rows, fits, bundles, failed = [], {}, {}, False
         for name in self.c["names"]:
             task = self.root / "tasks" / slug(name)
@@ -486,7 +534,8 @@ class Job:
             if bundle_error is None:
                 for mode in self.c["modes"]:
                     frozen[mode] = self.score(name, mode, self.base, task / "frozen" / mode,
-                                              work / "frozen" / mode, self.c["name"] + "-frozen-" + mode)
+                                              work / "frozen" / mode, self.c["name"] + "-frozen-" + mode,
+                                              base_hashes)
                     failed |= frozen[mode]["status"] != "ok"
             for params, lr, seed in itertools.product(self.c["params"], self.c["lr_multipliers"], self.c["seeds"]):
                 key = params + "-lr" + str(lr) + "-seed" + str(seed)
@@ -522,11 +571,9 @@ class Job:
                             atomic(state / (mode + "-reuse.json"), score)
                         else:
                             try:
-                                if not valid(state / mode / "status.json"):
-                                    for n, ref in result["exports"].items():
-                                        self.restore(ref, output / n)
                                 score = self.score(name, mode, output, state / mode, work / "scores" / key / mode,
-                                                   self.c["name"] + "-" + key + "-" + mode)
+                                                   self.c["name"] + "-" + key + "-" + mode,
+                                                   report["export"], result["exports"])
                             except Exception as error:
                                 score = dict(status="failed", error=str(error))
                         row["outer_sql_" + mode] = score.get("sql")

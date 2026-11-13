@@ -1,14 +1,17 @@
 """Execute the complete generated adaptation job with offline guest commands."""
 
+import base64
 import csv
 import hashlib
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import textwrap
+import uuid
 from pathlib import Path
 
 import pytest
@@ -224,6 +227,7 @@ def machine(jobs, tmp_path):
             name, out = val('--task'), P(val('--output'))
             event('bundle', name)
             out.mkdir(parents=True)
+            if os.environ.get('KILL_BUNDLE'): os.kill(os.getpid(), 9)
             (out / 'train.parquet').write_bytes(os.environ.get('BUNDLE_CONTENT', 'bounded history').encode())
             write(out / 'manifest.json', {'schema_version': json.loads(os.environ.get('SCHEMA', '2')),
                 'fingerprint': 'fingerprint-' + name + sha(out / 'train.parquet'), 'phase': 'development',
@@ -256,7 +260,8 @@ def machine(jobs, tmp_path):
             selected = arm == 'all'
             for n in ('config.json', 'model.safetensors'):
                 shutil.copyfile(P(val('--base')) / n, out / n)
-            if selected: (out / 'model.safetensors').write_bytes(b'adapted weights')
+            if selected:
+                (out / 'model.safetensors').write_bytes(os.environ.get('ADAPTED_WEIGHTS', 'adapted weights').encode())
             manifest = json.loads((bundle / 'manifest.json').read_text())
             write(out / 'adaptation.json', {'schema_version': 1, 'seed': seed,
                 'identity': {'bundle_fingerprint': manifest['fingerprint']},
@@ -272,10 +277,16 @@ def machine(jobs, tmp_path):
             event('score', name, mode, val('--checkpoint'), args)
             out.mkdir(parents=True, exist_ok=True)
             if os.environ.get('FAIL_SCORE') == mode: sys.exit(4)
+            weights_sha256 = {n: sha(P(val('--checkpoint')) / n) for n in ('config.json', 'model.safetensors')}
+            identity = out / 'yardstick.json'
+            if identity.exists() and json.loads(identity.read_text()) != weights_sha256:
+                raise ValueError('run identity mismatch; use a new out-dir for changed weights')
+            write(identity, weights_sha256)
             window = out / name / 'window_0.npz'
             window.parent.mkdir(parents=True, exist_ok=True)
             window.write_bytes(b'prediction array')
-            score = .7 if (P(val('--checkpoint')) / 'model.safetensors').read_bytes() == b'adapted weights' else 1.0
+            weights = (P(val('--checkpoint')) / 'model.safetensors').read_bytes()
+            score = {b'adapted weights': .7, b'retrained weights': .6}.get(weights, 1.0)
             row = {'task': name, 'model_name': val('--model-name'), 'run_identity': 'id', 'SQL': score}
             write(out / name / 'run.json', {'run_identity': 'id', 'summary': row, 'window_sha256': {'window_0.npz': sha(window)}})
             with (out / 'summaries.csv').open('w') as f:
@@ -307,15 +318,25 @@ def machine(jobs, tmp_path):
         EVENTS=str(tmp_path / "events.jsonl"),
     )
     script = tmp_path / "job.sh"
+    job_name = "pilot_" + uuid.uuid4().hex
+    workdirs = set()
 
     def run(options=None, **overrides):
         config = arguments()
-        config["name"] = "pilot_" + hashlib.sha256(str(tmp_path).encode()).hexdigest()[:16]
+        config["name"] = job_name
         config.update(options or {})
-        script.write_text(jobs.generate(**config))
-        return subprocess.run(
-            ["bash", str(script)], env={**env, **overrides}, capture_output=True, text=True
-        )
+        job_env = {**env, **overrides}
+        source = jobs.generate(**config)
+        # Register every configuration before dispatch, including preflight failures.
+        encoded = re.search(
+            r'\(root / "inputs.json"\)\.write_bytes\(base64.b64decode\("([^"]+)"\)\)', source
+        )[1]
+        generated = json.loads(base64.b64decode(encoded))
+        uri = job_env["STATE_URI"].rstrip("/") + "-adapt-artifacts/" + generated["name"]
+        identity = hashlib.sha256(json.dumps([generated, uri], sort_keys=True).encode()).hexdigest()
+        workdirs.add(Path("/tmp") / ("demand-forecast-adapt-" + identity))
+        script.write_text(source)
+        return subprocess.run(["bash", str(script)], env=job_env, capture_output=True, text=True)
 
     def events(kind):
         return [
@@ -324,18 +345,14 @@ def machine(jobs, tmp_path):
             if kind == "*" or json.loads(s)[0] == kind
         ]
 
-    state = (
-        Path(env["RUN_DIR"])
-        / "state/adapt"
-        / ("pilot_" + hashlib.sha256(str(tmp_path).encode()).hexdigest()[:16])
-    )
-    yield run, state, events, cloud
-    for e in events("fit"):
-        work = next(
-            (p for p in Path(e[4]).parents if p.name.startswith("demand-forecast-adapt-")), None
-        )
-        if work:
-            shutil.rmtree(work, ignore_errors=True)
+    state = Path(env["RUN_DIR"]) / "state/adapt" / job_name
+    try:
+        yield run, state, events, cloud
+    finally:
+        for work in workdirs:
+            if work.exists():
+                shutil.rmtree(work)
+            assert not work.exists(), f"adaptation work directory leaked: {work}"
 
 
 def test_pipeline_reuse_and_identity(machine):
@@ -383,6 +400,46 @@ def test_bundle_schema_rejected_before_frozen_scoring_or_fitting(machine, versio
         "schema_version" in b["error"] and "2" in b["error"] for b in marker["bundles"].values()
     )
     assert not list(state.glob("tasks/*/bundle-manifest.json"))
+
+
+@pytest.mark.parametrize("failure", [{"KILL_BUNDLE": "1"}, {"SCHEMA": "1"}])
+def test_failed_bundle_attempt_is_rebuilt_on_same_guest(machine, failure):
+    run, state, events, _ = machine
+    options = dict(names=["alpha"], params=["head"], seeds=[11], processing="raw")
+    assert run(options, **failure).returncode != 0
+    assert not events("fit") and not events("score")
+    result = run(options)
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert len(events("bundle")) == 2
+    assert len(events("fit")) == len(events("score")) == 1
+    assert json.loads((state / "completed.json").read_text())["success"]
+
+
+@pytest.mark.parametrize("damage", ["partial", "schema", "payload", "identity"])
+def test_invalid_cached_bundle_is_rebuilt_without_refitting(machine, damage):
+    run, state, events, _ = machine
+    options = dict(names=["alpha"], params=["head"], seeds=[11], processing="raw")
+    assert run(options).returncode == 0
+    bundle = Path(events("fit")[0][4]).parents[1] / "bundle"
+    original = (bundle / "manifest.json").read_bytes()
+    (state / "completed.json").unlink()
+    if damage == "partial":
+        shutil.rmtree(bundle)
+        bundle.mkdir()
+    elif damage == "payload":
+        (bundle / "train.parquet").write_bytes(b"corrupt payload")
+    else:
+        manifest = json.loads(original)
+        if damage == "schema":
+            manifest["schema_version"] = 1
+        else:
+            manifest["task"]["name"] = "other"
+        (bundle / "manifest.json").write_text(json.dumps(manifest))
+    result = run(options)
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert (bundle / "manifest.json").read_bytes() == original
+    assert len(events("bundle")) == 2
+    assert len(events("fit")) == len(events("score")) == 1
 
 
 def test_environment_and_task_order(machine):
@@ -434,6 +491,127 @@ def test_corrupt_completion_evidence_reruns_only_missing_score(machine):
     assert run().returncode == 0
     assert len(events("fit")) == 8 and len(events("bundle")) == 2
     assert len(events("score")) == before + 1
+
+
+@pytest.mark.parametrize("replacement_guest", [False, True])
+@pytest.mark.parametrize("damage", ["missing", "invalid_hash"])
+def test_retrained_export_rescores_surviving_receipts(machine, damage, replacement_guest):
+    run, state, events, _ = machine
+    options = dict(names=["alpha"], params=["all"], seeds=[11])
+    result = run(options)
+    assert result.returncode == 0, result.stderr + result.stdout
+    fit = next(state.glob("tasks/*/fits/*/fit.json"))
+    old_scores = {
+        mode: (fit.parent / mode / "status.json").read_bytes() for mode in ("raw", "published")
+    }
+    rows = list(csv.DictReader((state / "results.csv").open()))
+    assert rows[0]["outer_sql_raw"] == rows[0]["outer_sql_published"] == "0.7"
+    if damage == "missing":
+        fit.unlink()
+    else:
+        damaged = json.loads(fit.read_text())
+        damaged["hashes"]["adaptation.json"] = "0" * 64
+        fit.write_text(json.dumps(damaged))
+    if replacement_guest:
+        # Retain state and blobs, but no disposable exports/scores.
+        work = next(
+            p
+            for p in Path(events("fit")[0][4]).parents
+            if p.name.startswith("demand-forecast-adapt-")
+        )
+        shutil.rmtree(work)
+    before = len(events("score"))
+    result = run(options, ADAPTED_WEIGHTS="retrained weights")
+    assert result.returncode == 0, result.stderr + result.stdout
+    rows = list(csv.DictReader((state / "results.csv").open()))
+    assert rows[0]["outer_sql_raw"] == rows[0]["outer_sql_published"] == "0.6"
+    assert len(events("fit")) == 2
+    assert len(events("score")) == before + 2
+    marker = json.loads((state / "completed.json").read_text())
+    completed_fit = next(iter(marker["fits"].values()))
+    for mode in ("raw", "published"):
+        path = fit.parent / mode / "status.json"
+        assert path.read_bytes() != old_scores[mode]
+        score = json.loads(path.read_text())
+        assert score["weights_sha256"] == {
+            "config.json": hashlib.sha256(b'{"width":24}').hexdigest(),
+            "model.safetensors": hashlib.sha256(b"retrained weights").hexdigest(),
+        }
+        assert completed_fit["scores"][mode] == score
+    before_resume = len(events("*"))
+    assert run(options).returncode == 0
+    assert len(events("*")) == before_resume
+    # Rebuilding completion must also reuse scores when their export is unchanged.
+    (state / "completed.json").unlink()
+    assert run(options).returncode == 0
+    assert len(events("fit")) == 2 and len(events("score")) == before + 2
+
+
+@pytest.mark.parametrize("kind", ["frozen", "adapted"])
+@pytest.mark.parametrize(
+    "binding", [None, {"config.json": "0" * 64, "model.safetensors": "1" * 64}]
+)
+def test_unbound_score_is_rebuilt_even_with_matching_completion_hashes(machine, kind, binding):
+    run, state, events, _ = machine
+    options = dict(names=["alpha"], params=["all"], seeds=[11])
+    assert run(options).returncode == 0
+    task = state / "tasks" / b"alpha".hex()
+    path = (
+        task / "frozen/raw/status.json"
+        if kind == "frozen"
+        else next(task.glob("fits/*/raw/status.json"))
+    )
+    score = json.loads(path.read_text())
+    if binding is None:
+        score.pop("weights_sha256", None)
+    else:
+        score["weights_sha256"] = binding
+    path.write_text(json.dumps(score))
+    marker_path = state / "completed.json"
+    marker = json.loads(marker_path.read_text())
+    marker["artifacts"][path.relative_to(state).as_posix()] = hashlib.sha256(
+        path.read_bytes()
+    ).hexdigest()
+    if kind == "adapted":
+        next(iter(marker["fits"].values()))["scores"]["raw"] = score
+    marker_path.write_text(json.dumps(marker))
+    work = next(
+        p for p in Path(events("fit")[0][4]).parents if p.name.startswith("demand-forecast-adapt-")
+    )
+    shutil.rmtree(work)
+    before = len(events("score"))
+    result = run(options)
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert len(events("fit")) == 1
+    assert len(events("score")) == before + 1
+    expected = b"base weights" if kind == "frozen" else b"adapted weights"
+    assert (
+        json.loads(path.read_text())["weights_sha256"]["model.safetensors"]
+        == hashlib.sha256(expected).hexdigest()
+    )
+
+
+@pytest.mark.parametrize("params,weights", [("all", b"adapted weights"), ("head", b"base weights")])
+def test_completion_score_binding_is_verified(machine, params, weights):
+    run, state, events, _ = machine
+    options = dict(names=["alpha"], params=[params], seeds=[11])
+    assert run(options).returncode == 0
+    path = state / "completed.json"
+    marker = json.loads(path.read_text())
+    next(iter(marker["fits"].values()))["scores"]["raw"]["weights_sha256"] = {
+        "model.safetensors": "0" * 64
+    }
+    path.write_text(json.dumps(marker))
+    before = len(events("score"))
+    result = run(options)
+    assert result.returncode == 0, result.stderr + result.stdout
+    rebuilt = json.loads(path.read_text())
+    assert rebuilt != marker
+    assert (
+        next(iter(rebuilt["fits"].values()))["scores"]["raw"]["weights_sha256"]["model.safetensors"]
+        == hashlib.sha256(weights).hexdigest()
+    )
+    assert len(events("fit")) == 1 and len(events("score")) == before
 
 
 def test_refuses_changed_base_after_failure(machine):
