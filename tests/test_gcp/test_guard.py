@@ -7,7 +7,7 @@ import runpy
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -105,19 +105,21 @@ if args[:3] in (['compute', 'instances', 'list'], ['compute', 'disks', 'list']):
     end(state.get(kind, []))
 if args[:3] == ['compute', 'instances', 'describe']:
     time.sleep(state.get('describe_delay', 0))
-    matches = [v for v in state.get('instances', []) if v['name'] == args[3]]
+    matches = [v for v in state.get('instances', []) if v['name'] == args[3]
+               and v['zone'].rsplit('/', 1)[-1] == opt('--zone')]
     if not matches: end(error='The resource was not found')
     end(matches[0])
 if args[:3] == ['compute', 'instances', 'stop']:
     from datetime import datetime, timezone
     for v in state['instances']:
-        if v['name'] == args[3]:
+        if v['name'] == args[3] and v['zone'].rsplit('/', 1)[-1] == opt('--zone'):
             if any(d['type'] == 'SCRATCH' for d in v['disks']) and opt('--discard-local-ssd') != 'true':
                 end(error='Local SSD data must be explicitly discarded')
             v.update(status='TERMINATED', lastStopTimestamp=datetime.now(timezone.utc).isoformat())
     end({})
 if args[:3] == ['compute', 'instances', 'delete']:
-    state['instances'] = [v for v in state.get('instances', []) if v['name'] != args[3]]
+    state['instances'] = [v for v in state.get('instances', []) if v['name'] != args[3]
+                          or v['zone'].rsplit('/', 1)[-1] != opt('--zone')]
     if not state.get('orphan_disk'): state['disks'] = []
     end({})
 if args[:3] == ['compute', 'disks', 'add-labels']:
@@ -1993,3 +1995,211 @@ def test_adopted_session_repeated_start_cannot_hide_earlier_runtime(cloud):
     assert saved["runtime_uncertain"]
     assert cloud.run("close", "run-a", ok=False).returncode == 2
     assert cloud.read()["sessions"][0]["settled_cost_usd"] is None
+
+
+@pytest.mark.parametrize("orphan_disk", [False, True])
+def test_close_inventory_evidence_excludes_account_and_guest_metadata(cloud, orphan_disk):
+    cloud.setup()
+    cloud.launch()
+    state = json.loads(cloud.state.read_text())
+    vm, disk = state["instances"][0], state["disks"][0]
+    private = {
+        "serviceAccounts": [{"email": "private-operator@example.test"}],
+        "metadata": {"items": [{"key": "startup-script", "value": "private-guest-script"}]},
+        "networkInterfaces": [{"networkIP": "private-network-address"}],
+        "user": "private-account-id",
+    }
+    vm.update(private)
+    disk.update(private, id="disk-id", status="READY")
+    cloud.change(instances=[vm], disks=[disk], orphan_disk=orphan_disk)
+    result = cloud.run("close", "run-a", ok=not orphan_disk)
+    assert result.returncode == (2 if orphan_disk else 0)
+    saved = cloud.read()["sessions"][0]
+    reads = saved["settlement_inventory"]
+    assert len(reads) == 2
+    assert reads[0]["instances"] == [
+        {
+            "name": "run-a",
+            "id": "1",
+            "zone": "europe-west4-a",
+            "status": "RUNNING",
+            "labels": vm["labels"],
+        }
+    ]
+    expected_disk = {
+        "name": disk["name"],
+        "id": "disk-id",
+        "zone": "europe-west4-a",
+        "status": "READY",
+        "labels": disk["labels"],
+    }
+    assert reads[0]["disks"] == [expected_disk]
+    assert reads[1]["instances"] == []
+    assert reads[1]["disks"] == ([expected_disk] if orphan_disk else [])
+    output = cloud.ledger.read_text() + result.stdout + cloud.run("report").stdout
+    assert "private-" not in output
+    assert saved["settled_cost_usd"] is None if orphan_disk else saved["status"] == "closed"
+
+
+def reserved_live_session(cloud, provisional=False):
+    cloud.setup()
+    cloud.launch()
+    ledger = cloud.read()
+    session = ledger["sessions"][0]
+    session["status"] = "reserved"
+    for key in ("instance_id", "last_start", "instance_created_at"):
+        session.pop(key, None)
+    cloud.ledger.write_text(json.dumps(ledger))
+    vm = json.loads(cloud.state.read_text())["instances"][0]
+    operation = insert_operation(
+        "DONE",
+        targetId=vm["id"],
+        insertTime=vm["creationTimestamp"],
+        startTime=vm["creationTimestamp"],
+        endTime=vm["lastStartTimestamp"],
+    )
+    if provisional:
+        vm.pop("lastStartTimestamp")
+        vm["status"] = "STAGING"
+        operation.pop("endTime")
+        operation["status"] = "RUNNING"
+    cloud.change(instances=[vm], operations=[operation])
+    return vm, operation
+
+
+@pytest.mark.parametrize("session_state", ["reserved", "adopted", "open"])
+@pytest.mark.parametrize("foreign", ["ledger", "session", "zone", "unlabeled"])
+def test_status_ignores_foreign_same_name_instances(cloud, session_state, foreign):
+    vm, _ = reserved_live_session(cloud)
+    if session_state != "reserved":
+        cloud.run("status", "run-a")
+    if session_state == "open":
+        ledger = cloud.read()
+        ledger["sessions"][0].pop("adoption")
+        cloud.ledger.write_text(json.dumps(ledger))
+    original = cloud.read()["sessions"][0]
+    if foreign == "ledger":
+        vm["labels"]["guard-ledger"] = "another-ledger"
+    elif foreign == "session":
+        vm["labels"]["guard-session"] = "another-session"
+    elif foreign == "zone":
+        vm["zone"] = "europe-west4-b"
+    else:
+        vm.pop("labels")
+    cloud.change(instances=[vm], operations=[])
+    result = cloud.run("status")
+    assert json.loads(result.stdout)[0]["instances"] == []
+    saved = cloud.read()["sessions"][0]
+    assert saved["settled_cost_usd"] is None
+    assert saved["reservation_usd"] == original["reservation_usd"]
+    assert saved["reserved_end"] == original["reserved_end"]
+    assert saved.get("instance_id") == original.get("instance_id")
+    assert not any(c[2] in {"stop", "delete"} for c in cloud.calls() if c[0] == "compute")
+
+
+@pytest.mark.parametrize("command", ["status", "close"])
+def test_adopted_session_ignores_same_name_instance_in_other_zone(cloud, command):
+    vm, _ = reserved_live_session(cloud)
+    cloud.run("status", "run-a")
+    foreign = dict(vm, id="foreign-vm", zone="europe-west4-b")
+    cloud.change(instances=[foreign, vm])
+    result = cloud.run(command, "run-a")
+    if command == "status":
+        assert json.loads(result.stdout)[0]["instances"] == [vm]
+    else:
+        assert cloud.read()["sessions"][0]["status"] == "closed"
+        assert json.loads(cloud.state.read_text())["instances"] == [foreign]
+
+
+@pytest.mark.parametrize("command", ["status", "wait", "close"])
+@pytest.mark.parametrize("history", ["expired", "partial", "unreadable"])
+def test_adopted_session_survives_unavailable_insert_history(cloud, command, history):
+    vm, _ = reserved_live_session(cloud)
+    cloud.run("status", "run-a")
+    original = cloud.read()["sessions"][0]
+    cloud.change(
+        operations=[],
+        operations_warning="partial list" if history == "partial" else "",
+        operations_error=history == "unreadable",
+    )
+    args = (
+        ("wait", "run-a", "--timeout", "0")
+        if command == "wait"
+        else ("close", "run-a", "--settled-usd", "0.25", "--evidence", "saved billing export")
+        if command == "close"
+        else ("status", "run-a")
+    )
+    cloud.run(*args)
+    saved = cloud.read()["sessions"][0]
+    assert saved["instance_id"] == vm["id"]
+    assert saved["last_start"] == original["last_start"]
+    assert saved["reserved_end"] == original["reserved_end"]
+    if command == "close":
+        assert saved["status"] == "closed" and saved["settled_cost_usd"] == "0.250000"
+        assert not json.loads(cloud.state.read_text())["instances"]
+    else:
+        assert saved["settled_cost_usd"] is None
+
+
+@pytest.mark.parametrize("command", ["status", "close"])
+def test_provisional_adoption_can_refresh_or_settle_after_insert_expires(cloud, command):
+    vm, _ = reserved_live_session(cloud, provisional=True)
+    cloud.run("status", "run-a")
+    original = cloud.read()["sessions"][0]
+    assert original["adoption"]["charge_from_insert_request"]
+    if command == "status":
+        vm.update(status="RUNNING", lastStartTimestamp=vm["creationTimestamp"])
+    cloud.change(instances=[vm], operations=[])
+    args = (
+        ("status", "run-a")
+        if command == "status"
+        else ("close", "run-a", "--settled-usd", "0.25", "--evidence", "saved billing export")
+    )
+    cloud.run(*args)
+    saved = cloud.read()["sessions"][0]
+    assert saved["reserved_end"] == original["reserved_end"]
+    if command == "status":
+        assert saved["last_start"] == vm["lastStartTimestamp"]
+        assert not saved["adoption"]["charge_from_insert_request"]
+    else:
+        assert saved["status"] == "closed" and saved["settled_cost_usd"] == "0.250000"
+
+
+@pytest.mark.parametrize(
+    "fault,manual",
+    [
+        ("ledger", False),
+        ("session", False),
+        ("zone", False),
+        ("id", False),
+        ("restart", False),
+        ("gone", False),
+        ("ledger", True),
+        ("session", True),
+        ("id", True),
+    ],
+)
+def test_adopted_session_with_expired_history_retains_safety_checks(cloud, fault, manual):
+    vm, _ = reserved_live_session(cloud)
+    cloud.run("status", "run-a")
+    original = cloud.read()["sessions"][0]
+    if fault in {"ledger", "session"}:
+        vm["labels"]["guard-" + fault] = "foreign"
+    elif fault == "zone":
+        vm["zone"] = "europe-west4-b"
+    elif fault == "id":
+        vm["id"] = "foreign"
+    elif fault == "restart":
+        vm["lastStartTimestamp"] = (
+            datetime.fromisoformat(vm["lastStartTimestamp"]) + timedelta(microseconds=1)
+        ).isoformat()
+    cloud.change(instances=[] if fault == "gone" else [vm], operations=[])
+    args = ("--settled-usd", "0.25", "--evidence", "saved billing export") if manual else ()
+    result = cloud.run("close", "run-a", *args, ok=False)
+    assert result.returncode == 2
+    saved = cloud.read()["sessions"][0]
+    assert saved["settled_cost_usd"] is None
+    assert saved["reservation_usd"] == original["reservation_usd"]
+    assert saved["last_start"] == original["last_start"]
+    if fault == "restart":
+        assert saved["runtime_uncertain"]

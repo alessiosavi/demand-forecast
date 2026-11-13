@@ -65,6 +65,14 @@ def stamp(value):
     return value.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
+def inventory_evidence(resources):
+    fields = ("name", "id", "zone", "region", "status", "labels")
+    return {
+        kind: [{key: item[key] for key in fields if key in item} for item in items]
+        for kind, items in resources.items()
+    }
+
+
 def instant(value):
     parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     if parsed.tzinfo is None:
@@ -431,13 +439,7 @@ class Guard:
                 time.sleep(3)
             observed = {"observed_at": stamp(now())}
             try:
-                fields = ("name", "id", "zone", "region", "status", "labels")
-                observed.update(
-                    {
-                        kind: [{key: item[key] for key in fields if key in item} for item in items]
-                        for kind, items in self.inventory(session).items()
-                    }
-                )
+                observed.update(inventory_evidence(self.inventory(session)))
             except (GuardError, ValueError, OSError, subprocess.SubprocessError) as exc:
                 observed["error"] = str(getattr(exc, "stderr", "") or exc)
             reads.append(observed)
@@ -723,6 +725,27 @@ class Guard:
             or (session.get("instance_id") and str(vm["id"]) != str(session["instance_id"]))
         ):
             raise GuardError("instance ownership mismatch; reservation retained")
+        if session.get("instance_id") and session.get("adoption"):
+            # Initial adoption already proved the insert identity. Its operation
+            # may expire long before the owned VM does; refresh from that VM
+            # without making inspection or manual settlement depend on retention.
+            if vm and vm.get("lastStartTimestamp"):
+                started = vm["lastStartTimestamp"]
+                try:
+                    if not instant(session["instance_created_at"]) <= instant(started) <= now():
+                        raise ValueError("invalid instance start")
+                except (KeyError, TypeError, ValueError, GuardError) as exc:
+                    raise GuardError(
+                        "instance timestamps unverified; reservation retained"
+                    ) from exc
+                previous_start = session.get("last_start")
+                if session["adoption"].get("charge_from_insert_request") or not previous_start:
+                    session["last_start"] = started
+                    session["adoption"]["charge_from_insert_request"] = False
+                elif instant(started) != instant(previous_start):
+                    session["runtime_uncertain"] = True
+                self.save()
+            return
         # Save the pre-existing evidence before the fresh query replaces anything.
         retained = session.get("create_failure_operations", {}).get("operations", [])
         if session.get("create_operation"):
@@ -861,14 +884,25 @@ class Guard:
 
     def status(self, args):
         sessions = [self.session(args.label)] if args.label else self.data["sessions"]
-        inventory = self.inventory(include_all=True)
+        inventory = self.inventory()
+        instances = {
+            session["label"]: [
+                vm
+                for vm in inventory["instances"]
+                if vm.get("name") == session["label"]
+                and vm.get("zone", "").rsplit("/", 1)[-1] == session["launch"]["zone"]
+                and vm.get("labels", {}).get("guard-ledger") == self.config["token"]
+                and vm.get("labels", {}).get("guard-session") == session["label"]
+            ]
+            for session in sessions
+        }
         for session in sessions:
             if (
                 session["launch"]["provisioning"] != "FLEX_START"
                 and session["status"] in OPEN
                 and (not session.get("instance_id") or session.get("adoption"))
             ):
-                matches = [v for v in inventory["instances"] if v.get("name") == session["label"]]
+                matches = instances[session["label"]]
                 if len(matches) > 1:
                     raise GuardError("ambiguous instance identity; reservation retained")
                 self.adopt(session, matches[0] if matches else None)
@@ -877,9 +911,7 @@ class Guard:
                 [
                     {
                         "session": session,
-                        "instances": [
-                            v for v in inventory["instances"] if v.get("name") == session["label"]
-                        ],
+                        "instances": instances[session["label"]],
                         "markers": self.markers(session),
                         "queue": self.queue(session)
                         if session["launch"]["provisioning"] == "FLEX_START"
@@ -896,8 +928,12 @@ class Guard:
             kind: [
                 item
                 for item in items
-                if item.get("labels", {}).get("guard-session") == session["label"]
-                or item.get("name") in {session["label"], session["boot_disk"]}
+                if (
+                    item.get("labels", {}).get("guard-session") == session["label"]
+                    or item.get("name") in {session["label"], session["boot_disk"]}
+                )
+                # Unknown zones still block settlement; another zone does not.
+                and item.get("zone", "").rsplit("/", 1)[-1] in {"", session["launch"]["zone"]}
             ]
             for kind, items in inventory.items()
         }
@@ -1123,7 +1159,9 @@ class Guard:
         if session["status"] in OPEN:
             session["status"] = "needs_settlement"
             self.save()
-        session["settlement_inventory"] = [{"observed_at": stamp(now()), **resources}]
+        session["settlement_inventory"] = [
+            {"observed_at": stamp(now()), **inventory_evidence(resources)}
+        ]
         had_resources = any(resources.values())
         if session["status"] == "cancelled":
             if not had_resources:
@@ -1218,7 +1256,9 @@ class Guard:
         if self.dry_run:
             return
         remaining = self.matches(self.inventory(session), session)
-        session["settlement_inventory"].append({"observed_at": stamp(now()), **remaining})
+        session["settlement_inventory"].append(
+            {"observed_at": stamp(now()), **inventory_evidence(remaining)}
+        )
         self.save()
         if any(remaining.values()):
             raise GuardError("instance or disk remains; reservation retained; use sweep")

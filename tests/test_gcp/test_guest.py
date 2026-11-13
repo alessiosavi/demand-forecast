@@ -467,6 +467,47 @@ def test_cancel_children_only_tolerates_permission_error_after_child_exit(
         control.ns["cancel_children"]()
 
 
+@pytest.mark.parametrize("signal_name", ["SIGTERM", "SIGINT"])
+def test_termination_during_popen_wait_does_not_deadlock(control, signal_name):
+    # Interrupt waitpid while the real Popen._waitpid_lock is held. Isolate the
+    # monitor so a regression fails on the timeout rather than hanging pytest.
+    source = control.source.split("\nmode = sys.argv[1]", 1)[0]
+    probe = (
+        source
+        + "\n"
+        + f"""
+real_waitpid = os.waitpid
+interrupted = False
+def interrupt_waitpid(pid, flags):
+    global interrupted
+    if flags == os.WNOHANG and not interrupted:
+        interrupted = True
+        assert next(iter(children))._waitpid_lock.locked()
+        os.kill(os.getpid(), signal.{signal_name})
+    return real_waitpid(pid, flags)
+os.waitpid = interrupt_waitpid
+try:
+    command([sys.executable, "-c", "import time; time.sleep(120)"], 60)
+except SystemExit as exc:
+    assert interrupted and exc.code == 0
+    print("monitor terminated")
+else:
+    raise AssertionError("termination did not stop the monitor")
+"""
+    )
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail("termination deadlocked while Popen held its waitpid lock")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "monitor terminated"
+
+
 def test_job_restarts_from_restored_state(guest):
     (guest.store / "checkpoint-resume").write_text("saved")
     guest.job.write_text(
