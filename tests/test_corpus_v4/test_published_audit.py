@@ -10,6 +10,8 @@ from scripts.corpus_v4.fetch_native import fetch
 from scripts.corpus_v4.make_corpus_job import render
 from tests.test_corpus_v4.test_manifest_fetch import FakeHub, manifest, native
 
+pytestmark = pytest.mark.slow_audit
+
 
 def published(tmp_path):
     hub = FakeHub(native(tmp_path / "remote.parquet"))

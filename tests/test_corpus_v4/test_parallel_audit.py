@@ -17,6 +17,8 @@ from tests.test_corpus_v4 import baseline_audit_32511ee as baseline
 from tests.test_corpus_v4 import test_audit as fixtures
 from tests.test_corpus_v4.test_manifest_fetch import manifest, native
 
+pytestmark = pytest.mark.slow_audit
+
 
 def oracle(*args, **kwargs):
     # Run the original scanner directly: its CLI worker name belongs to the new code.

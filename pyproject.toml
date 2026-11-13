@@ -85,4 +85,7 @@ ignore = ["E501"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-v --cov=demand_forecast --cov-report=term-missing"
-markers = ["bench: needs the bench extra"]
+markers = [
+    "bench: needs the bench extra",
+    "slow_audit: long corpus content audits run separately in CI",
+]
