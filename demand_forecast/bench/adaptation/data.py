@@ -1,4 +1,4 @@
-"""Export only permitted task-local histories; schema version 1 is in docs/adaptation.md.
+"""Export only permitted task-local histories; schema version 2 is in docs/adaptation.md.
 
 No dataset fingerprint is used: fev's full-data hash includes outer labels.
 The public task loader and the scoring adapter are read, never modified.
@@ -20,7 +20,7 @@ import pandas as pd
 
 from demand_forecast.bench.yardsticks.runner import FEV_SOURCE, SIMONS_SOURCE, load_tasks
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 MAX_VARIATES = 32
 PHASES = ("development", "confirmation", "official")
 
@@ -82,7 +82,11 @@ class _Item:
 def _resolve_items(task, dataset, targets, known) -> list[_Item]:
     # Project away dropped columns before materializing rows. Their values and
     # vocabulary must never influence adaptation, including its identity.
-    dataset = dataset.select_columns([task.id_column, task.timestamp_column, *targets, *known])
+    # Raw cells preserve timestamp zones, scoring precision and source hashes.
+    # Model/training slices separately apply the unchanged scorer's formatter.
+    dataset = dataset.select_columns(
+        [task.id_column, task.timestamp_column, *targets, *known]
+    ).with_format(None)
     items = []
     cutoff = task.cutoffs[0]
     for row in dataset:
@@ -127,13 +131,32 @@ def _numeric(values, *, dtype=np.float64):
     return result
 
 
+def _scorer_slice(dataset, row, columns, start, end):
+    """Format only permitted cells, as fev does after slicing each window.
+
+    Formatting the full series first could let forbidden cells affect dtype
+    inference. fev retains the format type, but resets its keyword arguments.
+    """
+    values = {c: row[c][start:end] for c in columns}
+    formatter = getattr(dataset, "format", {}).get("type")
+    if formatter is None or not values:
+        return values
+    import datasets
+
+    bounded = datasets.Dataset.from_dict(
+        {c: [v] for c, v in values.items()},
+        features=datasets.Features({c: dataset.features[c] for c in columns}),
+    ).with_format(formatter)
+    return next(iter(bounded))
+
+
 def _encode_training(values):
     """Native covariate rows are numeric; categorical vocabulary is history-only."""
     values = list(values)
     observed = [v for v in values if v is not None and not pd.isna(v)]
-    if all(isinstance(v, (int, float, bool, np.number)) for v in observed):
+    if all(isinstance(v, (int, float, bool, np.number, np.bool_)) for v in observed):
         return _numeric(
-            [np.nan if v is None or pd.isna(v) else v for v in values], dtype=np.float32
+            _numeric([np.nan if v is None or pd.isna(v) else v for v in values]), dtype=np.float32
         ), {"kind": "numeric"}
     if not all(isinstance(v, str) for v in observed):
         raise ValueError("known covariates must contain numeric, boolean or string scalars")
@@ -223,11 +246,13 @@ def build_manifest(
                 {"target": raw_train, "known_covariates": {c: item.row[c][:end] for c in known}}
             )
         )
-        train = _numeric(raw_train, dtype=np.float32)
+        training = _scorer_slice(dataset, item.row, [*targets, *known], 0, end)
+        # The runner casts targets to float64 before Simons casts to float32.
+        train = _numeric(_numeric([training[c] for c in targets]), dtype=np.float32)
         observed_targets += int(np.isfinite(train).sum())
         covariates, encoding = [], {}
         for column in known:
-            array, spec = _encode_training(item.row[column][:end])
+            array, spec = _encode_training(training[column])
             covariates.append(array.tolist())
             encoding[column] = spec
         encodings.append({"item_id": item.item_id, "columns": encoding})
@@ -270,11 +295,22 @@ def build_manifest(
             # dtype/category inference or finite-value validation.
             score_past = _numeric([item.row[c][score_start:origin] for c in targets])
             score_target = _numeric([item.row[c][origin : origin + task.horizon] for c in targets])
-            model_target = _numeric(
-                [item.row[c][model_start:origin] for c in targets], dtype=np.float32
-            )
+            # fev formats capped history and future separately; the runner's
+            # optional cap comes afterwards. Mirror that order before joining.
+            past = _scorer_slice(dataset, item.row, [*targets, *known], score_start, origin)
+            future = _scorer_slice(dataset, item.row, known, origin, origin + task.horizon)
+            offset = model_start - score_start
+            model_target = _numeric(_numeric([past[c][offset:] for c in targets]), dtype=np.float32)
             model_known = {
-                c: _jsonable(item.row[c][model_start : origin + task.horizon]) for c in known
+                c: _jsonable(
+                    np.concatenate(
+                        [
+                            np.asarray(np.asarray(past[c])[offset:], dtype=object),
+                            np.asarray(np.asarray(future[c]), dtype=object),
+                        ]
+                    )
+                )
+                for c in known
             }
             data["items"].append(
                 {

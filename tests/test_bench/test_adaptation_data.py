@@ -115,7 +115,7 @@ def inner(root, i):
 def test_adaptation_native_layout_roles_and_ragged_cutoffs(tmp_path):
     manifest, root = build(tmp_path)
     assert manifest == json.loads((root / "manifest.json").read_text())
-    assert manifest["schema_version"] == 1
+    assert manifest["schema_version"] == 2
     assert manifest["phase"] == "development"
     assert manifest["task"]["name"] == "family/task"
     assert len(manifest["fingerprint"]) == 64
@@ -294,6 +294,11 @@ def test_adaptation_adapter_and_fev_metric_parity(tmp_path):
         adapter.forecast_series = record
         adapter.predict(prepare_windows(shifted, options), 2, shifted.quantile_levels)
         data = inner(tmp_path / "out", i)
+        for record in data["items"]:
+            origin = record["origin"]["index"]
+            assert all(len(channel) == 9 for channel in record["score_past"])
+            assert record["score_history_start_index"] == origin - 9
+            assert record["history_start_index"] == origin - 5
         groups = [g for it in data["items"] for g in it["model_input"]]
         for group, recorded, cov in zip(
             groups, calls[0][0], calls[0][1]["future_covariates"], strict=True
@@ -329,6 +334,184 @@ def test_adaptation_adapter_and_fev_metric_parity(tmp_path):
             quantile_levels=data["scoring"]["quantile_levels"],
         )
         assert float(np.mean(score["SQL"])) == pytest.approx(expected)
+
+
+def test_adaptation_public_seam_accepts_numpy_boolean_covariates(tmp_path):
+    class ScalarRows(list):
+        """Dataset seam retaining NumPy scalars even with Python formatting."""
+
+        def select_columns(self, columns):
+            return ScalarRows({c: row[c] for c in columns} for row in self)
+
+        def with_format(self, formatter):
+            assert formatter is None
+            return self
+
+    rows, targets = task_rows(lengths=(24,), starts=(0,))
+    rows[0]["promo"] = [np.bool_(i % 2) for i in range(24)]
+    integer = 2**53 + 2**29 + 1
+    rows[0]["integer"] = [np.int64(integer)] * 24
+    task = SyntheticTask(rows, targets)
+    task.known_dynamic_columns.append("integer")
+    task.load_full_dataset = lambda: ScalarRows(rows)
+    yaml = tmp_path / "tasks.yaml"
+    yaml.write_text("tasks: []\n")
+    manifest = build_manifest(task, task_yaml=yaml, output=tmp_path / "out")
+    assert manifest["covariates"]["training_encodings"][0]["columns"]["promo"] == {
+        "kind": "numeric"
+    }
+    cov = pq.read_table(tmp_path / "out/covariates/train-00000.parquet").to_pylist()
+    assert cov[0]["covariates"][0] == [float(i % 2) for i in range(16)]
+    assert cov[0]["covariates"][2] == [float(np.float32(np.float64(integer)))] * 16
+
+
+@pytest.mark.parametrize("formatter", ["numpy", None])
+@pytest.mark.parametrize("target_dtype", ["float64", "int64"])
+def test_adaptation_real_fev_matches_scorer_nulls_booleans_and_precision(
+    tmp_path, formatter, target_dtype
+):
+    rows, targets = task_rows(lengths=(40,), starts=(0,))
+    row = rows[0]
+    row["promo"] = (np.arange(40) % 2).astype(bool)
+    # Establish the unchanged scorer's treatment of actual/literal nulls.
+    row["event"] = ["a", None, "None", "nan", "b"] * 8
+    row["nullable"] = [1.0000000001] * 40
+    row["y0"] = [1.0000000001 + i for i in range(40)]
+    if target_dtype == "int64":
+        # Direct int64->float32 differs from the scorer's float64 intermediate.
+        row["y0"] = [2**53 + 2**29 + 1 + i for i in range(40)]
+    for index in (0, 28, 32, 34):
+        row["nullable"][index] = None
+        if target_dtype == "float64":
+            row["y0"][index] = None
+    row["static"] = None
+    parquet = tmp_path / "source.parquet"
+    datasets.Dataset.from_list(rows).to_parquet(parquet)
+    task = fev.Task(
+        dataset_path=str(parquet),
+        target=targets,
+        horizon=2,
+        initial_cutoff=-4,
+        known_dynamic_columns=["promo", "event", "nullable"],
+        past_dynamic_columns=["past"],
+        static_columns=["static"],
+        max_context_length=9,
+        eval_metric="SQL",
+        quantile_levels=[0.1, 0.5, 0.9],
+    )
+    full = task.load_full_dataset()
+    assert full.format["type"] == "numpy"
+    assert full.features["y0"].feature.dtype == target_dtype
+    task._full_dataset = full.with_format(formatter)
+    yaml = tmp_path / "tasks.yaml"
+    yaml.write_text("tasks: []\n")
+    manifest = build_manifest(task, task_yaml=yaml, output=tmp_path / "numpy", max_context=5)
+    encodings = manifest["covariates"]["training_encodings"][0]["columns"]
+    assert encodings["event"]["categories"] == ["None", "a", "b", "nan"]
+    assert encodings["promo"] == encodings["nullable"] == {"kind": "numeric"}
+    train = pq.read_table(tmp_path / "numpy/univariate/train-00000.parquet").to_pylist()
+    cov = pq.read_table(tmp_path / "numpy/covariates/train-00000.parquet").to_pylist()
+    native_covariates = dict(zip(task.known_dynamic_columns, cov[0]["covariates"], strict=True))
+    if target_dtype == "float64":
+        assert np.isnan(train[0]["target"][0][0])
+    assert np.isnan(native_covariates["event"][1])
+    assert native_covariates["event"][2] == encodings["event"]["categories"].index("None")
+    assert np.isnan(native_covariates["nullable"][0])
+    assert native_covariates["nullable"][1] == float(np.float32(np.float64(row["nullable"][1])))
+    assert native_covariates["promo"] == [float(v) for v in row["promo"][:32]]
+    np.testing.assert_equal(
+        train[0]["target"][0], np.asarray(row["y0"][:32], dtype=np.float64).astype(np.float32)
+    )
+    assert manifest["counts"]["training_observed_target_values"] == (
+        30 if target_dtype == "float64" else 32
+    )
+    options = Options("simons", "unused", "recording", processing="raw", max_context=5).resolved()
+    for i, cutoff in enumerate((-8, -6)):
+        record = inner(tmp_path / "numpy", i)["items"][0]
+        start, origin = record["history_start_index"], record["origin"]["index"]
+        assert record["score_past"][0] == [
+            None if v is None else float(v) for v in row["y0"][origin - 9 : origin]
+        ]
+        assert record["score_target"][0] == [
+            None if v is None else float(v) for v in row["y0"][origin : origin + 2]
+        ]
+        known = record["model_input"][0]["known_covariates"]
+        assert known["event"] == row["event"][start : origin + 2]
+        assert known["promo"] == list(row["promo"][start : origin + 2])
+        expected_numeric = np.asarray(
+            row["nullable"][start : origin + 2],
+            dtype=np.float32 if formatter == "numpy" else np.float64,
+        )
+        np.testing.assert_equal(np.asarray(known["nullable"], dtype=np.float64), expected_numeric)
+        calls = []
+        adapter = SimonsAdapter.__new__(SimonsAdapter)
+        adapter.options, adapter.model = options, None
+
+        def record_call(model, series, horizon, **kwargs):
+            calls.append((series, kwargs))
+            return [np.zeros((len(a), horizon, 9)) for a in series]
+
+        adapter.forecast_series = record_call
+        shifted = replace(task, initial_cutoff=cutoff)
+        shifted._full_dataset = task._full_dataset
+        adapter.predict(prepare_windows(shifted, options), 2, shifted.quantile_levels)
+        np.testing.assert_equal(
+            np.asarray(record["model_input"][0]["target"], dtype=np.float32), calls[0][0][0]
+        )
+        for column, values in calls[0][1]["future_covariates"][0].items():
+            if column == "nullable":
+                np.testing.assert_equal(
+                    np.asarray(values, dtype=np.float64),
+                    np.asarray(known[column], dtype=np.float64),
+                )
+                if formatter == "numpy":
+                    assert all(v is not None for v in values)
+            else:
+                assert values.tolist() == known[column]
+                if column == "promo":
+                    assert all(isinstance(v, bool) for v in values)
+                else:
+                    assert None in values  # Text null remains missing, not a "None" category.
+    # Dropped nullable/static cells cannot affect the permitted representations.
+    rows[0]["static"] = "OTHER SECRET"
+    rows[0]["past"] = [None] * 40
+    task._full_dataset = datasets.Dataset.from_list(rows).with_format(formatter)
+    build_manifest(task, task_yaml=yaml, output=tmp_path / "dropped", max_context=5)
+    assert files(tmp_path / "numpy") == files(tmp_path / "dropped")
+    assert task._full_dataset.format["type"] == formatter
+    assert full.format["type"] == "numpy"  # Builder and runner must not mutate shared data.
+
+
+@pytest.mark.parametrize("invalid_timestamp", [False, True])
+def test_adaptation_formatter_preserves_timestamp_zones_and_rejects_nulls(
+    tmp_path, invalid_timestamp
+):
+    rows, targets = task_rows(lengths=(24,), starts=(0,), known=False)
+    times = list(pd.date_range("2020-01-01", periods=24, freq="D", tz="Europe/Rome"))
+    if invalid_timestamp:
+        times[2] = None
+    rows[0]["timestamp"] = times
+    task = SyntheticTask(rows, targets, cutoff="2020-01-18T00:00:00+01:00", known=False)
+    yaml = tmp_path / "tasks.yaml"
+    yaml.write_text("tasks: []\n")
+    for formatter, name in ((None, "python"), ("numpy", "numpy")):
+        task.load_full_dataset = lambda formatter=formatter: datasets.Dataset.from_list(
+            rows
+        ).with_format(formatter)
+        if invalid_timestamp:
+            with pytest.raises(
+                ValueError, match="timestamps must be strictly monotonic and non-null"
+            ):
+                build_manifest(task, task_yaml=yaml, output=tmp_path / name)
+            assert not (tmp_path / name).exists()
+        else:
+            manifest = build_manifest(task, task_yaml=yaml, output=tmp_path / name)
+            assert manifest["items"][0]["outer_origin"] == {
+                "index": 18,
+                "timestamp": "2020-01-19T00:00:00+01:00",
+            }
+    if not invalid_timestamp:
+        assert files(tmp_path / "numpy") == files(tmp_path / "python")
 
 
 def test_adaptation_yaml_selection_and_cli(tmp_path):
@@ -465,3 +648,20 @@ def test_adaptation_fingerprint_identifies_precise_training_input_before_float32
         b / "univariate/train-00000.parquet"
     ).read_bytes()
     assert first["fingerprint"] != second["fingerprint"]
+
+
+@pytest.mark.parametrize("column", ["y0", "promo"])
+def test_adaptation_numpy_formatter_preserves_precise_training_fingerprint(tmp_path, column):
+    rows, targets = task_rows(lengths=(24,), starts=(0,))
+    rows[0][column] = [1.0000000001] * 24
+    task = SyntheticTask(rows, targets, max_context=4)
+    task.load_full_dataset = lambda: datasets.Dataset.from_list(rows).with_format("numpy")
+    yaml = tmp_path / "tasks.yaml"
+    yaml.write_text("tasks: []\n")
+    first = build_manifest(task, task_yaml=yaml, output=tmp_path / "first")
+    rows[0][column][0] += 1e-10  # Raw input changes; float32 payloads stay identical.
+    second = build_manifest(task, task_yaml=yaml, output=tmp_path / "second")
+    assert first["items"][0]["training_input_sha256"] != second["items"][0]["training_input_sha256"]
+    assert first["fingerprint"] != second["fingerprint"]
+    for name in first["files"]:
+        assert (tmp_path / "first" / name).read_bytes() == (tmp_path / "second" / name).read_bytes()
