@@ -1,0 +1,207 @@
+#!/usr/bin/env python3
+"""Generate a self-contained Simons job for the RUN_DIR / STATE_URI guest contract."""
+
+import argparse
+import base64
+import gzip
+import hashlib
+import json
+import math
+import re
+import shlex
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[3]
+BUNDLE = ROOT / "third_party/simons"
+LEGS = ("stage1", "stage2", "stage3", "stage4", "stage4-long", "qualify", "export")
+
+
+def generate(
+    *,
+    size,
+    leg,
+    seed,
+    micro_batches,
+    checkpoint_minutes,
+    repo_sha,
+    upstream_pin,
+    corpus_uri=None,
+    qualify_leg="stage1",
+    name=None,
+    warmup=20,
+    max_micro_batches=128,
+    qualify_step=None,
+):
+    """Return executable shell text embedding the complete pinned source patch bundle."""
+    pin = (BUNDLE / "PINNED").read_text().strip()
+    if upstream_pin != pin:
+        raise ValueError(f"upstream pin must equal {pin}")
+    if not re.fullmatch(r"[0-9a-f]{40}", repo_sha):
+        raise ValueError("repo SHA must be the full 40-character revision")
+    if size not in ("25m", "12m") or leg not in LEGS or qualify_leg not in LEGS[:5]:
+        raise ValueError("invalid size or leg")
+    if (
+        seed < 0
+        or micro_batches < 1
+        or max_micro_batches < micro_batches
+        or warmup < 0
+        or not math.isfinite(checkpoint_minutes)
+        or checkpoint_minutes <= 0
+    ):
+        raise ValueError("invalid seed, micro-batches, warm-up or checkpoint minutes")
+    needs_corpus = (qualify_leg if leg == "qualify" else leg) in LEGS[2:5]
+    if needs_corpus and not corpus_uri:
+        raise ValueError("a corpus URI is required for legs 3 to 5")
+    if corpus_uri and not re.fullmatch(r"gs://[A-Za-z0-9._-]+(?:/[^\r\n]*)?", corpus_uri):
+        raise ValueError("corpus URI must be a Cloud Storage prefix")
+    name = name or f"{size}-{qualify_leg}"
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
+        raise ValueError("qualification name may contain letters, digits, underscore or hyphen")
+    paths = [BUNDLE / p for p in ("PINNED", "NOTICE", "prepare.py")]
+    patches = sorted((BUNDLE / "patches").glob("*.patch"))
+    if not patches:
+        raise ValueError("missing upstream patch set")
+    files = {str(p.relative_to(BUNDLE)): p.read_text() for p in [*paths, *patches]}
+    packed = gzip.compress(json.dumps(files, sort_keys=True).encode(), mtime=0)
+    digest = hashlib.sha256(packed).hexdigest()
+    payload = base64.b64encode(packed).decode()
+    arguments = [
+        "--leg",
+        leg,
+        "--size",
+        size,
+        "--seed",
+        str(seed),
+        "--micro-batches",
+        str(micro_batches),
+        "--checkpoint-minutes",
+        str(checkpoint_minutes),
+        "--repo-sha",
+        repo_sha,
+        "--upstream-pin",
+        pin,
+        "--bundle-sha256",
+        digest,
+        "--qualify-leg",
+        qualify_leg,
+        "--name",
+        name,
+        "--warmup",
+        str(warmup),
+        "--max-micro-batches",
+        str(max_micro_batches),
+    ]
+    if qualify_step is not None:
+        arguments += ["--qualify-step", str(qualify_step)]
+    if corpus_uri:
+        arguments += ["--corpus-uri", corpus_uri]
+    # A marker can upload before its artifact. Check sizes and checkpoint hashes
+    # before taking the dependency-free fast path; otherwise recover normally.
+    early_exit = ""
+    if leg != "qualify":
+        early_exit = rf"""if python3 - "$RUN_DIR/state/{leg}" {leg} <<'SIMONS_COMPLETED'
+import hashlib, json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+try:
+    marker = json.loads((root / "completed.json").read_text())
+    if sys.argv[2] == "export":
+        names = ["config.json", "model.safetensors"]
+        valid = all((root / n).stat().st_size == marker["artifacts"][n] > 0 for n in names)
+    else:
+        name = marker["checkpoint"]
+        valid = name == "checkpoint-final.pt"
+        valid = valid and (root / name).stat().st_size == marker["bytes"] > 0
+        if valid:
+            footer = b"\nSIMONS-SHA256:"
+            size = len(footer) + 64
+            with (root / name).open("rb") as handle:
+                handle.seek(-size, 2)
+                trailer = handle.read()
+                remaining = handle.seek(0, 2) - size
+                handle.seek(0)
+                digest = hashlib.sha256()
+                while remaining:
+                    block = handle.read(min(1 << 20, remaining))
+                    if not block:
+                        raise ValueError("truncated checkpoint")
+                    digest.update(block)
+                    remaining -= len(block)
+            valid = trailer == footer + digest.hexdigest().encode()
+            valid = valid and marker["sha256"] == digest.hexdigest()
+except (OSError, ValueError, KeyError, TypeError):
+    valid = False
+sys.exit(0 if valid else 1)
+SIMONS_COMPLETED
+then
+    exit 0
+fi
+"""
+    fetch = ""
+    if needs_corpus:
+        fetch = f"""mkdir -p "$RUN_DIR/corpus"
+gcloud storage rsync --recursive {shlex.quote(corpus_uri)} "$RUN_DIR/corpus"
+"""
+    return f'''#!/usr/bin/env bash
+# Simons {size} {leg}; repository {repo_sha}; upstream {pin}
+set -euo pipefail
+: "${{RUN_DIR:?guest must export RUN_DIR}}"
+: "${{STATE_URI:?guest must export STATE_URI}}"
+export RUN_DIR
+export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1
+case "$RUN_DIR" in /*) ;; *) echo "RUN_DIR must be absolute" >&2; exit 2 ;; esac
+mkdir -p "$RUN_DIR/state"
+{early_exit}scratch=$(mktemp -d "$RUN_DIR/simons-install-XXXXXX")
+python3 - "$scratch/bundle" <<'SIMONS_BUNDLE'
+import base64, gzip, hashlib, json, pathlib, sys
+packed = base64.b64decode("{payload}")
+assert hashlib.sha256(packed).hexdigest() == "{digest}"
+root = pathlib.Path(sys.argv[1])
+for name, content in json.loads(gzip.decompress(packed)).items():
+    path = root / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content)
+SIMONS_BUNDLE
+upstream="$scratch/Simons"
+git clone --filter=blob:none --no-checkout https://github.com/Abel-ai-lab/Simons.git "$upstream"
+git -C "$upstream" sparse-checkout set --no-cone /src/ /configs/ /pyproject.toml /README.md /LICENSE /NOTICE
+git -C "$upstream" checkout --detach {shlex.quote(pin)}
+python3 "$scratch/bundle/prepare.py" "$upstream" "$scratch/bundle"
+python3 -m venv "$scratch/venv"
+"$scratch/venv/bin/python" -m pip install "$upstream"
+"$scratch/venv/bin/python" -m pip freeze > "$scratch/environment.txt"
+{fetch}exec "$scratch/venv/bin/python" -m simons.training.spot_job \\
+    --root "$upstream" --run-dir "$RUN_DIR" --corpus "$RUN_DIR/corpus" --environment-file "$scratch/environment.txt" \\
+    {shlex.join(arguments)}
+'''
+
+
+def main():
+    """Write one executable job without contacting any cloud service."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--size", required=True, choices=["25m", "12m"])
+    parser.add_argument("--leg", required=True, choices=LEGS)
+    parser.add_argument("--seed", required=True, type=int)
+    parser.add_argument("--micro-batches", type=int, default=1)
+    parser.add_argument("--checkpoint-minutes", type=float, default=10)
+    parser.add_argument("--corpus-uri")
+    parser.add_argument("--repo-sha", required=True)
+    parser.add_argument("--upstream-pin", required=True)
+    parser.add_argument("--qualify-leg", choices=LEGS[:5], default="stage1")
+    parser.add_argument("--name")
+    parser.add_argument("--warmup", type=int, default=20)
+    parser.add_argument("--qualify-step", type=int)
+    parser.add_argument("--max-micro-batches", type=int, default=128)
+    parser.add_argument("--output", required=True, type=Path)
+    args = vars(parser.parse_args())
+    output = args.pop("output")
+    try:
+        script = generate(**args)
+    except ValueError as error:
+        parser.error(str(error))
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(script)
+    output.chmod(0o755)
+
+
+if __name__ == "__main__":
+    main()
