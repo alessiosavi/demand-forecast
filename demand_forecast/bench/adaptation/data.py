@@ -102,15 +102,23 @@ def _resolve_items(task, dataset, targets, known) -> list[_Item]:
         if any(len(row[c]) != n for c in [*targets, *known]):
             raise ValueError(f"{key}: target/covariate lengths must match timestamps")
         if isinstance(cutoff, (int, np.integer)) and not isinstance(cutoff, bool):
-            outer = int(cutoff if cutoff >= 0 else n + cutoff)
+            outer = max(0, min(n, int(cutoff if cutoff >= 0 else n + cutoff)))
         else:
+            import pyarrow as pa
+            from fev.utils import _compute_cutoff_indices
+
             try:
-                date = pd.Timestamp(cutoff)
-                if pd.isna(date) or date not in times:
-                    raise ValueError("date is not an observed timestamp")
-                # fev dates include the cutoff in history, unlike integer cuts.
-                outer = int(times.get_loc(date)) + 1
-            except (ValueError, TypeError, KeyError) as exc:
+                # Use the pinned splitter's inclusive count and Arrow cast,
+                # including source timestamp units/zones. No grid snapping or
+                # step offset: task.cutoffs[0] is fev's first window unchanged.
+                timestamps = pa.array(
+                    [row[task.timestamp_column]],
+                    type=dataset.features[task.timestamp_column].pa_type,
+                )
+                outer = int(
+                    _compute_cutoff_indices(timestamps, cutoff, np.array([n]), np.array([0, n]))[0]
+                )
+            except (ValueError, TypeError) as exc:
                 raise ValueError(f"{key}: unresolvable date cut-off {cutoff!r}") from exc
         item = _Item(key, row, times, outer, outer - 2 * task.horizon)
         if outer < task.min_context_length or n - outer < task.horizon or outer > n:
