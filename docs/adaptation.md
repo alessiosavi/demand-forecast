@@ -358,3 +358,116 @@ checkpointed before export publication, so an interrupted publication is
 repairable by rerunning the same command. Corrupt input hashes and identity
 mismatches fail closed; they are configuration/integrity errors, not coverage
 fallbacks.
+
+## Adaptation pilot guest job (AD5)
+
+Generate the job locally; generation reads the patch bundle and makes no cloud
+calls. Supply an immutable repository revision containing the bundle builder and
+yardstick runner, the pin in `third_party/simons/PINNED`, and the SHA-256 of the
+operator's **shifted development task YAML**. There is no default task file or
+implicit cohort. The job passes exactly one requested name to each bundle and
+scoring command, including names such as `fred_md_2025/macro`.
+
+```bash
+python scripts/gcp/jobs/make_adapt_job.py \
+  --name adapt-pilot-01 --repo-sha "$REPO_SHA" --upstream-pin "$SIMONS_PIN" \
+  --tasks-uri gs://BUCKET/pilot/shifted.yaml --tasks-sha256 "$TASKS_SHA256" \
+  --names epf_de ercot_1H fred_md_2025/macro rohlik_sales_1W hospital_admissions_1D \
+  --hub-weights abel-lab/Simons-25M --hub-revision "$HUB_REVISION_40_HEX" \
+  --params head all --lr-multipliers 0.02 0.10 --seeds 11 29 \
+  --max-updates 500 --processing both --output /tmp/adapt-pilot-01.sh
+```
+
+Alternatively use `--checkpoint-uri gs://BUCKET/export-prefix`, containing
+`config.json` and `model.safetensors`; it is mutually exclusive with the Hub
+source. Hub revisions must be full 40-character lowercase commit IDs. Defaults
+are the two parameter arms, rates 0.02/0.10, seeds 11/29, 500 updates and both
+outer processing modes. `--processing raw` or `published` runs only that mode.
+The registered inner selection and evaluation schedule remain trainer defaults;
+seeds are reported individually and are never selected by outer performance.
+
+The generated Bash job implements the `RUN_DIR` / `STATE_URI` guest contract in
+`docs/gcp.md`. One Python 3.12 environment, provisioned through uv when needed,
+uses stage-1 torch 2.8.0+cu128, CUDA 12.8 and `requirements-yardsticks.txt`. The
+guest verifies the repository revision, clones Simons at its upstream pin, checks
+and applies every embedded patch through `prepare.py`, and installs that tree
+editable alongside this repository. It verifies the dependency pins, CUDA, and
+both the imported Simons and trainer paths, then records pip freeze and runtime
+facts before downloading inputs or loading datasets.
+
+Each task builds one bundle, scores the frozen base once per requested mode,
+then runs the Cartesian product of arms, multipliers and seeds from that base.
+The trainer automatically resumes its own checkpoint slots. Only a selected
+adapted export is scored; a frozen decision writes a reuse receipt pointing to
+the already measured frozen score. Failures are recorded per fit/mode, remaining
+fits and tasks are attempted, and any failed bundle, fit or score makes the final
+exit nonzero. Failed or incomplete work is retried by rerunning the same job.
+
+Small evidence lives under `$RUN_DIR/state/adapt/<name>/`:
+
+```text
+inputs.json, tasks.yaml, checkpoint-sha256.json, environment.txt
+results.csv, completed.json
+tasks/<UTF-8-task-name-as-hex>/
+  bundle-manifest.json, bundle.log
+  frozen/<mode>/{status.json,run.json,summaries.csv,score.log}
+  fits/<params>-lr<multiplier>-seed<seed>/
+    fit.json, adaptation.json, train.log, checkpoints.json
+    <mode>/{status.json,run.json,summaries.csv,score.log}  # adapted selection
+    <mode>-reuse.json                                # frozen selection
+```
+
+`results.csv` has one row per task/arm/seed, including failed fits, with columns:
+`task`, `params`, `lr_multiplier`, `seed`, `status`, `selected`, `selected_update`,
+`decision_reason`, `inner_0_window_0`, `inner_0_window_1`,
+`inner_selected_window_0`, `inner_selected_window_1`, `outer_sql_raw`,
+`outer_sql_published`, `frozen_sql_raw`, `frozen_sql_published`,
+`trainable_parameters`, `training_seconds`, `inner_evaluation_seconds`,
+`outer_evaluation_seconds`, `peak_gpu_memory_bytes`, `error`.
+The outer columns describe the selected model, so frozen decisions equal the
+frozen control. Missing/failed/unrequested scores are empty. Training and inner
+evaluation seconds come from the trainer receipt; outer seconds sum the adapted
+scorer subprocess durations. Frozen reuse adds zero outer seconds. Each frozen
+scorer's duration is retained separately in its status receipt. Peak GPU memory
+is the trainer's peak allocated CUDA bytes, with the same limitations described
+above; it does not include the separate outer scorer process.
+
+Bundles, exports, trainer checkpoints, prediction arrays and dataset caches stay
+outside `state/`. Disposable work uses a fixed `/tmp/demand-forecast-adapt-<hash>`
+path determined by inputs and the artifact URI, preserving scorer checkpoint
+identities across replacement guest labels. Durable checkpoint generations and
+selected exports are uploaded as immutable hash-addressed objects under
+`${STATE_URI%/}-adapt-artifacts/<name>/blobs/<sha256>`, a sibling prefix in the
+same bucket, excluded from the runner's state restore. `checkpoints.json` and
+`fit.json` publish references only after uploads succeed. Restore downloads and
+verifies those referenced objects; lost bundles are rebuilt and their complete
+manifest hashes must match. Object lifecycle cleanup is an operator task.
+
+The supervisor forwards guest checkpoint-request nonces to the active trainer's
+private control directory. It acknowledges a matching nonce only after checkpoint
+uploads and atomic reference publication; normal trainer checkpoints are uploaded
+while training continues. This provides the last successfully uploaded generation
+on preemption, without assuming a final shutdown upload will finish.
+`completed.json` records the full inputs, payload hashes, base hashes, bundle
+versions/fingerprints, per-fit and per-score status, and hashes of the small state
+artifacts. A successful, fully verified completion exits before environment
+installation or downloads. A changed input identity or changed base/bundle content
+under the same name is refused. A damaged completion is rebuilt from independently
+verified evidence; finished fits and scores are reused.
+If both base identity records are absent while task evidence survives, the job
+refuses reuse. A missing bundle manifest is recoverable only when a surviving
+completion hash or verified trainer receipt establishes its original exact hash;
+frozen scores alone cannot establish that bundle identity. Restore the original
+identity evidence or use a new name instead of rebinding surviving results.
+
+The job reads `schema_version` from each bundle manifest and preserves the exact
+manifest bytes. It requires the manifest's task/phase, fingerprint and file-hash
+fields, without assuming the version equals 1. The embedded trainer patch 0004
+currently accepts bundle schema 1 and emits `adaptation.json` schema 1; a builder
+change to schema 2 requires a compatible trainer before a real pilot. Unsupported
+bundles fail as fits rather than being relabelled. The caller must provide the
+registered shifted development windows: a supplied YAML hash authenticates its
+bytes, not its cohort declaration. The job never substitutes official task YAML
+or opens another task's dataset to establish that declaration. Offline tests
+cannot establish CUDA determinism, real dataset coverage, GPU cost/throughput,
+package installation on the guest image, or live preemption durability.
