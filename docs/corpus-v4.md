@@ -34,9 +34,10 @@ are for the cloud guest:
 
 ```bash
 python -m scripts.corpus_v4.freeze_manifest SOURCE_DRAFT.yaml configs/corpus-v4.yaml
-python -m scripts.corpus_v4.fetch_native "$RUN_DIR/state/corpus" --state "$RUN_DIR/state"
+python -m scripts.corpus_v4.fetch_native "$RUN_DIR/state/corpus" --state "$RUN_DIR/state" \
+  --memory-budget-gib 32
 python -m scripts.corpus_v4.audit_fev_overlap "$RUN_DIR/state/corpus" \
-  "$RUN_DIR/state/audit" --state "$RUN_DIR/state"
+  "$RUN_DIR/state/audit" --state "$RUN_DIR/state" --memory-budget-gib 32
 ```
 
 The generator is deterministic, sorted by full folder name, and does not use
@@ -50,8 +51,9 @@ unlisted folders, unexpected nested paths and missing folders are refused
 before transfer. Every shard must match the Hub's size and LFS SHA256 (or Git
 blob SHA1 for a non-LFS file). A digest mismatch is an error, not an implicit
 repair or a silently accepted download. The per-folder receipt records these
-identities. Existing completed folders are rehashed before skip; measurements
-are regenerated to avoid trusting modified stats. Policy/revision mismatches in
+identities and the statistics digest. Existing completed folders are rehashed
+before skip; statistics are reused only when their digest, measurement version
+and measured memory requirements agree. Modified or legacy statistics are regenerated. Policy/revision mismatches in
 an existing corpus require a new root.
 
 The pinned tree contains 150 Parquet shards in exactly 121 dataset folders
@@ -80,7 +82,10 @@ Allowed data lands only in `corpus/univariate/<dataset>` and
 `corpus/quarantine/{univariate,covariates}/<dataset>`. Pass the two explicit
 allowed roots to the trainer. Download staging and partial files live under
 `$RUN_DIR/state/downloads`, outside either reader root, and remain there after
-interruption. A folder is atomically renamed into place only after verification
+interruption. Hub downloads use `local_dir` regular files and transfer metadata,
+then rename the file into staging; no Hub blob cache or symlinks are created in
+state. Obsolete `.hub-cache` directories from earlier failed downloads are removed
+before transfer. A folder is atomically renamed into place only after verification
 and measurement. Corpus and download state must be on the same filesystem.
 Never pass `corpus/quarantine` to a trainer. Quarantine status never changes
 because a restart or an audit finishes.
@@ -106,8 +111,8 @@ acceptance counts for this public subset. They do not specify per-row lengths,
 Arrow schemas or exact frequency strings; these remain runtime checks. The
 README's segment IDs and optional metadata agree with the native validator;
 empty covariate lists are supported, as required by the NOTICE's seven clubs
-without schedule pages. Long-row counts and memory-guard compatibility still
-require the cloud run; no row is truncated to fit a guard.
+without schedule pages. Actual longest rows still require the cloud run; no row
+is truncated to fit a guard.
 
 Trainer compatibility was checked against upstream Simons commit
 `8e338e915d26c8960713889ef12ab1cf5c08d591`:
@@ -122,6 +127,13 @@ Each folder has `stats.json`: rows and split counts, target variates, exact
 length histogram/min/max/mean, count of rows at least 16,384 steps, target and
 covariate observed counts, target observed share, frequency strings,
 `domain/subdomain` presence counts and covariate channel-count histogram.
+It also records `values` (targets plus covariates), `longest_row` (steps),
+`largest_row_bytes`, and maxima of row-group bytes, leaf values and rows.
+`measurement` records the strategy/version, wall seconds for the validation and
+statistics pass, the worker's peak RSS in bytes, configured budget and hard row
+byte limit. Each measurement runs in a fresh subprocess: its RSS is specific to
+that folder, not a previous folder's process high-water mark. Download/hash time
+and process startup are outside `measurement.wall_seconds`.
 The first training shard is representative only if it covers every observed
 training support value for variates/lengths/frequencies and each marginal total
 variation distance from all training shards is at most 0.10. This is a
@@ -206,28 +218,90 @@ hourly-parent/aggregated controls. The unrelated seasonal control must remain
 negative. If no identifying benchmark series can support the plants, the run is
 invalid. Controls use the production matcher and the same information threshold.
 
-State is under `$RUN_DIR/state` (override with `--state`). SQLite spools benchmark
-histories to disk. A folder result is atomically checkpointed with the method,
+State is under `$RUN_DIR/state` (override with `--state`). SQLite stores benchmark
+metadata and signed 64-bit offsets into flat numeric/timestamp spool files.
+Histories are written in 65,536-point blocks and mapped for iteration; there is
+no per-history SQLite BLOB or 1 GB BLOB limit. SQLite's page cache is 8 MiB and
+temporary tables stay on disk. A folder result is atomically checkpointed with the method,
 manifest, benchmark content/revision, search budget and its current Parquet
 hashes. On restart benchmark identity is rebuilt, all corpus hashes are reread,
-completed identical folders resume, and controls run again. Incompletely
+completed identical folders resume, and controls run again. Runtime failures are
+retried, including quarantined folders. When missing data is repaired and the
+opportunity bound increases, an identical clean result remains valid under the
+stricter information threshold and can resume; a reduced bound or a non-clean
+result with a changed bound requires a new scan. Matching thresholds are unchanged. Incompletely
 restored published folders are moved back into isolated staging after surviving
 files are rehashed; missing files are fetched again. Wrong existing hashes
 remain errors. No within-folder
 progress claim is made. Changing code requires a method-version bump when its
 search semantics change; changing inputs automatically invalidates cached results.
 
-Parquet rows are streamed one at a time; numeric rows above two million values
-or row groups above 512 MiB / 32 million leaf values are refused before large
-row-group decoding. Series chunks use at most 65,536 points with a 512-point
-overlap; combined benchmark indices contain at most 262,144 points. Total hash
-postings are counted before the old matcher expands them; more than one million
-postings for a query is an explicit unresolved resource limit. The old explicit expansion and
-candidate caps remain; dropped candidate/offset coverage produces inconclusive.
-There is a 10,000-evidence-record guard per folder. Benchmark contents and audit
-state require disk in addition to the native corpus. Processing bounded benchmark-index batches
-trades repeated corpus reads for bounded memory;
-cloud wall time and peak RSS remain unmeasured.
+The default process RSS budget is **32 GiB** on the 64 GB guest, leaving memory
+for the parent, benchmark loading, the operating system and uploads. Override
+it with `--memory-budget-gib` on fetch and audit (fractions are accepted).
+The job generator accepts the same option; the guest can override it with
+`CORPUS_MEMORY_BUDGET_GIB`. Measurement and audit folder workers have a 10 ms
+RSS watchdog and check their high-water mark during processing. Exceeding the
+budget records measured peak RSS and configured bytes. Sampling can overshoot
+between checks; this is not a kernel-enforced memory limit.
+
+The native reader uses `ParquetFile(buffer_size=65536, pre_buffer=False)` and
+`iter_batches(batch_size=1, use_threads=False)`. Both options matter: a one-row
+batch with the default unbuffered input can still retain an entire compressed
+column chunk. Numeric values stay in Arrow-backed NumPy arrays, with no Python
+float list and no whole-row float64 conversion. Validation and exact counts use
+nonoverlapping 65,536-value blocks. Arrow still decodes an entire row, so the
+explicit hard row limit is decoded numeric storage no larger than the process
+budget (32 GiB by default): more cannot fit even without decoder overhead.
+A single-row group's footer can prove this before decoding; otherwise the row
+is checked after decoding, with the watchdog measuring actual decoder and
+consumer allocations. There is no speculative multiplier of row/group values. There
+is no row-group byte/value refusal and no two-million-value row refusal.
+Long rows, including the trainer's >=16,384-step rows, are retained intact.
+
+Offline PyArrow 24 measurements compared 4 versus 34 nested float64 rows, each
+2,100,001 steps: 67.2 versus 571.2 MB uncompressed in one group. Unbuffered
+Arrow-view peaks grew from 290 to 797 MB; buffered peaks were 229 MB for both.
+The old Python-list path peaked at 444 and 1,051 MB. The group is scaled down
+from ERA5's 3.91 GB/10,000 rows; the individual rows are deliberately longer.
+Regression fixtures also use the actual release types: nested float32 targets
+(68 long rows) and float64 targets plus two covariates (12 long rows). Each has
+a group above 512 MiB, a row above two million values, and measurement plus
+matching scans in subprocesses that assert peak RSS below **512 MiB**. These
+are synthetic measurements, not a measurement of the real corpus or Arrow 25.
+
+Audit series chunks retain 65,536 points and a 512-point overlap (0.79% extra
+work on long series). Fixed-bin reductions are lazy, preserving global bin phase
+and evidence offsets across chunks. Long-parent identification retains the
+existing precision, quantization, periodicity and strict-ramp gates using bounded
+passes. Frequency discovery projects only `freq`, in 4,096-row batches. Combined
+benchmark indices contain at most 262,144 points and 4,096 histories; unresolved
+event batches contain at most 128 histories. Batching
+adds passes without dropping coverage. Comparison reporting groups metadata
+by dataset, avoiding a Python loop over every indexed history for every query.
+Histogram totals are computed once per marginal, avoiding quadratic work over
+unique lengths. Counts and opportunity arithmetic use Python integers; Parquet
+counts and SQLite offsets are 64-bit. Groups are inspected once, including
+files with 199 groups; numeric groups are decoded sequentially.
+
+More than one million hash postings per query remains an explicit unresolved
+limit before the old matcher expands them. Candidate caps, 4,096 phase coverage,
+10,000 evidence records, tolerances and the 512-point overlap are unchanged;
+dropped coverage is inconclusive. Calendar aggregation still needs full
+benchmark timestamps and can be expensive. Bounded index batches intentionally
+reread corpus rows; all-frequency/all-phase audit cost can dominate measurement.
+Real wall time depends on benchmark points, frequency pairs and candidate density.
+
+A folder failure is checkpointed in `fetch-summary.json`, with its name and
+error, while later folders continue to download, validate and publish. The
+fetch CLI exits 2 after listing all failed folders. Completed folders rehash but
+do not redownload or remeasure unless inputs/statistics require it. Audit scans
+run in separate workers, record errors, continue, and retry failed checkpoints.
+`audit.json.failed_folders` includes runtime errors (also in quarantine) and
+non-clean allowed folders. Stable non-clean policy/coverage results can resume;
+restarting cannot change their policy meaning. The generated job runs audit
+even after fetch fails and exits nonzero after both stages; final uploads still
+include every completed folder and both summaries.
 
 ## Cloud guest job and release
 
@@ -264,9 +338,10 @@ The SHA must contain this implementation and frozen manifest.
 
 If `HOME` is empty or unset, the job sets it to `RUN_DIR/home` for startup-script
 execution as root. Default Hugging Face caches are under `RUN_DIR/hf-cache`,
-outside the periodically uploaded state tree. The fetcher's explicit staging
-cache and the audit's explicit benchmark cache retain their existing resumable
-locations under state; these explicit paths override the default cache settings.
+outside the periodically uploaded state tree. Native downloads have one regular
+file in staging or the published tree, with only transfer metadata alongside.
+The audit's explicit benchmark dataset cache remains resumable under state; it
+overrides the default dataset cache setting.
 
 The host restores `RUN_DIR/state` before invocation. The job syncs it every ten
 minutes and at exit; the host's final copy also covers guest preemption. Each attempt first invalidates the old final audit and publishes

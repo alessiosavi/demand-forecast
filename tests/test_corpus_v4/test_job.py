@@ -127,9 +127,9 @@ elif args == ["-m", "pip", "freeze"]:
     print("torch==" + os.environ["IMAGE_TORCH_VERSION"])
     print("# fake installed environment")
 elif args[:2] == ["-m", "scripts.corpus_v4.fetch_native"]:
-    pass
+    sys.exit(int(os.environ.get("FETCH_EXIT", "0")))
 elif args[:2] == ["-m", "scripts.corpus_v4.audit_fev_overlap"]:
-    pass
+    sys.exit(int(os.environ.get("AUDIT_EXIT", "0")))
 else:
     os.execv(sys.executable, [sys.executable, *args])
 """
@@ -358,3 +358,23 @@ def test_failed_attempt_does_not_publish_restored_success(tmp_path, monkeypatch)
     assert status["repo_sha"] == "a" * 40
     calls = (tmp_path / "calls").read_text()
     assert not any(" cp " in f" {line} " and "/audit.json" in line for line in calls.splitlines())
+
+
+@pytest.mark.parametrize("fetch_code,audit_code", [(2, 0), (2, 2), (0, 2)])
+def test_guest_audits_completed_folders_after_fetch_failure(
+    environment_guest, monkeypatch, fetch_code, audit_code
+):
+    guest, _, invoke = environment_guest
+    monkeypatch.setenv("FETCH_EXIT", str(fetch_code))
+    monkeypatch.setenv("AUDIT_EXIT", str(audit_code))
+    result, calls = invoke()
+    assert result.returncode != 0
+    phases = [
+        c["args"]
+        for c in calls
+        if c["args"][:2]
+        in (["-m", "scripts.corpus_v4.fetch_native"], ["-m", "scripts.corpus_v4.audit_fev_overlap"])
+    ]
+    assert len(phases) == 2
+    assert all("--memory-budget-gib" in args for args in phases)
+    assert not json.loads((guest / "state/attempt-status.json").read_text())["complete"]

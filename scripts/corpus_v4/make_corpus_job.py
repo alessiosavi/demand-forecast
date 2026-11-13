@@ -6,6 +6,8 @@ import argparse
 import re
 from pathlib import Path
 
+from scripts.corpus_v4.native import memory_budget_arg
+
 REPOSITORY = "https://github.com/alessiosavi/demand-forecast.git"
 
 ENVIRONMENT = r"""# Preserve the image's CUDA-matched torch, including its local version suffix.
@@ -14,6 +16,7 @@ python3 - "$scratch/image-torch.json" "$scratch/torch-constraint.txt" <<'CORPUS_
 import json
 import sys
 from pathlib import Path
+
 
 import torch
 
@@ -36,6 +39,7 @@ import subprocess
 import sys
 from importlib import import_module, metadata
 from pathlib import Path
+
 from urllib.parse import unquote, urlparse
 
 root = Path(sys.argv[1]).resolve()
@@ -81,12 +85,14 @@ CORPUS_ENVIRONMENT
 """
 
 
-def render(repo_sha, corpus_prefix):
+def render(repo_sha, corpus_prefix, *, memory_budget_gib=32):
     """Generate a bash job that preserves incomplete work and uploads failure evidence."""
     if not re.fullmatch(r"[0-9a-f]{40}", repo_sha):
         raise ValueError("repo SHA must be a full lowercase commit hash")
     if not re.fullmatch(r"gs://[a-z0-9][a-z0-9._-]+(?:/[A-Za-z0-9._/-]+)?", corpus_prefix):
         raise ValueError("corpus prefix must be a plain gs:// bucket path")
+    memory_budget_arg(memory_budget_gib)
+    memory_budget_gib = float(memory_budget_gib)
     return f"""#!/usr/bin/env bash
 # Research-only use. Original source licences apply.
 # Full corpus and audit state are durable below RUN_DIR/state.
@@ -156,9 +162,19 @@ git checkout --detach "$REPO_SHA"
 test "$(git rev-parse HEAD)" = "$REPO_SHA"
 {ENVIRONMENT}\
 export HF_HUB_DISABLE_IMPLICIT_TOKEN=1
-python -m scripts.corpus_v4.fetch_native "$CORPUS" --state "$RUN_DIR/state"
-# Each folder contains stats.json and a verified per-file receipt.
-python -m scripts.corpus_v4.audit_fev_overlap "$CORPUS" "$AUDIT" --state "$RUN_DIR/state"
+MEMORY_BUDGET_GIB="${{CORPUS_MEMORY_BUDGET_GIB:-{memory_budget_gib:g}}}"
+fetch_status=0
+python -m scripts.corpus_v4.fetch_native "$CORPUS" --state "$RUN_DIR/state" \\
+    --memory-budget-gib "$MEMORY_BUDGET_GIB" || fetch_status=$?
+# Each complete folder has stats.json and a verified receipt.
+# Audit it even when another folder failed to fetch/measure.
+audit_status=0
+python -m scripts.corpus_v4.audit_fev_overlap "$CORPUS" "$AUDIT" --state "$RUN_DIR/state" \\
+    --memory-budget-gib "$MEMORY_BUDGET_GIB" || audit_status=$?
+if (( fetch_status != 0 || audit_status != 0 )); then
+    echo "Corpus attempt failed: fetch=$fetch_status audit=$audit_status; see fetch-summary.json and audit.json" >&2
+    exit 2
+fi
 """
 
 
@@ -168,8 +184,9 @@ def main(argv=None):
     parser.add_argument("repo_sha")
     parser.add_argument("corpus_prefix")
     parser.add_argument("out", type=Path, help="job.sh path")
+    parser.add_argument("--memory-budget-gib", type=float, default=32)
     args = parser.parse_args(argv)
-    source = render(args.repo_sha, args.corpus_prefix)
+    source = render(args.repo_sha, args.corpus_prefix, memory_budget_gib=args.memory_budget_gib)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(source)
     args.out.chmod(0o755)
