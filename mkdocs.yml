@@ -110,6 +110,7 @@ nav:
       - Frozen fev on EC2: ec2.md
       - Google Cloud GPU runs: gcp.md
       - Dataset wins: dataset-wins.md
+      - Task-local adaptation inputs: adaptation.md
       - Pretraining on EC2: pretrain-ec2.md
       - Corpus v2: corpus.md
       - Corpus attributions: NOTICE-corpus.md
