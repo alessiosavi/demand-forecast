@@ -3,6 +3,7 @@
 import copy
 import hashlib
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -429,7 +430,6 @@ def test_counter_resume_continuity(upstream, tmp_path):
 def test_full_shell_matches_e5959bb_except_listed_changes(jobs, size):
     """Golden hashes measured from main e5959bb; normalize only explicit exceptions."""
     import re
-    from pathlib import Path
 
     golden = json.loads((Path(__file__).parent / "full-e5959bb-sha256.json").read_text())
     for leg in jobs.LEGS:
@@ -559,7 +559,7 @@ def test_unsafe_qualification_executes_but_checkpoint_is_unusable(upstream, tmp_
     "pre_recipe,next_recipe,accepted",
     [("full", "full", True), ("full", "screen", False), ("screen", "full", False)],
 )
-@pytest.mark.parametrize("provenance", ["e5959bb", "f86878c"])
+@pytest.mark.parametrize("provenance", ["e5959bb", "f86878c", "b606a50"])
 def test_actual_legacy_predecessor_path(
     upstream, tmp_path, monkeypatch, pre_recipe, next_recipe, accepted, provenance
 ):
@@ -627,10 +627,24 @@ def test_replayed_work_is_separate_from_lineage(upstream, tmp_path):
 
 
 @pytest.mark.parametrize(
-    "recipe,with_identity,accepted", [("full", True, True), ("screen", False, False)]
+    "recipe,member_releases,with_identity,accepted",
+    [
+        pytest.param("full", (None, None), True, True, id="legacy-legacy"),
+        pytest.param("full", (None, "a"), True, True, id="legacy-audited"),
+        pytest.param("full", ("a", None), True, True, id="audited-legacy"),
+        pytest.param("full", ("a", "a"), True, True, id="same-release"),
+        pytest.param("full", ("a", "new-attempt"), True, False, id="changed-attempt"),
+        pytest.param("full", ("new-attempt", "a"), True, False, id="changed-attempt-reversed"),
+        pytest.param("full", ("a", "new-hash"), True, False, id="changed-audit"),
+        pytest.param("full", ("new-hash", "a"), True, False, id="changed-audit-reversed"),
+        pytest.param("screen", ("a", "a"), True, True, id="screen-same-release"),
+        pytest.param("screen", ("a", "new-attempt"), True, False, id="screen-changed-attempt"),
+        pytest.param("screen", ("a", "new-hash"), True, False, id="screen-changed-audit"),
+        pytest.param("screen", ("a", "a"), False, False, id="screen-missing-identity"),
+    ],
 )
 def test_export_identity_and_corpus_free_invocation(
-    upstream, tmp_path, recipe, with_identity, accepted
+    upstream, tmp_path, recipe, member_releases, with_identity, accepted
 ):
     from simons.config import SimonsConfig
     from simons.model import Simons
@@ -651,7 +665,14 @@ def test_export_identity_and_corpus_free_invocation(
             period_slots=0,
         )
     )
-    for leg in ("stage4", "stage4-long"):
+    releases = {
+        None: None,
+        "a": dict(attempt_id="tiny", audit_sha256="hash"),
+        "new-attempt": dict(attempt_id="other", audit_sha256="hash"),
+        "new-hash": dict(attempt_id="tiny", audit_sha256="other-hash"),
+    }
+    receipts = [releases[name] for name in member_releases]
+    for leg, receipt in zip(("stage4", "stage4-long"), receipts):
         directory = tmp_path / "state" / leg
         directory.mkdir(parents=True)
         payload = checkpoint_payload(8)
@@ -663,18 +684,31 @@ def test_export_identity_and_corpus_free_invocation(
                 leg=leg,
                 upstream_pin=PIN,
                 corpus_uri="gs://offline/corpus",
-                corpus_release=dict(attempt_id="tiny", audit_sha256="hash"),
                 recipe={},
             )
+            if receipt is not None:
+                payload["job_identity"]["corpus_release"] = receipt
+            if recipe == "screen":
+                payload["job_identity"].update(recipe_name="screen", screen_updates=25000)
         write_checkpoint(directory / "checkpoint-final.pt", payload)
         (directory / "completed.json").write_text(json.dumps({"checkpoint": "checkpoint-final.pt"}))
     args = job_args(tmp_path, upstream, leg="export", recipe=recipe, corpus_uri=None)
     if accepted:
         assert spot_job.run_export(args) == 0
         assert (tmp_path / "state/export/model.safetensors").stat().st_size > 0
+        marker = json.loads((tmp_path / "state/export/completed.json").read_text())
+        assert marker["member_corpus_releases"] == receipts
+        assert [Path(path).parent.name for path in marker["members"]] == [
+            "stage4",
+            "stage4-long",
+        ]
+        assert marker["corpus_release"] == (receipts[0] or receipts[1])
+        assert not args.corpus.exists()
     else:
-        with pytest.raises(ValueError, match="identity"):
+        error = "different corpus audit identities" if with_identity else "identity"
+        with pytest.raises(ValueError, match=error):
             spot_job.run_export(args)
+        assert not (tmp_path / "state/export/completed.json").exists()
 
 
 def test_legacy_receipt_migration_can_retry_before_new_checkpoint(upstream, tmp_path, monkeypatch):
@@ -706,7 +740,7 @@ def test_legacy_receipt_migration_can_retry_before_new_checkpoint(upstream, tmp_
     )
 
 
-@pytest.mark.parametrize("provenance", ["e5959bb", "f86878c"])
+@pytest.mark.parametrize("provenance", ["e5959bb", "f86878c", "b606a50"])
 @pytest.mark.parametrize("checkpoint_name", ["checkpoint-slot-0.pt", "checkpoint-final.pt"])
 def test_final_legacy_checkpoint_recovers_accepted_receipt(
     upstream, tmp_path, monkeypatch, provenance, checkpoint_name
@@ -721,7 +755,7 @@ def test_final_legacy_checkpoint_recovers_accepted_receipt(
     args = job_args(tmp_path, upstream, seed=19)
     raw = yaml.safe_load(tiny_recipe(tmp_path).read_text())
     receipt = corpus_release(args.corpus)
-    if provenance == "f86878c":
+    if provenance != "e5959bb":
         args.corpus_release = receipt
     saved = spot_job.identity(args, raw)
     saved.update(repo_sha=provenance, bundle_sha256="previous-bundle")

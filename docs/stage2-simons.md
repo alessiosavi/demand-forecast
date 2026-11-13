@@ -6,9 +6,9 @@ on our corpus. The implementation uses upstream commit
 `third_party/simons/patches/`. The `12m` variant copies the same five upstream
 25M configurations and changes only `model.width` to 264. Seeds, micro-batches
 and machine-local data/weight paths are explicit job inputs. Effective batch,
-With the default `--recipe full`, contexts, objectives, synthetic
-families/pools/banks, optimizer and curriculum values remain upstream's values. In particular, checkpoint-block counts are
-not increased to make a card fit.
+contexts, objectives, synthetic families/pools/banks, optimizer and curriculum
+values remain upstream's values with the default `--recipe full`. In particular,
+checkpoint-block counts are not increased to make a card fit.
 
 | Job | Input weights | Data | Absolute updates executed | Durable product |
 | --- | --- | --- | --- | --- |
@@ -252,7 +252,7 @@ with the same global observed-value loss normalization. It does not split raw
 loading, synthetic pools/banks, preprocessing/packing or auxiliary covariate
 forwards. If those peaks exceed a 40 GB card even at the maximum count, retain
 the report and choose a larger card; reducing batch/context/pools would change
-the experiment. The live 25M full stage1 qualification fit with two micro-batches on A100
+the experiment. The live 25M full stage1 qualification fit two micro-batches on an A100
 40 GB; later-leg and 60M fit remain unmeasured.
 
 Export uses upstream's uniform arithmetic averaging of `stage4` and
@@ -370,6 +370,11 @@ The exact audit bytes' SHA-256 and accepted attempt ID enter `identity.json`,
 checkpoint identity and `completed.json`. Changing that receipt between mixed
 legs or on resume is refused. Completed, validated jobs remain no-ops without
 reading a corpus. Legacy mixed state without a receipt acquires one on resume.
+Export accepts a legacy full-recipe member alongside an audited member, or two
+legacy full-recipe members. Two recorded receipts must match. The export's
+`member_corpus_releases` lists each member's receipt (or `null`) in `members`
+order; `corpus_release` records the available receipt, or `null` if neither
+member recorded one.
 
 For **qualification only**, the explicitly named
 `--unsafe-qualification-allow-unaudited-corpus` bypasses the release check for

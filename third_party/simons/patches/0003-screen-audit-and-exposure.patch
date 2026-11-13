@@ -522,7 +522,7 @@ diff --git a/src/simons/training/spot_job.py b/src/simons/training/spot_job.py
              if all(
                  (destination / n).stat().st_size == marker["artifacts"][n] > 0
                  for n in ("config.json", "model.safetensors")
-@@ -242,6 +301,15 @@
+@@ -242,6 +301,16 @@
          except (OSError, KeyError, ValueError, TypeError):
              pass
      paths = [completed_checkpoint(state / leg) for leg in ("stage4", "stage4-long")]
@@ -533,23 +533,25 @@ diff --git a/src/simons/training/spot_job.py b/src/simons/training/spot_job.py
 +        if saved is not None:
 +            check_identity(saved, args)
 +    receipts = [read_checkpoint(p).get("job_identity", {}).get("corpus_release") for p in paths]
-+    if receipts[0] != receipts[1]:
++    if all(receipt is not None for receipt in receipts) and receipts[0] != receipts[1]:
 +        raise ValueError("soup members have different corpus audit identities")
++    receipt = next((item for item in receipts if item is not None), None)
      temporary = Path(tempfile.mkdtemp(prefix="export-", dir=args.run_dir))
      averaged = soup.write(paths, temporary / "checkpoint.pt")
      export(averaged, temporary / "inference")
-@@ -253,6 +321,10 @@
+@@ -253,6 +322,11 @@
          destination / "completed.json",
          {
              "members": [str(p) for p in paths],
 +            "job_identity": {**(read_checkpoint(paths[0]).get("job_identity") or {}),
 +                             "recipe_name": mode(args)[0], "screen_updates": mode(args)[1]},
 +            "recipe_name": mode(args)[0], "screen_updates": mode(args)[1],
-+            "corpus_release": receipts[0],
++            "corpus_release": receipt,
++            "member_corpus_releases": receipts,
              "artifacts": {
                  n: (destination / n).stat().st_size for n in ("config.json", "model.safetensors")
              },
-@@ -267,9 +339,19 @@
+@@ -267,9 +341,19 @@
  
      directory = Path(args.run_dir)
      state = directory / "state"
@@ -571,7 +573,7 @@ diff --git a/src/simons/training/spot_job.py b/src/simons/training/spot_job.py
      attempt = Path(tempfile.mkdtemp(prefix="qualify-attempt-", dir=directory))
      path = write_recipe(raw, attempt)
      # CUDA is mandatory here: a CPU smoke check must never masquerade as GPU qualification.
-@@ -284,17 +366,21 @@
+@@ -284,17 +368,21 @@
      start = probe_start(model, settings, args.qualify_step, updates)
      measurement = Measurement(args.warmup, 500)
      try:
@@ -594,7 +596,7 @@ diff --git a/src/simons/training/spot_job.py b/src/simons/training/spot_job.py
      result.update(
          size=args.size,
          leg=args.qualify_leg,
-@@ -377,7 +463,10 @@
+@@ -377,7 +465,10 @@
  def main():
      parser = argparse.ArgumentParser(description=__doc__)
      parser.add_argument("--leg", required=True, choices=[*LEGS, "qualify", "export"])
@@ -606,7 +608,7 @@ diff --git a/src/simons/training/spot_job.py b/src/simons/training/spot_job.py
      parser.add_argument("--root", type=Path, required=True)
      parser.add_argument("--run-dir", type=Path, default=os.environ.get("RUN_DIR"), required=False)
      parser.add_argument("--corpus", type=Path)
-@@ -406,6 +495,14 @@
+@@ -406,6 +497,14 @@
          )
      if args.micro_batches < 1 or args.checkpoint_minutes <= 0 or args.warmup < 0:
          parser.error("invalid microbatches, checkpoint interval or warm-up")
