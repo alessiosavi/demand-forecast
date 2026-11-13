@@ -62,7 +62,8 @@ tasks use the same v2 pipeline with task-specific roles, horizons and quantiles.
 naive, and `fev leaderboard` compares saved summaries.
 
 Use the [frozen protocol](protocol.md), [Colab workflow](colab.md) and
-[EC2 runbook](ec2.md) for benchmark execution. The
+[EC2 runbook](ec2.md) for benchmark execution, or the
+[Google Cloud GPU runbook](gcp.md) for bounded Compute Engine sessions. The
 [architecture guide](ARCHITECTURE.md#fev-orchestration-identity-and-resume)
 describes per-item origins, resume behavior and timing diagnostics.
 

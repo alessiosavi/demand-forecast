@@ -114,7 +114,8 @@ working directory.
 
 ## fev evaluation
 
-External pretrained Chronos-2 and Timestral runs use a separate environment and
+External pretrained Chronos-2 and Timestral runs, and runs of exported Simons
+checkpoints, use a separate environment and
 [`scripts/fev_yardstick.py`](scripts/fev_yardstick.py). See the [host installation,
 published settings, ablations and audit commands](docs/yardsticks.md).
 
@@ -127,7 +128,8 @@ demand-forecast fev --help
 ```
 
 For the seven bundled weekly tasks, use the [frozen protocol](docs/protocol.md),
-[Colab workflow](docs/colab.md) or [EC2 runbook](docs/ec2.md). The checked-in
+[Colab workflow](docs/colab.md), [EC2 runbook](docs/ec2.md), or
+[Google Cloud GPU runbook](docs/gcp.md). The checked-in
 [standard configuration](configs/fev-v2-standard.yaml) defines the model and
 training controls; the runner derives data roles, horizon and quantiles from
 each task. On the benchmark host:

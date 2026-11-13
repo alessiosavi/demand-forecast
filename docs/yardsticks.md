@@ -66,6 +66,80 @@ Timestral retains its forecaster defaults: symmetric averaging, nonnegative
 clipping, block autoregression and forecast caps. Chronos retains its pipeline's
 normalization, category encoding and long-horizon decoding defaults.
 
+## Simons checkpoints: raw and published
+
+Simons is an optional inference dependency, pinned to
+[Abel-ai-lab/Simons@8e338e9](https://github.com/Abel-ai-lab/Simons/tree/8e338e915d26c8960713889ef12ab1cf5c08d591).
+Install it in the benchmark host environment:
+
+```bash
+python -m pip install 'simons @ git+https://github.com/Abel-ai-lab/Simons.git@8e338e915d26c8960713889ef12ab1cf5c08d591'
+```
+
+Export our trained checkpoint with Simons's `save_pretrained` first. The runner
+requires a local directory containing `config.json` and `model.safetensors`,
+loaded with `Simons.from_pretrained`. It does not resolve Simons Hub IDs or accept
+`--revision`. `--checkpoint` is an alias for `--weights` for every model.
+
+Choose a processing mode explicitly. Use **raw** for checkpoint selection and
+report **published** separately, with distinct labels and output directories:
+
+```bash
+python scripts/fev_yardstick.py --model simons --checkpoint /checkpoints/simons/export \
+  --processing raw --tasks shifted.yaml --model-name simons25m-raw \
+  --out-dir results/simons25m-raw --resume --keep-going
+python scripts/fev_yardstick.py --model simons --checkpoint /checkpoints/simons/export \
+  --processing published --tasks shifted.yaml --model-name simons25m-published \
+  --out-dir results/simons25m-published --resume --keep-going
+```
+
+Both modes also accept the official fev task YAML. `--processing` is rejected for
+Chronos-2 and Timestral; their settings and resume identities are unchanged.
+
+**Raw** replaces all six inference-rule flags in the loaded frozen config with
+`False`, even if the export enables them: `views`, `sign_clip`, `integer_snap`,
+`fit_row`, `xreg`, and `xreg_guard`. This removes transformed views and pooled tail
+distributions, sign clipping, integer snapping, the in-context ridge-fit row,
+ridge residual/add-back processing and its backtest guard. Learned covariate
+modules (including binary rows and learned reads), intrinsic normalization and
+inversion, and quantile ordering remain enabled as configured. Horizons beyond
+the model's single-pass prediction length roll forward on the median in raw mode.
+**Published** leaves the exported config untouched, including any history-based
+XReg limits; the actual defaults depend on the export.
+
+Each item's targets are stacked together. Contiguous blocks of at most 32 targets
+match upstream's group split; items never share a group. Known-future covariates
+include the aligned historical values and exactly the forecast horizon.
+`shared_categories=False` retains upstream's separate history/horizon category
+encoding, and upstream limits known-future inputs to 16 usable columns. A
+checkpoint needs learned covariate support to consume these inputs; otherwise
+use `--covariates none`. Static columns are unused. Unsupported past-only
+covariates are dropped. `dropped_past_only_covariates`, in each summary row and
+`run.json`'s `input_metadata`, counts dropped column occurrences per item per
+window, before target-group splitting. With `--covariates none`, this count is
+zero because the shared ablation already removes every covariate.
+
+`--max-context N` retains the last N target and covariate history values; upstream
+also applies the checkpoint's context cap. `--covariates none` supplies targets
+only. `--batch-size` defaults to upstream's fev wrapper value of 256 groups per
+batch; `--cross-series off` is rejected. Following upstream's benchmark script,
+the adapter sorts the nine quantile predictions (levels 0.1–0.9) and linearly
+interpolates requested fev levels, clamping outside that range. The fifth
+quantile (median) supplies the point forecast, even if fev omits 0.5.
+
+The processing mode, SHA-256 content identity of `config.json` and
+`model.safetensors`, and the pinned upstream commit enter the run identity.
+The installed Simons Python source is also content-hashed, and its actual VCS
+commit is recorded when installation metadata provides it. This detects changed
+upstream commits and edited installations even if their package version is equal.
+Unrelated export files, such as training logs, do not affect it. Changing a mode,
+checkpoint or inference implementation requires a new output directory; resume
+refuses mismatches before touching existing results.
+
+The Simons conversion follows its Apache-2.0 benchmark implementation, Copyright
+2026 Abel AI Lab. This product includes software developed at Abel AI Lab
+(https://abel.ai).
+
 ## Evidence and resume
 
 `summaries.csv` uses fev's summary schema plus `task`, the adapter name, every CLI
@@ -111,7 +185,8 @@ These defaults reproduce the public adapter settings; numerical parity remains
 unverified until the preregistered five-task host check passes. Tests use only
 synthetic local data and recording fakes; they download no model weights.
 
-The optional Simons adapter is deferred. Its public fev wrapper additionally
-requires the Simons inference package, grouped targets (at most 32), covariate
-limits (16 known-future columns), category handling and an independently pinned
-checkpoint/API contract with synthetic tests.
+Simons tests use synthetic local data and a recording inference module; they
+verify processing overrides, input isolation, oversized groups and resume
+identity without downloading weights. Numerical parity with the pinned upstream
+benchmark, forecast quality and GPU throughput require host runs with real
+exported weights.
