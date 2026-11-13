@@ -114,7 +114,8 @@ working directory.
 
 ## fev evaluation
 
-External pretrained Chronos-2 and Timestral runs use a separate environment and
+External pretrained Chronos-2 and Timestral runs, and runs of exported Simons
+checkpoints, use a separate environment and
 [`scripts/fev_yardstick.py`](scripts/fev_yardstick.py). See the [host installation,
 published settings, ablations and audit commands](docs/yardsticks.md).
 

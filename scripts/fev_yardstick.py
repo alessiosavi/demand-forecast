@@ -10,9 +10,12 @@ from pathlib import Path
 def main(argv: list[str] | None = None) -> int:
     """Parse switches before importing optional benchmark or inference packages."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", choices=["chronos2", "timestral"], required=True)
+    parser.add_argument("--model", choices=["chronos2", "timestral", "simons"], required=True)
     parser.add_argument(
-        "--weights", required=True, help="Hugging Face model ID or local checkpoint directory"
+        "--weights",
+        "--checkpoint",
+        required=True,
+        help="Hugging Face model ID or local checkpoint directory (Simons: local export only)",
     )
     parser.add_argument(
         "--revision", help="Hub commit or alias; resolved and recorded before inference"
@@ -22,6 +25,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--model-name", required=True)
     parser.add_argument("--max-context", type=int)
+    parser.add_argument(
+        "--processing", choices=["raw", "published"], help="required for Simons only"
+    )
     parser.add_argument("--covariates", choices=["all", "none"], default="all")
     parser.add_argument(
         "--cross-series",
@@ -30,7 +36,9 @@ def main(argv: list[str] | None = None) -> int:
         help="Chronos-2 only: off isolates items and target variates",
     )
     parser.add_argument(
-        "--batch-size", type=int, help="Chronos variate budget (100); Timestral item limit (1024)"
+        "--batch-size",
+        type=int,
+        help="Chronos variate budget (100); Timestral item limit (1024); Simons group limit (256)",
     )
     parser.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
     parser.add_argument("--resume", action="store_true")
@@ -54,9 +62,10 @@ def main(argv: list[str] | None = None) -> int:
                     "cross_series",
                     "batch_size",
                     "device",
+                    "processing",
                 )
             }
-        )
+        ).resolved()
         tasks = load_tasks(args.tasks, read_names(args.names))
         frame = run_yardstick(
             tasks, options, args.out_dir, resume=args.resume, keep_going=args.keep_going
