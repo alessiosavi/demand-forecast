@@ -1191,7 +1191,14 @@ Checkout, push, dispatch and copy-back have overall command timeouts (defaults
 180/180/60/180 seconds); copy-back has a shared 240-second budget. Configure
 `CHECKOUT_TIMEOUT_SECONDS`, `PUSH_TIMEOUT_SECONDS`, `DISPATCH_TIMEOUT_SECONDS`,
 `COPY_TIMEOUT_SECONDS` and `COPY_BUDGET_SECONDS` as needed. Interrupting copy-back
-advances to cleanup. Cleanup has its own `STOP_TIMEOUT_SECONDS` budget (480
+advances to cleanup, using exit 130 when no earlier failure was recorded;
+an unresolved stop supersedes it.
+Each local operation has one process group, shared by its nested supervisors
+and SSH/SCP/rsync transports. Cancellation kills and waits for that entire group
+before copy-back or stop/reconcile proceeds; a shell exiting is insufficient.
+If local process death cannot be confirmed, the chain waits with its session
+open, retaining the independent guest deadline and AWS stop schedule.
+Cleanup has its own `STOP_TIMEOUT_SECONDS` budget (480
 seconds), with bounded guard calls and the SSH stop fallback. These limits supplement
 the existing guest deadline and AWS stop schedule. After capacity retry, the
 original label's `ops/session.<label>.json` identifies the actual transaction;
