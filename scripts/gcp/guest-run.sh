@@ -127,6 +127,13 @@ children_lock = threading.RLock()
 copy_lock = threading.Lock()
 
 
+def budget_seconds(seconds):
+    # TEST ONLY: offline behavior tests enlarge every watcher budget together.
+    # Never set GCP_TEST_BUDGET_SCALE on a VM: its default 1 preserves the
+    # production deadlines (including the independent 24 s save alarm).
+    return seconds * float(os.environ.get("GCP_TEST_BUDGET_SCALE", "1"))
+
+
 def log(message):
     print(f"gcp preemption: {message}", file=sys.stderr, flush=True)
 
@@ -167,9 +174,17 @@ def cancel_children():
         for child in list(children):
             try:
                 os.killpg(child.pid, signal.SIGKILL)
-                child.wait(timeout=0.2)
+                child.wait(timeout=budget_seconds(0.2))
             except (ProcessLookupError, subprocess.TimeoutExpired):
                 pass
+            except PermissionError as denied:
+                # A completed child may leave a vanished/denied process group
+                # before its command thread removes it from children.
+                # Reap it: poll() can report None while communicate() waits.
+                try:
+                    child.wait(timeout=budget_seconds(0.2))
+                except subprocess.TimeoutExpired:
+                    raise denied from None
 
 
 def terminate(*_):
@@ -194,7 +209,7 @@ def marker(key, source, budget=3, status="interrupted"):
     )
     path = root / ("." + key)
     path.write_text(body)
-    return upload(path, key, budget)
+    return upload(path, key, budget_seconds(budget))
 
 
 def upload(path, key, budget):
@@ -207,14 +222,14 @@ def upload(path, key, budget):
             "--silent",
             "--show-error",
             "--connect-timeout",
-            "0.5",
+            str(budget_seconds(0.5)),
             "--max-time",
-            "1",
+            str(budget_seconds(1)),
             "-H",
             "Metadata-Flavor: Google",
             "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
         ],
-        min(1, max(0, deadline - time.monotonic())),
+        min(budget_seconds(1), max(0, deadline - time.monotonic())),
         True,
     )
     try:
@@ -234,9 +249,9 @@ def upload(path, key, budget):
                     "--silent",
                     "--show-error",
                     "--connect-timeout",
-                    "0.5",
+                    str(budget_seconds(0.5)),
                     "--max-time",
-                    "1.5",
+                    str(budget_seconds(1.5)),
                     "--output",
                     "/dev/null",
                     "--write-out",
@@ -251,7 +266,7 @@ def upload(path, key, budget):
                     "@" + str(path),
                     url,
                 ],
-                min(1.5, max(0, deadline - time.monotonic())),
+                min(budget_seconds(1.5), max(0, deadline - time.monotonic())),
                 True,
             )
             == b"200"
@@ -282,7 +297,7 @@ def claim(source):
 def periodic():
     interval = os.environ["COPY_INTERVAL"]
     while not stop.is_set():
-        command(["sleep", interval], float(interval) + 1, cancel_if_stopped=True)
+        command(["sleep", interval], budget_seconds(float(interval) + 1), cancel_if_stopped=True)
         if stop.is_set():
             return
         with copy_lock:
@@ -355,10 +370,10 @@ def preempt(save_deadline):
         # Small diagnostics precede the state queue and get a protected refresh.
         path = root / "job.log"
         if path.exists():
-            result = upload(path, f"logs/{label}.log", min(2.5 if final else 3, max(0, save_deadline - time.monotonic() - 1.5)))
+            result = upload(path, f"logs/{label}.log", min(budget_seconds(2.5 if final else 3), max(0, save_deadline - time.monotonic() - budget_seconds(1.5))))
             trace("job_log", "uploaded" if result else "failed", final=final)
         trace("trace_upload", "attempting", final=final)
-        upload(trace_path, f"logs/{label}.preempt.jsonl", min(1.5, max(0, save_deadline - time.monotonic())))
+        upload(trace_path, f"logs/{label}.preempt.jsonl", min(budget_seconds(1.5), max(0, save_deadline - time.monotonic())))
 
     def expired(*_):
         trace("deadline", "expired")
@@ -378,7 +393,7 @@ def preempt(save_deadline):
         # Stop periodic writers only AFTER the first marker attempt; never the job.
         stop.set()
         cancel_children()
-        acquired = copy_lock.acquire(timeout=0.5)
+        acquired = copy_lock.acquire(timeout=budget_seconds(0.5))
         trace("periodic_stop", "stopped" if acquired else "lock_unavailable")
         try:
             nonce = uuid.uuid4().hex
@@ -391,7 +406,7 @@ def preempt(save_deadline):
                 wait = min(8, max(0, float(os.environ.get("GCP_CHECKPOINT_WAIT", "8"))))
             except ValueError:
                 wait = 8
-            deadline = time.monotonic() + wait
+            deadline = time.monotonic() + budget_seconds(wait)
             outcome = "timed_out"
             while time.monotonic() < deadline:
                 try:
@@ -408,7 +423,7 @@ def preempt(save_deadline):
             diagnostics()
             # Newest immutable generations first. Reserve seven seconds for
             # reconciliation (<=3 s) and a final fast log/trace refresh (<=4 s).
-            deadline = min(time.monotonic() + 8, save_deadline - 7)
+            deadline = min(time.monotonic() + budget_seconds(8), save_deadline - budget_seconds(7))
             copied = True
             files = inventory()
             if files is None:
@@ -467,16 +482,16 @@ def reconcile(status):
     # Preserve the event first; never leave two conflicting root markers.
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     archive = f"history/{timestamp}-{label}-PREEMPTED"
-    if not upload(root / ".PREEMPTED", archive, 0.6):
+    if not upload(root / ".PREEMPTED", archive, budget_seconds(0.6)):
         return
-    if not cloud(["storage", "rm", state_uri + "/PREEMPTED"], 1.2):
+    if not cloud(["storage", "rm", state_uri + "/PREEMPTED"], budget_seconds(1.2)):
         return
     key = "DONE" if status == "0" else "TIMEOUT" if status in ("124", "137") else "FAILED"
     if marker(key, "watcher", 0.8, status):
         (root / ".finished").touch()
     else:
         log("completion marker failed; restoring PREEMPTED")
-        upload(root / ".PREEMPTED", "PREEMPTED", 0.4)
+        upload(root / ".PREEMPTED", "PREEMPTED", budget_seconds(0.4))
 
 
 mode = sys.argv[1]
@@ -508,22 +523,22 @@ while not stop.is_set():
             "--silent",
             "--show-error",
             "--connect-timeout",
-            "0.5",
+            str(budget_seconds(0.5)),
             "--max-time",
-            "1.5",
+            str(budget_seconds(1.5)),
             "-H",
             "Metadata-Flavor: Google",
             "http://metadata.google.internal/computeMetadata/v1/instance/preempted",
         ],
-        1.5,
+        budget_seconds(1.5),
         True,
     )
     if response in (b"TRUE", b"TRUE\n"):
-        save_deadline = time.monotonic() + 24
+        save_deadline = time.monotonic() + budget_seconds(24)
         if claim("watcher"):
             preempt(save_deadline)
         break
-    command(["sleep", "1"], 2)
+    command(["sleep", "1"], budget_seconds(2))
 terminate()
 GCP_CONTROL_PY
 fi

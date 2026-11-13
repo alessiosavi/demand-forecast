@@ -1,4 +1,10 @@
-"""Execute the guest script offline with real bash, jobs and GNU timeout."""
+"""Offline guest behavior uses real processes with test-only enlarged budgets.
+
+GCP_TEST_BUDGET_SCALE stretches all watcher limits, including checkpoint waits
+and the alarm. The timeout double records production arguments but executes GNU
+timeout with GCP_TEST_COMMAND_TIMEOUT, preserving process groups without racing
+machine load. Bound tests instead use the unscaled helper and synthetic time.
+"""
 
 import json
 import os
@@ -13,6 +19,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts/gcp/guest-run.sh"
+PROCESS_TIMEOUT = 900  # Test deadlock guard, never a production acceptance bound.
 
 
 def assert_marker_identity(path, label="run-a", job_uri="gs://test-bucket/job.sh"):
@@ -41,7 +48,6 @@ def lock_upload():
 if name == 'curl':
     url = args[-1]
     if '/upload/storage/v1/' in url:
-        if os.environ.get('HANG_API_MARKER'): time.sleep(30)
         if os.environ.get('FAIL_API_MARKER'): sys.exit(22)
         if os.environ.get('API_REDIRECT'):
             sys.stdout.write('302')
@@ -70,7 +76,7 @@ if name == 'curl':
         counter.write_text(str(n+1))
         responses = json.loads(os.environ.get('PREEMPT_RESPONSES', '["FALSE"]'))
         response = responses[min(n, len(responses)-1)]
-        if response == 'timeout': time.sleep(30)
+        if response == 'timeout': sys.exit(28)
         if response == 'error': sys.exit(22)
         print(response)
         sys.exit(0)
@@ -84,6 +90,8 @@ elif name == 'sleep': time.sleep(0.05)
 elif name == 'timeout':
     if os.environ.get('FORCE_JOB_TIMEOUT') and 'bash' in args: sys.exit(124)
     if os.environ.get('FORCE_FINAL_TIMEOUT') and 'rsync' in args and not args[args.index('rsync')+1].startswith('gs://'): sys.exit(124)
+    duration = next(i for i, a in enumerate(args) if not a.startswith('-'))
+    args[duration] = os.environ['GCP_TEST_COMMAND_TIMEOUT']
     os.execv(os.environ['REAL_TIMEOUT'], [os.environ['REAL_TIMEOUT'], *args])
 elif name == 'gcloud':
     assert '--format=json' in args
@@ -131,10 +139,7 @@ elif name == 'gcloud':
         src, dst = args[2:4]
         if not src.startswith('gs://') and '/state/' in src:
             upload_lock = lock_upload()
-            if os.environ.get('HANG_STATE_CP'): time.sleep(30)
             if os.environ.get('REQUIRE_PREEMPT_MARKER'): assert (store/'PREEMPTED').exists()
-        if os.environ.get('HANG_LOG') and '/logs/' in dst: time.sleep(30)
-        if os.environ.get('HANG_MARKER') and dst.endswith('/PREEMPTED'): time.sleep(30)
         if src.startswith('gs://') and dst.startswith('gs://'):
             if src.endswith('/'+os.environ.get('FAIL_ARCHIVE', 'NO_MARKER')):
                 print('synthetic archive copy failure', file=sys.stderr)
@@ -206,6 +211,8 @@ def guest(tmp_path):
         COUNT=str(tmp_path / "count"),
         METADATA=json.dumps(metadata),
         GCP_RUN_ROOT=str(tmp_path / "runs"),
+        GCP_TEST_BUDGET_SCALE="3600",
+        GCP_TEST_COMMAND_TIMEOUT="86400s",
         REAL_TIMEOUT=timeout,
     )
 
@@ -216,7 +223,6 @@ def guest(tmp_path):
             fail="",
             seconds=3600,
             hang="",
-            hang_marker="",
             label=None,
             job_uri=None,
             **overrides,
@@ -235,12 +241,11 @@ def guest(tmp_path):
                     METADATA=json.dumps(metadata),
                     FAIL_COPY=fail,
                     HANG_COPY=hang,
-                    HANG_MARKER=hang_marker,
                     **overrides,
                 ),
                 capture_output=True,
                 text=True,
-                timeout=60,
+                timeout=PROCESS_TIMEOUT,
             )
 
         def calls(self):
@@ -385,7 +390,7 @@ PY
     )
     process = guest.start()
     pidfile = guest.tmp / "runs/run-a/state/pid"
-    deadline = time.monotonic() + 60
+    deadline = time.monotonic() + PROCESS_TIMEOUT
     pid = None
     try:
         while not pidfile.exists() and time.monotonic() < deadline:
@@ -393,7 +398,7 @@ PY
         assert pidfile.exists()
         pid = int(pidfile.read_text())
         process.terminate()
-        process.communicate(timeout=60)
+        process.communicate(timeout=PROCESS_TIMEOUT)
         assert process.returncode == 143
         tick = pidfile.with_name("tick")
         before = tick.read_text()
@@ -410,13 +415,15 @@ PY
             except ProcessLookupError:
                 pass
         try:
-            process.communicate(timeout=60)
+            process.communicate(timeout=PROCESS_TIMEOUT)
         except subprocess.TimeoutExpired:
             process.kill()
-            process.communicate(timeout=60)
+            process.communicate(timeout=PROCESS_TIMEOUT)
 
 
-def test_preemption_marker_upload_is_bounded(control):
+@pytest.mark.parametrize("scale", [1, 3600])
+def test_preemption_marker_upload_is_bounded(control, monkeypatch, scale):
+    monkeypatch.setenv("GCP_TEST_BUDGET_SCALE", str(scale))
     ns = control.ns
     budgets = []
 
@@ -427,8 +434,37 @@ def test_preemption_marker_upload_is_bounded(control):
 
     ns["command"] = command
     assert not ns["marker"]("PREEMPTED", "hook")
-    assert sum(budgets) == 3
+    assert sum(budgets) == 3 * scale
     assert not (control.root / "state/checkpoint").exists()
+
+
+@pytest.mark.parametrize("returncode", [0, None])
+def test_cancel_children_only_tolerates_permission_error_after_child_exit(
+    control, monkeypatch, returncode
+):
+    class Child:
+        pid = 123
+
+        def poll(self):
+            # communicate() can still own Popen's wait lock after process exit.
+            return None
+
+        def wait(self, *, timeout):
+            assert timeout == 0.2
+            if returncode is None:
+                raise subprocess.TimeoutExpired("child", timeout)
+            return returncode
+
+    def killpg(*_):
+        raise PermissionError("process group already disappeared")
+
+    control.ns["children"].add(Child())
+    monkeypatch.setattr(os, "killpg", killpg)
+    if returncode is None:
+        with pytest.raises(PermissionError):
+            control.ns["cancel_children"]()
+    else:
+        control.ns["cancel_children"]()
 
 
 def test_job_restarts_from_restored_state(guest):
@@ -731,40 +767,44 @@ def test_watcher_requires_literal_true_and_survives_metadata_errors(guest, respo
 
 def test_watcher_reconnects_after_hiccups_and_ignores_stale_nonce(guest):
     watcher_job(guest, cooperate=False)
-    result = guest.run(
-        PREEMPT_RESPONSES='["error", "", "FALSE", "TRUE"]', GCP_CHECKPOINT_WAIT="0.2"
-    )
+    result = guest.run(PREEMPT_RESPONSES='["error", "", "FALSE", "TRUE"]', GCP_CHECKPOINT_WAIT="0")
     assert result.returncode == 0, result.stderr
     assert (guest.store / "PREEMPTED").exists()
     assert (guest.store / "old.log").exists()
     assert not (guest.tmp / "runs/run-a/checkpoint-done").exists()
 
 
-def test_watcher_saves_marker_before_hanging_copy_and_still_attempts_log(guest):
-    watcher_job(guest, cooperate=False)
-    result = guest.run(PREEMPT_RESPONSES='["TRUE"]', GCP_CHECKPOINT_WAIT="0.1", HANG_STATE_CP="1")
-    assert result.returncode == 0, result.stderr
-    assert (guest.store / "PREEMPTED").exists()
-    assert not (guest.store / "DONE").exists()
-    assert (guest.store / "logs/run-a.log").exists()
+def test_watcher_saves_marker_before_hanging_copy_and_still_attempts_log(control):
+    ns, root = control.ns, control.root
+    (root / "state/checkpoint").write_text("saved")
+    (root / "job.log").write_text("job running")
+    events = []
 
+    def upload(path, key, budget):
+        events.append(key)
+        return True
 
-def test_watcher_all_storage_calls_hang_but_total_save_is_bounded(guest):
-    watcher_job(guest, cooperate=False, finish="request")
-    result = guest.run(
-        PREEMPT_RESPONSES='["TRUE"]',
-        GCP_CHECKPOINT_WAIT="0",
-        HANG_API_MARKER="1",
-        hang_marker="1",
-        HANG_STATE_CP="1",
-    )
-    assert result.returncode == 0, result.stderr
-    assert not (guest.store / "DONE").exists()
+    def cloud(args, budget):
+        events.append("state-copy")
+        control.clock.value += budget
+        return False
+
+    ns["upload"], ns["cloud"] = upload, cloud
+    ns["preempt"](24)
+    assert events[0] == "PREEMPTED"
+    assert "logs/run-a.log" in events[events.index("state-copy") + 1 :]
+    records = [
+        json.loads(line) for line in (root / ".preempt-trace.jsonl").read_text().splitlines()
+    ]
+    assert any(r["step"] == "state_copy" and r["outcome"] == "incomplete" for r in records)
+    assert not (root / ".finished").exists()
 
 
 def test_finished_job_is_not_mislabelled_by_late_metadata(guest):
     guest.job.write_text('touch "$RUN_DIR/.job-running"\nexit 0\n')
-    result = guest.run(PREEMPT_RESPONSES='["TRUE"]')
+    result = guest.run(
+        PREEMPT_RESPONSES='["TRUE"]', PREEMPT_GATE=str(guest.tmp / "runs/run-a/.job-ended")
+    )
     assert result.returncode == 0, result.stderr
     assert (guest.store / "DONE").exists()
     assert not (guest.store / "PREEMPTED").exists()
@@ -876,7 +916,7 @@ def test_hook_first_cannot_prevent_watcher_checkpoint_and_state_save(guest):
     process = guest.start(PREEMPT_RESPONSES='["TRUE"]', PREEMPT_GATE=str(gate))
     run = guest.tmp / "runs/run-a"
     try:
-        deadline = time.monotonic() + 60
+        deadline = time.monotonic() + PROCESS_TIMEOUT
         while not (run / ".job-running").exists() and time.monotonic() < deadline:
             time.sleep(0.01)
         assert (run / ".job-running").exists()
@@ -884,7 +924,7 @@ def test_hook_first_cannot_prevent_watcher_checkpoint_and_state_save(guest):
         assert hook.returncode == 0, hook.stderr
         assert "source=hook" in (guest.store / "PREEMPTED").read_text()
         gate.touch()
-        _, stderr = process.communicate(timeout=60)
+        _, stderr = process.communicate(timeout=PROCESS_TIMEOUT)
         assert process.returncode == 0, stderr
         assert (run / "checkpoint-request").exists(), stderr
         assert (guest.store / "fresh.ckpt").read_text() == (run / "checkpoint-request").read_text()
@@ -893,7 +933,7 @@ def test_hook_first_cannot_prevent_watcher_checkpoint_and_state_save(guest):
     finally:
         if process.poll() is None:
             process.terminate()
-            process.communicate(timeout=60)
+            process.communicate(timeout=PROCESS_TIMEOUT)
 
 
 @pytest.fixture
@@ -910,6 +950,7 @@ def control(guest, monkeypatch):
         "LABEL": "run-a",
         "JOB_URI": "gs://test-bucket/job.sh",
         "GCP_CHECKPOINT_WAIT": "0",
+        "GCP_TEST_BUDGET_SCALE": "1",
     }.items():
         monkeypatch.setenv(key, value)
     alarms = []
@@ -930,7 +971,108 @@ def control(guest, monkeypatch):
 
     clock = Clock()
     namespace["time"] = clock
-    return types.SimpleNamespace(ns=namespace, root=root, clock=clock, alarms=alarms)
+    return types.SimpleNamespace(ns=namespace, root=root, clock=clock, alarms=alarms, source=source)
+
+
+@pytest.mark.parametrize("scale", [1, 3600])
+def test_watcher_default_budgets_and_test_only_scale(control, monkeypatch, scale):
+    """Pin production waits, copy/diagnostic budgets, lock and alarm without real time."""
+    if scale == 1:
+        monkeypatch.delenv("GCP_TEST_BUDGET_SCALE")
+    else:
+        monkeypatch.setenv("GCP_TEST_BUDGET_SCALE", str(scale))
+    monkeypatch.delenv("GCP_CHECKPOINT_WAIT")
+    ns, root = control.ns, control.root
+    (root / "job.log").write_text("running")
+    (root / "state/checkpoint").write_text("saved")
+    uploads, copies, locks = [], [], []
+
+    class Lock:
+        def acquire(self, *, timeout):
+            locks.append(timeout)
+            return True
+
+        def release(self):
+            pass
+
+    def upload(path, key, budget):
+        uploads.append((key, budget))
+        return True
+
+    def cloud(args, budget):
+        copies.append((control.clock.value, budget))
+        control.clock.value += budget
+        return False
+
+    # Jump over the checkpoint wait rather than looping for scaled hours.
+    def sleep(_):
+        control.clock.value += 8 * scale
+
+    control.clock.sleep = sleep
+    ns["copy_lock"], ns["upload"], ns["cloud"] = Lock(), upload, cloud
+    ns["preempt"](24 * scale)
+    assert control.alarms == [(ns["signal"].ITIMER_REAL, 24 * scale), (ns["signal"].ITIMER_REAL, 0)]
+    assert locks == [0.5 * scale]
+    assert copies == [(8 * scale, 8 * scale)]
+    assert uploads == [
+        ("PREEMPTED", 3 * scale),
+        ("logs/run-a.log", 3 * scale),
+        ("logs/run-a.preempt.jsonl", 1.5 * scale),
+        ("logs/run-a.log", 2.5 * scale),
+        ("logs/run-a.preempt.jsonl", 1.5 * scale),
+    ]
+
+
+@pytest.mark.parametrize("scale", [1, 3600])
+def test_reconciliation_default_budgets_and_test_only_scale(control, monkeypatch, scale):
+    monkeypatch.setenv("GCP_TEST_BUDGET_SCALE", str(scale))
+    ns = control.ns
+    uploads, removals = [], []
+
+    def upload(path, key, budget):
+        uploads.append((key, budget))
+        return key != "DONE"  # Exercise the bounded fallback too.
+
+    def cloud(args, budget):
+        removals.append((args, budget))
+        return True
+
+    ns["upload"], ns["cloud"] = upload, cloud
+    ns["reconcile"]("0")
+    assert uploads[0][0].startswith("history/")
+    assert [budget for _, budget in uploads] == [0.6 * scale, 0.8 * scale, 0.4 * scale]
+    assert removals == [
+        (["storage", "rm", "gs://test-bucket/runs/run-a/state/PREEMPTED"], 1.2 * scale)
+    ]
+
+
+@pytest.mark.parametrize("scale", [1, 3600])
+def test_monitor_default_budgets_poll_and_save_deadline(control, monkeypatch, scale):
+    import types
+
+    monkeypatch.setenv("GCP_TEST_BUDGET_SCALE", str(scale))
+    ns = control.ns
+    calls, deadlines = [], []
+    responses = iter([b"FALSE", b"TRUE"])
+
+    def command(argv, budget, *_, **__):
+        calls.append((argv, budget))
+        return next(responses) if argv[0] == "curl" else True
+
+    ns["threading"] = types.SimpleNamespace(
+        Thread=lambda **_: types.SimpleNamespace(start=lambda: None)
+    )
+    ns["command"] = command
+    ns["claim"] = lambda source: True
+    ns["preempt"] = deadlines.append
+    monitor = control.source[control.source.index("\nthreading.Thread(target=periodic") :]
+    with pytest.raises(SystemExit):
+        exec(compile(monitor, "control.py", "exec"), ns)
+    assert deadlines == [24 * scale]
+    assert [budget for _, budget in calls] == [1.5 * scale, 2 * scale, 1.5 * scale]
+    assert calls[1][0] == ["sleep", "1"]
+    assert float(calls[0][0][calls[0][0].index("--connect-timeout") + 1]) == 0.5 * scale
+    assert float(calls[0][0][calls[0][0].index("--max-time") + 1]) == 1.5 * scale
 
 
 def test_preemption_log_and_trace_survive_exhausted_state_budget(control):
