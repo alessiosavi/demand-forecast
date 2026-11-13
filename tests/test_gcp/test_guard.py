@@ -1,5 +1,6 @@
 """Real operator CLI against a fake gcloud; never uses an account or cloud API."""
 
+import fcntl
 import json
 import os
 import runpy
@@ -59,6 +60,13 @@ if args[:3] == ['compute', 'instances', 'create']:
         state['create_failed'] = dict(instance=args[3], disk=session['boot_disk'])
         end(error=state['create_error'])
     if 'create_response' in state: end(state['create_response'])
+    if '--async' in args:
+        operation = dict(name='insert-'+args[3], operationType='insert',
+                         zone='https://www.googleapis.com/compute/v1/projects/test-project/zones/'+opt('--zone'),
+                         targetLink='https://www.googleapis.com/compute/v1/projects/test-project/zones/'+opt('--zone')+'/instances/'+args[3],
+                         targetId=str(len(ledger['sessions'])), status='PENDING')
+        state.setdefault('operations', []).append(operation)
+        if state.get('async_pending'): end([operation])
     labels = dict(item.split('=', 1) for item in opt('--labels').split(','))
     assert opt('--boot-disk-name') is None, 'unsupported GA flag'
     disk = dict(item.split('=', 1) for item in opt('--create-disk').split(','))
@@ -76,6 +84,9 @@ if args[:3] == ['compute', 'instances', 'create']:
     response = dict(vm)
     if state.get('omit_create_start'): response.pop('lastStartTimestamp')
     if state.get('omit_all_start'): vm.pop('lastStartTimestamp'); response.pop('lastStartTimestamp', None)
+    if '--async' in args:
+        operation['status'] = 'DONE'
+        end([operation])
     end([response])
 if args[:3] in (['compute', 'instances', 'list'], ['compute', 'disks', 'list']):
     kind = args[1]
@@ -115,15 +126,24 @@ if args[:3] == ['compute', 'disks', 'add-labels']:
         if d['name'] == args[3]: d['labels'] = dict(x.split('=', 1) for x in opt('--labels').split(','))
     end({})
 if args[:3] == ['compute', 'disks', 'delete']:
+    if not any(d['name'] == args[3] for d in state.get('disks', [])):
+        end(error='HTTPError 404: disk not found')
     state['disks'] = [d for d in state.get('disks', []) if d['name'] != args[3]]
     end({})
 if args[:3] == ['compute', 'operations', 'list']:
     assert opt('--zones') == 'europe-west4-a', args
     target = opt('--filter')
-    assert target and target.startswith('targetId='), args
     if state.get('operations_error'): end(error='403 Permission denied')
-    end([o for o in state.get('operations', []) if str(o.get('targetId')) == target.split('=', 1)[1]
-         and o.get('zone', '').rsplit('/', 1)[-1] == opt('--zones')])
+    if state.get('operations_warning'): print(state['operations_warning'], file=sys.stderr)
+    if 'operations_response' in state: end(state['operations_response'])
+    assert target, args
+    if target.startswith('targetId='):
+        end([o for o in state.get('operations', []) if str(o.get('targetId')) == target.split('=', 1)[1]
+             and o.get('zone', '').rsplit('/', 1)[-1] == opt('--zones')])
+    assert target.startswith("targetLink~'/projects/test-project/zones/europe-west4-a/instances/") and target.endswith("$' AND operationType=insert"), args
+    link = target.removeprefix("targetLink~'").removesuffix("$' AND operationType=insert")
+    end([o for o in state.get('operations', []) if o.get('targetLink', '').endswith(link)
+         and o.get('operationType') == 'insert' and o.get('zone', '').rsplit('/', 1)[-1] == opt('--zones')])
 raise AssertionError(args)
 """
 # Decimal is imported separately to keep fake executable's source self-contained.
@@ -998,7 +1018,7 @@ def test_deleted_ambiguous_operations_keep_full_reservation(cloud, fault):
 @pytest.mark.parametrize(
     "duration,seconds", [("0s", 0), ("90s", 90), ("1h2m3s", 3723), ("2h", 7200)]
 )
-def test_flex_wait_reaches_create_and_sets_subprocess_budget(cloud, monkeypatch, duration, seconds):
+def test_flex_wait_submits_async_with_bounded_budget(cloud, monkeypatch, duration, seconds):
     cloud.setup()
     cloud.price("FLEX_START")
     real_run = subprocess.run
@@ -1039,9 +1059,10 @@ def test_flex_wait_reaches_create_and_sets_subprocess_budget(cloud, monkeypatch,
         )[1:],
     )
     assert runpy.run_path(str(GUARD))["main"]() == 0
-    assert budgets == [seconds + 300]
+    assert budgets == [300]
     create = next(c for c in cloud.calls() if c[:3] == ["compute", "instances", "create"])
     assert f"--request-valid-for-duration={duration}" in create
+    assert "--async" in create
     cloud.change(instances=[], disks=[])
     cloud.run("resume", "run-a", "run-b")
     creates = [c for c in cloud.calls() if c[:3] == ["compute", "instances", "create"]]
@@ -1113,7 +1134,7 @@ def test_create_timeout_keeps_reservation(cloud, monkeypatch):
         )[1:],
     )
     assert runpy.run_path(str(GUARD))["main"]() == 2
-    assert budgets == [390]
+    assert budgets == [300]
     session = cloud.read()["sessions"][0]
     assert session["status"] == "reserved"
     assert session["settled_cost_usd"] is None
@@ -1173,3 +1194,294 @@ def test_missing_start_after_followup_still_requires_evidence(cloud):
     cloud.change(instances=[], disks=[])
     assert cloud.run("close", "run-a", ok=False).returncode == 2
     assert cloud.read()["sessions"][0]["status"] == "needs_settlement"
+
+
+def insert_operation(status="PENDING", **fields):
+    return dict(
+        name="insert-run-a",
+        zone="https://www.googleapis.com/compute/v1/projects/test-project/zones/europe-west4-a",
+        targetLink="https://www.googleapis.com/compute/v1/projects/test-project/zones/europe-west4-a/instances/run-a",
+        operationType="insert",
+        status=status,
+        **fields,
+    )
+
+
+@pytest.mark.parametrize("status", ["PENDING", "RUNNING", "DONE", "UNKNOWN"])
+def test_polling_error_with_insert_and_clean_inventory_retains_reservation(cloud, status):
+    cloud.setup()
+    cloud.price("FLEX_START")
+    cloud.change(
+        create_error="Polling operation failed: HTTP 502", operations=[insert_operation(status)]
+    )
+    assert cloud.launch(model="FLEX_START", ok=False).returncode == 2
+    session = cloud.read()["sessions"][0]
+    assert session["settled_cost_usd"] is None
+    assert len(session["create_failure_inventory"]) == 2
+    assert session["create_failure_operations"]["operations"][0]["status"] == status
+    assert Decimal(json.loads(cloud.run("report").stdout)["committed_usd"]) == Decimal(
+        session["reservation_usd"]
+    )
+
+
+def test_done_with_error_insert_and_clean_inventory_cancels(cloud):
+    cloud.setup()
+    cloud.change(
+        create_error="HTTP 502 while polling",
+        operations=[
+            insert_operation(
+                "DONE",
+                error={"errors": [{"code": "ZONE_RESOURCE_POOL_EXHAUSTED"}]},
+                user="not-retained@example.invalid",
+            )
+        ],
+    )
+    assert cloud.launch(ok=False).returncode == 2
+    session = cloud.read()["sessions"][0]
+    assert session["status"] == "cancelled" and Decimal(session["settled_cost_usd"]) == 0
+    assert "user" not in session["create_failure_operations"]["operations"][0]
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        {"operations_error": True},
+        {"operations_warning": "partial results"},
+        {"operations_response": None},
+        {"operations_response": [{}]},
+    ],
+)
+def test_create_error_unreadable_or_ambiguous_operations_keep_reservation(cloud, fault):
+    cloud.setup()
+    cloud.change(create_error="INVALID_ARGUMENT", **fault)
+    assert cloud.launch(ok=False).returncode == 2
+    session = cloud.read()["sessions"][0]
+    assert session["settled_cost_usd"] is None
+    assert session["create_failure_operations"]["error"]
+
+
+@pytest.mark.parametrize("kind", ["instances", "disks"])
+def test_cancelled_resource_reopens_on_close_even_over_cap(cloud, kind):
+    cloud.setup(cap="6")
+    cloud.launch()
+    ledger = cloud.read()
+    session = ledger["sessions"][0]
+    session.update(status="cancelled", settled_cost_usd="0.000000")
+    # A late resource has no saved first boot; reconciliation must retain money.
+    session.pop("last_start")
+    cloud.ledger.write_text(json.dumps(ledger))
+    cloud.run("hold", "set", "storage", "5")
+    if kind == "disks":
+        cloud.change(instances=[])
+    result = cloud.run("sweep", ok=False)
+    assert result.returncode == 1 and "cancelled_session_resource" in result.stdout
+    before = cloud.ledger.read_bytes()
+    cloud.run("close", "run-a", "--dry-run")
+    assert cloud.ledger.read_bytes() == before
+    result = cloud.run("close", "run-a", ok=False)
+    assert result.returncode == 2 and "overrun" in result.stderr
+    reopened = cloud.read()["sessions"][0]
+    assert reopened["status"] == "needs_settlement" and reopened["settled_cost_usd"] is None
+    assert reopened["reopened"]["committed_usd"] == "10.017124"
+    assert Decimal(json.loads(cloud.run("report").stdout)["committed_usd"]) > 6
+    assert cloud.launch("run-b", ok=False).returncode == 2
+    cloud.change(disks=[])
+    cloud.run("close", "run-a", "--settled-usd", "1", "--evidence", "billing fixture")
+    assert cloud.read()["sessions"][0]["status"] == "closed"
+
+
+def test_sweep_delete_already_autodeleted_disk_keeps_findings_exit_code(cloud):
+    cloud.setup()
+    cloud.launch()
+    ledger = cloud.read()
+    ledger["sessions"][0].update(status="closed", settled_cost_usd="1")
+    cloud.ledger.write_text(json.dumps(ledger))
+    result = cloud.run("sweep", "--delete", ok=False)
+    assert result.returncode == 1, result.stderr
+    assert cloud.run("sweep").returncode == 0
+
+
+def test_flex_async_records_operation_without_polling_or_disk_label(cloud):
+    cloud.setup()
+    cloud.price("FLEX_START")
+    cloud.change(async_pending=True)
+    result = cloud.launch("run-a", "--request-valid-for", "2h", model="FLEX_START")
+    session = cloud.read()["sessions"][0]
+    assert session["status"] == "open" and session["operation_name"] == "insert-run-a"
+    assert session["settled_cost_usd"] is None
+    assert "insert-run-a" in result.stdout
+    create = next(c for c in cloud.calls() if c[:3] == ["compute", "instances", "create"])
+    assert "--async" in create and any(
+        "guard-reserved-end=" + session["reserved_end"] in a for a in create
+    )
+    assert not any(
+        c[:3] in (["compute", "instances", "describe"], ["compute", "disks", "add-labels"])
+        for c in cloud.calls()
+    )
+
+
+@pytest.mark.parametrize("outcome", ["pending", "running", "failed", "expired"])
+def test_flex_status_and_wait_report_queue_state(cloud, outcome):
+    cloud.setup()
+    cloud.price("FLEX_START")
+    cloud.change(async_pending=outcome != "running")
+    cloud.launch("run-a", "--request-valid-for", "90s", model="FLEX_START")
+    if outcome in {"failed", "expired"}:
+        code = "FLEX_START_REQUEST_EXPIRED" if outcome == "expired" else "QUOTA_EXCEEDED"
+        cloud.change(
+            operations=[
+                insert_operation(
+                    "DONE",
+                    error={
+                        "errors": [
+                            {
+                                "code": code,
+                                "message": "request expired" if outcome == "expired" else "quota",
+                            }
+                        ]
+                    },
+                )
+            ]
+        )
+    status = json.loads(cloud.run("status", "run-a").stdout)[0]
+    assert status["queue"]["state"] == outcome
+    result = cloud.run("wait", "run-a", "--timeout", "0", ok=False)
+    assert json.loads(result.stdout)["queue"]["state"] == outcome
+    assert result.returncode == (0 if outcome == "running" else 1)
+    assert cloud.read()["sessions"][0]["settled_cost_usd"] is None
+    if outcome == "running":
+        assert cloud.read()["sessions"][0]["last_start"]
+        cloud.run("close", "run-a")
+        assert Decimal(cloud.read()["sessions"][0]["settled_cost_usd"]) > 0
+
+
+@pytest.mark.parametrize("code", ["FLEX_START_REQUEST_EXPIRED", "QUOTA_EXCEEDED"])
+def test_close_failed_flex_request_settles_zero_with_operation_and_absence(cloud, code):
+    cloud.setup()
+    cloud.price("FLEX_START")
+    cloud.change(async_pending=True)
+    cloud.launch(model="FLEX_START")
+    cloud.change(operations=[insert_operation("DONE", error={"errors": [{"code": code}]})])
+    cloud.run("close", "run-a")
+    session = cloud.read()["sessions"][0]
+    assert session["status"] == "closed" and Decimal(session["settled_cost_usd"]) == 0
+    assert len(session["create_failure_inventory"]) == 2
+    assert session["create_failure_operations"]["operations"][0]["error"]
+
+
+@pytest.mark.parametrize(
+    "fault", ["pending", "missing", "unreadable", "success", "inventory-warning"]
+)
+def test_close_ambiguous_flex_request_retains_full_reservation(cloud, fault):
+    cloud.setup()
+    cloud.price("FLEX_START")
+    cloud.change(async_pending=True)
+    cloud.launch(model="FLEX_START")
+    if fault == "missing":
+        cloud.change(operations=[])
+    elif fault == "unreadable":
+        cloud.change(operations_error=True)
+    elif fault == "success":
+        cloud.change(operations=[insert_operation("DONE")])
+    elif fault == "inventory-warning":
+        cloud.change(
+            operations=[insert_operation("DONE", error={"errors": [{"code": "QUOTA_EXCEEDED"}]})],
+            create_failed={"instance": "run-a", "disk": cloud.read()["sessions"][0]["boot_disk"]},
+            failure_inventory=[{}, {"disks_warning": "partial inventory"}],
+        )
+    assert cloud.run("close", "run-a", ok=False).returncode == 2
+    session = cloud.read()["sessions"][0]
+    assert session["status"] == "needs_settlement" and session["settled_cost_usd"] is None
+
+
+def test_pending_insert_with_alternate_api_hostname_retains_reservation(cloud):
+    cloud.setup()
+    operation = insert_operation()
+    operation["targetLink"] = operation["targetLink"].replace(
+        "www.googleapis.com", "compute.googleapis.com"
+    )
+    cloud.change(create_error="HTTP 502", operations=[operation])
+    assert cloud.launch(ok=False).returncode == 2
+    assert cloud.read()["sessions"][0]["settled_cost_usd"] is None
+
+
+def test_pending_flex_blocks_resume_and_shared_prefix_launch(cloud):
+    cloud.setup()
+    cloud.price("FLEX_START")
+    cloud.change(async_pending=True)
+    cloud.launch(model="FLEX_START")
+    prefix = cloud.read()["sessions"][0]["state_uri"]
+    assert cloud.run("resume", "run-a", "run-b", ok=False).returncode == 2
+    assert cloud.launch("run-c", "--state-uri", prefix, ok=False).returncode == 2
+    assert len(cloud.read()["sessions"]) == 1
+
+
+def test_flex_dry_run_has_only_async_submission_and_changes_no_bytes(cloud):
+    cloud.setup()
+    cloud.price("FLEX_START")
+    before = cloud.ledger.read_bytes()
+    result = cloud.launch("dry", "--dry-run", model="FLEX_START")
+    assert "--async" in result.stdout and "add-labels" not in result.stdout
+    assert before == cloud.ledger.read_bytes()
+
+
+@pytest.mark.parametrize(
+    "field,value", [("zone", None), ("targetLink", None), ("status", []), ("error", {"errors": []})]
+)
+def test_malformed_insert_evidence_cannot_cancel(cloud, field, value):
+    cloud.setup()
+    operation = insert_operation("DONE", error={"errors": [{"code": "QUOTA_EXCEEDED"}]})
+    operation[field] = value
+    # Force the returned malformed object past the fake's server-side filtering.
+    cloud.change(create_error="HTTP 502", operations_response=[operation])
+    result = cloud.launch(ok=False)
+    assert result.returncode == 2 and "Traceback" not in result.stderr
+    assert cloud.read()["sessions"][0]["settled_cost_usd"] is None
+
+
+def test_wait_releases_lock_and_observes_pending_to_running_without_extending_deadline(
+    cloud, monkeypatch, capsys
+):
+    cloud.setup()
+    cloud.price("FLEX_START")
+    cloud.change(async_pending=True)
+    cloud.launch(model="FLEX_START")
+    original_end = cloud.read()["sessions"][0]["reserved_end"]
+
+    def advance(_seconds):
+        with cloud.ledger.with_suffix(".json.lock").open("rb") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        cloud.change(
+            operations=[insert_operation("DONE", targetId="1")],
+            instances=[
+                dict(
+                    name="run-a",
+                    id="1",
+                    zone="europe-west4-a",
+                    status="RUNNING",
+                    creationTimestamp="2026-11-13T00:00:00Z",
+                    lastStartTimestamp="2026-11-13T00:01:00Z",
+                )
+            ],
+        )
+
+    for key, value in cloud.env.items():
+        monkeypatch.setenv(key, value)
+    module = runpy.run_path(str(GUARD))
+    monkeypatch.setattr(module["time"], "sleep", advance)
+    args = module["parser"]().parse_args(
+        [
+            "--ledger",
+            str(cloud.ledger),
+            "wait",
+            "run-a",
+            "--timeout",
+            "20",
+            "--poll-interval",
+            "0.01",
+        ]
+    )
+    assert module["wait_for_session"](cloud.ledger, args) == 0
+    output = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert [item["queue"]["state"] for item in output] == ["pending", "running"]
+    assert cloud.read()["sessions"][0]["reserved_end"] == original_end

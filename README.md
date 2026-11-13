@@ -127,7 +127,8 @@ demand-forecast fev --help
 ```
 
 For the seven bundled weekly tasks, use the [frozen protocol](docs/protocol.md),
-[Colab workflow](docs/colab.md) or [EC2 runbook](docs/ec2.md). The checked-in
+[Colab workflow](docs/colab.md), [EC2 runbook](docs/ec2.md), or
+[Google Cloud GPU runbook](docs/gcp.md). The checked-in
 [standard configuration](configs/fev-v2-standard.yaml) defines the model and
 training controls; the runner derives data roles, horizon and quantiles from
 each task. On the benchmark host:

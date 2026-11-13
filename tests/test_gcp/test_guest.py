@@ -31,6 +31,9 @@ with Path(os.environ['CALLS']).open('a') as out: out.write(json.dumps([name, *ar
 store = Path(os.environ['STORE'])
 if name == 'curl':
     key = args[-1].rsplit('/', 1)[1]
+    if key == os.environ.get('MISSING_METADATA'):
+        print('HTTP 404: metadata not found', file=sys.stderr)
+        sys.exit(22)
     print(json.loads(os.environ['METADATA'])[key])
 elif name == 'shutdown': pass
 elif name == 'install': pass
@@ -204,6 +207,14 @@ def test_failed_periodic_copy_does_not_kill_job_and_next_copy_recovers(guest):
     assert any(c[0] == "shutdown" for c in guest.calls())
     for key in ("STARTED", "HEARTBEAT", "DONE"):
         assert_marker_identity(guest.store / key)
+
+
+def test_missing_metadata_powers_off_before_restore_or_job_fetch(guest):
+    result = guest.run(MISSING_METADATA="guard-label")
+    assert result.returncode != 0
+    assert any(c[0] == "shutdown" for c in guest.calls())
+    assert not any(c[0] == "gcloud" for c in guest.calls())
+    assert not (guest.tmp / "runs/run-a/job.sh").exists()
 
 
 def test_job_timeout_writes_timeout_and_powers_off(guest):

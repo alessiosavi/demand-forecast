@@ -45,7 +45,7 @@ and [GPU regions and zones](https://docs.cloud.google.com/compute/docs/gpus/gpu-
 
 ## Local ledger, prices, and holds
 
-Copy [operator-env.example.sh](../scripts/gcp/operator-env.example.sh) outside the
+Copy `scripts/gcp/operator-env.example.sh` outside the
 checkout, replace every placeholder from evidence, and source it in Bash. Keep the
 ledger on one durable local filesystem, outside Git. All operators must use the
 same ledger and lock file; copies on separate laptops do not coordinate.
@@ -228,18 +228,21 @@ prices, cap, region and markers. The resulting cloud state can change before a
 real command. `close --dry-run` shows planned stop/delete operations.
 
 When create returns a CLI error (positive nonzero exit), the guard reads instance
-and disk inventory twice, three seconds apart. It cancels at zero **only if both
-reads succeed and neither contains the exact instance name or boot disk name**,
-including resources without labels. The original error and both timestamped
-inventory results are saved in the session (`error`, `create_failure_inventory`),
-with each read persisted before the next. A resource found in either read, failed
-inventory, timeout, signal termination or unexpected create response retains the
-reservation. The label stays burned in every case. Known rejection texts include
-`ZONE_RESOURCE_POOL_EXHAUSTED`, `QUOTA_EXCEEDED`, `Quota '…' exceeded`, `stock-out`,
-`INVALID_ARGUMENT`, `Invalid value`, and incompatible disk types. This list is
-documentation, **not the cancellation gate**. Disk-label failure after create also retains the reservation.
+and disk inventory twice, three seconds apart, then reads zonal insert operations
+filtered by `targetLink` and `operationType=insert`. It cancels at zero **only if
+both inventory reads are clean and no matching insert can still produce a VM**.
+An insert in PENDING or RUNNING, or DONE without an error, retains the reservation.
+DONE with an error and clean inventory proves rejection; a clean empty operations
+list also permits cancellation of a returned create error. Missing recorded
+operations, unreadable or partial operation results, unknown status/identity,
+timeout, signal termination and unexpected responses retain the reservation.
+The original error, timestamped inventory results and operation fields are saved
+as `error`, `create_failure_inventory` and `create_failure_operations`; each read
+is persisted before the next. Names and labels both count, even before disk labeling.
+The label stays burned in every case. Error text alone never proves rejection.
+Disk-label failure after a synchronous create also retains the reservation.
 Use `status` and `sweep`, then close/settle. There are no automatic create retries.
-For these two reads, any stderr output also prevents cancellation: SDK 593 can
+For inventory and operation reads, any stderr output also prevents cancellation: SDK 593 can
 return partial inventory with exit zero and a warning about an unreachable scope.
 Evidence stores resource names, IDs, zones/regions, status and labels; account and
 guest metadata fields are omitted.
@@ -249,14 +252,41 @@ in the selected zone. The default `0s` requests immediately available capacity a
 fails if it is unavailable; it does not queue or retry in another zone. Nonzero
 waits must be 90 seconds–2 hours; `h`, `m`, `s` and combinations such as `1h2m3s`
 are accepted. Resume retains this setting, including for older ledger entries
-without it (which use `0s`). The create subprocess budget is the wait plus 300
-seconds. A subprocess timeout retains the full reservation because creation might
-still succeed. Google's runtime limit starts at RUNNING; the guest's conservative
+without it (which use `0s`). Flex-start always submits create with `--async`, using
+a 300-second submission budget, and records an `open` session with `operation_name`
+and `create_operation` immediately. It does not hold a CLI poll open throughout
+the capacity wait or try to label a disk that might not exist yet; the tokenized
+disk name keeps it discoverable. A subprocess timeout retains the full reservation
+because creation might still succeed. Google's runtime limit starts at RUNNING; the guest's conservative
 metadata deadline starts at request submission, so capacity waits consume its
-training window and can exhaust it. After create, a missing `lastStartTimestamp`
+training window and can exhaust it. `status` and `wait` never extend this metadata
+deadline. For synchronous Spot/Standard create, a missing `lastStartTimestamp`
 triggers one further describe with a 60-second budget. If that still provides no
 start, the instance identity and reservation remain recorded, and settlement
 requires operation history or manual evidence.
+
+```bash
+guard status flex-01
+guard wait flex-01 --timeout 300 --poll-interval 5
+guard wait flex-01 --timeout 0  # one observation
+```
+
+Flex-start status includes `queue.state`, the described instance and saved insert
+operation evidence. States include `pending`, `running`, `failed`, `expired`,
+and `unknown` when evidence is insufficient. Expiry is identified from the
+operation error; elapsed laptop time alone does not prove Google rejected it.
+Other observed instance states, such as `terminated`, are reported directly.
+`wait` polls with separate bounded read calls, releasing the ledger lock between
+polls. Its local timeout bounds polling, with up to 60 seconds per cloud read;
+it exits 0 for running, 1 for a terminal/unknown state or local wait expiry, and
+2 for a read/usage error. A local wait timeout never cancels or releases money.
+Status/wait save observed instance identity and first start for later settlement.
+An unresolved Flex-start insert also blocks resume or another launch on its state
+prefix, even while inventory contains no VM, so two jobs cannot later share it.
+For a failed or expired request with nothing created, `close` settles zero only
+after a matching DONE-with-error insert and the same two clean inventory reads.
+Missing operations, unfinished/successful inserts or uncertain inventory keep
+`needs_settlement` and the full reservation.
 
 `close` first stops a running VM, reads `lastStartTimestamp` and
 `lastStopTimestamp` from `instances describe`, saves that evidence **before**
@@ -304,6 +334,15 @@ create: the name scan covers a crash before disk labeling. Findings always give
 exit 1, even with `--delete`; rerun to check cleanup. Read/API errors give exit 2.
 `--delete` prints findings before deleting their resources, without settling money.
 It may destroy an overdue job's unflushed state; inspect the dry run first.
+An already-absent disk after its instance was deleted counts as successful cleanup.
+Late resources belonging to a cancelled session have the distinct finding
+`cancelled_session_resource`. `close <label>` on such a session durably reopens it
+as `needs_settlement`, restoring the full reservation before attempting cleanup.
+An enforcement/cap overrun is recorded in `reopened` and reported, rather than
+refusing to account for resources that may already have spent money. Close then
+uses the normal runtime/evidence rules; if those cannot establish cost, reconcile
+with `--settled-usd` and `--evidence`. A cancelled session with no resources stays
+settled. Sweep deletion itself never settles money.
 
 ## Guest contract and recovery
 
@@ -371,9 +410,10 @@ bound bucket storage or stopped/detached disk lifetime.
 
 ## Verified flag differences and sources
 
-Only `gcloud ... --help` was run against the real SDK; no account/API calls or
-cloud mutations were made during implementation. Offline fake-CLI tests cover
-both create paths for all three provisioning models. On 2026-11-13, SDK 593 help
+During worker implementation, real SDK calls were limited to `gcloud ... --help`;
+workers made no account/API calls or cloud mutations. The operator's separate live
+canary on 2026-11-13 covered the behaviours listed below. Offline fake-CLI tests cover
+launch and resume for all three provisioning models. On 2026-11-13, SDK 593 help
 and these official documents established:
 
 - [`instances create`](https://docs.cloud.google.com/sdk/gcloud/reference/compute/instances/create):
@@ -381,6 +421,8 @@ and these official documents established:
   `--max-run-duration` accepts duration syntax; `--instance-termination-action=DELETE`
   applies to preemption and automatic time limits. The limit is relative to the
   last RUNNING transition, not request submission; stop/restart resets it.
+  `--async` returns the insert operation without waiting for completion; SDK 593's
+  create implementation returns operation JSON when `--format=json` is explicit.
 - [Runtime limits](https://docs.cloud.google.com/compute/docs/instances/limit-vm-runtime):
   Standard and Spot support limits (legacy `--preemptible` does not). Public bounds
   are 30 seconds–120 days, and termination can start up to 30 seconds late. This
@@ -398,13 +440,18 @@ and these official documents established:
   `--local-ssd` takes a property list, e.g. `interface=NVME`; repeat for more disks.
   `--create-disk` explicitly sets the boot disk name, image, size, type,
   `boot=yes` and `auto-delete=yes`; GA has no `--boot-disk-name` flag.
-  GA create-disk help lacks disk labels,
-  so the guard adds them separately and scans tokenized names.
+  GA create-disk help lacks disk labels, so the guard adds them after synchronous
+  creates and scans tokenized names for both synchronous and asynchronous creates.
 - SDK stop help confirms `--discard-local-ssd=true` accepts an explicit boolean.
   SDK `operations/list.py` selects zonal operations with `--zones`; the generated
   v1 `Operation` message and [zoneOperations reference](https://docs.cloud.google.com/compute/docs/reference/rest/v1/zoneOperations)
   define `targetId`, `zone`, `targetLink`, `status`, `startTime`, `endTime` and
-  `insertTime`, and name `insert`/`delete` operation types.
+  `insertTime`, and name `insert`/`delete` operation types. `status` is PENDING,
+  RUNNING or DONE; `error.errors` and `httpErrorStatusCode` describe failures.
+  Target-name insert queries use `--zones` and a `targetLink`/`operationType` filter,
+  so they work before an instance ID is available. The target filter matches the
+  full project/zone/instance path suffix, independent of API URL hostname; its
+  regex syntax was checked against the installed SDK's offline filter evaluator.
   [Spot preemption history](https://docs.cloud.google.com/compute/docs/instances/create-use-spot#detect-preemption)
   explicitly documents `compute.instances.preempted` and its `startTime`.
   The operation type is a string, not an exhaustive SDK enum; `start`/`stop` are
@@ -427,10 +474,18 @@ credits and use independent billing alerts. Do not put credentials or personal
 account identifiers in job scripts, evidence text or logs.
 
 The server limit is the final compute guard; guest copies and laptop uptime are
-not required for it. Successful completion, checkpoint durability, capacity, IAM,
-quota, actual billing accuracy, full guest-agent integration and real Spot recovery
-still require a separately authorized canary. No live cloud canary was performed.
-Specifically unverified until that canary: actual zonal operation fields/types and
-their completeness for Spot and deadline deletion; first-prefix and resumed
-restores with the real storage CLI; real server deadline deletion, including
-auto-deletion of the boot disk. Fake-CLI tests do not establish these live behaviours.
+not required for it. The operator's live canary on **2026-11-13** covered:
+
+- A first `g2-standard-8` Spot launch end to end: restore from an empty state
+  prefix, heartbeat, DONE, guest power-off and close using instance timestamps.
+- Spot stock-out cancellations and the `g4-standard-48` boot-disk-type rejection.
+- A Flex-start request that remained PENDING after the CLI operation poll failed
+  with HTTP 502; inventory showed the instance and its reservation was retained.
+
+Still unverified live: Spot preemption and resume from a checkpoint; settlement
+from retained operations (including expiry/failure and operation field/type
+completeness); the new asynchronous Flex-start submission/status/wait flow;
+server deadline deletion and automatic boot-disk deletion. The pending-request
+incident did not verify a clean-inventory polling failure. Fake-CLI tests cover
+that case and the new accounting rules but cannot establish live control-plane
+behaviour, checkpoint durability or billing accuracy.

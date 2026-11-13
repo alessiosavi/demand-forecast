@@ -23,6 +23,20 @@ MARKERS = ("STARTED", "DONE", "FAILED", "TIMEOUT", "PREEMPTED", "HEARTBEAT")
 OPEN = {"reserved", "open", "needs_settlement"}
 HERE = Path(__file__).resolve().parent
 CENT = Decimal("0.000001")
+OP_FIELDS = {
+    "name",
+    "id",
+    "zone",
+    "targetId",
+    "targetLink",
+    "operationType",
+    "status",
+    "insertTime",
+    "startTime",
+    "endTime",
+    "error",
+    "httpErrorStatusCode",
+}
 
 
 class GuardError(Exception):
@@ -99,6 +113,23 @@ def committed(ledger):
             for s in ledger["sessions"]
         ),
         sum((number(h["usd"]) for h in ledger["holds"].values()), Decimal(0)),
+    )
+
+
+def operation_failed(operation):
+    error = operation.get("error")
+    errors = error.get("errors") if isinstance(error, dict) else None
+    code = operation.get("httpErrorStatusCode")
+    return bool(
+        (
+            isinstance(errors, list)
+            and errors
+            and all(
+                isinstance(item, dict) and isinstance(item.get("code"), str) and item["code"]
+                for item in errors
+            )
+        )
+        or (isinstance(code, int) and 400 <= code <= 599)
     )
 
 
@@ -295,7 +326,7 @@ class Guard:
         resources = {}
         for kind in ("instances", "disks"):
             items = self.cloud("compute", kind, "list", clean_stderr=session is not None)
-            if not isinstance(items, list):
+            if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
                 raise GuardError(f"invalid {kind} list; absence unverified")
             resources[kind] = [
                 item
@@ -335,6 +366,86 @@ class Guard:
     def labels(self, session):
         return f"guard-ledger={self.config['token']},guard-session={session['label']}"
 
+    def insert_operations(self, session, evidence_key):
+        """Read by target name even when an insert has not produced an instance ID."""
+        zone = session["launch"]["zone"]
+        target = f"/projects/{self.config['project']}/zones/{zone}/instances/{session['label']}"
+        evidence = session[evidence_key] = {"observed_at": stamp(now())}
+        try:
+            operations = self.cloud(
+                "compute",
+                "operations",
+                "list",
+                f"--zones={zone}",
+                f"--filter=targetLink~'{target}$' AND operationType=insert",
+                clean_stderr=True,
+                timeout=60,
+            )
+            if not isinstance(operations, list) or any(
+                not isinstance(op, dict) for op in operations
+            ):
+                raise GuardError("invalid insert operation list; rejection unverified")
+            evidence["operations"] = [
+                {key: value for key, value in op.items() if key in OP_FIELDS} for op in operations
+            ]
+            if any(
+                not all(
+                    isinstance(op.get(key), str) for key in ("name", "zone", "targetLink", "status")
+                )
+                or not op["name"]
+                or op.get("operationType") != "insert"
+                or op.get("zone", "").rsplit("/", 1)[-1] != zone
+                or not op.get("targetLink", "").endswith(target)
+                or op.get("status") not in {"PENDING", "RUNNING", "DONE"}
+                for op in operations
+            ):
+                raise GuardError("ambiguous insert operation identity or status")
+            if session.get("operation_name") and not any(
+                op["name"] == session["operation_name"] for op in operations
+            ):
+                raise GuardError("recorded insert operation missing; rejection unverified")
+            return evidence["operations"]
+        except (GuardError, ValueError, OSError, subprocess.SubprocessError) as exc:
+            evidence["error"] = str(getattr(exc, "stderr", "") or exc)
+            return None
+        finally:
+            self.save()
+
+    def rejection_verified(self, session, require_operation=False):
+        """Two clean absence reads AND no insert that could still create a VM."""
+        reads = session["create_failure_inventory"] = []
+        for attempt in range(2):
+            if attempt:
+                time.sleep(3)
+            observed = {"observed_at": stamp(now())}
+            try:
+                fields = ("name", "id", "zone", "region", "status", "labels")
+                observed.update(
+                    {
+                        kind: [{key: item[key] for key in fields if key in item} for item in items]
+                        for kind, items in self.inventory(session).items()
+                    }
+                )
+            except (GuardError, ValueError, OSError, subprocess.SubprocessError) as exc:
+                observed["error"] = str(getattr(exc, "stderr", "") or exc)
+            reads.append(observed)
+            self.save()
+        operations = self.insert_operations(session, "create_failure_operations")
+        return (
+            all(
+                "error" not in read
+                and not any(
+                    self.matches(
+                        {kind: read[kind] for kind in ("instances", "disks")}, session
+                    ).values()
+                )
+                for read in reads
+            )
+            and operations is not None
+            and (not require_operation or bool(operations))
+            and all(op["status"] == "DONE" and operation_failed(op) for op in operations)
+        )
+
     def launch(self, args, previous=None):
         if any(s["label"] == args.label for s in self.data["sessions"]):
             raise GuardError("label was used before; choose a new label")
@@ -353,7 +464,7 @@ class Guard:
         request_valid_for = getattr(args, "request_valid_for", None)
         if request_valid_for is not None and args.provisioning != "FLEX_START":
             raise GuardError("--request-valid-for is only supported with FLEX_START")
-        wait_seconds = request_seconds(request_valid_for or "0s")
+        request_seconds(request_valid_for or "0s")
         key = f"{args.machine_type}|{args.provisioning}|{region}"
         if key not in self.data["prices"]:
             raise GuardError(f"no stored price for {key}")
@@ -384,6 +495,16 @@ class Guard:
                 v.get("name") == old["label"] for v in inventory["instances"]
             ):
                 raise GuardError("state prefix already has an instance; close it before resuming")
+            if (
+                old["state_uri"] == state_uri
+                and old["status"] in OPEN
+                and old["launch"]["provisioning"] == "FLEX_START"
+            ):
+                operations = self.insert_operations(old, "queue_operations")
+                if not operations or any(op["status"] != "DONE" for op in operations):
+                    raise GuardError(
+                        "state prefix has a pending or uncertain insert; close it before resuming"
+                    )
         done = self.marker(state_uri, "DONE")
         if done is not None:
             if not done["job_uri"]:
@@ -462,7 +583,7 @@ class Guard:
             f"image-family={args.image_family},image-project={args.image_project}",
         ]
         if args.provisioning == "FLEX_START":
-            command.append(f"--request-valid-for-duration={request_valid_for or '0s'}")
+            command.extend(["--async", f"--request-valid-for-duration={request_valid_for or '0s'}"])
         if args.accelerator:
             command.append(f"--accelerator={args.accelerator}")
         if session["launch"]["nic_type"]:
@@ -471,52 +592,49 @@ class Guard:
         self.data["sessions"].append(session)
         self.save()  # Lock covers admission and this durable reservation, before create.
         try:
-            result = self.cloud(*command, mutate=True, timeout=wait_seconds + 300)
+            result = self.cloud(*command, mutate=True, timeout=300)
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
             session["error"] = str(getattr(exc, "stderr", "") or exc)
             self.save()
-            # A returned CLI error can settle only with two successful absence
-            # reads. Timeouts and signal termination never prove rejection.
-            if isinstance(exc, subprocess.CalledProcessError) and exc.returncode > 0:
-                reads = session["create_failure_inventory"] = []
-                for attempt in range(2):
-                    if attempt:
-                        time.sleep(3)
-                    observed = {"observed_at": stamp(now())}
-                    try:
-                        # Record identity evidence, not accounts or guest metadata.
-                        fields = ("name", "id", "zone", "region", "status", "labels")
-                        observed.update(
-                            {
-                                kind: [
-                                    {key: item[key] for key in fields if key in item}
-                                    for item in items
-                                ]
-                                for kind, items in self.inventory(session).items()
-                            }
-                        )
-                    except (
-                        GuardError,
-                        ValueError,
-                        OSError,
-                        subprocess.SubprocessError,
-                    ) as read_exc:
-                        observed["error"] = str(getattr(read_exc, "stderr", "") or read_exc)
-                    reads.append(observed)
-                    self.save()  # Keep each read even if the next one fails or we exit.
-                if all(
-                    "error" not in read
-                    and not any(v.get("name") == args.label for v in read["instances"])
-                    and not any(d.get("name") == session["boot_disk"] for d in read["disks"])
-                    for read in reads
-                ):
-                    session.update(status="cancelled", settled_cost_usd="0.000000")
-                    self.save()
+            # Polling/transport errors can leave an insert queued with no VM yet.
+            if (
+                isinstance(exc, subprocess.CalledProcessError)
+                and exc.returncode > 0
+                and self.rejection_verified(session)
+            ):
+                session.update(status="cancelled", settled_cost_usd="0.000000")
+                self.save()
             raise GuardError("create failed; " + session["error"]) from exc
+        if self.dry_run and args.provisioning == "FLEX_START":
+            return
         if not self.dry_run:
             if not isinstance(result, list) or len(result) != 1:
                 raise GuardError("unexpected create response; reservation retained; run sweep")
             vm = result[0]
+            if args.provisioning == "FLEX_START":
+                target = (
+                    f"/projects/{self.config['project']}/zones/{args.zone}/instances/{args.label}"
+                )
+                if (
+                    not isinstance(vm, dict)
+                    or not vm.get("name")
+                    or vm.get("operationType") != "insert"
+                    or vm.get("zone", "").rsplit("/", 1)[-1] != args.zone
+                    or not vm.get("targetLink", "").endswith(target)
+                ):
+                    raise GuardError(
+                        "unexpected async insert response; reservation retained; run sweep"
+                    )
+                session.update(
+                    status="open",
+                    operation_name=vm["name"],
+                    create_operation={key: value for key, value in vm.items() if key in OP_FIELDS},
+                )
+                self.save()
+                print(json.dumps(session))
+                # There may be no disk to label until capacity is available.
+                # Tokenized disk names already make that gap visible to sweep.
+                return
             session["instance_id"] = vm.get("id")
             session["instance_created_at"] = vm.get("creationTimestamp")
             session["last_start"] = vm.get("lastStartTimestamp")
@@ -572,6 +690,52 @@ class Guard:
             launch["hours"] = args.hours
         self.launch(argparse.Namespace(**launch), previous=previous)
 
+    def queue(self, session):
+        """Observe Flex-start without waiting in gcloud or extending the guest deadline."""
+        vm = self.cloud(
+            "compute",
+            "instances",
+            "describe",
+            session["label"],
+            f"--zone={session['launch']['zone']}",
+            absent=True,
+            clean_stderr=True,
+            timeout=60,
+        )
+        if vm:
+            if (
+                vm.get("name") != session["label"]
+                or vm.get("zone", "").rsplit("/", 1)[-1] != session["launch"]["zone"]
+                or (session.get("instance_id") and str(vm.get("id")) != str(session["instance_id"]))
+            ):
+                raise GuardError("instance identity changed; reservation retained")
+            session["instance_id"] = vm.get("id")
+            session["instance_created_at"] = session.get("instance_created_at") or vm.get(
+                "creationTimestamp"
+            )
+            if not session.get("last_start") and vm.get("lastStartTimestamp"):
+                session["last_start"] = vm["lastStartTimestamp"]
+            self.save()
+        operations = self.insert_operations(session, "queue_operations")
+        result = {"state": "unknown", "instance": vm, "evidence": session["queue_operations"]}
+        if vm and vm.get("status") == "RUNNING":
+            result["state"] = "running"
+        elif operations and len(operations) == 1:
+            operation = operations[0]
+            if operation["status"] == "DONE" and operation_failed(operation):
+                result["state"] = (
+                    "expired"
+                    if re.search(
+                        r"expir|deadline.?exceeded", json.dumps(operation.get("error", {})), re.I
+                    )
+                    else "failed"
+                )
+            elif operation["status"] in {"PENDING", "RUNNING"}:
+                result["state"] = "pending"
+            elif vm:
+                result["state"] = vm.get("status", "unknown").lower()
+        return result
+
     def status(self, args):
         inventory = self.inventory()
         sessions = [self.session(args.label)] if args.label else self.data["sessions"]
@@ -584,6 +748,9 @@ class Guard:
                             v for v in inventory["instances"] if v.get("name") == session["label"]
                         ],
                         "markers": self.markers(session),
+                        "queue": self.queue(session)
+                        if session["launch"]["provisioning"] == "FLEX_START"
+                        else None,
                     }
                     for session in sessions
                 ],
@@ -607,7 +774,15 @@ class Guard:
         value = item.get(location, "").rsplit("/", 1)[-1]
         if not value:
             raise GuardError("resource location missing; refusing deletion")
-        self.cloud("compute", kind, "delete", item["name"], f"--{location}={value}", mutate=True)
+        self.cloud(
+            "compute",
+            kind,
+            "delete",
+            item["name"],
+            f"--{location}={value}",
+            mutate=True,
+            absent=True,
+        )
 
     def operations_evidence(self, session):
         """Recover a single boot's lifetime from retained zonal control-plane history."""
@@ -707,13 +882,38 @@ class Guard:
 
     def close(self, args):
         session = self.session(args.label)
-        if session["status"] in {"closed", "cancelled"}:
+        if session["status"] == "closed":
             raise GuardError("session is already settled")
         if (args.settled_usd is None) != (args.evidence is None) or (
             args.evidence is not None and not args.evidence.strip()
         ):
             raise GuardError("manual settlement requires both --settled-usd and --evidence")
-        resources = self.matches(self.inventory(), session)
+        if session["status"] in OPEN:
+            session["status"] = "needs_settlement"
+            self.save()
+        resources = self.matches(self.inventory(session), session)
+        had_resources = any(resources.values())
+        if session["status"] == "cancelled":
+            if not had_resources:
+                raise GuardError("cancelled session has no resources to re-open")
+            session.update(status="needs_settlement", settled_cost_usd=None)
+            total = committed(self.data)
+            session["reopened"] = {
+                "observed_at": stamp(now()),
+                "reason": "cancelled_session_resource",
+                "committed_usd": money(total),
+                "enforce_overrun_usd": money(
+                    max(Decimal(0), total - number(self.config["enforce_usd"]))
+                ),
+                "cap_overrun_usd": money(max(Decimal(0), total - number(self.config["cap_usd"]))),
+            }
+            self.save()  # Restore all money before stop/delete or any possible failure.
+            if total > number(self.config["enforce_usd"]):
+                print(
+                    "gcp-guard: re-opened cancelled session; overrun "
+                    + json.dumps(session["reopened"]),
+                    file=sys.stderr,
+                )
         for item in resources["instances"]:
             vm = self.cloud(
                 "compute",
@@ -771,10 +971,30 @@ class Guard:
             self.delete_resource("instances", item)
         if self.dry_run:
             return
-        remaining = self.matches(self.inventory(), session)
+        remaining = self.matches(self.inventory(session), session)
         if any(remaining.values()):
             raise GuardError("instance or disk remains; reservation retained; use sweep")
         evidence = session.get("runtime_evidence")
+        if (
+            not had_resources
+            and not evidence
+            and not session.get("last_start")
+            and not session.get("instance_created_at")
+            and not session.get("reopened")
+            and args.settled_usd is None
+        ):
+            session["status"] = "needs_settlement"
+            self.save()
+            if self.rejection_verified(session, require_operation=True):
+                session.update(
+                    status="closed",
+                    settled_cost_usd="0.000000",
+                    closed_at=stamp(now()),
+                    settlement_evidence="failed insert operation + two clean instance/disk absence reads",
+                )
+                self.save()
+                print(json.dumps(session))
+                return
         if not evidence and args.settled_usd is None and session.get("instance_id"):
             session["status"] = "needs_settlement"
             self.save()
@@ -831,7 +1051,21 @@ class Guard:
                     None,
                 )
                 reason = None
-                if known is None:
+                cancelled = next(
+                    (
+                        s
+                        for s in self.data["sessions"]
+                        if s["status"] == "cancelled"
+                        and (
+                            item.get("labels", {}).get("guard-session") == s["label"]
+                            or item.get("name") in {s["label"], s["boot_disk"]}
+                        )
+                    ),
+                    None,
+                )
+                if cancelled:
+                    reason = "cancelled_session_resource"
+                elif known is None:
                     reason = "unknown_resource"
                 elif known["status"] not in OPEN:
                     reason = "settled_session_resource"
@@ -848,7 +1082,10 @@ class Guard:
                 ):
                     reason = "orphan_disk"
                 if reason:
-                    findings.append({"finding": reason, "kind": kind, "name": item["name"]})
+                    finding = {"finding": reason, "kind": kind, "name": item["name"]}
+                    if cancelled:
+                        finding["label"] = cancelled["label"]
+                    findings.append(finding)
                     targets.append((kind, item))
         for session in self.data["sessions"]:
             if session["status"] in OPEN and not any(
@@ -936,6 +1173,12 @@ def parser():
     launch.add_argument("--dry-run", action="store_true")
     status = commands.add_parser("status")
     status.add_argument("label", nargs="?", type=name)
+    wait = commands.add_parser("wait")
+    wait.add_argument("label", type=name)
+    wait.add_argument(
+        "--timeout", type=float, default=300, help="local wait budget in seconds; 0 observes once"
+    )
+    wait.add_argument("--poll-interval", type=float, default=5)
     resume = commands.add_parser("resume")
     resume.add_argument("old_label", type=name)
     resume.add_argument("label", type=name)
@@ -960,11 +1203,33 @@ def parser():
     return result
 
 
+def wait_for_session(path, args):
+    if not 0 <= args.timeout < float("inf") or not 0 < args.poll_interval <= 60:
+        raise GuardError("wait requires finite timeout >= 0 and 0 < poll-interval <= 60")
+    deadline = time.monotonic() + args.timeout
+    while True:
+        # Release between polls so close and other operators can use the ledger.
+        with locked(path, False):
+            guard = Guard(path)
+            session = guard.session(args.label)
+            if session["launch"]["provisioning"] != "FLEX_START":
+                raise GuardError("wait is for FLEX_START sessions; use status")
+            queue = guard.queue(session)
+            print(json.dumps({"label": args.label, "queue": queue}), flush=True)
+        if queue["state"] == "running":
+            return 0
+        if queue["state"] != "pending" or time.monotonic() >= deadline:
+            return 1
+        time.sleep(min(args.poll_interval, max(0, deadline - time.monotonic())))
+
+
 def main():
     args = parser().parse_args()
     try:
         dry_run = getattr(args, "dry_run", False)
         path = args.ledger.resolve()
+        if args.command == "wait":
+            return wait_for_session(path, args)
         with locked(path, dry_run):
             guard = Guard(path, dry_run)
             if args.command != "init":
