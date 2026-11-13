@@ -285,3 +285,76 @@ configs and Git metadata into pytest scratch and apply patches there; they do
 not modify the supplied clone or install Simons globally. Without that variable
 (or without source at the specified path), source-dependent tests skip with a
 clear reason and generator/shell tests still run in ordinary repository CI.
+
+## Score an exported checkpoint on fev
+
+`scripts/gcp/jobs/make_score_job.py` generates one self-contained executable job
+for the same guest contract. Generation is offline. Choose a **published repository
+commit containing the Simons yardstick adapter**; the chain branch predates it.
+For example, with operator-supplied immutable revisions and input hashes:
+
+```bash
+python scripts/gcp/jobs/make_score_job.py \
+  --name simons25m-stage4 \
+  --repo-sha "$SCORING_REPO_SHA" \
+  --upstream-pin "$(cat third_party/simons/PINNED)" \
+  --checkpoint-uri gs://BUCKET/chain-state/export \
+  --tasks-uri gs://BUCKET/scoring/cohort.yaml --tasks-sha256 "$TASKS_SHA256" \
+  --names-uri gs://BUCKET/scoring/names.txt --names-sha256 "$NAMES_SHA256" \
+  --processing both --output /tmp/simons-score/job.sh
+```
+
+Upload and launch through the guard/guest workflow, with a dedicated scoring
+state prefix. No launch, cloud access or model download happens in the generator.
+Replace `--checkpoint-uri` with `--hub-weights abel-lab/REPO --hub-revision SHA`
+for an anonymous Hub download; the full 40-character revision is mandatory.
+Only `config.json` and `model.safetensors` are copied. Both files are SHA-256
+hashed before scoring, and changed checkpoint contents are refused when resume
+downloads them again. A completed marker's early exit checks only recorded state;
+it does not contact the checkpoint source or detect changes there. Use a new score
+name/state prefix to score a changed checkpoint. The task YAML and optional
+one-name-per-line selection require SHA-256 hashes. Omit both names switches to
+select the complete YAML. `--max-context N` is the only extra inference switch;
+it must be a positive integer.
+
+The job starts with the training environment's system-site-packages venv and uv
+fallback for missing ensurepip. The full yardstick requirements cannot run on
+the image's Python 3.10: SciPy 1.16.3 requires Python >=3.11. The job explicitly
+provisions Python 3.12 using uv and installs stage 1's CUDA 12.8 torch 2.8.0 wheel,
+then the fetched repository's yardstick requirements and bench extra, plus the
+unmodified Simons source at `PINNED` as described in `yardsticks.md`. The image's
+Python 3.10 torch 2.9.1+cu129 cannot be shared across that interpreter ABI. There
+is no fev downgrade: fev 0.10.0, datasets 3.6.0 and huggingface-hub 0.36.0 are
+asserted, together with CUDA availability, torch 2.8.0+cu128 and the Simons VCS pin.
+`environment.txt` records pip freeze, both image and scoring runtimes, and the
+NVIDIA driver. Python patch versions and unpinned transitive dependencies can
+differ from the stage-1 freeze. A real image must verify successful installation.
+
+Results live under `$RUN_DIR/state/score/<name>/raw/` and `published/`, with labels
+`<name>-raw` and `<name>-published`. The default is both, raw first; a failure in
+raw still allows published to run. Each CLI invocation uses `--resume --keep-going`.
+The guest owns restore, periodic/final state copies, timeouts and terminal markers.
+Dataset, Hub and uv caches stay under `$RUN_DIR/score-cache/`, outside `state`.
+Checkpoint downloads use a deterministic disposable directory under `/tmp/`, so
+the adapter's absolute checkpoint path remains stable across changed guest labels.
+No required resume data lives there: both files are obtained and verified again.
+
+The job records its input identity before installation. Different inputs with
+the same name fail without overwriting prior results. Each mode records requested,
+completed and failed task names (first error line), wall seconds and provenance.
+`completed.json` is published atomically after both modes finish; failed tasks or
+a nonzero scorer status give a nonzero job exit. Failed runs remain resumable.
+A successful marker permits a dependency-free exit only after hashing the recorded
+state artifacts and checking task/window coverage. Missing or damaged input
+identity can be repaired from the marker before this check. Incomplete evidence
+requires the normal resume path; damaged checkpoint hashes are repaired only when
+freshly downloaded hashes match the marker's independent copy. Without independent
+evidence, damaged identity or checkpoint hashes cause refusal to overwrite state.
+Changed inputs, or downloaded checkpoint contents that differ from trusted
+recorded hashes, cause refusal. State written by the `139f3f7` guest retains its
+input identity and checkpoint path through these recovery fixes. This is evidence
+consistency checking, not a fresh recomputation of fev scores. There is no
+concurrent-writer lock: use one guest per score name/state prefix. GPU execution,
+numerical parity, memory fit
+and real preemption/copy recovery require a GPU canary; offline stubs establish
+control flow, input validation and local recovery behavior only.
