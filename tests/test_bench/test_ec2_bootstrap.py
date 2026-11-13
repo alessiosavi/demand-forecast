@@ -41,7 +41,11 @@ def test_only_deadline_helper_invokes_shutdown():
         if not path.is_file() or path.suffix not in {".py", ".sh", ".service"}:
             continue
         source = path.read_text()
-        if path.name == "arm-deadline.sh":
+        # EC2 may halt only through its armed, verified deadline helper.
+        # GCE's runner may finish early because every create (including resume)
+        # carries Google's max-run-duration + DELETE; test_gcp tests both paths.
+        # Match exact paths so unrelated scripts cannot inherit this exception.
+        if path in {EC2 / "arm-deadline.sh", ROOT / "scripts/gcp/guest-run.sh"}:
             continue
         if path.name == "pretrain-user-data.sh":
             source = source.replace(embedded(path.read_bytes(), "ARM_DEADLINE").decode(), "")
