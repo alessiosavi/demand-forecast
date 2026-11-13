@@ -206,8 +206,14 @@ ruff format --check .
 python scripts/latency.py --bundle /tmp/dfc-example/run/bundle
 ```
 
-CI runs the full suite both with `.[dev,bench]` and in a fresh `.[dev]` environment,
-where bench tests skip. It also installs a built wheel outside the checkout and
+CI runs the suite with `-m "not slow_audit"` both with `.[dev,bench]` and in a fresh
+`.[dev]` environment, where bench tests skip. The two long corpus audit modules
+(`test_parallel_audit.py` and `test_published_audit.py`) run with `-m slow_audit` in
+the Ubuntu Corpus Audit job: always on pushes to `main`/`develop`, and on PRs
+changing corpus scripts, `demand_forecast/` (including transitive imports), corpus
+tests, shared fixtures, `configs/`, pytest/build configuration or CI workflows.
+Unrelated PRs print a skip reason. Plain local `pytest` still runs everything.
+CI also installs a built wheel outside the checkout and
 checks CLI help and the packaged weekly task definitions without the bench extra.
 
 The latency script generates 512 synthetic series matching the bundle's roles
