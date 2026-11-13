@@ -296,7 +296,7 @@ clear reason and generator/shell tests still run in ordinary repository CI.
 
 `--recipe full` is the default. `--screen-updates` is accepted only with
 `--recipe screen`; its default is 25,000. Append these flags to every job in a
-screen chain, including qualification and export:
+12M or 25M screen chain, including qualification and export:
 
 ```bash
 --recipe screen --screen-updates 25000
@@ -337,11 +337,10 @@ at 7,899 (stage3), 16,040 (stage4), and 14,840 (long), with ramp 600 and
 90-update re-warm in the final branches. Thus the full 60M chain executes
 79,941 updates. Job seed/path overrides remain the same as for 25M.
 
-The implemented 60M **screen** uses the registered screen clocks above,
-while retaining native 60M architecture, sampling and dimensionless LR values.
-This interpretation makes every screen total N; scaling the native 60M
-clocks by N/120,208 would not. Confirm this protocol interpretation before
-paid 60M screen runs.
+`--size 60m --recipe screen` is refused by the generator and guest program:
+a 60M short schedule needs a registered protocol. The registered short schedule
+uses the 120,208-update 25M chain; no short protocol is registered for the
+native 79,941-update 60M chain. Use `--recipe full` for 60M.
 
 Full synthetic-leg identity retains its existing schema. Legacy e5959bb
 checkpoints are full-recipe checkpoints and remain valid predecessors and

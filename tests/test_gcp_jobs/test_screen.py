@@ -25,7 +25,7 @@ def release(corpus):
     return status, audit
 
 
-@pytest.mark.parametrize("size", ["12m", "25m", "60m"])
+@pytest.mark.parametrize("size", ["12m", "25m"])
 @pytest.mark.parametrize("budget", [25000, 30000])
 def test_screen_clocks(upstream, tmp_path, monkeypatch, size, budget):
     from simons.training import config, schedule, spot_job
@@ -52,9 +52,7 @@ def test_screen_clocks(upstream, tmp_path, monkeypatch, size, budget):
         if leg in ("stage4", "stage4-long"):
             assert s["warm_start"] == str(tmp_path / "stage3")
         original = __import__("yaml").safe_load(
-            (
-                upstream / f"configs/simons-{'60m' if size == '60m' else '25m'}-{leg}.yaml"
-            ).read_text()
+            (upstream / f"configs/simons-25m-{leg}.yaml").read_text()
         )
         for key in (
             "mech_refresh",
@@ -147,8 +145,10 @@ def test_predecessor_identity_legacy_and_screen(upstream):
         check_identity({**legacy, "qualification_only": True}, args)
 
 
-@pytest.mark.parametrize("size", ["12m", "25m", "60m"])
-@pytest.mark.parametrize("recipe", ["full", "screen"])
+@pytest.mark.parametrize(
+    "size,recipe",
+    [("12m", "full"), ("25m", "full"), ("60m", "full"), ("12m", "screen"), ("25m", "screen")],
+)
 def test_all_shells(jobs, tmp_path, size, recipe):
     import subprocess
 
@@ -167,6 +167,68 @@ def test_all_shells(jobs, tmp_path, size, recipe):
         path = tmp_path / "job.sh"
         path.write_text(script)
         assert subprocess.run(["bash", "-n", str(path)], capture_output=True).returncode == 0
+
+
+@pytest.mark.parametrize(
+    "leg", ["stage1", "stage2", "stage3", "stage4", "stage4-long", "qualify", "export"]
+)
+def test_generator_refuses_unregistered_60m_screen(jobs, leg):
+    with pytest.raises(ValueError, match="60M short schedule needs a registered protocol"):
+        jobs.generate(
+            size="60m",
+            leg=leg,
+            seed=11,
+            micro_batches=2,
+            checkpoint_minutes=10,
+            repo_sha=SHA,
+            upstream_pin=PIN,
+            corpus_uri="gs://offline/corpus",
+            recipe="screen",
+        )
+
+
+@pytest.mark.parametrize(
+    "leg", ["stage1", "stage2", "stage3", "stage4", "stage4-long", "qualify", "export"]
+)
+def test_guest_refuses_unregistered_60m_screen(upstream, tmp_path, monkeypatch, capsys, leg):
+    import sys
+
+    from simons.training import spot_job
+
+    def forbidden(*args):
+        pytest.fail("unsupported schedule reached execution")
+
+    for name in ("run_leg", "qualify", "run_export"):
+        monkeypatch.setattr(spot_job, name, forbidden)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "spot_job",
+            f"--leg={leg}",
+            "--size=60m",
+            "--recipe=screen",
+            f"--root={upstream}",
+            f"--run-dir={tmp_path / 'run'}",
+            "--seed=11",
+            f"--repo-sha={SHA}",
+            f"--upstream-pin={PIN}",
+            "--bundle-sha256=test",
+        ],
+    )
+    with pytest.raises(SystemExit) as error:
+        spot_job.main()
+    assert error.value.code == 2
+    assert "60M short schedule needs a registered protocol" in capsys.readouterr().err
+    assert not (tmp_path / "run").exists()
+
+
+@pytest.mark.parametrize("leg", ["stage1", "stage2", "stage3", "stage4", "stage4-long"])
+def test_recipe_refuses_unregistered_60m_screen(upstream, tmp_path, leg):
+    from simons.training import spot_job
+
+    with pytest.raises(ValueError, match="60M short schedule needs a registered protocol"):
+        spot_job.recipe(upstream, tmp_path, None, "60m", leg, 11, 2, recipe_name="screen")
 
 
 def test_override_is_only_for_qualification(jobs):
@@ -233,6 +295,88 @@ def test_exposure_masks_and_microbatch_invariance(upstream, synthetic_rows):
     assert totals[0]["E_synthetic"] == (512 if synthetic_rows == 1 else 1023)
     assert totals[0]["S_real"] == (384 if synthetic_rows == 1 else 0)
     assert totals[0]["S_synthetic"] == 384 * synthetic_rows
+
+
+def test_role_exposure_separates_covariates_and_procedural_rows(upstream):
+    import numpy as np
+    import torch
+    from simons.config import SimonsConfig
+    from simons.model import Simons
+    from simons.synth.covariates.families import FAMILIES
+    from simons.training.covariates.roles import Hook
+    from simons.training.exposure import Counts
+    from simons.training.objective import packed_loss
+
+    torch.manual_seed(17)
+    model = Simons(
+        SimonsConfig(
+            width=24,
+            heads=2,
+            layers=2,
+            patch_length=32,
+            context_length=384,
+            prediction_length=32,
+            near_context=128,
+            stats_window=128,
+            period_slots=0,
+            covariates=True,
+            binary_rows=True,
+            read_after=0,
+        )
+    )
+    sequence = torch.arange(128, dtype=torch.float32).expand(3, 32, -1).clone()
+    ids = np.arange(96).reshape(3, 32)
+    synthetic_meta = torch.zeros(1, 32, 3, dtype=torch.long)
+    synthetic_meta[0, :4, 0] = 1
+    effect_meta = torch.zeros(32, 3, dtype=torch.long)
+    effect_meta[:8, 0] = 1
+    hook = Hook({}, 11, 0, "cpu", 100, 128)
+    # Deterministic effect contents exercise the real prepare/tagging path.
+    hook.effects = iter(
+        [
+            dict(
+                values=sequence[0],
+                meta=effect_meta,
+                group=torch.arange(32),
+                first=torch.zeros(32, dtype=torch.long),
+                families=torch.zeros(len(FAMILIES), dtype=torch.long),
+            )
+        ]
+    )
+    hook.p_eff = lambda step: 1 / 3
+    mixer = SimpleNamespace(fraction=1 / 3, last_meta=lambda: synthetic_meta)
+
+    def slots():
+        return ids.copy(), np.zeros_like(ids)
+
+    sequence, _, slots, roles = hook.prepare(0, mixer, sequence, torch.from_numpy(ids), slots)
+    assert roles.role.sum().item() == 12
+    assert roles.exposure_synthetic[0].all()
+    assert not roles.exposure_synthetic[1:].any()
+    totals = []
+    for micro in (1, 3):
+        counts = Counts()
+        packed_loss(
+            model,
+            sequence,
+            slots,
+            0,
+            1,
+            roles=roles,
+            micro_batches=micro,
+            exposure=counts,
+            synthetic_rows=1,
+        )
+        totals.append(counts.snapshot())
+    assert totals[0] == totals[1]
+    # Row 0 is a procedural effect, row 1 real, row 2 the synthetic mixer tail.
+    # Covariates shift left one patch and never supply target E or supervised S.
+    assert totals[0]["E_real"] == 32 * 128
+    assert totals[0]["E_synthetic"] == (24 + 28) * 128
+    assert totals[0]["S_real"] == 32 * 96
+    assert totals[0]["S_synthetic"] == (24 + 28) * 96
+    assert totals[0]["covariate_values"] == (8 + 4) * 96
+    assert totals[0]["channel_windows"] == 32 + 24 + 28
 
 
 def test_auxiliary_real_derived_and_positive_weights(upstream):
@@ -415,8 +559,9 @@ def test_unsafe_qualification_executes_but_checkpoint_is_unusable(upstream, tmp_
     "pre_recipe,next_recipe,accepted",
     [("full", "full", True), ("full", "screen", False), ("screen", "full", False)],
 )
+@pytest.mark.parametrize("provenance", ["e5959bb", "f86878c"])
 def test_actual_legacy_predecessor_path(
-    upstream, tmp_path, monkeypatch, pre_recipe, next_recipe, accepted
+    upstream, tmp_path, monkeypatch, pre_recipe, next_recipe, accepted, provenance
 ):
     from simons.training import spot_job
     from simons.training.trainer import write_checkpoint
@@ -428,7 +573,7 @@ def test_actual_legacy_predecessor_path(
         size="25m",
         seed=11,
         leg="stage1",
-        repo_sha="e5959bb",
+        repo_sha=provenance,
         upstream_pin=PIN,
         bundle_sha256="legacy-bundle",
         corpus_uri=None,
@@ -559,6 +704,44 @@ def test_legacy_receipt_migration_can_retry_before_new_checkpoint(upstream, tmp_
         marker["corpus_release"]
         == json.loads((state / "identity.json").read_text())["corpus_release"]
     )
+
+
+@pytest.mark.parametrize("provenance", ["e5959bb", "f86878c"])
+@pytest.mark.parametrize("checkpoint_name", ["checkpoint-slot-0.pt", "checkpoint-final.pt"])
+def test_final_legacy_checkpoint_recovers_accepted_receipt(
+    upstream, tmp_path, monkeypatch, provenance, checkpoint_name
+):
+    import yaml
+    from simons.training import spot_job
+    from simons.training.screen import corpus_release
+    from simons.training.trainer import read_checkpoint, write_checkpoint
+    from test_jobs import checkpoint_payload
+
+    release(tmp_path / "corpus")
+    args = job_args(tmp_path, upstream, seed=19)
+    raw = yaml.safe_load(tiny_recipe(tmp_path).read_text())
+    receipt = corpus_release(args.corpus)
+    if provenance == "f86878c":
+        args.corpus_release = receipt
+    saved = spot_job.identity(args, raw)
+    saved.update(repo_sha=provenance, bundle_sha256="previous-bundle")
+    payload = {**checkpoint_payload(8), "job_identity": saved}
+    directory = tmp_path / "state/stage3"
+    directory.mkdir(parents=True)
+    checkpoint = directory / checkpoint_name
+    write_checkpoint(checkpoint, payload)
+    original = checkpoint.read_bytes()
+    monkeypatch.setattr(spot_job, "train", lambda *a, **kw: pytest.fail("training began"))
+
+    assert spot_job.run_leg(args) == 0
+    marker = json.loads((directory / "completed.json").read_text())
+    manifest = json.loads((directory / "identity.json").read_text())
+    assert marker["corpus_release"] == receipt
+    assert marker["job_identity"] == manifest == {**saved, "corpus_release": receipt}
+    assert marker["step"] == 8
+    final = directory / "checkpoint-final.pt"
+    assert final.read_bytes() == original
+    assert read_checkpoint(final)["job_identity"] == saved
 
 
 def test_native_60m_recipe_is_unchanged(upstream, tmp_path, monkeypatch):

@@ -195,7 +195,7 @@ diff --git a/src/simons/training/screen.py b/src/simons/training/screen.py
 new file mode 100644
 --- /dev/null
 +++ b/src/simons/training/screen.py
-@@ -0,0 +1,126 @@
+@@ -0,0 +1,125 @@
 +"""Registered screen clocks, corpus release receipts and compatible run identities."""
 +
 +import copy
@@ -209,8 +209,7 @@ new file mode 100644
 +def screen_settings(root, leg, updates):
 +    """Round absolute clocks; put total-rounding residual in the long mixed leg.
 +
-+    The registered screen uses the same clocks for every model size. Native 60M
-+    clocks are retained by full runs only. Sampling mechanics are never scaled.
++    The registered 12M/25M screen uses 25M clocks. Sampling mechanics are never scaled.
 +    """
 +    import yaml
 +
@@ -355,7 +354,7 @@ diff --git a/src/simons/training/spot_job.py b/src/simons/training/spot_job.py
      return path
  
  
-@@ -80,12 +87,18 @@
+@@ -80,12 +87,20 @@
      return {"data": str(corpus / "univariate"), "covariate_data": str(corpus / "covariates")}
  
  
@@ -364,6 +363,8 @@ diff --git a/src/simons/training/spot_job.py b/src/simons/training/spot_job.py
 +           recipe_name="full", screen_updates=None):
      """Copy the upstream YAML; width is the *only* model edit for 12m."""
 -    raw = yaml.safe_load((Path(root) / f"configs/simons-25m-{leg}.yaml").read_text())
++    if size == "60m" and recipe_name == "screen":
++        raise ValueError("60M short schedule needs a registered protocol")
 +    native_size = "60m" if size == "60m" else "25m"
 +    raw = yaml.safe_load((Path(root) / f"configs/simons-{native_size}-{leg}.yaml").read_text())
      if size == "12m":
@@ -376,7 +377,7 @@ diff --git a/src/simons/training/spot_job.py b/src/simons/training/spot_job.py
      settings.update(seed=seed, micro_batches=micro_batches, **corpus_paths(corpus, leg))
      previous = LEGS[leg]
      settings["warm_start"] = None if previous is None else str(predecessor(state, leg))
-@@ -126,7 +139,7 @@
+@@ -126,7 +141,7 @@
      raw["training"].pop("micro_batches", None)
      for key in ("warm_start", "data", "covariate_data"):
          raw["training"].pop(key, None)  # Machine-local paths differ across restores.
@@ -385,7 +386,7 @@ diff --git a/src/simons/training/spot_job.py b/src/simons/training/spot_job.py
          "size": args.size,
          "seed": args.seed,
          "leg": args.leg,
-@@ -136,20 +149,35 @@
+@@ -136,20 +151,35 @@
          "corpus_uri": args.corpus_uri,
          "recipe": raw,
      }
@@ -422,7 +423,7 @@ diff --git a/src/simons/training/spot_job.py b/src/simons/training/spot_job.py
      checkpoint = latest_checkpoint(directory)
      # On resume no predecessor is required: the checkpoint owns model and optimizer.
      # recipe() resolves the predecessor only for a new leg.
-@@ -158,30 +186,49 @@
+@@ -158,30 +188,49 @@
          manifest_path = directory / "identity.json"
          if manifest_path.exists():
              manifest = json.loads(manifest_path.read_text())
@@ -478,20 +479,34 @@ diff --git a/src/simons/training/spot_job.py b/src/simons/training/spot_job.py
      if getattr(args, "environment_file", None):
          shutil.copyfile(args.environment_file, attempt / "environment.txt")
      path = write_recipe(raw, attempt)
-@@ -214,6 +261,7 @@
+@@ -192,7 +241,7 @@
+         if step > settings["steps"]:
+             raise ValueError("checkpoint is beyond the leg's plan")
+         if step == settings["steps"]:
+-            complete_leg(directory, checkpoint, step)
++            complete_leg(directory, checkpoint, step, job_identity=expected)
+             return 0
+     final = train(
+         path,
+@@ -212,8 +261,11 @@
+-def complete_leg(directory, checkpoint, step):
++def complete_leg(directory, checkpoint, step, job_identity=None):
+     """Publish a single stable final before its completion record; safe to repeat after restore."""
      final = directory / FINAL_NAME
      if checkpoint != final:
          checkpoint.replace(final)
 +    payload = read_checkpoint(final)
++    if job_identity is None:
++        job_identity = payload.get("job_identity")
      atomic_json(
          directory / "completed.json",
          {
-@@ -221,6 +269,12 @@
+@@ -221,6 +273,12 @@
              "step": step,
              "bytes": final.stat().st_size,
              "sha256": checkpoint_hash(final),
-+            "job_identity": payload.get("job_identity"),
-+            "corpus_release": payload.get("job_identity", {}).get("corpus_release"),
++            "job_identity": job_identity,
++            "corpus_release": (job_identity or {}).get("corpus_release"),
 +            "exposure": payload.get("exposure"),
 +            "elapsed_seconds": payload.get("elapsed_seconds"),
 +            "gpu_hours": payload.get("gpu_hours"),
@@ -499,7 +514,7 @@ diff --git a/src/simons/training/spot_job.py b/src/simons/training/spot_job.py
          },
      )
      prune_checkpoints(directory)
-@@ -234,6 +288,7 @@
+@@ -234,6 +292,7 @@
      if (destination / "completed.json").is_file():
          try:
              marker = json.loads((destination / "completed.json").read_text())
@@ -507,7 +522,7 @@ diff --git a/src/simons/training/spot_job.py b/src/simons/training/spot_job.py
              if all(
                  (destination / n).stat().st_size == marker["artifacts"][n] > 0
                  for n in ("config.json", "model.safetensors")
-@@ -242,6 +297,15 @@
+@@ -242,6 +301,15 @@
          except (OSError, KeyError, ValueError, TypeError):
              pass
      paths = [completed_checkpoint(state / leg) for leg in ("stage4", "stage4-long")]
@@ -523,7 +538,7 @@ diff --git a/src/simons/training/spot_job.py b/src/simons/training/spot_job.py
      temporary = Path(tempfile.mkdtemp(prefix="export-", dir=args.run_dir))
      averaged = soup.write(paths, temporary / "checkpoint.pt")
      export(averaged, temporary / "inference")
-@@ -253,6 +317,10 @@
+@@ -253,6 +321,10 @@
          destination / "completed.json",
          {
              "members": [str(p) for p in paths],
@@ -534,7 +549,7 @@ diff --git a/src/simons/training/spot_job.py b/src/simons/training/spot_job.py
              "artifacts": {
                  n: (destination / n).stat().st_size for n in ("config.json", "model.safetensors")
              },
-@@ -267,9 +335,19 @@
+@@ -267,9 +339,19 @@
  
      directory = Path(args.run_dir)
      state = directory / "state"
@@ -556,7 +571,7 @@ diff --git a/src/simons/training/spot_job.py b/src/simons/training/spot_job.py
      attempt = Path(tempfile.mkdtemp(prefix="qualify-attempt-", dir=directory))
      path = write_recipe(raw, attempt)
      # CUDA is mandatory here: a CPU smoke check must never masquerade as GPU qualification.
-@@ -284,17 +362,21 @@
+@@ -284,17 +366,21 @@
      start = probe_start(model, settings, args.qualify_step, updates)
      measurement = Measurement(args.warmup, 500)
      try:
@@ -579,7 +594,7 @@ diff --git a/src/simons/training/spot_job.py b/src/simons/training/spot_job.py
      result.update(
          size=args.size,
          leg=args.qualify_leg,
-@@ -377,7 +459,10 @@
+@@ -377,7 +463,10 @@
  def main():
      parser = argparse.ArgumentParser(description=__doc__)
      parser.add_argument("--leg", required=True, choices=[*LEGS, "qualify", "export"])
@@ -591,10 +606,12 @@ diff --git a/src/simons/training/spot_job.py b/src/simons/training/spot_job.py
      parser.add_argument("--root", type=Path, required=True)
      parser.add_argument("--run-dir", type=Path, default=os.environ.get("RUN_DIR"), required=False)
      parser.add_argument("--corpus", type=Path)
-@@ -406,6 +491,12 @@
+@@ -406,6 +495,14 @@
          )
      if args.micro_batches < 1 or args.checkpoint_minutes <= 0 or args.warmup < 0:
          parser.error("invalid microbatches, checkpoint interval or warm-up")
++    if args.size == "60m" and args.recipe == "screen":
++        parser.error("60M short schedule needs a registered protocol")
 +    if args.screen_updates is not None and args.recipe != "screen":
 +        parser.error("--screen-updates requires --recipe screen")
 +    if args.recipe == "screen" and args.screen_updates is not None and args.screen_updates < 100:

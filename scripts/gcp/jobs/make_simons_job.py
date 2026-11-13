@@ -112,6 +112,8 @@ def generate(
         raise ValueError("invalid seed, micro-batches, warm-up or checkpoint minutes")
     if recipe not in ("full", "screen"):
         raise ValueError("invalid recipe")
+    if size == "60m" and recipe == "screen":
+        raise ValueError("60M short schedule needs a registered protocol")
     if screen_updates is not None and recipe != "screen":
         raise ValueError("screen updates require the screen recipe")
     if recipe == "screen" and screen_updates is None:
