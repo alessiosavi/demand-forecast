@@ -101,9 +101,31 @@ Use one GPU per job and one active writer per `STATE_URI`. All jobs in one
 chain share the run prefix, size and seed; use a separate prefix for another
 chain/size/seed. Qualification runs use their own state prefix, separate from
 the training run. The guest image needs NVIDIA drivers, Linux, Git,
-Python with venv/pip, and authenticated `gcloud` for corpus copying. Jobs install
-Simons and its upstream dependencies in a fresh virtual environment; they do
-not install into our package. They fetch upstream source, never model weights.
+Python >= 3.10 with pip and an already installed CUDA-matched torch >= 2.5,
+plus authenticated `gcloud` for corpus copying. The 2026-11-13 A100 canary used
+image family `pytorch-2-9-cu129-ubuntu-2204-nvidia-580`: the job runs as root,
+system `python3` is 3.10, and torch `2.9.1+cu129` imports with CUDA available.
+That image lacks `ensurepip`; the job does not require it or use `apt`.
+
+Every unfinished start, including resume on the same or a replacement machine,
+creates fresh scratch and an environment with `--system-site-packages`, reusing
+the image's torch. It first tries `python3 -m venv`; if that fails, it installs
+uv with system pip into scratch, then uses `uv venv --clear --seed
+--system-site-packages` with that same system interpreter and Python downloads
+disabled. uv supplies pip without `ensurepip` and clears the failed venv.
+The environment's pip installs the patched Simons tree in editable mode and
+missing upstream dependencies. An exact torch constraint, including the CUDA
+version suffix, prevents resolution to a different torch build; installation
+does not upgrade the image's satisfied packages or download another torch.
+
+Before corpus copying or training, the environment interpreter must import
+torch at the image's original path/version, satisfy the installed Simons torch
+requirement, report CUDA available, and import both Simons and the patched job
+module from this attempt's source tree. A failed check exits nonzero with a
+one-line reason. `environment.txt` retains the resolved package list and adds
+a runtime JSON comment with Python, torch, CUDA runtime and NVIDIA driver
+versions and the torch/Simons paths; training copies it into the attempt record.
+Jobs fetch upstream source, never model weights.
 Hub and datasets offline modes prevent implicit model/dataset downloads. The
 patch bundle is embedded, so the job does not need credentials for our repository.
 The supplied repository SHA records provenance; the embedded bundle SHA records
@@ -236,7 +258,12 @@ under `state/export/`, with a completion marker last. Interrupted export is
 rebuilt. Its soup checkpoint is intermediate local scratch, not a third chain
 member or an additional permanent weight artifact.
 
-Measured locally: CPU tests for role schedules across interruption, deterministic
+Measured locally: shell tests with fake image commands/packages for venv failure
+and uv fallback, fresh environments on repeated starts, and rejection of missing
+CUDA, old torch or an unpatched Simons import. These tests do not measure actual
+image dependency installation or GPU operation; the real image must confirm
+environment creation, torch reuse without a large download, and GPU training.
+CPU tests cover role schedules across interruption, deterministic
 restarts, partial-write/hash rejection, bounded remote snapshot names, embedded-step selection,
 cadence/retention, corpus layout checks on fresh/resumed legs, predecessor wiring, wrong
 pin/source rejection, width-only configuration differences, main micro-batch

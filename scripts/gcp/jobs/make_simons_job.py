@@ -15,6 +15,64 @@ ROOT = Path(__file__).resolve().parents[3]
 BUNDLE = ROOT / "third_party/simons"
 LEGS = ("stage1", "stage2", "stage3", "stage4", "stage4-long", "qualify", "export")
 
+ENVIRONMENT = r"""# Keep the image's CUDA-matched torch, including its local version suffix.
+python3 - "$scratch/image-torch.json" "$scratch/torch-constraint.txt" <<'SIMONS_IMAGE'
+import json, pathlib, sys
+try:
+    import torch
+    image = {"version": torch.__version__, "path": str(pathlib.Path(torch.__file__).resolve())}
+    pathlib.Path(sys.argv[1]).write_text(json.dumps(image))
+    pathlib.Path(sys.argv[2]).write_text("torch==" + image["version"] + "\n")
+except Exception as error:
+    sys.exit("Simons environment check failed: image torch: " + " ".join(str(error).splitlines()))
+SIMONS_IMAGE
+if ! python3 -m venv --system-site-packages "$scratch/venv"; then
+    # Ubuntu's system Python may lack ensurepip. Bootstrap only a small tool in
+    # scratch; uv seeds pip without ensurepip and clears the incomplete venv.
+    python3 -m pip install --target "$scratch/uv-bootstrap" uv
+    "$scratch/uv-bootstrap/bin/uv" venv --clear --seed --system-site-packages \
+        --python "$(command -v python3)" --no-python-downloads "$scratch/venv"
+fi
+"$scratch/venv/bin/python" -m pip install --constraint "$scratch/torch-constraint.txt" \
+    packaging --editable "$upstream"
+"$scratch/venv/bin/python" -m pip freeze > "$scratch/environment.txt"
+"$scratch/venv/bin/python" - "$upstream" "$scratch/image-torch.json" "$scratch/environment.txt" <<'SIMONS_ENVIRONMENT'
+import json, pathlib, subprocess, sys
+from importlib import metadata
+try:
+    import torch
+    import simons
+    from packaging.requirements import Requirement
+    from simons.training import spot_job
+
+    root = pathlib.Path(sys.argv[1]).resolve() / "src/simons"
+    image = json.loads(pathlib.Path(sys.argv[2]).read_text())
+    requirement = next(Requirement(r) for r in metadata.requires("simons")
+                       if Requirement(r).name == "torch")
+    if not requirement.specifier.contains(torch.__version__):
+        raise RuntimeError("torch " + torch.__version__ + " does not satisfy " + str(requirement))
+    if torch.__version__ != image["version"] or str(pathlib.Path(torch.__file__).resolve()) != image["path"]:
+        raise RuntimeError("torch is not the image's CUDA-matched package")
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is unavailable")
+    if (pathlib.Path(simons.__file__).resolve() != root / "__init__.py"
+            or pathlib.Path(spot_job.__file__).resolve() != root / "training/spot_job.py"):
+        raise RuntimeError("installed simons is not the patched tree")
+    drivers = subprocess.check_output(
+        ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"], text=True
+    ).strip().splitlines()
+    if not drivers:
+        raise RuntimeError("NVIDIA driver version is unavailable")
+    runtime = {"python": sys.version.split()[0], "torch": torch.__version__,
+               "torch_path": image["path"], "cuda": torch.version.cuda,
+               "cuda_available": True, "nvidia_driver": drivers, "simons_path": str(root)}
+    with pathlib.Path(sys.argv[3]).open("a") as handle:
+        handle.write("# runtime " + json.dumps(runtime, sort_keys=True) + "\n")
+except Exception as error:
+    sys.exit("Simons environment check failed: " + " ".join(str(error).splitlines()))
+SIMONS_ENVIRONMENT
+"""
+
 
 def generate(
     *,
@@ -169,10 +227,7 @@ git clone --filter=blob:none --no-checkout https://github.com/Abel-ai-lab/Simons
 git -C "$upstream" sparse-checkout set --no-cone /src/ /configs/ /pyproject.toml /README.md /LICENSE /NOTICE
 git -C "$upstream" checkout --detach {shlex.quote(pin)}
 python3 "$scratch/bundle/prepare.py" "$upstream" "$scratch/bundle"
-python3 -m venv "$scratch/venv"
-"$scratch/venv/bin/python" -m pip install "$upstream"
-"$scratch/venv/bin/python" -m pip freeze > "$scratch/environment.txt"
-{fetch}exec "$scratch/venv/bin/python" -m simons.training.spot_job \\
+{ENVIRONMENT}{fetch}exec "$scratch/venv/bin/python" -m simons.training.spot_job \\
     --root "$upstream" --run-dir "$RUN_DIR" --corpus "$RUN_DIR/corpus" --environment-file "$scratch/environment.txt" \\
     {shlex.join(arguments)}
 '''

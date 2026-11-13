@@ -30,6 +30,11 @@ def test_generated_shell(jobs, tmp_path, size, leg):
     assert result.returncode == 0, result.stderr
     assert PIN in script and SHA in script
     assert "HF_HUB_OFFLINE=1" in script
+    assert "--system-site-packages" in script
+    assert '"$scratch/uv-bootstrap/bin/uv" venv' in script
+    assert 'metadata.requires("simons")' in script
+    assert "torch.cuda.is_available()" in script
+    assert "pathlib.Path(spot_job.__file__).resolve()" in script
 
 
 def test_corpus_required_and_pin_checked(jobs):
