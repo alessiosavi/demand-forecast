@@ -59,6 +59,10 @@ guard init --project "$GCP_PROJECT" --bucket "$GCP_BUCKET" \
   --boot-disk-usd-per-gb-month "$GCP_BOOT_DISK_USD_PER_GB_MONTH"
 guard price set "$GCP_MACHINE|$GCP_PROVISIONING|${GCP_ZONE%-*}" \
   --usd "$GCP_HOURLY_USD" --source "$GCP_PRICE_SOURCE" --fetched-on "$GCP_PRICE_DATE"
+# Repeat for each additional boot disk type; --usd is USD/GiB-month for a disk key.
+GCP_HYPERDISK_USD_PER_GB_MONTH='REPLACE_FROM_CATALOGUE'
+guard price set hyperdisk-balanced --usd "$GCP_HYPERDISK_USD_PER_GB_MONTH" \
+  --source "$GCP_PRICE_SOURCE" --fetched-on "$GCP_PRICE_DATE"
 guard hold set storage 5.00
 guard report
 ```
@@ -73,9 +77,17 @@ mandatory; stale prices are the operator's responsibility.
 The hourly rate must cover the **whole configuration**, including separately
 billed accelerator(s) and Local SSD. The machine-only rate is insufficient when
 those are extra. Use separate ledgers if configurations sharing a key need distinct
-rates. One ledger has one boot disk type and USD/GiB-month price; use the largest
-applicable regional price or separate ledgers. Check whether your selected machine
-requires Hyperdisk instead of `pd-balanced`, particularly newer families. Do not
+rates. `init` sets the default boot disk type and its USD/GiB-month price. The
+ledger's `disk_prices` table stores a positive price per disk type, with source
+and fetch date when set via `price set <disk-type>`. For each disk type, use the
+largest applicable regional price or separate ledgers. `launch --boot-disk-type`
+overrides the default and refuses an unpriced type **before reserving money**.
+Existing ledgers without this table still load: the old
+`config.boot_disk_usd_per_gb_month` becomes the price of
+`config.boot_disk_type`; the next write persists the table. Existing sessions keep
+their recorded disk hourly rate; new sessions also snapshot the disk price.
+For Hyperdisk, account for any separately billed provisioned IOPS/throughput with
+conservative holds; the table covers capacity. Do not
 enter zero to omit a cost. Fixed costs, bucket storage, object versions, requests,
 networking, logs and other services need conservative holds. Decreasing a hold is
 an operator assertion that those costs have been reconciled, not an automatic
@@ -88,6 +100,43 @@ a dollar; cap and enforce remain exact. The admission check and atomic,
 fsync-backed ledger replacement share a POSIX file lock. A process exit between
 reservation and create leaves a charged reservation for reconciliation. Never
 remove or rename the lock file while an operator command is running.
+
+## Boot disk and network compatibility
+
+Verified in Google's public reference on 2026-11-13. These are boot-disk choices
+and the VPC NIC requirements for the machine types used by this runbook:
+
+| Machine family / shape | Boot disk types | VPC NIC |
+| --- | --- | --- |
+| G4 (`g4-standard-48`) | `hyperdisk-balanced` only; Persistent Disk is unsupported | `GVNIC` required |
+| A3 High (`a3-highgpu-1g`) | `pd-balanced`, `pd-ssd`, `hyperdisk-balanced` | `GVNIC` required |
+| A2 Standard / Ultra (`a2-highgpu-1g`, `a2-ultragpu-1g`) | `pd-standard`, `pd-balanced`, `pd-ssd` | `VIRTIO_NET` or `GVNIC` |
+
+Sources: [G4 disk support](https://docs.cloud.google.com/compute/docs/accelerator-optimized-machines#g4-series),
+[A3 disk support](https://docs.cloud.google.com/compute/docs/accelerator-optimized-machines#a3-vms),
+[A2 disk support](https://docs.cloud.google.com/compute/docs/accelerator-optimized-machines#a2-vms),
+and [gVNIC requirements](https://docs.cloud.google.com/compute/docs/networking/using-gvnic#when_to_use)
+([machine generations](https://docs.cloud.google.com/compute/docs/machine-resource#vm_terminology)).
+Generation 3 and later require gVNIC; A2 needs it for supported 50–100 Gbps
+configurations. The two A2 one-GPU shapes above do not require those bandwidths.
+A3 Mega/Edge have the same listed boot choices as High; A3 Ultra uses
+`hyperdisk-balanced` for boot. Hyperdisk ML/Throughput/Extreme are data-disk
+types, not boot choices; see [Hyperdisk limitations](https://docs.cloud.google.com/compute/docs/disks/hyperdisks#limitations).
+Other variants, multi-NIC/RDMA topologies and images require their own checks.
+
+Pass `launch --nic-type GVNIC` explicitly for G4 and A3, using an image with the
+gVNIC driver and GVNIC guest feature. The option becomes
+`--network-interface=nic-type=GVNIC` in the create argv (SDK 593's
+`compute/instances/flags.py` and the [gVNIC create reference](https://docs.cloud.google.com/compute/docs/networking/using-gvnic#create_a_vm_with_gvnic_support)).
+Omitting it leaves NIC selection to gcloud/image defaults. Both disk type and NIC
+choice are recorded per launch and retained by resume. Old sessions without
+these fields use the ledger's default disk type and omit the NIC override.
+The guard passes the choices through; it does not maintain a hardware compatibility
+database or automatically change disk/NIC settings based on the machine name.
+
+For G4, store a `hyperdisk-balanced` capacity price first (the variable above must
+be filled from catalogue evidence), then add these options to the launch example:
+`--boot-disk-type hyperdisk-balanced --nic-type GVNIC`.
 
 ## Launch, inspect, resume, close, sweep
 
@@ -141,11 +190,22 @@ change neither resources nor ledger bytes (including its lock file). They valida
 prices, cap, region and markers. The resulting cloud state can change before a
 real command. `close --dry-run` shows planned stop/delete operations.
 
-A definitive stock-out, quota or invalid-argument rejection is cancelled at zero
-only after inventory confirms no matching instance or disk. An ambiguous CLI
-failure or timeout might have created resources: its reservation stays and its
-label is burned. Disk-label failure after create also retains the reservation.
+When create returns a CLI error (positive nonzero exit), the guard reads instance
+and disk inventory twice, three seconds apart. It cancels at zero **only if both
+reads succeed and neither contains the exact instance name or boot disk name**,
+including resources without labels. The original error and both timestamped
+inventory results are saved in the session (`error`, `create_failure_inventory`),
+with each read persisted before the next. A resource found in either read, failed
+inventory, timeout, signal termination or unexpected create response retains the
+reservation. The label stays burned in every case. Known rejection texts include
+`ZONE_RESOURCE_POOL_EXHAUSTED`, `QUOTA_EXCEEDED`, `Quota '…' exceeded`, `stock-out`,
+`INVALID_ARGUMENT`, `Invalid value`, and incompatible disk types. This list is
+documentation, **not the cancellation gate**. Disk-label failure after create also retains the reservation.
 Use `status` and `sweep`, then close/settle. There are no automatic create retries.
+For these two reads, any stderr output also prevents cancellation: SDK 593 can
+return partial inventory with exit zero and a warning about an unreachable scope.
+Evidence stores resource names, IDs, zones/regions, status and labels; account and
+guest metadata fields are omitted.
 
 For Flex-start only, `launch --request-valid-for 30m` lets Google wait for capacity
 in the selected zone. The default `0s` requests immediately available capacity and

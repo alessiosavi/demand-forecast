@@ -13,6 +13,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from decimal import ROUND_CEILING, Decimal, InvalidOperation
@@ -107,8 +108,10 @@ def validate(ledger):
         raise GuardError("unsupported ledger schema or currency")
     if not 0 < number(cfg["enforce_usd"]) <= number(cfg["cap_usd"]):
         raise GuardError("require 0 < enforce <= cap")
-    if number(cfg["boot_disk_usd_per_gb_month"]) <= 0:
-        raise GuardError("boot disk price must be positive")
+    for disk_type, price in ledger["disk_prices"].items():
+        name(disk_type)
+        if number(price["usd_per_gb_month"]) <= 0:
+            raise GuardError("boot disk price must be positive")
     if not re.fullmatch(r"[0-9a-f]{24}", cfg["token"]):
         raise GuardError("invalid ledger token")
     labels = set()
@@ -146,6 +149,15 @@ class Guard:
         self.dry_run = dry_run
         self.data = json.loads(path.read_text()) if path.exists() else None
         if self.data is not None:
+            if "disk_prices" not in self.data:
+                cfg = self.data["config"]
+                self.data["disk_prices"] = {
+                    cfg["boot_disk_type"]: {
+                        "usd_per_gb_month": cfg.pop("boot_disk_usd_per_gb_month"),
+                        "source": "legacy ledger default",
+                        "fetched_on": None,
+                    }
+                }
             validate(self.data)
 
     @property
@@ -176,7 +188,7 @@ class Guard:
             if temporary and os.path.exists(temporary):
                 os.unlink(temporary)
 
-    def cloud(self, *args, mutate=False, absent=False, timeout=300):
+    def cloud(self, *args, mutate=False, absent=False, timeout=300, clean_stderr=False):
         command = [
             "gcloud",
             *args,
@@ -206,6 +218,9 @@ class Guard:
             ):
                 return None
             raise
+        # Compute list can report partial failures as warnings with exit zero.
+        if clean_stderr and result.stderr.strip():
+            raise GuardError("inventory stderr; absence unverified: " + result.stderr.strip())
         return json.loads(result.stdout) if result.stdout.strip() else None
 
     def init(self, args):
@@ -221,12 +236,18 @@ class Guard:
                 "currency": args.currency,
                 "cap_usd": str(number(args.cap)),
                 "enforce_usd": str(number(args.enforce)),
-                "boot_disk_usd_per_gb_month": str(number(args.boot_disk_usd_per_gb_month)),
                 "boot_disk_type": args.boot_disk_type,
                 "token": os.urandom(12).hex(),
                 "created_at": stamp(now()),
             },
             "prices": {},
+            "disk_prices": {
+                args.boot_disk_type: {
+                    "usd_per_gb_month": str(number(args.boot_disk_usd_per_gb_month)),
+                    "source": "init --boot-disk-usd-per-gb-month",
+                    "fetched_on": None,
+                }
+            },
             "sessions": [],
             "holds": {},
         }
@@ -234,6 +255,17 @@ class Guard:
         self.report(args)
 
     def price(self, args):
+        date.fromisoformat(args.fetched_on)
+        if number(args.usd) <= 0 or not args.source.strip():
+            raise GuardError("price and source are required and price must be positive")
+        if "|" not in args.key:
+            self.data["disk_prices"][name(args.key)] = {
+                "usd_per_gb_month": str(number(args.usd)),
+                "source": args.source,
+                "fetched_on": args.fetched_on,
+            }
+            self.save()
+            return
         parts = args.key.split("|")
         if (
             len(parts) != 3
@@ -242,9 +274,6 @@ class Guard:
         ):
             raise GuardError("price key must be machine_type|provisioning|region")
         parts[1] = model(parts[1])
-        date.fromisoformat(args.fetched_on)
-        if number(args.usd) <= 0 or not args.source.strip():
-            raise GuardError("price and source are required and price must be positive")
         self.data["prices"]["|".join(parts)] = {
             "hourly_usd": str(number(args.usd)),
             "source": args.source,
@@ -258,17 +287,22 @@ class Guard:
                 return session
         raise GuardError(f"unknown session: {label}")
 
-    def inventory(self):
+    def inventory(self, session=None):
         # Include tokenized boot disks left before the post-create label call.
         resources = {}
         for kind in ("instances", "disks"):
-            items = self.cloud("compute", kind, "list")
+            items = self.cloud("compute", kind, "list", clean_stderr=session is not None)
             if not isinstance(items, list):
                 raise GuardError(f"invalid {kind} list; absence unverified")
             resources[kind] = [
                 item
                 for item in items
                 if item.get("labels", {}).get("guard-ledger") == self.config["token"]
+                or (
+                    session is not None
+                    and item.get("name")
+                    == (session["label"] if kind == "instances" else session["boot_disk"])
+                )
                 or (
                     kind == "disks"
                     and item.get("name", "").startswith(f"gcp-{self.config['token']}-")
@@ -313,9 +347,11 @@ class Guard:
         if state_uri.split("/")[2] != self.config["bucket"]:
             raise GuardError("state URI must use the configured bucket")
         price = self.data["prices"][key]
-        disk_rate = (
-            Decimal(args.boot_disk_size) * number(self.config["boot_disk_usd_per_gb_month"]) / 730
-        )
+        disk_type = getattr(args, "boot_disk_type", None) or self.config["boot_disk_type"]
+        if disk_type not in self.data["disk_prices"]:
+            raise GuardError(f"no stored boot disk price for {disk_type}")
+        disk_price = self.data["disk_prices"][disk_type]
+        disk_rate = Decimal(args.boot_disk_size) * number(disk_price["usd_per_gb_month"]) / 730
         if args.boot_disk_size <= 0:
             raise GuardError("boot disk size must be positive")
         # The 15-minute margin includes boot disk provisioning/cleanup time too.
@@ -348,6 +384,7 @@ class Guard:
             "hourly_usd": price["hourly_usd"],
             "price": dict(price),
             "disk_hourly_usd": str(disk_rate),
+            "disk_price": dict(disk_price),
             "created_at": stamp(now()),
             "reserved_end": stamp(now() + timedelta(seconds=int(seconds))),
             "boot_disk": f"gcp-{self.config['token']}-{args.label}",
@@ -368,6 +405,8 @@ class Guard:
             },
         }
         session["launch"]["request_valid_for"] = request_valid_for
+        session["launch"]["boot_disk_type"] = disk_type
+        session["launch"]["nic_type"] = getattr(args, "nic_type", None)
         if len(session["boot_disk"]) > 63:
             raise GuardError(
                 "label is too long for tokenized boot disk name (maximum 34 characters)"
@@ -400,13 +439,15 @@ class Guard:
             f"--metadata={metadata}",
             f"--metadata-from-file=startup-script={HERE / 'guest-run.sh'},shutdown-script={HERE / 'guest-stop.sh'}",
             f"--create-disk=name={session['boot_disk']},boot=yes,auto-delete=yes,"
-            f"size={args.boot_disk_size}GB,type={self.config['boot_disk_type']},"
+            f"size={args.boot_disk_size}GB,type={disk_type},"
             f"image-family={args.image_family},image-project={args.image_project}",
         ]
         if args.provisioning == "FLEX_START":
             command.append(f"--request-valid-for-duration={request_valid_for or '0s'}")
         if args.accelerator:
             command.append(f"--accelerator={args.accelerator}")
+        if session["launch"]["nic_type"]:
+            command.append(f"--network-interface=nic-type={session['launch']['nic_type']}")
         command.extend("--local-ssd=interface=NVME" for _ in range(args.local_ssd))
         self.data["sessions"].append(session)
         self.save()  # Lock covers admission and this durable reservation, before create.
@@ -415,17 +456,40 @@ class Guard:
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
             session["error"] = str(getattr(exc, "stderr", "") or exc)
             self.save()
-            # A rejected request with no resources is free. A transport timeout or
-            # unknown error may have created resources; never silently free it.
-            definitive = isinstance(exc, subprocess.CalledProcessError) and re.search(
-                r"ZONE_RESOURCE_POOL_EXHAUSTED|QUOTA_EXCEEDED|Quota ['\"][^'\"]+['\"] exceeded|stock-out|INVALID_ARGUMENT|Invalid value",
-                session["error"],
-                re.I,
-            )
-            if definitive:
-                remaining = self.inventory()
-                if not any(v.get("name") == args.label for v in remaining["instances"]) and not any(
-                    d.get("name") == session["boot_disk"] for d in remaining["disks"]
+            # A returned CLI error can settle only with two successful absence
+            # reads. Timeouts and signal termination never prove rejection.
+            if isinstance(exc, subprocess.CalledProcessError) and exc.returncode > 0:
+                reads = session["create_failure_inventory"] = []
+                for attempt in range(2):
+                    if attempt:
+                        time.sleep(3)
+                    observed = {"observed_at": stamp(now())}
+                    try:
+                        # Record identity evidence, not accounts or guest metadata.
+                        fields = ("name", "id", "zone", "region", "status", "labels")
+                        observed.update(
+                            {
+                                kind: [
+                                    {key: item[key] for key in fields if key in item}
+                                    for item in items
+                                ]
+                                for kind, items in self.inventory(session).items()
+                            }
+                        )
+                    except (
+                        GuardError,
+                        ValueError,
+                        OSError,
+                        subprocess.SubprocessError,
+                    ) as read_exc:
+                        observed["error"] = str(getattr(read_exc, "stderr", "") or read_exc)
+                    reads.append(observed)
+                    self.save()  # Keep each read even if the next one fails or we exit.
+                if all(
+                    "error" not in read
+                    and not any(v.get("name") == args.label for v in read["instances"])
+                    and not any(d.get("name") == session["boot_disk"] for d in read["disks"])
+                    for read in reads
                 ):
                     session.update(status="cancelled", settled_cost_usd="0.000000")
                     self.save()
@@ -828,8 +892,10 @@ def parser():
         .add_subparsers(dest="price_command", required=True)
         .add_parser("set")
     )
-    price.add_argument("key")
-    price.add_argument("--usd", required=True)
+    price.add_argument("key", help="machine_type|provisioning|region, or a boot disk type")
+    price.add_argument(
+        "--usd", required=True, help="USD/hour for a machine; USD/GiB-month for a disk"
+    )
     price.add_argument("--source", required=True)
     price.add_argument("--fetched-on", required=True)
     launch = commands.add_parser("launch")
@@ -839,6 +905,8 @@ def parser():
     launch.add_argument("--provisioning", required=True, type=model)
     launch.add_argument("--hours", required=True)
     launch.add_argument("--boot-disk-size", required=True, type=int)
+    launch.add_argument("--boot-disk-type", type=name, help="default: ledger boot disk type")
+    launch.add_argument("--nic-type", type=str.upper, choices=["GVNIC", "VIRTIO_NET"])
     launch.add_argument("--job-uri", required=True, type=uri)
     launch.add_argument("--state-uri", type=uri)
     launch.add_argument("--accelerator")

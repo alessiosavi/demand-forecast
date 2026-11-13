@@ -48,7 +48,10 @@ if args[:3] == ['compute', 'instances', 'create']:
     assert session['status'] == 'reserved' and session['settled_cost_usd'] is None
     assert Decimal(session['reservation_usd']) > 0
     time.sleep(state.get('create_delay', 0))
-    if state.get('create_error'): end(error=state['create_error'])
+    if state.get('create_error'):
+        state['create_failed'] = dict(instance=args[3], disk=session['boot_disk'])
+        end(error=state['create_error'])
+    if 'create_response' in state: end(state['create_response'])
     labels = dict(item.split('=', 1) for item in opt('--labels').split(','))
     assert opt('--boot-disk-name') is None, 'unsupported GA flag'
     disk = dict(item.split('=', 1) for item in opt('--create-disk').split(','))
@@ -67,8 +70,21 @@ if args[:3] == ['compute', 'instances', 'create']:
     if state.get('omit_create_start'): response.pop('lastStartTimestamp')
     if state.get('omit_all_start'): vm.pop('lastStartTimestamp'); response.pop('lastStartTimestamp', None)
     end([response])
-if args[:3] == ['compute', 'instances', 'list']: end(state.get('instances', []))
-if args[:3] == ['compute', 'disks', 'list']: end(state.get('disks', []))
+if args[:3] in (['compute', 'instances', 'list'], ['compute', 'disks', 'list']):
+    kind = args[1]
+    if state.get('create_failed'):
+        index = state.get('failure_inventory_index', 0)
+        reads = state.get('failure_inventory', [{}, {}])
+        read = reads[min(index, len(reads)-1)]
+        if kind == 'disks': state['failure_inventory_index'] = index + 1
+        if read.get(kind+'_error'): end(error=read[kind+'_error'])
+        if read.get(kind+'_warning'): print(read[kind+'_warning'], file=sys.stderr)
+        items = read.get(kind, [])
+        if isinstance(items, list):
+            items = [dict(item, name=state['create_failed'][item['name']])
+                     if item.get('name') in ('instance', 'disk') else item for item in items]
+        end(items)
+    end(state.get(kind, []))
 if args[:3] == ['compute', 'instances', 'describe']:
     time.sleep(state.get('describe_delay', 0))
     matches = [v for v in state.get('instances', []) if v['name'] == args[3]]
@@ -234,6 +250,116 @@ def test_failed_create_reserved_first_cancels_zero_and_burns_label(cloud):
     before = len(cloud.calls())
     assert cloud.launch(ok=False).returncode != 0
     assert not any(c[:3] == ["compute", "instances", "create"] for c in cloud.calls()[before:])
+
+
+def test_launch_disk_type_and_nic_are_priced_and_retained_by_resume(cloud):
+    cloud.setup()
+    cloud.run(
+        "price",
+        "set",
+        "hyperdisk-balanced",
+        "--usd",
+        "0.2",
+        "--source",
+        "disk catalogue fixture",
+        "--fetched-on",
+        "2026-11-13",
+    )
+    cloud.run(
+        "price",
+        "set",
+        "g4-standard-48|SPOT|europe-west4",
+        "--usd",
+        "4",
+        "--source",
+        "machine fixture",
+        "--fetched-on",
+        "2026-11-13",
+    )
+    cloud.launch(
+        "run-a",
+        "--machine-type",
+        "g4-standard-48",
+        "--boot-disk-type",
+        "hyperdisk-balanced",
+        "--nic-type",
+        "GVNIC",
+    )
+    session = cloud.read()["sessions"][0]
+    assert session["reservation_usd"] == "5.034247"
+    assert session["launch"]["boot_disk_type"] == "hyperdisk-balanced"
+    assert session["launch"]["nic_type"] == "GVNIC"
+    cloud.change(instances=[], disks=[])
+    before = cloud.ledger.read_bytes()
+    dry = cloud.run("resume", "run-a", "run-b", "--dry-run")
+    assert cloud.ledger.read_bytes() == before
+    assert "type=hyperdisk-balanced" in dry.stdout
+    assert "--network-interface=nic-type=GVNIC" in dry.stdout
+    cloud.run("resume", "run-a", "run-b")
+    resumed = cloud.read()["sessions"][1]
+    assert resumed["reservation_usd"] == "5.034247"
+    creates = [c for c in cloud.calls() if c[:3] == ["compute", "instances", "create"]]
+    assert len(creates) == 2
+    for call in creates:
+        assert any(",type=hyperdisk-balanced," in a for a in call)
+        assert "--network-interface=nic-type=GVNIC" in call
+        assert "--max-run-duration=3600s" in call
+        assert "--instance-termination-action=DELETE" in call
+
+
+def test_unpriced_disk_refused_before_reserving(cloud):
+    cloud.setup()
+    before = len(cloud.calls())
+    result = cloud.launch("run-a", "--boot-disk-type", "hyperdisk-balanced", ok=False)
+    assert result.returncode == 2 and "no stored" in result.stderr
+    assert not cloud.read()["sessions"]
+    assert len(cloud.calls()) == before
+
+
+def test_legacy_disk_price_default_launch_and_resume(cloud):
+    cloud.setup()
+    ledger = cloud.read()
+    ledger.pop("disk_prices", None)
+    ledger["config"].update(boot_disk_type="pd-ssd", boot_disk_usd_per_gb_month="0.15")
+    cloud.ledger.write_text(json.dumps(ledger))
+    before = cloud.ledger.read_bytes()
+    cloud.launch("dry", "--dry-run")
+    assert cloud.ledger.read_bytes() == before
+    cloud.launch()
+    assert cloud.read()["sessions"][0]["reservation_usd"] == "5.025685"
+    ledger = cloud.read()
+    assert ledger["disk_prices"]["pd-ssd"]["usd_per_gb_month"] == "0.15"
+    assert "boot_disk_usd_per_gb_month" not in ledger["config"]
+    ledger["sessions"][0]["launch"].pop("boot_disk_type", None)
+    ledger["sessions"][0]["launch"].pop("nic_type", None)
+    cloud.ledger.write_text(json.dumps(ledger))
+    cloud.change(instances=[], disks=[])
+    cloud.run("resume", "run-a", "run-b")
+    creates = [c for c in cloud.calls() if c[:3] == ["compute", "instances", "create"]]
+    assert len(creates) == 2
+    for call in creates:
+        assert any(",type=pd-ssd," in a for a in call)
+        assert not any(a.startswith("--network-interface=") for a in call)
+
+
+def test_disk_price_cannot_be_zero_or_nonfinite(cloud):
+    cloud.setup()
+    before = cloud.ledger.read_bytes()
+    for rate in ("0", "-1", "NaN", "Infinity"):
+        result = cloud.run(
+            "price",
+            "set",
+            "hyperdisk-balanced",
+            "--usd",
+            rate,
+            "--source",
+            "disk fixture",
+            "--fetched-on",
+            "2026-11-13",
+            ok=False,
+        )
+        assert result.returncode == 2
+        assert cloud.ledger.read_bytes() == before
 
 
 @pytest.mark.parametrize("model", ["SPOT", "STANDARD", "FLEX_START"])
@@ -452,13 +578,113 @@ def test_sweep_names_stopped_vm_that_still_has_billable_disk(cloud):
     assert "stopped_instance" in result.stdout
 
 
-def test_ambiguous_create_error_retains_money_and_label(cloud):
+@pytest.mark.parametrize(
+    "error",
+    [
+        "pd-balanced disk type cannot be used by g4-standard-48 machine type",
+        "Connection reset before response",
+        "Polling operation failed: quota for read requests exceeded",
+    ],
+)
+def test_returned_create_error_cancels_after_two_absence_reads(cloud, error):
     cloud.setup()
-    cloud.change(create_error="Connection reset before response")
-    assert cloud.launch(ok=False).returncode != 0
+    cloud.change(create_error=error)
+    assert cloud.launch(ok=False).returncode == 2
     session = cloud.read()["sessions"][0]
-    assert session["settled_cost_usd"] is None
-    assert cloud.launch(ok=False).returncode != 0
+    assert session["status"] == "cancelled"
+    assert Decimal(session["settled_cost_usd"]) == 0
+    assert error in session["error"]
+    reads = session["create_failure_inventory"]
+    assert len(reads) == 2
+    assert all(read["instances"] == read["disks"] == [] for read in reads)
+    times = [datetime.fromisoformat(read["observed_at"].replace("Z", "+00:00")) for read in reads]
+    assert (times[1] - times[0]).total_seconds() >= 3
+    assert Decimal(json.loads(cloud.run("report").stdout)["committed_usd"]) == 0
+    assert cloud.launch(ok=False).returncode == 2
+
+
+@pytest.mark.parametrize("kind,resource", [("disks", "disk"), ("instances", "instance")])
+@pytest.mark.parametrize("found_read", [0, 1])
+def test_create_error_resource_in_either_read_retains_reservation(
+    cloud, kind, resource, found_read
+):
+    cloud.setup()
+    reads = [{}, {}]
+    # No labels: an exact instance/disk name alone prevents cancellation.
+    reads[found_read] = {kind: [{"name": resource, "zone": "europe-west4-a"}]}
+    cloud.change(
+        create_error="INVALID_ARGUMENT: incompatible configuration", failure_inventory=reads
+    )
+    assert cloud.launch(ok=False).returncode == 2
+    session = cloud.read()["sessions"][0]
+    assert session["status"] == "reserved" and session["settled_cost_usd"] is None
+    evidence = session["create_failure_inventory"]
+    assert len(evidence) == 2
+    assert evidence[found_read][kind][0]["name"] == (
+        session["boot_disk"] if kind == "disks" else "run-a"
+    )
+    assert Decimal(json.loads(cloud.run("report").stdout)["committed_usd"]) == Decimal(
+        session["reservation_usd"]
+    )
+
+
+@pytest.mark.parametrize("fault", [{"disks_error": "403 Permission denied"}, {"disks": None}])
+def test_create_error_inventory_failure_retains_reservation(cloud, fault):
+    cloud.setup()
+    cloud.change(create_error="rejected configuration", failure_inventory=[{}, fault])
+    assert cloud.launch(ok=False).returncode == 2
+    session = cloud.read()["sessions"][0]
+    assert session["status"] == "reserved" and session["settled_cost_usd"] is None
+    assert "rejected configuration" in session["error"]
+    assert len(session["create_failure_inventory"]) == 2
+    assert session["create_failure_inventory"][1]["error"]
+
+
+@pytest.mark.parametrize("kind", ["instances", "disks"])
+@pytest.mark.parametrize("warned_read", [0, 1])
+def test_create_error_partial_inventory_warning_retains_reservation(cloud, kind, warned_read):
+    cloud.setup()
+    reads = [{}, {}]
+    warning = "WARNING: Some requests did not succeed: zone europe-west4-a is unreachable"
+    reads[warned_read][kind + "_warning"] = warning
+    cloud.change(create_error="rejected configuration", failure_inventory=reads)
+    assert cloud.launch(ok=False).returncode == 2
+    session = cloud.read()["sessions"][0]
+    assert session["status"] == "reserved" and session["settled_cost_usd"] is None
+    assert len(session["create_failure_inventory"]) == 2
+    assert warning in session["create_failure_inventory"][warned_read]["error"]
+
+
+def test_create_failure_inventory_omits_account_and_metadata_fields(cloud):
+    cloud.setup()
+    resource = {
+        "name": "instance",
+        "zone": "europe-west4-a",
+        "id": "123",
+        "status": "PROVISIONING",
+        "serviceAccounts": [{"email": "fixture@example.invalid"}],
+        "metadata": {"items": [{"key": "ssh-keys", "value": "private fixture metadata"}]},
+    }
+    cloud.change(
+        create_error="rejected configuration", failure_inventory=[{}, {"instances": [resource]}]
+    )
+    assert cloud.launch(ok=False).returncode == 2
+    session = cloud.read()["sessions"][0]
+    assert session["status"] == "reserved" and session["settled_cost_usd"] is None
+    inventory = session["create_failure_inventory"][1]["instances"][0]
+    assert inventory["name"] == "run-a" and inventory["id"] == "123"
+    assert inventory["zone"] == "europe-west4-a" and inventory["status"] == "PROVISIONING"
+    assert "serviceAccounts" not in inventory and "metadata" not in inventory
+
+
+@pytest.mark.parametrize("response", [None, {}, [], [{}, {}]])
+def test_unexpected_create_response_retains_reservation(cloud, response):
+    cloud.setup()
+    cloud.change(create_response=response)
+    assert cloud.launch(ok=False).returncode == 2
+    session = cloud.read()["sessions"][0]
+    assert session["status"] == "reserved" and session["settled_cost_usd"] is None
+    assert "create_failure_inventory" not in session
 
 
 def test_permission_error_is_not_done_absence(cloud):
@@ -506,15 +732,6 @@ def test_dry_close_and_sweep_never_delete_existing_vm(cloud):
     assert len(json.loads(cloud.state.read_text())["instances"]) == 1
     assert not any(c[2] in {"stop", "delete"} for c in cloud.calls()[count:] if c[0] == "compute")
     assert json.loads(before)["sessions"][0]["status"] == "open"
-
-
-def test_poll_quota_error_is_ambiguous_and_retains_reservation(cloud):
-    cloud.setup()
-    cloud.change(create_error="Polling operation failed: quota for read requests exceeded")
-    assert cloud.launch(ok=False).returncode != 0
-    session = cloud.read()["sessions"][0]
-    assert session["settled_cost_usd"] is None
-    assert Decimal(json.loads(cloud.run("report").stdout)["committed_usd"]) > 0
 
 
 def test_missing_first_start_requires_manual_settlement(cloud):
