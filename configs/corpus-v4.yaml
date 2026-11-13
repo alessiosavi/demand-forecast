@@ -1,0 +1,3998 @@
+# Research-only use. Original per-source licences apply; no commercial clearance implied.
+version: '4.0'
+notice: Research-only use. Original per-source licences apply; no commercial clearance implied.
+repo_id: abel-lab/Simons-Pretrain
+revision: 5f17ab8cfa3fa00a8e821599b631127ba250c342
+default_rule: L
+folders:
+- folder: covariates/aemo_solar_farm_nwp
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: AEMO copyright permissions (use with attribution); Open-Meteo / ECMWF CC BY 4.0
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: minute
+  structure:
+    type: with_covariates
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only:
+      - All released covariates unless future availability is independently established; observed NASA/other
+        weather always past-only.
+      known_future:
+      - Only calendar/tariff/timetable/events known at origin, or forecasts with issue_time <= forecast
+        origin; preserve covariate_names.
+      static: []
+  lineage: AEMO NEM and WEM market data (Australia)
+  domain: Energy
+  reason: Distinct documented source; preserve native groups and full available segment chains. Apply
+    conservative covariate availability rules.
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - Manifest calls inputs known-future but supplies no per-row issue-time role schema; downgrade unsupported
+    future channels to past-only at ingestion.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: covariates/aemo_wem_load_forecast
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: AEMO copyright permissions (use with attribution)
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: minute
+  structure:
+    type: with_covariates
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only:
+      - All released covariates unless future availability is independently established; observed NASA/other
+        weather always past-only.
+      known_future:
+      - Only calendar/tariff/timetable/events known at origin, or forecasts with issue_time <= forecast
+        origin; preserve covariate_names.
+      static: []
+  lineage: AEMO NEM and WEM market data (Australia)
+  domain: Energy
+  reason: Distinct documented source; preserve native groups and full available segment chains. Apply
+    conservative covariate availability rules.
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - Manifest calls inputs known-future but supplies no per-row issue-time role schema; downgrade unsupported
+    future channels to past-only at ingestion.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: covariates/aemo_wind_farm_nwp
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: AEMO copyright permissions (use with attribution); Open-Meteo / ECMWF CC BY 4.0
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: minute
+  structure:
+    type: with_covariates
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only:
+      - All released covariates unless future availability is independently established; observed NASA/other
+        weather always past-only.
+      known_future:
+      - Only calendar/tariff/timetable/events known at origin, or forecasts with issue_time <= forecast
+        origin; preserve covariate_names.
+      static: []
+  lineage: AEMO NEM and WEM market data (Australia)
+  domain: Energy
+  reason: Distinct documented source; preserve native groups and full available segment chains. Apply
+    conservative covariate availability rules.
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - Manifest calls inputs known-future but supplies no per-row issue-time role schema; downgrade unsupported
+    future channels to past-only at ingestion.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: covariates/asos_temperature_mos
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: Public domain (NWS)
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: hour
+  structure:
+    type: with_covariates
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only:
+      - All released covariates unless future availability is independently established; observed NASA/other
+        weather always past-only.
+      known_future:
+      - Only calendar/tariff/timetable/events known at origin, or forecasts with issue_time <= forecast
+        origin; preserve covariate_names.
+      static: []
+  lineage: NWS GFS Model Output Statistics (MOS), via the Iowa Environmental Mesonet
+  domain: Energy
+  reason: duplicate/alternate to selected original or GIFT/Chronos representation, or insufficient additional
+    metadata; do not add entire release wholesale
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - Manifest calls inputs known-future but supplies no per-row issue-time role schema; downgrade unsupported
+    future channels to past-only at ingestion.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: covariates/battery_drive_cycles
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: CC BY 4.0
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: second
+  structure:
+    type: with_covariates
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only:
+      - All released covariates unless future availability is independently established; observed NASA/other
+        weather always past-only.
+      known_future:
+      - Only calendar/tariff/timetable/events known at origin, or forecasts with issue_time <= forecast
+        origin; preserve covariate_names.
+      static: []
+  lineage: 'Li-ion battery drive-cycle tests: LG 18650HG2, Panasonic 18650PF'
+  domain: Industry
+  reason: Distinct documented source; preserve native groups and full available segment chains. Apply
+    conservative covariate availability rules.
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - Manifest calls inputs known-future but supplies no per-row issue-time role schema; downgrade unsupported
+    future channels to past-only at ingestion.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: covariates/bcb_focus_inflation
+  status: quarantined
+  rule_f: unresolved
+  rule_l: unresolved
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: 'ODbL 1.0 (BCB open data portal: Focus survey and SGS series)'
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: month+
+  structure:
+    type: with_covariates
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only:
+      - All released covariates unless future availability is independently established; observed NASA/other
+        weather always past-only.
+      known_future:
+      - Only calendar/tariff/timetable/events known at origin, or forecasts with issue_time <= forecast
+        origin; preserve covariate_names.
+      static: []
+  lineage: Banco Central do Brasil Focus survey
+  domain: Economics and finance
+  reason: 'quarantine: macro lineage crosswalk required'
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - Manifest calls inputs known-future but supplies no per-row issue-time role schema; downgrade unsupported
+    future channels to past-only at ingestion.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+  - Benchmark lineage or Rule F interpretation unresolved; quarantine enforced.
+- folder: covariates/bts_airport_schedule
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: US Government work (BTS/DOT), public domain
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: hour
+  structure:
+    type: with_covariates
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only:
+      - All released covariates unless future availability is independently established; observed NASA/other
+        weather always past-only.
+      known_future:
+      - Only calendar/tariff/timetable/events known at origin, or forecasts with issue_time <= forecast
+        origin; preserve covariate_names.
+      static: []
+  lineage: BTS Airline On-Time Performance
+  domain: Transport
+  reason: Distinct documented source; preserve native groups and full available segment chains. Apply
+    conservative covariate availability rules.
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - Manifest calls inputs known-future but supplies no per-row issue-time role schema; downgrade unsupported
+    future channels to past-only at ingestion.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: covariates/cams_europe_air_quality
+  status: quarantined
+  rule_f: unresolved
+  rule_l: unresolved
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: Copernicus licence (CAMS; free, with attribution); EEA re-use policy (CC BY 4.0); Open-Meteo
+      CC BY 4.0
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: hour
+  structure:
+    type: with_covariates
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only:
+      - All released covariates unless future availability is independently established; observed NASA/other
+        weather always past-only.
+      known_future:
+      - Only calendar/tariff/timetable/events known at origin, or forecasts with issue_time <= forecast
+        origin; preserve covariate_names.
+      static: []
+  lineage: EEA air-quality observations with CAMS European air-quality forecasts
+  domain: Environment
+  reason: quarantine pending EEA station/observation lineage crosswalk; separate Beijing source already
+    selected
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - Manifest calls inputs known-future but supplies no per-row issue-time role schema; downgrade unsupported
+    future channels to past-only at ingestion.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+  - Benchmark lineage or Rule F interpretation unresolved; quarantine enforced.
+- folder: covariates/city_load_weather_forecast
+  status: quarantined
+  rule_f: unresolved
+  rule_l: unresolved
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: US Government work, public domain (EIA; NWS MOS via the Iowa Environmental Mesonet)
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: hour
+  structure:
+    type: with_covariates
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only:
+      - All released covariates unless future availability is independently established; observed NASA/other
+        weather always past-only.
+      known_future:
+      - Only calendar/tariff/timetable/events known at origin, or forecasts with issue_time <= forecast
+        origin; preserve covariate_names.
+      static: []
+  lineage: NWS GFS Model Output Statistics (MOS), via the Iowa Environmental Mesonet
+  domain: Energy
+  reason: 'quarantine: unresolved energy lineage'
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - Manifest calls inputs known-future but supplies no per-row issue-time role schema; downgrade unsupported
+    future channels to past-only at ingestion.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+  - Benchmark lineage or Rule F interpretation unresolved; quarantine enforced.
+- folder: covariates/covid_hub_admissions
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: CC0 / US public domain (CDC Forecast Hub)
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: week
+  structure:
+    type: with_covariates
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only:
+      - All released covariates unless future availability is independently established; observed NASA/other
+        weather always past-only.
+      known_future:
+      - Only calendar/tariff/timetable/events known at origin, or forecasts with issue_time <= forecast
+        origin; preserve covariate_names.
+      static: []
+  lineage: CDC COVID-19 and RSV Forecast Hubs
+  domain: Health
+  reason: Distinct documented source; preserve native groups and full available segment chains. Apply
+    conservative covariate availability rules.
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - Manifest calls inputs known-future but supplies no per-row issue-time role schema; downgrade unsupported
+    future channels to past-only at ingestion.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: covariates/cpc_monthly_outlook
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: US government works (NOAA/NWS/NCEI), public domain in the US
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: month+
+  structure:
+    type: with_covariates
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only:
+      - All released covariates unless future availability is independently established; observed NASA/other
+        weather always past-only.
+      known_future:
+      - Only calendar/tariff/timetable/events known at origin, or forecasts with issue_time <= forecast
+        origin; preserve covariate_names.
+      static: []
+  lineage: NOAA CPC long-lead outlooks with NCEI climate-division data
+  domain: Environment
+  reason: Distinct documented source; preserve native groups and full available segment chains. Apply
+    conservative covariate availability rules.
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - Manifest calls inputs known-future but supplies no per-row issue-time role schema; downgrade unsupported
+    future channels to past-only at ingestion.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: covariates/dk_wind_solar_dayahead
+  status: quarantined
+  rule_f: unresolved
+  rule_l: unresolved
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: CC BY 4.0 (Energi Data Service, Energinet)
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: hour
+  structure:
+    type: with_covariates
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only:
+      - All released covariates unless future availability is independently established; observed NASA/other
+        weather always past-only.
+      known_future:
+      - Only calendar/tariff/timetable/events known at origin, or forecasts with issue_time <= forecast
+        origin; preserve covariate_names.
+      static: []
+  lineage: Energinet Energi Data Service (Denmark)
+  domain: Energy
+  reason: 'quarantine: unresolved energy lineage'
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - Manifest calls inputs known-future but supplies no per-row issue-time role schema; downgrade unsupported
+    future channels to past-only at ingestion.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+  - Benchmark lineage or Rule F interpretation unresolved; quarantine enforced.
+- folder: covariates/eia930_ba_load_weather
+  status: quarantined
+  rule_f: unresolved
+  rule_l: unresolved
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: Public domain (EIA); NASA POWER open data
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: hour
+  structure:
+    type: with_covariates
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only:
+      - All released covariates unless future availability is independently established; observed NASA/other
+        weather always past-only.
+      known_future:
+      - Only calendar/tariff/timetable/events known at origin, or forecasts with issue_time <= forecast
+        origin; preserve covariate_names.
+      static: []
+  lineage: EIA Form 930 Hourly Electric Grid Monitor (US)
+  domain: Energy
+  reason: 'quarantine: unresolved energy lineage'
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - Manifest calls inputs known-future but supplies no per-row issue-time role schema; downgrade unsupported
+    future channels to past-only at ingestion.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+  - Benchmark lineage or Rule F interpretation unresolved; quarantine enforced.
+- folder: covariates/eia930_ba_solar_weather
+  status: quarantined
+  rule_f: unresolved
+  rule_l: unresolved
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: Public domain (EIA); NASA POWER open data
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: hour
+  structure:
+    type: with_covariates
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only:
+      - All released covariates unless future availability is independently established; observed NASA/other
+        weather always past-only.
+      known_future:
+      - Only calendar/tariff/timetable/events known at origin, or forecasts with issue_time <= forecast
+        origin; preserve covariate_names.
+      static: []
+  lineage: EIA Form 930 Hourly Electric Grid Monitor (US)
+  domain: Energy
+  reason: 'quarantine: unresolved energy lineage'
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - Manifest calls inputs known-future but supplies no per-row issue-time role schema; downgrade unsupported
+    future channels to past-only at ingestion.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+  - Benchmark lineage or Rule F interpretation unresolved; quarantine enforced.
+- folder: covariates/eia930_ba_wind_weather
+  status: quarantined
+  rule_f: unresolved
+  rule_l: unresolved
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: Public domain (EIA); NASA POWER open data
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: hour
+  structure:
+    type: with_covariates
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only:
+      - All released covariates unless future availability is independently established; observed NASA/other
+        weather always past-only.
+      known_future:
+      - Only calendar/tariff/timetable/events known at origin, or forecasts with issue_time <= forecast
+        origin; preserve covariate_names.
+      static: []
+  lineage: EIA Form 930 Hourly Electric Grid Monitor (US)
+  domain: Energy
+  reason: 'quarantine: unresolved energy lineage'
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - Manifest calls inputs known-future but supplies no per-row issue-time role schema; downgrade unsupported
+    future channels to past-only at ingestion.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+  - Benchmark lineage or Rule F interpretation unresolved; quarantine enforced.
+- folder: covariates/eia930_demand_da
+  status: quarantined
+  rule_f: unresolved
+  rule_l: unresolved
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: US government public domain
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: hour
+  structure:
+    type: with_covariates
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only:
+      - All released covariates unless future availability is independently established; observed NASA/other
+        weather always past-only.
+      known_future:
+      - Only calendar/tariff/timetable/events known at origin, or forecasts with issue_time <= forecast
+        origin; preserve covariate_names.
+      static: []
+  lineage: EIA Form 930 Hourly Electric Grid Monitor (US)
+  domain: Energy
+  reason: 'quarantine: unresolved energy lineage'
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - Manifest calls inputs known-future but supplies no per-row issue-time role schema; downgrade unsupported
+    future channels to past-only at ingestion.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+  - Benchmark lineage or Rule F interpretation unresolved; quarantine enforced.
+- folder: covariates/eia930_subregion_load_weather
+  status: quarantined
+  rule_f: unresolved
+  rule_l: unresolved
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: Public domain (EIA); NASA POWER open data
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: hour
+  structure:
+    type: with_covariates
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only:
+      - All released covariates unless future availability is independently established; observed NASA/other
+        weather always past-only.
+      known_future:
+      - Only calendar/tariff/timetable/events known at origin, or forecasts with issue_time <= forecast
+        origin; preserve covariate_names.
+      static: []
+  lineage: EIA Form 930 Hourly Electric Grid Monitor (US)
+  domain: Energy
+  reason: 'quarantine: unresolved energy lineage'
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - Manifest calls inputs known-future but supplies no per-row issue-time role schema; downgrade unsupported
+    future channels to past-only at ingestion.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+  - Benchmark lineage or Rule F interpretation unresolved; quarantine enforced.
+- folder: covariates/eirgrid_ireland_demand_wind
+  status: quarantined
+  rule_f: unresolved
+  rule_l: unresolved
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: EirGrid Group Open Data Licence (covers the dashboard and the SEMO reports)
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: minute
+  structure:
+    type: with_covariates
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only:
+      - All released covariates unless future availability is independently established; observed NASA/other
+        weather always past-only.
+      known_future:
+      - Only calendar/tariff/timetable/events known at origin, or forecasts with issue_time <= forecast
+        origin; preserve covariate_names.
+      static: []
+  lineage: EirGrid Smart Grid Dashboard and SEMO reports (Ireland)
+  domain: Energy
+  reason: 'quarantine: unresolved energy lineage'
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - Manifest calls inputs known-future but supplies no per-row issue-time role schema; downgrade unsupported
+    future channels to past-only at ingestion.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+  - Benchmark lineage or Rule F interpretation unresolved; quarantine enforced.
+- folder: covariates/elia_load_dayahead
+  status: quarantined
+  rule_f: unresolved
+  rule_l: unresolved
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: Elia Open Data Licence
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: minute
+  structure:
+    type: with_covariates
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only:
+      - All released covariates unless future availability is independently established; observed NASA/other
+        weather always past-only.
+      known_future:
+      - Only calendar/tariff/timetable/events known at origin, or forecasts with issue_time <= forecast
+        origin; preserve covariate_names.
+      static: []
+  lineage: Elia Open Data (Belgium)
+  domain: Energy
+  reason: 'quarantine: unresolved energy lineage'
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - Manifest calls inputs known-future but supplies no per-row issue-time role schema; downgrade unsupported
+    future channels to past-only at ingestion.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+  - Benchmark lineage or Rule F interpretation unresolved; quarantine enforced.
+- folder: covariates/elia_wind_solar_dayahead
+  status: quarantined
+  rule_f: unresolved
+  rule_l: unresolved
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: Elia Open Data Licence
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: minute
+  structure:
+    type: with_covariates
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only:
+      - All released covariates unless future availability is independently established; observed NASA/other
+        weather always past-only.
+      known_future:
+      - Only calendar/tariff/timetable/events known at origin, or forecasts with issue_time <= forecast
+        origin; preserve covariate_names.
+      static: []
+  lineage: Elia Open Data (Belgium)
+  domain: Energy
+  reason: 'quarantine: unresolved energy lineage'
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - Manifest calls inputs known-future but supplies no per-row issue-time role schema; downgrade unsupported
+    future channels to past-only at ingestion.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+  - Benchmark lineage or Rule F interpretation unresolved; quarantine enforced.
+- folder: covariates/enso_forecast_plume
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: IRI ENSO Forecast Data CC BY 4.0; NOAA public domain
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: month+
+  structure:
+    type: with_covariates
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only:
+      - All released covariates unless future availability is independently established; observed NASA/other
+        weather always past-only.
+      known_future:
+      - Only calendar/tariff/timetable/events known at origin, or forecasts with issue_time <= forecast
+        origin; preserve covariate_names.
+      static: []
+  lineage: "IRI ENSO forecasts with NOAA Ni\xF1o indices"
+  domain: Environment
+  reason: Distinct documented source; preserve native groups and full available segment chains. Apply
+    conservative covariate availability rules.
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - Manifest calls inputs known-future but supplies no per-row issue-time role schema; downgrade unsupported
+    future channels to past-only at ingestion.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: covariates/eu_wind_farm_nwp
+  status: quarantined
+  rule_f: unresolved
+  rule_l: unresolved
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: 'BMRS data licence (Elexon): use incl. commercial, with attribution; Open-Meteo / ECMWF CC
+      BY 4.0'
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: hour, minute
+  structure:
+    type: with_covariates
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only:
+      - All released covariates unless future availability is independently established; observed NASA/other
+        weather always past-only.
+      known_future:
+      - Only calendar/tariff/timetable/events known at origin, or forecasts with issue_time <= forecast
+        origin; preserve covariate_names.
+      static: []
+  lineage: Elexon BMRS (Great Britain)
+  domain: Energy
+  reason: 'quarantine: unresolved energy lineage'
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - Manifest calls inputs known-future but supplies no per-row issue-time role schema; downgrade unsupported
+    future channels to past-only at ingestion.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+  - Benchmark lineage or Rule F interpretation unresolved; quarantine enforced.
+- folder: covariates/eurostat_flash_hicp
+  status: quarantined
+  rule_f: unresolved
+  rule_l: unresolved
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: 'Eurostat re-use policy: free re-use with attribution (Commission Decision 2011/833/EU; CC
+      BY 4.0)'
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: month+
+  structure:
+    type: with_covariates
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only:
+      - All released covariates unless future availability is independently established; observed NASA/other
+        weather always past-only.
+      known_future:
+      - Only calendar/tariff/timetable/events known at origin, or forecasts with issue_time <= forecast
+        origin; preserve covariate_names.
+      static: []
+  lineage: Eurostat HICP flash estimates
+  domain: Economics and finance
+  reason: 'quarantine: macro lineage crosswalk required'
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - Manifest calls inputs known-future but supplies no per-row issue-time role schema; downgrade unsupported
+    future channels to past-only at ingestion.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+  - Benchmark lineage or Rule F interpretation unresolved; quarantine enforced.
+- folder: covariates/fi_rail_timetable
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: CC BY 4.0 (Digitraffic open data licence, as stated by Fintraffic)
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: hour
+  structure:
+    type: with_covariates
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only:
+      - All released covariates unless future availability is independently established; observed NASA/other
+        weather always past-only.
+      known_future:
+      - Only calendar/tariff/timetable/events known at origin, or forecasts with issue_time <= forecast
+        origin; preserve covariate_names.
+      static: []
+  lineage: Fintraffic Digitraffic rail (Finland)
+  domain: Transport
+  reason: Distinct documented source; preserve native groups and full available segment chains. Apply
+    conservative covariate availability rules.
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - Manifest calls inputs known-future but supplies no per-row issue-time role schema; downgrade unsupported
+    future channels to past-only at ingestion.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: covariates/gb_gsp_solar_nwp
+  status: quarantined
+  rule_f: unresolved
+  rule_l: unresolved
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: PV_Live CC BY 4.0; NESO Open Data Licence; Open-Meteo / ECMWF CC BY 4.0
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: minute
+  structure:
+    type: with_covariates
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only:
+      - All released covariates unless future availability is independently established; observed NASA/other
+        weather always past-only.
+      known_future:
+      - Only calendar/tariff/timetable/events known at origin, or forecasts with issue_time <= forecast
+        origin; preserve covariate_names.
+      static: []
+  lineage: Sheffield Solar PV_Live (Great Britain)
+  domain: Energy
+  reason: 'quarantine: unresolved energy lineage'
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - Manifest calls inputs known-future but supplies no per-row issue-time role schema; downgrade unsupported
+    future channels to past-only at ingestion.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+  - Benchmark lineage or Rule F interpretation unresolved; quarantine enforced.
+- folder: covariates/gb_unit_output_availability
+  status: quarantined
+  rule_f: unresolved
+  rule_l: unresolved
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: 'BMRS data licence (Elexon): use incl. commercial, with attribution'
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: hour, minute
+  structure:
+    type: with_covariates
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only:
+      - All released covariates unless future availability is independently established; observed NASA/other
+        weather always past-only.
+      known_future:
+      - Only calendar/tariff/timetable/events known at origin, or forecasts with issue_time <= forecast
+        origin; preserve covariate_names.
+      static: []
+  lineage: Elexon BMRS (Great Britain)
+  domain: Energy
+  reason: 'quarantine: unresolved energy lineage'
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - Manifest calls inputs known-future but supplies no per-row issue-time role schema; downgrade unsupported
+    future channels to past-only at ingestion.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+  - Benchmark lineage or Rule F interpretation unresolved; quarantine enforced.
+- folder: covariates/gb_wind_generation
+  status: quarantined
+  rule_f: unresolved
+  rule_l: unresolved
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: 'BMRS data licence (Elexon): use incl. commercial, with attribution'
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: hour, minute
+  structure:
+    type: with_covariates
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only:
+      - All released covariates unless future availability is independently established; observed NASA/other
+        weather always past-only.
+      known_future:
+      - Only calendar/tariff/timetable/events known at origin, or forecasts with issue_time <= forecast
+        origin; preserve covariate_names.
+      static: []
+  lineage: Elexon BMRS (Great Britain)
+  domain: Energy
+  reason: 'quarantine: unresolved energy lineage'
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - Manifest calls inputs known-future but supplies no per-row issue-time role schema; downgrade unsupported
+    future channels to past-only at ingestion.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+  - Benchmark lineage or Rule F interpretation unresolved; quarantine enforced.
+- folder: covariates/hai_setpoints
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: CC BY-SA 4.0
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: minute
+  structure:
+    type: with_covariates
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only:
+      - All released covariates unless future availability is independently established; observed NASA/other
+        weather always past-only.
+      known_future:
+      - Only calendar/tariff/timetable/events known at origin, or forecasts with issue_time <= forecast
+        origin; preserve covariate_names.
+      static: []
+  lineage: HAI industrial control system dataset
+  domain: Industry
+  reason: Distinct documented source; preserve native groups and full available segment chains. Apply
+    conservative covariate availability rules.
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - Manifest calls inputs known-future but supplies no per-row issue-time role schema; downgrade unsupported
+    future channels to past-only at ingestion.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: covariates/hotel_bookings_otb64
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: CC BY 4.0
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: day
+  structure:
+    type: with_covariates
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only:
+      - All released covariates unless future availability is independently established; observed NASA/other
+        weather always past-only.
+      known_future:
+      - Only calendar/tariff/timetable/events known at origin, or forecasts with issue_time <= forecast
+        origin; preserve covariate_names.
+      static: []
+  lineage: Hotel booking demand (two Portuguese hotels)
+  domain: Commerce
+  reason: Distinct documented source; preserve native groups and full available segment chains. Apply
+    conservative covariate availability rules.
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - Manifest calls inputs known-future but supplies no per-row issue-time role schema; downgrade unsupported
+    future channels to past-only at ingestion.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: covariates/london_dtou_tariff
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: CC BY 4.0 (London Datastore dataset licence field)
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: minute
+  structure:
+    type: with_covariates
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only:
+      - All released covariates unless future availability is independently established; observed NASA/other
+        weather always past-only.
+      known_future:
+      - Only calendar/tariff/timetable/events known at origin, or forecasts with issue_time <= forecast
+        origin; preserve covariate_names.
+      static: []
+  lineage: Low Carbon London smart meters with the dynamic time-of-use trial tariff
+  domain: Energy
+  reason: Distinct documented source; preserve native groups and full available segment chains. Apply
+    conservative covariate availability rules.
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - Manifest calls inputs known-future but supplies no per-row issue-time role schema; downgrade unsupported
+    future channels to past-only at ingestion.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: covariates/mbta_planned_disruptions
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: CC0 (MBTA gated station entries); MassDOT Developers License Agreement (GTFS)
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: day
+  structure:
+    type: with_covariates
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only:
+      - All released covariates unless future availability is independently established; observed NASA/other
+        weather always past-only.
+      known_future:
+      - Only calendar/tariff/timetable/events known at origin, or forecasts with issue_time <= forecast
+        origin; preserve covariate_names.
+      static: []
+  lineage: MBTA open data (Boston)
+  domain: Transport
+  reason: Distinct documented source; preserve native groups and full available segment chains. Apply
+    conservative covariate availability rules.
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - Manifest calls inputs known-future but supplies no per-row issue-time role schema; downgrade unsupported
+    future channels to past-only at ingestion.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: covariates/mlb_attendance_schedule
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: 'Retrosheet notice (https://www.retrosheet.org/notice.txt): free use incl. commercial, with
+      the required statement'
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: day
+  structure:
+    type: with_covariates
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only:
+      - All released covariates unless future availability is independently established; observed NASA/other
+        weather always past-only.
+      known_future:
+      - Only calendar/tariff/timetable/events known at origin, or forecasts with issue_time <= forecast
+        origin; preserve covariate_names.
+      static: []
+  lineage: Retrosheet (Major League Baseball)
+  domain: Media attention
+  reason: Distinct documented source; preserve native groups and full available segment chains. Apply
+    conservative covariate availability rules.
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - Manifest calls inputs known-future but supplies no per-row issue-time role schema; downgrade unsupported
+    future channels to past-only at ingestion.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: covariates/neso_demand_dayahead
+  status: quarantined
+  rule_f: unresolved
+  rule_l: unresolved
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: NESO Open Data Licence
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: minute
+  structure:
+    type: with_covariates
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only:
+      - All released covariates unless future availability is independently established; observed NASA/other
+        weather always past-only.
+      known_future:
+      - Only calendar/tariff/timetable/events known at origin, or forecasts with issue_time <= forecast
+        origin; preserve covariate_names.
+      static: []
+  lineage: NESO Data Portal (Great Britain)
+  domain: Energy
+  reason: 'quarantine: unresolved energy lineage'
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - Manifest calls inputs known-future but supplies no per-row issue-time role schema; downgrade unsupported
+    future channels to past-only at ingestion.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+  - Benchmark lineage or Rule F interpretation unresolved; quarantine enforced.
+- folder: covariates/nist_nzertf_house
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: US Government work (NIST; open and free)
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: hour
+  structure:
+    type: with_covariates
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only:
+      - All released covariates unless future availability is independently established; observed NASA/other
+        weather always past-only.
+      known_future:
+      - Only calendar/tariff/timetable/events known at origin, or forecasts with issue_time <= forecast
+        origin; preserve covariate_names.
+      static: []
+  lineage: NIST Net-Zero Energy Residential Test Facility
+  domain: Energy
+  reason: Distinct documented source; preserve native groups and full available segment chains. Apply
+    conservative covariate availability rules.
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - Manifest calls inputs known-future but supplies no per-row issue-time role schema; downgrade unsupported
+    future channels to past-only at ingestion.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: covariates/noaa_tide_predictions
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: US Government work, public domain (NOAA)
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: minute
+  structure:
+    type: with_covariates
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only:
+      - All released covariates unless future availability is independently established; observed NASA/other
+        weather always past-only.
+      known_future:
+      - Only calendar/tariff/timetable/events known at origin, or forecasts with issue_time <= forecast
+        origin; preserve covariate_names.
+      static: []
+  lineage: NOAA CO-OPS Tides and Currents
+  domain: Environment
+  reason: Distinct documented source; preserve native groups and full available segment chains. Apply
+    conservative covariate availability rules.
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - Manifest calls inputs known-future but supplies no per-row issue-time role schema; downgrade unsupported
+    future channels to past-only at ingestion.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: covariates/nwm_streamflow_forecast
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: US Government work, public domain (NOAA NWM; USGS, provisional data statement)
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: hour
+  structure:
+    type: with_covariates
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only:
+      - All released covariates unless future availability is independently established; observed NASA/other
+        weather always past-only.
+      known_future:
+      - Only calendar/tariff/timetable/events known at origin, or forecasts with issue_time <= forecast
+        origin; preserve covariate_names.
+      static: []
+  lineage: NOAA National Water Model with USGS gauges
+  domain: Environment
+  reason: Distinct documented source; preserve native groups and full available segment chains. Apply
+    conservative covariate availability rules.
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - Manifest calls inputs known-future but supplies no per-row issue-time role schema; downgrade unsupported
+    future channels to past-only at ingestion.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: covariates/nyc_subway_events
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: OPEN-NY Terms of Use (MTA ridership); Retrosheet notice; CC BY-SA 4.0 (event dates from Wikipedia
+      team-season articles)
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: hour
+  structure:
+    type: with_covariates
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only:
+      - All released covariates unless future availability is independently established; observed NASA/other
+        weather always past-only.
+      known_future:
+      - Only calendar/tariff/timetable/events known at origin, or forecasts with issue_time <= forecast
+        origin; preserve covariate_names.
+      static: []
+  lineage: MTA subway hourly ridership (New York)
+  domain: Transport
+  reason: Distinct documented source; preserve native groups and full available segment chains. Apply
+    conservative covariate availability rules.
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - Manifest calls inputs known-future but supplies no per-row issue-time role schema; downgrade unsupported
+    future channels to past-only at ingestion.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: covariates/nyc_taxi_permitted_events
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: NYC Open Data terms of use
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: hour
+  structure:
+    type: with_covariates
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only:
+      - All released covariates unless future availability is independently established; observed NASA/other
+        weather always past-only.
+      known_future:
+      - Only calendar/tariff/timetable/events known at origin, or forecasts with issue_time <= forecast
+        origin; preserve covariate_names.
+      static: []
+  lineage: NYC TLC trip records with NYC permitted events
+  domain: Transport
+  reason: Distinct documented source; preserve native groups and full available segment chains. Apply
+    conservative covariate availability rules.
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - Manifest calls inputs known-future but supplies no per-row issue-time role schema; downgrade unsupported
+    future channels to past-only at ingestion.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: covariates/nz_node_price_schedule
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: CC BY 4.0 (EMI datasets)
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: minute
+  structure:
+    type: with_covariates
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only:
+      - All released covariates unless future availability is independently established; observed NASA/other
+        weather always past-only.
+      known_future:
+      - Only calendar/tariff/timetable/events known at origin, or forecasts with issue_time <= forecast
+        origin; preserve covariate_names.
+      static: []
+  lineage: NZ Electricity Authority EMI datasets
+  domain: Energy
+  reason: duplicate/alternate to selected original or GIFT/Chronos representation, or insufficient additional
+    metadata; do not add entire release wholesale
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - Manifest calls inputs known-future but supplies no per-row issue-time role schema; downgrade unsupported
+    future channels to past-only at ingestion.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: covariates/ons_brazil_load_forecast
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: Creative Commons Attribution (ONS Dados Abertos)
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: hour, minute
+  structure:
+    type: with_covariates
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only:
+      - All released covariates unless future availability is independently established; observed NASA/other
+        weather always past-only.
+      known_future:
+      - Only calendar/tariff/timetable/events known at origin, or forecasts with issue_time <= forecast
+        origin; preserve covariate_names.
+      static: []
+  lineage: ONS open data (Brazil)
+  domain: Energy
+  reason: Distinct documented source; preserve native groups and full available segment chains. Apply
+    conservative covariate availability rules.
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - Manifest calls inputs known-future but supplies no per-row issue-time role schema; downgrade unsupported
+    future channels to past-only at ingestion.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: covariates/ons_brazil_load_weather
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: CC-BY (ONS Dados Abertos); NASA POWER open data
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: hour, minute
+  structure:
+    type: with_covariates
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only:
+      - All released covariates unless future availability is independently established; observed NASA/other
+        weather always past-only.
+      known_future:
+      - Only calendar/tariff/timetable/events known at origin, or forecasts with issue_time <= forecast
+        origin; preserve covariate_names.
+      static: []
+  lineage: ONS open data (Brazil)
+  domain: Energy
+  reason: Distinct documented source; preserve native groups and full available segment chains. Apply
+    conservative covariate availability rules.
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - Manifest calls inputs known-future but supplies no per-row issue-time role schema; downgrade unsupported
+    future channels to past-only at ingestion.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: covariates/panasonic_battery_drive_cycles
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: CC BY 4.0
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: second
+  structure:
+    type: with_covariates
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only:
+      - All released covariates unless future availability is independently established; observed NASA/other
+        weather always past-only.
+      known_future:
+      - Only calendar/tariff/timetable/events known at origin, or forecasts with issue_time <= forecast
+        origin; preserve covariate_names.
+      static: []
+  lineage: 'Li-ion battery drive-cycle tests: LG 18650HG2, Panasonic 18650PF'
+  domain: Industry
+  reason: Distinct documented source; preserve native groups and full available segment chains. Apply
+    conservative covariate availability rules.
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - Manifest calls inputs known-future but supplies no per-row issue-time role schema; downgrade unsupported
+    future channels to past-only at ingestion.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: covariates/pvdaq_site_solar_weather
+  status: quarantined
+  rule_f: unresolved
+  rule_l: unresolved
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: CC-BY-4.0 (NREL/OEDI); NASA POWER open data
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: minute
+  structure:
+    type: with_covariates
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only:
+      - All released covariates unless future availability is independently established; observed NASA/other
+        weather always past-only.
+      known_future:
+      - Only calendar/tariff/timetable/events known at origin, or forecasts with issue_time <= forecast
+        origin; preserve covariate_names.
+      static: []
+  lineage: NREL PVDAQ
+  domain: Energy
+  reason: 'quarantine: unresolved energy lineage'
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - Manifest calls inputs known-future but supplies no per-row issue-time role schema; downgrade unsupported
+    future channels to past-only at ingestion.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+  - Benchmark lineage or Rule F interpretation unresolved; quarantine enforced.
+- folder: covariates/rba_smp_forecasts
+  status: quarantined
+  rule_f: unresolved
+  rule_l: unresolved
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: CC BY 4.0 (Reserve Bank of Australia); ABS data CC BY 4.0
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: month+
+  structure:
+    type: with_covariates
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only:
+      - All released covariates unless future availability is independently established; observed NASA/other
+        weather always past-only.
+      known_future:
+      - Only calendar/tariff/timetable/events known at origin, or forecasts with issue_time <= forecast
+        origin; preserve covariate_names.
+      static: []
+  lineage: Reserve Bank of Australia forecasts with ABS data
+  domain: Economics and finance
+  reason: 'quarantine: macro lineage crosswalk required'
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - Manifest calls inputs known-future but supplies no per-row issue-time role schema; downgrade unsupported
+    future channels to past-only at ingestion.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+  - Benchmark lineage or Rule F interpretation unresolved; quarantine enforced.
+- folder: covariates/rfc_river_forecasts
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: US Government work, public domain (NWS; USGS, provisional data statement)
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: hour
+  structure:
+    type: with_covariates
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only:
+      - All released covariates unless future availability is independently established; observed NASA/other
+        weather always past-only.
+      known_future:
+      - Only calendar/tariff/timetable/events known at origin, or forecasts with issue_time <= forecast
+        origin; preserve covariate_names.
+      static: []
+  lineage: NWS River Forecast Centers with USGS gauges
+  domain: Environment
+  reason: Distinct documented source; preserve native groups and full available segment chains. Apply
+    conservative covariate availability rules.
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - Manifest calls inputs known-future but supplies no per-row issue-time role schema; downgrade unsupported
+    future channels to past-only at ingestion.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: covariates/rsv_hub_admissions
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: CC0 / US public domain (CDC Forecast Hub)
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: week
+  structure:
+    type: with_covariates
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only:
+      - All released covariates unless future availability is independently established; observed NASA/other
+        weather always past-only.
+      known_future:
+      - Only calendar/tariff/timetable/events known at origin, or forecasts with issue_time <= forecast
+        origin; preserve covariate_names.
+      static: []
+  lineage: CDC COVID-19 and RSV Forecast Hubs
+  domain: Health
+  reason: Distinct documented source; preserve native groups and full available segment chains. Apply
+    conservative covariate availability rules.
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - Manifest calls inputs known-future but supplies no per-row issue-time role schema; downgrade unsupported
+    future channels to past-only at ingestion.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: covariates/rte_france_load_j1
+  status: quarantined
+  rule_f: unresolved
+  rule_l: unresolved
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: Licence Ouverte v2.0 (Etalab)
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: minute
+  structure:
+    type: with_covariates
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only:
+      - All released covariates unless future availability is independently established; observed NASA/other
+        weather always past-only.
+      known_future:
+      - Only calendar/tariff/timetable/events known at origin, or forecasts with issue_time <= forecast
+        origin; preserve covariate_names.
+      static: []
+  lineage: RTE eCO2mix (France)
+  domain: Energy
+  reason: 'quarantine: unresolved energy lineage'
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - Manifest calls inputs known-future but supplies no per-row issue-time role schema; downgrade unsupported
+    future channels to past-only at ingestion.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+  - Benchmark lineage or Rule F interpretation unresolved; quarantine enforced.
+- folder: covariates/sbb_rail_delays
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: opentransportdata.swiss Terms of Use (open data; cite the source)
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: hour
+  structure:
+    type: with_covariates
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only:
+      - All released covariates unless future availability is independently established; observed NASA/other
+        weather always past-only.
+      known_future:
+      - Only calendar/tariff/timetable/events known at origin, or forecasts with issue_time <= forecast
+        origin; preserve covariate_names.
+      static: []
+  lineage: opentransportdata.swiss (Switzerland)
+  domain: Transport
+  reason: Distinct documented source; preserve native groups and full available segment chains. Apply
+    conservative covariate availability rules.
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - Manifest calls inputs known-future but supplies no per-row issue-time role schema; downgrade unsupported
+    future channels to past-only at ingestion.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: covariates/seoul_metro_kbo
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: 'data.go.kr: no restriction on use (Seoul Metro); KOGL Type 1, source attribution (Seoul event
+      list)'
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: hour
+  structure:
+    type: with_covariates
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only:
+      - All released covariates unless future availability is independently established; observed NASA/other
+        weather always past-only.
+      known_future:
+      - Only calendar/tariff/timetable/events known at origin, or forecasts with issue_time <= forecast
+        origin; preserve covariate_names.
+      static: []
+  lineage: Seoul Metro gate counts with Seoul stadium events
+  domain: Transport
+  reason: Distinct documented source; preserve native groups and full available segment chains. Apply
+    conservative covariate availability rules.
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - Manifest calls inputs known-future but supplies no per-row issue-time role schema; downgrade unsupported
+    future channels to past-only at ingestion.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: covariates/stofs_water_level_forecast
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: US Government work, public domain (NOAA)
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: hour
+  structure:
+    type: with_covariates
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only:
+      - All released covariates unless future availability is independently established; observed NASA/other
+        weather always past-only.
+      known_future:
+      - Only calendar/tariff/timetable/events known at origin, or forecasts with issue_time <= forecast
+        origin; preserve covariate_names.
+      static: []
+  lineage: NOAA STOFS with CO-OPS water levels
+  domain: Environment
+  reason: Distinct documented source; preserve native groups and full available segment chains. Apply
+    conservative covariate availability rules.
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - Manifest calls inputs known-future but supplies no per-row issue-time role schema; downgrade unsupported
+    future channels to past-only at ingestion.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: covariates/surfrad_solar_hrrr
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: CC0 1.0 (SURFRAD/SOLRAD, NOAA GML); NOAA open data (HRRR)
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: hour
+  structure:
+    type: with_covariates
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only:
+      - All released covariates unless future availability is independently established; observed NASA/other
+        weather always past-only.
+      known_future:
+      - Only calendar/tariff/timetable/events known at origin, or forecasts with issue_time <= forecast
+        origin; preserve covariate_names.
+      static: []
+  lineage: NOAA SURFRAD / SOLRAD with NOAA HRRR
+  domain: Energy
+  reason: Distinct documented source; preserve native groups and full available segment chains. Apply
+    conservative covariate availability rules.
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - Manifest calls inputs known-future but supplies no per-row issue-time role schema; downgrade unsupported
+    future channels to past-only at ingestion.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: covariates/swpc_f107_45day
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: US Government work, public domain (NOAA SWPC); GFZ F10.7 CC BY 4.0
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: day, hour
+  structure:
+    type: with_covariates
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only:
+      - All released covariates unless future availability is independently established; observed NASA/other
+        weather always past-only.
+      known_future:
+      - Only calendar/tariff/timetable/events known at origin, or forecasts with issue_time <= forecast
+        origin; preserve covariate_names.
+      static: []
+  lineage: NOAA SWPC with GFZ Potsdam indices
+  domain: Environment
+  reason: Distinct documented source; preserve native groups and full available segment chains. Apply
+    conservative covariate availability rules.
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - Manifest calls inputs known-future but supplies no per-row issue-time role schema; downgrade unsupported
+    future channels to past-only at ingestion.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: covariates/swpc_kp_forecast
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: US Government work, public domain (NOAA SWPC); GFZ Kp CC BY 4.0
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: day, hour
+  structure:
+    type: with_covariates
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only:
+      - All released covariates unless future availability is independently established; observed NASA/other
+        weather always past-only.
+      known_future:
+      - Only calendar/tariff/timetable/events known at origin, or forecasts with issue_time <= forecast
+        origin; preserve covariate_names.
+      static: []
+  lineage: NOAA SWPC with GFZ Potsdam indices
+  domain: Environment
+  reason: Distinct documented source; preserve native groups and full available segment chains. Apply
+    conservative covariate availability rules.
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - Manifest calls inputs known-future but supplies no per-row issue-time role schema; downgrade unsupported
+    future channels to past-only at ingestion.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: covariates/tennessee_eastman_setpoints
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: CC0
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: minute
+  structure:
+    type: with_covariates
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only:
+      - All released covariates unless future availability is independently established; observed NASA/other
+        weather always past-only.
+      known_future:
+      - Only calendar/tariff/timetable/events known at origin, or forecasts with issue_time <= forecast
+        origin; preserve covariate_names.
+      static: []
+  lineage: Extended Tennessee Eastman simulation data (simulated plant)
+  domain: Industry
+  reason: Distinct documented source; preserve native groups and full available segment chains. Apply
+    conservative covariate availability rules.
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - Manifest calls inputs known-future but supplies no per-row issue-time role schema; downgrade unsupported
+    future channels to past-only at ingestion.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: covariates/transit_scheduled_service
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: BART Developer License Agreement (ridership and GTFS)
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: day
+  structure:
+    type: with_covariates
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only:
+      - All released covariates unless future availability is independently established; observed NASA/other
+        weather always past-only.
+      known_future:
+      - Only calendar/tariff/timetable/events known at origin, or forecasts with issue_time <= forecast
+        origin; preserve covariate_names.
+      static: []
+  lineage: BART ridership and GTFS (San Francisco Bay Area)
+  domain: Transport
+  reason: Distinct documented source; preserve native groups and full available segment chains. Apply
+    conservative covariate availability rules.
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - Manifest calls inputs known-future but supplies no per-row issue-time role schema; downgrade unsupported
+    future channels to past-only at ingestion.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: covariates/uk_roadworks_traffic
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: Open Government Licence v3.0
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: hour
+  structure:
+    type: with_covariates
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only:
+      - All released covariates unless future availability is independently established; observed NASA/other
+        weather always past-only.
+      known_future:
+      - Only calendar/tariff/timetable/events known at origin, or forecasts with issue_time <= forecast
+        origin; preserve covariate_names.
+      static: []
+  lineage: National Highways WebTRIS with planned roadworks (England)
+  domain: Transport
+  reason: Distinct documented source; preserve native groups and full available segment chains. Apply
+    conservative covariate availability rules.
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - Manifest calls inputs known-future but supplies no per-row issue-time role schema; downgrade unsupported
+    future channels to past-only at ingestion.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: covariates/us_ba_load_mos
+  status: quarantined
+  rule_f: unresolved
+  rule_l: unresolved
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: US government public domain
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: hour
+  structure:
+    type: with_covariates
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only:
+      - All released covariates unless future availability is independently established; observed NASA/other
+        weather always past-only.
+      known_future:
+      - Only calendar/tariff/timetable/events known at origin, or forecasts with issue_time <= forecast
+        origin; preserve covariate_names.
+      static: []
+  lineage: EIA Form 930 Hourly Electric Grid Monitor (US)
+  domain: Energy
+  reason: 'quarantine: unresolved energy lineage'
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - Manifest calls inputs known-future but supplies no per-row issue-time role schema; downgrade unsupported
+    future channels to past-only at ingestion.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+  - Benchmark lineage or Rule F interpretation unresolved; quarantine enforced.
+- folder: covariates/wikipedia_sports_fixtures
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: CC0 (pageviews) / CC BY-SA 4.0 (wikitext)
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: day
+  structure:
+    type: with_covariates
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only:
+      - All released covariates unless future availability is independently established; observed NASA/other
+        weather always past-only.
+      known_future:
+      - Only calendar/tariff/timetable/events known at origin, or forecasts with issue_time <= forecast
+        origin; preserve covariate_names.
+      static: []
+  lineage: Wikimedia pageviews with Wikipedia fixture and episode lists
+  domain: Media attention
+  reason: Distinct documented source; preserve native groups and full available segment chains. Apply
+    conservative covariate availability rules.
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - Manifest calls inputs known-future but supplies no per-row issue-time role schema; downgrade unsupported
+    future channels to past-only at ingestion.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: covariates/wikipedia_tv_episodes
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: CC0 (pageviews) / CC BY-SA 4.0 (wikitext)
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: day
+  structure:
+    type: with_covariates
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only:
+      - All released covariates unless future availability is independently established; observed NASA/other
+        weather always past-only.
+      known_future:
+      - Only calendar/tariff/timetable/events known at origin, or forecasts with issue_time <= forecast
+        origin; preserve covariate_names.
+      static: []
+  lineage: Wikimedia pageviews with Wikipedia fixture and episode lists
+  domain: Media attention
+  reason: Distinct documented source; preserve native groups and full available segment chains. Apply
+    conservative covariate availability rules.
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - Manifest calls inputs known-future but supplies no per-row issue-time role schema; downgrade unsupported
+    future channels to past-only at ingestion.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: univariate/ajile
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: CC-BY-4.0
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: sub-second
+  structure:
+    type: univariate_or_multivariate
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only: []
+      known_future: []
+      static: []
+  lineage: 'AJILE12: long-term naturalistic human intracranial'
+  domain: Health
+  reason: Distinct source; lower priority high-rate physiology, telemetry or movement data; storage and
+    domain balance determine inclusion.
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: univariate/arpa-e-perform
+  status: quarantined
+  rule_f: unresolved
+  rule_l: unresolved
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: CC-BY-4.0 (OEDI)
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: hour
+  structure:
+    type: univariate_or_multivariate
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only: []
+      known_future: []
+      static: []
+  lineage: ARPA-E PERFORM datasets
+  domain: Energy
+  reason: 'quarantine: unresolved energy lineage'
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+  - Benchmark lineage or Rule F interpretation unresolved; quarantine enforced.
+- folder: univariate/australian-electricity-demand
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: CC-BY-4.0
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: minute
+  structure:
+    type: univariate_or_multivariate
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only: []
+      known_future: []
+      static: []
+  lineage: Australian Electricity Demand
+  domain: Energy
+  reason: duplicate/alternate to selected original or GIFT/Chronos representation, or insufficient additional
+    metadata; do not add entire release wholesale
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: univariate/azure-vm-traces-2017
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: CC-BY-4.0 (data); MIT (code)
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: minute
+  structure:
+    type: univariate_or_multivariate
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only: []
+      known_future: []
+      static: []
+  lineage: Azure Public Dataset V1
+  domain: Computing
+  reason: duplicate/alternate to selected original or GIFT/Chronos representation, or insufficient additional
+    metadata; do not add entire release wholesale
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: univariate/batch-distillation
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: CC-BY-4.0
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: no time step
+  structure:
+    type: univariate_or_multivariate
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only: []
+      known_future: []
+      static: []
+  lineage: Batch Distillation Data for Developing Machine Learning Anomaly Detection Methods
+  domain: Industry
+  reason: Distinct documented source; preserve native groups and full available segment chains. Apply
+    conservative covariate availability rules.
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: univariate/bdg-2
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: CC-BY-SA-4.0
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: hour
+  structure:
+    type: univariate_or_multivariate
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only: []
+      known_future: []
+      static: []
+  lineage: Building Data Genome Project 2
+  domain: Energy
+  reason: duplicate/alternate to selected original or GIFT/Chronos representation, or insufficient additional
+    metadata; do not add entire release wholesale
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: univariate/bidmc32hr
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: ODC-By-1.0 (PhysioNet)
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: no time step
+  structure:
+    type: univariate_or_multivariate
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only: []
+      known_future: []
+      static: []
+  lineage: BIDMC32HR
+  domain: Health
+  reason: Distinct source; lower priority high-rate physiology, telemetry or movement data; storage and
+    domain balance determine inclusion.
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: univariate/borealis
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: CC0-1.0
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: hour
+  structure:
+    type: univariate_or_multivariate
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only: []
+      known_future: []
+      static: []
+  lineage: 6-second load measurement dataset
+  domain: Energy
+  reason: duplicate/alternate to selected original or GIFT/Chronos representation, or insufficient additional
+    metadata; do not add entire release wholesale
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: univariate/borg-cluster-data-2011
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: CC-BY-4.0
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: minute
+  structure:
+    type: univariate_or_multivariate
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only: []
+      known_future: []
+      static: []
+  lineage: Google cluster-usage traces ClusterData2011_2
+  domain: Computing
+  reason: duplicate/alternate to selected original or GIFT/Chronos representation, or insufficient additional
+    metadata; do not add entire release wholesale
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: univariate/camels-de
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: CC-BY-4.0
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: day
+  structure:
+    type: univariate_or_multivariate
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only: []
+      known_future: []
+      static: []
+  lineage: 'CAMELS-DE: hydrometeorological time series and attributes for 1582 catchments in Germany'
+  domain: Environment
+  reason: Distinct documented source; preserve native groups and full available segment chains. Apply
+    conservative covariate availability rules.
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: univariate/cdc-fluview-who-nrevss
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: US Government work (public domain)
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: week
+  structure:
+    type: univariate_or_multivariate
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only: []
+      known_future: []
+      static: []
+  lineage: CDC FluView WHO/NREVSS clinical and public-health lab influenza data
+  domain: Health
+  reason: duplicate/alternate to selected original or GIFT/Chronos representation, or insufficient additional
+    metadata; do not add entire release wholesale
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: univariate/cesnet
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: CC-BY-4.0
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: day, minute
+  structure:
+    type: univariate_or_multivariate
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only: []
+      known_future: []
+      static: []
+  lineage: CESNET-TimeSeries24
+  domain: Computing
+  reason: Distinct documented source; preserve native groups and full available segment chains. Apply
+    conservative covariate availability rules.
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: univariate/eia930
+  status: quarantined
+  rule_f: unresolved
+  rule_l: unresolved
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: Public domain (U.S. government work)
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: hour
+  structure:
+    type: univariate_or_multivariate
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only: []
+      known_future: []
+      static: []
+  lineage: EIA Form 930 Hourly Electric Grid Monitor
+  domain: Energy
+  reason: 'quarantine: unresolved energy lineage'
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+  - Benchmark lineage or Rule F interpretation unresolved; quarantine enforced.
+- folder: univariate/eigenworms
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: CC-BY-4.0 (Open Worm Movement Database)
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: no time step
+  structure:
+    type: univariate_or_multivariate
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only: []
+      known_future: []
+      static: []
+  lineage: EigenWorms
+  domain: Health
+  reason: Distinct source; lower priority high-rate physiology, telemetry or movement data; storage and
+    domain balance determine inclusion.
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: univariate/elecdemand
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: CC-BY-4.0 (Monash copy); original AEMO data under AEMO copyright permissions
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: minute
+  structure:
+    type: univariate_or_multivariate
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only: []
+      known_future: []
+      static: []
+  lineage: Half-hourly electricity demand for Victoria, Australia, 2014
+  domain: Energy
+  reason: duplicate/alternate to selected original or GIFT/Chronos representation, or insufficient additional
+    metadata; do not add entire release wholesale
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: univariate/era5
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: CC-BY-4.0 (Copernicus products since 2025-07-02; earlier, the Licence to use Copernicus Products)
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: hour
+  structure:
+    type: univariate_or_multivariate
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only: []
+      known_future: []
+      static: []
+  lineage: ERA5 reanalysis
+  domain: Environment
+  reason: duplicate/alternate to selected original or GIFT/Chronos representation, or insufficient additional
+    metadata; do not add entire release wholesale
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: univariate/factorynet-aursad
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: CC-BY-4.0
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: no time step
+  structure:
+    type: univariate_or_multivariate
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only: []
+      known_future: []
+      static: []
+  lineage: 'AURSAD: Universal Robot Screwdriving Anomaly Detection Dataset'
+  domain: Industry
+  reason: Distinct documented source; preserve native groups and full available segment chains. Apply
+    conservative covariate availability rules.
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: univariate/factorynet-cnc
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: CC0-1.0
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: no time step
+  structure:
+    type: univariate_or_multivariate
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only: []
+      known_future: []
+      static: []
+  lineage: UMich SMART CNC Mill Tool Wear
+  domain: Industry
+  reason: Distinct documented source; preserve native groups and full available segment chains. Apply
+    conservative covariate availability rules.
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: univariate/freshretailnet
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: CC-BY-4.0
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: day
+  structure:
+    type: univariate_or_multivariate
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only: []
+      known_future: []
+      static: []
+  lineage: FreshRetailNet-50K
+  domain: Commerce
+  reason: duplicate/alternate to selected original or GIFT/Chronos representation, or insufficient additional
+    metadata; do not add entire release wholesale
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: univariate/gpm-mergir
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: NASA EOSDIS open data (no restrictions)
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: minute
+  structure:
+    type: univariate_or_multivariate
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only: []
+      known_future: []
+      static: []
+  lineage: NCEP/CPC L3 Half Hourly 4km Global
+  domain: Environment
+  reason: Distinct source; lower priority high-rate physiology, telemetry or movement data; storage and
+    domain balance determine inclusion.
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: univariate/ideal
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: CC-BY-4.0
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: minute
+  structure:
+    type: univariate_or_multivariate
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only: []
+      known_future: []
+      static: []
+  lineage: IDEAL Household Energy Dataset (raw readings)
+  domain: Energy
+  reason: duplicate/alternate to selected original or GIFT/Chronos representation, or insufficient additional
+    metadata; do not add entire release wholesale
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: univariate/ideal-hourly
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: CC-BY-4.0
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: hour
+  structure:
+    type: univariate_or_multivariate
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only: []
+      known_future: []
+      static: []
+  lineage: IDEAL Household Energy Dataset (hourly copy)
+  domain: Energy
+  reason: duplicate/alternate to selected original or GIFT/Chronos representation, or insufficient additional
+    metadata; do not add entire release wholesale
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: univariate/lcl
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: CC-BY-4.0
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: hour
+  structure:
+    type: univariate_or_multivariate
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only: []
+      known_future: []
+      static: []
+  lineage: 'Low Carbon London: SmartMeter Energy Consumption Data in London Households'
+  domain: Energy
+  reason: duplicate/alternate to selected original or GIFT/Chronos representation, or insufficient additional
+    metadata; do not add entire release wholesale
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: univariate/london-smart-meters
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: CC-BY-4.0
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: minute
+  structure:
+    type: univariate_or_multivariate
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only: []
+      known_future: []
+      static: []
+  lineage: SmartMeter Energy Consumption Data in London Households
+  domain: Energy
+  reason: duplicate/alternate to selected original or GIFT/Chronos representation, or insufficient additional
+    metadata; do not add entire release wholesale
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: univariate/m100-ipmi
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: CC-BY-4.0
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: second
+  structure:
+    type: univariate_or_multivariate
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only: []
+      known_future: []
+      static: []
+  lineage: M100 ExaData
+  domain: Computing
+  reason: Distinct documented source; preserve native groups and full available segment chains. Apply
+    conservative covariate availability rules.
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: univariate/metro-traffic
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: CC-BY-4.0
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: hour
+  structure:
+    type: univariate_or_multivariate
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only: []
+      known_future: []
+      static: []
+  lineage: UCI Metro Interstate Traffic Volume
+  domain: Transport
+  reason: Distinct documented source; preserve native groups and full available segment chains. Apply
+    conservative covariate availability rules.
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: univariate/museval-austin-water
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: Public domain (licence field on the City of Austin open data portal)
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: month+
+  structure:
+    type: univariate_or_multivariate
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only: []
+      known_future: []
+      static: []
+  lineage: City of Austin, Austin Water - Residential Water Consumption
+  domain: Industry
+  reason: Distinct documented source; preserve native groups and full available segment chains. Apply
+    conservative covariate availability rules.
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: univariate/museval-beijing-embassy
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: CC-BY-4.0
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: hour
+  structure:
+    type: univariate_or_multivariate
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only: []
+      known_future: []
+      static: []
+  lineage: Beijing PM2.5 Data
+  domain: Environment
+  reason: duplicate/alternate to selected original or GIFT/Chronos representation, or insufficient additional
+    metadata; do not add entire release wholesale
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: univariate/museval-causalrivers
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: DL-DE-BY-2.0 (Datenlizenz Deutschland - Namensnennung 2.0)
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: minute
+  structure:
+    type: univariate_or_multivariate
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only: []
+      known_future: []
+      static: []
+  lineage: CausalRivers
+  domain: Environment
+  reason: Distinct documented source; preserve native groups and full available segment chains. Apply
+    conservative covariate availability rules.
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: univariate/museval-cgm
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: CC-BY-SA-4.0
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: minute
+  structure:
+    type: univariate_or_multivariate
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only: []
+      known_future: []
+      static: []
+  lineage: Open D1NAMO dataset
+  domain: Health
+  reason: Distinct documented source; preserve native groups and full available segment chains. Apply
+    conservative covariate availability rules.
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: univariate/museval-mn-interstate
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: CC-BY-4.0
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: hour
+  structure:
+    type: univariate_or_multivariate
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only: []
+      known_future: []
+      static: []
+  lineage: Metro Interstate Traffic Volume (MUSEval copy)
+  domain: Transport
+  reason: duplicate/alternate to selected original or GIFT/Chronos representation, or insufficient additional
+    metadata; do not add entire release wholesale
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: univariate/museval-mta-ridership
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: OPEN-NY Terms of Use
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: day
+  structure:
+    type: univariate_or_multivariate
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only: []
+      known_future: []
+      static: []
+  lineage: 'MTA Daily Ridership Data: 2020-2025'
+  domain: Transport
+  reason: Distinct documented source; preserve native groups and full available segment chains. Apply
+    conservative covariate availability rules.
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: univariate/museval-traffic-pems
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: Public domain (Caltrans PeMS)
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: hour
+  structure:
+    type: univariate_or_multivariate
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only: []
+      known_future: []
+      static: []
+  lineage: 'MUSEval traffic_PeMS: Caltrans PeMS traffic data'
+  domain: Transport
+  reason: duplicate/alternate to selected original or GIFT/Chronos representation, or insufficient additional
+    metadata; do not add entire release wholesale
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: univariate/national-illness
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: US Government work (CDC; public domain)
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: week
+  structure:
+    type: univariate_or_multivariate
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only: []
+      known_future: []
+      static: []
+  lineage: ILI / 'national_illness'
+  domain: Health
+  reason: Alternate CDC FluView/ILINet lineage already selected through GIFT; use source join only to
+    restore missing channels, not extra independent target exposure.
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: univariate/nhanes-pax80
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: US Government work; NCHS data-use restrictions (see Attributions)
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: sub-second
+  structure:
+    type: univariate_or_multivariate
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only: []
+      known_future: []
+      static: []
+  lineage: NHANES 2011-2014 Physical Activity Monitor, raw 80 Hz accelerometer data
+  domain: Health
+  reason: Distinct source; lower priority high-rate physiology, telemetry or movement data; storage and
+    domain balance determine inclusion.
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: univariate/nmt-eeg
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: CC-BY-SA-4.0
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: sub-second
+  structure:
+    type: univariate_or_multivariate
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only: []
+      known_future: []
+      static: []
+  lineage: NMT Scalp EEG Dataset
+  domain: Health
+  reason: Distinct source; lower priority high-rate physiology, telemetry or movement data; storage and
+    domain balance determine inclusion.
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: univariate/ntu-fi-humanid-csi-amplitude
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: CC-BY-4.0
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: no time step
+  structure:
+    type: univariate_or_multivariate
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only: []
+      known_future: []
+      static: []
+  lineage: NTU-Fi HumanID
+  domain: Human activity
+  reason: Distinct source; lower priority high-rate physiology, telemetry or movement data; storage and
+    domain balance determine inclusion.
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: univariate/nyc-taxi
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: NYC Open Data terms (no use restrictions)
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: hour, minute
+  structure:
+    type: univariate_or_multivariate
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only: []
+      known_future: []
+      static: []
+  lineage: NYC TLC taxi trip records, aggregated
+  domain: Transport
+  reason: duplicate/alternate to selected original or GIFT/Chronos representation, or insufficient additional
+    metadata; do not add entire release wholesale
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: univariate/pedestrian-counts
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: CC-BY-4.0
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: hour
+  structure:
+    type: univariate_or_multivariate
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only: []
+      known_future: []
+      static: []
+  lineage: Melbourne Pedestrian Counting System hourly counts
+  domain: Transport
+  reason: duplicate/alternate to selected original or GIFT/Chronos representation, or insufficient additional
+    metadata; do not add entire release wholesale
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: univariate/pems-bay
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: Public domain (Caltrans PeMS)
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: minute
+  structure:
+    type: univariate_or_multivariate
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only: []
+      known_future: []
+      static: []
+  lineage: PEMS-BAY
+  domain: Transport
+  reason: duplicate/alternate to selected original or GIFT/Chronos representation, or insufficient additional
+    metadata; do not add entire release wholesale
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: univariate/pems-districts
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: Public domain (Caltrans PeMS)
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: minute
+  structure:
+    type: univariate_or_multivariate
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only: []
+      known_future: []
+      static: []
+  lineage: PEMS03 / PEMS04 / PEMS07 / PEMS08
+  domain: Transport
+  reason: duplicate/alternate to selected original or GIFT/Chronos representation, or insufficient additional
+    metadata; do not add entire release wholesale
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: univariate/project-tycho
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: CC-BY-4.0
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: week
+  structure:
+    type: univariate_or_multivariate
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only: []
+      known_future: []
+      static: []
+  lineage: Project Tycho Level 2 v1.1.0
+  domain: Health
+  reason: duplicate/alternate to selected original or GIFT/Chronos representation, or insufficient additional
+    metadata; do not add entire release wholesale
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: univariate/residential-load-power
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: CC-BY-4.0
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: minute
+  structure:
+    type: univariate_or_multivariate
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only: []
+      known_future: []
+      static: []
+  lineage: Residential Power and Battery Data (load)
+  domain: Energy
+  reason: duplicate/alternate to selected original or GIFT/Chronos representation, or insufficient additional
+    metadata; do not add entire release wholesale
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: univariate/residential-pv-power
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: CC-BY-4.0
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: minute
+  structure:
+    type: univariate_or_multivariate
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only: []
+      known_future: []
+      static: []
+  lineage: Residential Power and Battery Data (PV generation)
+  domain: Energy
+  reason: duplicate/alternate to selected original or GIFT/Chronos representation, or insufficient additional
+    metadata; do not add entire release wholesale
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: univariate/smart
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: CC-BY-4.0
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: hour
+  structure:
+    type: univariate_or_multivariate
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only: []
+      known_future: []
+      static: []
+  lineage: UMass Smart* Home dataset
+  domain: Energy
+  reason: duplicate/alternate to selected original or GIFT/Chronos representation, or insufficient additional
+    metadata; do not add entire release wholesale
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: univariate/solar-power
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: CC-BY-4.0 (Monash copy); original AEMO data under AEMO copyright permissions
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: second
+  structure:
+    type: univariate_or_multivariate
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only: []
+      known_future: []
+      static: []
+  lineage: Solar Power Dataset
+  domain: Energy
+  reason: duplicate/alternate to selected original or GIFT/Chronos representation, or insufficient additional
+    metadata; do not add entire release wholesale
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: univariate/subseasonal
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: CC-BY-4.0
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: day
+  structure:
+    type: univariate_or_multivariate
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only: []
+      known_future: []
+      static: []
+  lineage: SubseasonalClimateUSA
+  domain: Environment
+  reason: duplicate/alternate to selected original or GIFT/Chronos representation, or insufficient additional
+    metadata; do not add entire release wholesale
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: univariate/subseasonal-precip
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: CC-BY-4.0
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: day
+  structure:
+    type: univariate_or_multivariate
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only: []
+      known_future: []
+      static: []
+  lineage: SubseasonalClimateUSA US precipitation ground truth
+  domain: Environment
+  reason: duplicate/alternate to selected original or GIFT/Chronos representation, or insufficient additional
+    metadata; do not add entire release wholesale
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: univariate/telecomts-real
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: MIT
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: sub-second
+  structure:
+    type: univariate_or_multivariate
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only: []
+      known_future: []
+      static: []
+  lineage: TelecomTS
+  domain: Computing
+  reason: Distinct documented source; preserve native groups and full available segment chains. Apply
+    conservative covariate availability rules.
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: univariate/traffic
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: Public domain (Caltrans PeMS)
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: hour
+  structure:
+    type: univariate_or_multivariate
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only: []
+      known_future: []
+      static: []
+  lineage: Traffic
+  domain: Transport
+  reason: duplicate/alternate to selected original or GIFT/Chronos representation, or insufficient additional
+    metadata; do not add entire release wholesale
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: univariate/umass-sundance
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: CC-BY-4.0
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: hour
+  structure:
+    type: univariate_or_multivariate
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only: []
+      known_future: []
+      static: []
+  lineage: UMass Smart* SunDance dataset
+  domain: Energy
+  reason: Distinct documented source; preserve native groups and full available segment chains. Apply
+    conservative covariate availability rules.
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: univariate/urbangpt-chicago-taxi
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: City of Chicago data portal terms (see Attributions)
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: minute
+  structure:
+    type: univariate_or_multivariate
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only: []
+      known_future: []
+      static: []
+  lineage: UrbanGPT CHI_taxi
+  domain: Transport
+  reason: Distinct source; lower priority high-rate physiology, telemetry or movement data; storage and
+    domain balance determine inclusion.
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: univariate/urbangpt-nyc-crime
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: Apache-2.0 (UrbanGPT); NYC Open Data terms of use
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: day
+  structure:
+    type: univariate_or_multivariate
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only: []
+      known_future: []
+      static: []
+  lineage: UrbanGPT NYC crime grid
+  domain: Society
+  reason: Distinct source; lower priority high-rate physiology, telemetry or movement data; storage and
+    domain balance determine inclusion.
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: univariate/ushcn-daily
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: US Government work (NOAA/NCEI; public domain)
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: day
+  structure:
+    type: univariate_or_multivariate
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only: []
+      known_future: []
+      static: []
+  lineage: U.S. Historical Climatology Network
+  domain: Environment
+  reason: duplicate/alternate to selected original or GIFT/Chronos representation, or insufficient additional
+    metadata; do not add entire release wholesale
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: univariate/wiki-daily-100k
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: CC0-1.0 (Wikimedia pageview dumps)
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: day, week
+  structure:
+    type: univariate_or_multivariate
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only: []
+      known_future: []
+      static: []
+  lineage: Wikipedia/Wikimedia pageview series
+  domain: Media attention
+  reason: duplicate/alternate to selected original or GIFT/Chronos representation, or insufficient additional
+    metadata; do not add entire release wholesale
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: univariate/wiki-rolling-nips
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: CC0-1.0 (Wikimedia pageviews); Apache-2.0 (GluonTS)
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: day, week
+  structure:
+    type: univariate_or_multivariate
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only: []
+      known_future: []
+      static: []
+  lineage: Wikipedia/Wikimedia pageview series
+  domain: Media attention
+  reason: duplicate/alternate to selected original or GIFT/Chronos representation, or insufficient additional
+    metadata; do not add entire release wholesale
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: univariate/wikipedia
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: CC0-1.0 (Wikimedia pageview dumps)
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: day, week
+  structure:
+    type: univariate_or_multivariate
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only: []
+      known_future: []
+      static: []
+  lineage: Wikipedia/Wikimedia pageview series
+  domain: Media attention
+  reason: duplicate/alternate to selected original or GIFT/Chronos representation, or insufficient additional
+    metadata; do not add entire release wholesale
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: univariate/wind-farms
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: CC-BY-4.0 (Monash copy); original AEMO data under AEMO copyright permissions
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: minute
+  structure:
+    type: univariate_or_multivariate
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only: []
+      known_future: []
+      static: []
+  lineage: Monash Wind Farms Dataset
+  domain: Energy
+  reason: duplicate/alternate to selected original or GIFT/Chronos representation, or insufficient additional
+    metadata; do not add entire release wholesale
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: univariate/wind-power
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: CC-BY-4.0 (Monash copy); original AEMO data under AEMO copyright permissions
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: second
+  structure:
+    type: univariate_or_multivariate
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only: []
+      known_future: []
+      static: []
+  lineage: Wind Power Dataset
+  domain: Energy
+  reason: duplicate/alternate to selected original or GIFT/Chronos representation, or insufficient additional
+    metadata; do not add entire release wholesale
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: univariate/worldtrace
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: ODbL-1.0
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: second
+  structure:
+    type: univariate_or_multivariate
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only: []
+      known_future: []
+      static: []
+  lineage: WorldTrace
+  domain: Transport
+  reason: Distinct source; lower priority high-rate physiology, telemetry or movement data; storage and
+    domain balance determine inclusion.
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: univariate/worms
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: CC-BY-4.0 (Open Worm Movement Database)
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: sub-second
+  structure:
+    type: univariate_or_multivariate
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only: []
+      known_future: []
+      static: []
+  lineage: UCR/UEA archive Worms
+  domain: Health
+  reason: Distinct source; lower priority high-rate physiology, telemetry or movement data; storage and
+    domain balance determine inclusion.
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
+- folder: univariate/zhou2016
+  status: allowed
+  rule_f: no_identified_overlap
+  rule_l: no_identified_overlap
+  licence:
+    bundle: Per-dataset; Hub OpenMDW tag is not a dataset-wide replacement licence
+    source: CC0-1.0 (original figshare)
+    note: Source terms apply independently of a wrapper code licence.
+  frequency: sub-second
+  structure:
+    type: univariate_or_multivariate
+    target_channels: null
+    group_key: item_id base before @offset + source; preserve [variate,time] arrays and stitch only verified
+      contiguous matching-dimensional segments
+    covariates:
+      past_only: []
+      known_future: []
+      static: []
+  lineage: Zhou2016 three-class motor imagery EEG dataset
+  domain: Health
+  reason: Distinct source; lower priority high-rate physiology, telemetry or movement data; storage and
+    domain balance determine inclusion.
+  uncertain: true
+  uncertainty:
+  - Per-folder counts and history range absent from manifest; inspect row metadata after authorised ingestion.
+  - Neutral IDs and cleaning may prevent recovery of original entity identity or calendar start; cannot
+    claim full original raw histories.
+  - No per-config observation count established without dataset access.
+  - Min/max history range unverified.
+  - Exact frequency must come from released row freq; category labels minute/month+ are not exact intervals.
