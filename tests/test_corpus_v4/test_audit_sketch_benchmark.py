@@ -15,11 +15,14 @@ import time
 from pathlib import Path
 
 import numpy as np
-import pyarrow as pa
-import pyarrow.parquet as pq
+import pytest
 
-from scripts.corpus_v4 import audit_sketch as current
-from scripts.corpus_v4.audit_fev_overlap import BenchmarkSeries
+# Collected in the environment without the bench extra too: skip there instead of failing collection.
+pa = pytest.importorskip("pyarrow")
+pq = pytest.importorskip("pyarrow.parquet")
+
+from scripts.corpus_v4 import audit_sketch as current  # noqa: E402
+from scripts.corpus_v4.audit_fev_overlap import BenchmarkSeries  # noqa: E402
 
 
 def _profile_worker(specification):
