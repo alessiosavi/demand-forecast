@@ -1,0 +1,76 @@
+{
+  "note": "Sanitized ledger entry; preemption timestamps from its manual settlement evidence. No recorded instance read.",
+  "project": "veliu-forecast-train",
+  "session": {
+    "label": "canary-w2",
+    "state_uri": "gs://veliu-forecast-train-us-east1/runs/canary-w2/state",
+    "reservation_usd": "0.335395",
+    "hourly_usd": "0.321696",
+    "disk_hourly_usd": "0.01369863013698630136986301370",
+    "created_at": "2026-11-13T11:46:15Z",
+    "reserved_end": "2026-11-13T12:31:15Z",
+    "boot_disk": "gcp-<ledger-token>-canary-w2",
+    "launch": {
+      "machine_type": "e2-standard-16",
+      "zone": "us-east1-b",
+      "provisioning": "SPOT",
+      "hours": "0.75",
+      "boot_disk_size": 100,
+      "image_family": "pytorch-2-9-cu129-ubuntu-2204-nvidia-580",
+      "image_project": "deeplearning-platform-release",
+      "job_uri": "gs://veliu-forecast-train-us-east1/jobs/canary-watch-v1/job.sh",
+      "accelerator": null,
+      "local_ssd": 0,
+      "request_valid_for": null,
+      "boot_disk_type": "pd-balanced",
+      "nic_type": null,
+      "copy_interval": 120
+    },
+    "create_failure_operations": {
+      "observed_at": "2026-11-13T11:54:16Z",
+      "operations": [
+        {
+          "endTime": "2026-11-13T03:48:12.195-08:00",
+          "id": "310048121551537765",
+          "insertTime": "2026-11-13T03:46:19.037-08:00",
+          "name": "operation-1794570377515-66026f9e05021-45e289a6-dee0a286",
+          "operationType": "insert",
+          "startTime": "2026-11-13T03:46:19.104-08:00",
+          "status": "DONE",
+          "targetId": "746072728995055205",
+          "targetLink": "https://www.googleapis.com/compute/v1/projects/veliu-forecast-train/zones/us-east1-b/instances/canary-w2",
+          "zone": "https://www.googleapis.com/compute/v1/projects/veliu-forecast-train/zones/us-east1-b"
+        }
+      ]
+    },
+    "status": "reserved",
+    "settled_cost_usd": null,
+    "error": "HTTP 502 while polling insert"
+  },
+  "operations": [
+    {
+      "endTime": "2026-11-13T03:48:12.195-08:00",
+      "id": "310048121551537765",
+      "insertTime": "2026-11-13T03:46:19.037-08:00",
+      "name": "operation-1794570377515-66026f9e05021-45e289a6-dee0a286",
+      "operationType": "insert",
+      "startTime": "2026-11-13T03:46:19.104-08:00",
+      "status": "DONE",
+      "targetId": "746072728995055205",
+      "targetLink": "https://www.googleapis.com/compute/v1/projects/veliu-forecast-train/zones/us-east1-b/instances/canary-w2",
+      "zone": "https://www.googleapis.com/compute/v1/projects/veliu-forecast-train/zones/us-east1-b"
+    },
+    {
+      "endTime": "2026-11-13T11:53:13.001Z",
+      "id": "fixture-preemption",
+      "insertTime": "2026-11-13T11:53:03.035Z",
+      "name": "fixture-canary-w2-preemption",
+      "operationType": "compute.instances.preempted",
+      "startTime": "2026-11-13T11:53:03.035Z",
+      "status": "DONE",
+      "targetId": "746072728995055205",
+      "targetLink": "https://www.googleapis.com/compute/v1/projects/veliu-forecast-train/zones/us-east1-b/instances/canary-w2",
+      "zone": "https://www.googleapis.com/compute/v1/projects/veliu-forecast-train/zones/us-east1-b"
+    }
+  ]
+}

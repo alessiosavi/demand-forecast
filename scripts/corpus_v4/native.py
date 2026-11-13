@@ -4,14 +4,108 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import resource
+import subprocess
+import sys
+import threading
+import time
 from collections import Counter
 from pathlib import Path
 
 import numpy as np
 
-MAX_ROW_VALUES = 2_000_000
-MAX_ROW_GROUP_BYTES = 512 * 1024**2
-MAX_ROW_GROUP_VALUES = 32_000_000
+DEFAULT_MEMORY_BUDGET_BYTES = 32 * 1024**3
+READ_BUFFER_BYTES = 64 * 1024
+VALUE_CHUNK_POINTS = 65536
+MEASUREMENT_VERSION = "buffered-arrow-2"
+
+
+def peak_rss_bytes():
+    """Absolute RSS high-water mark for this interpreter's address space.
+
+    Linux getrusage retains the pre-exec high-water mark: even a fresh worker
+    can inherit a large launcher's RSS. VmHWM belongs to the current mm and
+    resets on exec. Keep the whole worker footprint, including imports and
+    shared/file-backed pages; subtracting a baseline would hide real memory.
+    macOS getrusage reports bytes and does not retain that pre-exec watermark.
+    """
+    if sys.platform == "linux":
+        for line in Path("/proc/self/status").read_text().splitlines():
+            if line.startswith("VmHWM:"):
+                return int(line.split()[1]) * 1024
+        raise ValueError("cannot measure Linux peak RSS: /proc/self/status has no VmHWM")
+    return int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) * (
+        1 if sys.platform == "darwin" else 1024
+    )
+
+
+class MemoryBudget:
+    """Process RSS budget, with a hard per-row decoded-size allowance for Arrow.
+
+    Arrow must decode a whole row. Its numeric storage is a proven lower bound;
+    decoder overhead is measured by the worker watchdog rather than guessed
+    from a group-size multiplier. Pages are buffered, independently of groups.
+    """
+
+    def __init__(self, limit=DEFAULT_MEMORY_BUDGET_BYTES):
+        if not isinstance(limit, int) or limit <= 0:
+            raise ValueError("memory budget must be a positive integer byte count")
+        self.limit = limit
+        self.check()
+
+    def check(self, *, row_bytes=0, context="reader"):
+        rss = peak_rss_bytes()
+        if rss > self.limit or row_bytes > self.limit:
+            raise ValueError(
+                f"memory budget exceeded at {context}: peak_rss_bytes={rss}, "
+                f"row_bytes={row_bytes}, hard_row_bytes={self.limit}, "
+                f"budget_bytes={self.limit}; buffered Arrow rows require whole-row decoding"
+            )
+
+
+def start_memory_watchdog(limit):
+    """Stop a disposable folder worker if a decoder allocation crosses its RSS budget.
+
+    Sampling is every 10 ms; RSS can overshoot by allocations between samples.
+    Running it in the worker also covers Arrow's atomic whole-row decode before
+    iter_batches yields. The parent records the error and continues other folders.
+    """
+    MemoryBudget(limit)
+
+    def watch():
+        while True:
+            rss = peak_rss_bytes()
+            if rss > limit:
+                os.write(
+                    2,
+                    f"memory budget exceeded: peak_rss_bytes={rss}, budget_bytes={limit}\n".encode(),
+                )
+                os._exit(97)
+            time.sleep(0.01)
+
+    threading.Thread(target=watch, daemon=True).start()
+
+
+def memory_budget_arg(value):
+    """CLI GiB value (including fractions), expressed internally as integer bytes."""
+    import argparse
+    import math
+
+    try:
+        gib = float(value)
+        if not math.isfinite(gib) or gib <= 0:
+            raise ValueError
+        return max(1, int(gib * 1024**3))
+    except (ValueError, OverflowError) as exc:
+        raise argparse.ArgumentTypeError("memory budget must be positive GiB") from exc
+
+
+def value_chunks(values):
+    """Nonoverlapping views for exact statistics and bounded validation temporaries."""
+    flat = values.reshape(-1)
+    for start in range(0, flat.size, VALUE_CHUNK_POINTS):
+        yield flat[start : start + VALUE_CHUNK_POINTS]
 
 
 def atomic_json(path, value):
@@ -43,21 +137,86 @@ def folder_path(root, entry):
     return path
 
 
-def iter_rows(folder, kind):
-    """Yield validated [V,T] targets and [C,T] covariates, one Parquet row at a time."""
+def _matrix(scalar, *, nested, name):
+    """Use Arrow numeric storage directly; never build Python floats per value."""
     import pyarrow as pa
-    import pyarrow.parquet as pq
 
+    if not scalar.is_valid:
+        raise ValueError(f"{name} must have nonempty shape")
+    array = scalar.values
+    if nested:
+        if array.null_count:
+            raise ValueError(f"{name} has null/ragged channels")
+        lengths = np.array([len(channel.values) for channel in array], dtype=np.int64)
+        if not len(lengths):
+            return np.empty((0, 0))
+        if not np.all(lengths == lengths[0]):
+            raise ValueError(f"{name} must have aligned/ragged-free shape")
+        # flatten respects slices/offsets, unlike .values on a sliced ListArray.
+        if pa.types.is_fixed_size_list(array.type):
+            leaf = array.values.slice(
+                array.offset * array.type.list_size, len(array) * array.type.list_size
+            )
+        else:
+            leaf = array.flatten()
+        numeric = (
+            np.full(len(leaf), np.nan)
+            if pa.types.is_null(leaf.type)
+            else leaf.to_numpy(zero_copy_only=False)
+        )
+        return numeric.reshape(len(lengths), int(lengths[0]))
+    numeric = (
+        np.full(len(array), np.nan)
+        if pa.types.is_null(array.type)
+        else array.to_numpy(zero_copy_only=False)
+    )
+    return numeric[None, :]
+
+
+def parquet_paths(folder):
     paths = sorted(Path(folder).glob("*.parquet"))
     if not paths or not any(p.name.startswith("train-") for p in paths):
         raise ValueError("folder has no train shards")
-    required = {"item_id", "source", "freq", "target"}
-    if kind == "covariates":
-        required.add("covariates")
     for path in paths:
         if not path.name.startswith(("train-", "validation-")) or path.is_symlink():
             raise ValueError(f"unsupported shard: {path}")
-        parquet = pq.ParquetFile(path)
+    return paths
+
+
+def folder_frequencies(folder):
+    """Discover aliases from scalar columns only, without decoding numeric payloads."""
+    import pyarrow.parquet as pq
+
+    aliases = set()
+    for path in parquet_paths(folder):
+        with pq.ParquetFile(path, buffer_size=READ_BUFFER_BYTES, pre_buffer=False) as parquet:
+            for batch in parquet.iter_batches(batch_size=4096, columns=["freq"], use_threads=False):
+                aliases.update(batch.column(0).to_pylist())
+    if any(not isinstance(alias, str) or not alias for alias in aliases):
+        raise ValueError("invalid native frequency")
+    return sorted(aliases)
+
+
+def iter_rows(
+    folder, kind, *, memory_budget_bytes=DEFAULT_MEMORY_BUDGET_BYTES, shard=None, row_group=None
+):
+    """Page-buffered native rows; numeric arrays are views, consumers chunk work.
+
+    batch_size=1 alone still retains whole compressed column chunks. A positive
+    buffer_size AND disabled pre_buffer avoid that allocation (measured offline).
+    Whole-row Arrow decoding remains the stated hard limit, not row-group size.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    budget = MemoryBudget(memory_budget_bytes)
+    required = {"item_id", "source", "freq", "target"}
+    if kind == "covariates":
+        required.add("covariates")
+    for path in parquet_paths(folder):
+        if shard is not None and path.name != shard:
+            continue
+        parquet = pq.ParquetFile(path, buffer_size=READ_BUFFER_BYTES, pre_buffer=False)
         schema = parquet.schema_arrow
         if not required <= set(schema.names):
             raise ValueError(f"missing native columns: {path}")
@@ -83,47 +242,90 @@ def iter_rows(folder, kind):
                 pa.types.is_integer(dtype) or pa.types.is_floating(dtype) or pa.types.is_null(dtype)
             ):
                 raise ValueError(f"{name} must be numeric: {path}")
-        for group in range(parquet.num_row_groups):
-            metadata = parquet.metadata.row_group(group)
-            if (
-                metadata.total_byte_size > MAX_ROW_GROUP_BYTES
-                or sum(metadata.column(i).num_values for i in range(metadata.num_columns))
-                > MAX_ROW_GROUP_VALUES
-            ):
-                raise ValueError(f"row group exceeds memory guard: {path}")
-        for number, batch in enumerate(parquet.iter_batches(batch_size=1)):
-            row = batch.to_pylist()[0]
-            if any(
-                not isinstance(row[n], str) or not row[n] for n in ("item_id", "source", "freq")
-            ):
-                raise ValueError(f"invalid native identity: {path}:{number}")
-            try:
-                target = np.asarray(row["target"], dtype=np.float64)
-                if kind == "covariates":
-                    if target.ndim != 1:
-                        raise ValueError("covariate target must have shape [T]")
-                    target = target[None, :]
-                    cov = np.asarray(row["covariates"], dtype=np.float64)
-                    if cov.ndim == 1 and cov.size == 0:
-                        cov = np.empty((0, target.shape[1]))
-                else:
-                    cov = np.empty((0, target.shape[-1] if target.ndim else 0))
-                if target.ndim != 2 or not all(target.shape):
-                    raise ValueError("target must have nonempty shape [V,T]")
-                if cov.ndim != 2 or cov.shape[1] != target.shape[1]:
-                    raise ValueError("covariates must be aligned shape [C,T]")
-                if target.size + cov.size > MAX_ROW_VALUES:
-                    raise ValueError("row exceeds memory guard")
-                if (
-                    np.isinf(target).any()
-                    or np.isinf(cov).any()
-                    or np.any(np.abs(target) > np.finfo(np.float32).max)
-                    or np.any(np.abs(cov) > np.finfo(np.float32).max)
+        columns = sorted(required | ({"domain", "subdomain"} & set(schema.names)))
+        try:
+            number = 0
+            for group in range(parquet.num_row_groups):
+                metadata = parquet.metadata.row_group(group)
+                if row_group is not None and group != row_group:
+                    number += metadata.num_rows
+                    continue
+                group_values = sum(
+                    metadata.column(i).num_values for i in range(metadata.num_columns)
+                )
+                # A one-row group proves a minimum row size before decoding.
+                minimum = (
+                    sum(
+                        metadata.column(i).num_values
+                        * (4 if metadata.column(i).physical_type in {"FLOAT", "INT32"} else 8)
+                        for i in range(metadata.num_columns)
+                        if metadata.column(i).path_in_schema.split(".")[0]
+                        in {"target", "covariates"}
+                    )
+                    if metadata.num_rows == 1
+                    else 0
+                )
+                budget.check(row_bytes=minimum, context=f"{path}:group={group}")
+                for batch in parquet.iter_batches(
+                    batch_size=1, row_groups=[group], columns=columns, use_threads=False
                 ):
-                    raise ValueError("native value is not finite in trainer float32")
-            except (TypeError, ValueError) as exc:
-                raise ValueError(f"invalid/ragged native shape at {path}:{number}: {exc}") from exc
-            yield dict(row=row, target=target, covariates=cov, shard=path.name, row_index=number)
+                    row = {
+                        name: batch.column(name)[0].as_py()
+                        for name in columns
+                        if name not in {"target", "covariates"}
+                    }
+                    if any(
+                        not isinstance(row[n], str) or not row[n]
+                        for n in ("item_id", "source", "freq")
+                    ):
+                        raise ValueError(f"invalid native identity: {path}:{number}")
+                    try:
+                        target = _matrix(
+                            batch.column("target")[0], nested=kind != "covariates", name="target"
+                        )
+                        cov = (
+                            _matrix(batch.column("covariates")[0], nested=True, name="covariates")
+                            if kind == "covariates"
+                            else np.empty((0, target.shape[-1]))
+                        )
+                        if target.ndim != 2 or not all(target.shape):
+                            raise ValueError("target must have nonempty shape [V,T]")
+                        if cov.shape == (0, 0):
+                            cov = np.empty((0, target.shape[1]))
+                        if cov.ndim != 2 or cov.shape[1] != target.shape[1]:
+                            raise ValueError("covariates must be aligned shape [C,T]")
+                        budget.check(
+                            row_bytes=target.nbytes + cov.nbytes, context=f"{path}:{number}"
+                        )
+                        for matrix in (target, cov):
+                            for part in value_chunks(matrix):
+                                if (
+                                    np.isinf(part).any()
+                                    or np.any(part > np.finfo(np.float32).max)
+                                    or np.any(part < -np.finfo(np.float32).max)
+                                ):
+                                    raise ValueError(
+                                        "native value is not finite in trainer float32"
+                                    )
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError(
+                            f"invalid/ragged native shape at {path}:{number}: {exc}"
+                        ) from exc
+                    yield dict(
+                        row=row,
+                        target=target,
+                        covariates=cov,
+                        shard=path.name,
+                        row_index=number,
+                        row_group_bytes=metadata.total_byte_size,
+                        row_group_values=group_values,
+                        row_group_rows=metadata.num_rows,
+                    )
+                    number += 1
+                    # Do not retain the previous row while Arrow decodes the next one.
+                    del target, cov, batch
+        finally:
+            parquet.close()
 
 
 def _summary(hist):
@@ -139,23 +341,30 @@ def _summary(hist):
     )
 
 
-def measure_folder(folder, kind):
+def _measure_folder(folder, kind, memory_budget_bytes):
     """Exact streamed counts; first training shard must cover supports and proportions."""
+    started = time.monotonic()
+    largest_group = largest_group_values = largest_group_rows = longest = largest_row_bytes = 0
     all_hist = {k: Counter() for k in ("variates", "lengths", "frequencies")}
     first_hist = {k: Counter() for k in all_hist}
     train_hist = {k: Counter() for k in all_hist}
     first = min(p.name for p in Path(folder).glob("train-*.parquet"))
     rows = observed = values = cov_observed = cov_values = long_rows = 0
     channels, domains, subdomains, splits = Counter(), Counter(), Counter(), Counter()
-    for rec in iter_rows(folder, kind):
+    for rec in iter_rows(folder, kind, memory_budget_bytes=memory_budget_bytes):
         row, target, cov = rec["row"], rec["target"], rec["covariates"]
         v, t = target.shape
+        largest_group = max(largest_group, rec["row_group_bytes"])
+        largest_group_values = max(largest_group_values, rec["row_group_values"])
+        largest_group_rows = max(largest_group_rows, rec["row_group_rows"])
+        largest_row_bytes = max(largest_row_bytes, target.nbytes + cov.nbytes)
+        longest = max(longest, t)
         rows += 1
         long_rows += t >= 16384
         values += target.size
-        observed += int(np.isfinite(target).sum())
+        observed += sum(int(np.isfinite(part).sum()) for part in value_chunks(target))
         cov_values += cov.size
-        cov_observed += int(np.isfinite(cov).sum())
+        cov_observed += sum(int(np.isfinite(part).sum()) for part in value_chunks(cov))
         channels[cov.shape[0]] += 1
         domains["present" if row.get("domain") is not None else "absent"] += 1
         subdomains["present" if row.get("subdomain") is not None else "absent"] += 1
@@ -173,14 +382,25 @@ def measure_folder(folder, kind):
     for key in all_hist:
         a, b = train_hist[key], first_hist[key]
         supports[key] = set(a) <= set(b)
-        tv[key] = (
-            sum(abs(a[x] / sum(a.values()) - b[x] / sum(b.values())) for x in a) / 2
-            if sum(b.values())
-            else 1.0
-        )
+        total_a, total_b = sum(a.values()), sum(b.values())
+        tv[key] = sum(abs(a[x] / total_a - b[x] / total_b) for x in a) / 2 if total_b else 1.0
     representative = all(supports.values()) and max(tv.values()) <= 0.1
     return dict(
         rows=rows,
+        values=values + cov_values,
+        longest_row=longest,
+        largest_row_group_bytes=largest_group,
+        largest_row_group_values=largest_group_values,
+        largest_row_group_rows=largest_group_rows,
+        largest_row_bytes=largest_row_bytes,
+        measurement=dict(
+            version=MEASUREMENT_VERSION,
+            strategy="buffered-arrow-rows",
+            wall_seconds=time.monotonic() - started,
+            peak_rss_bytes=peak_rss_bytes(),
+            memory_budget_bytes=memory_budget_bytes,
+            hard_row_bytes=memory_budget_bytes,
+        ),
         splits=dict(splits),
         variates_per_row=_summary(all_hist["variates"]),
         length_distribution=_summary(all_hist["lengths"]),
@@ -202,3 +422,24 @@ def measure_folder(folder, kind):
             maximum_total_variation=0.1,
         ),
     )
+
+
+def measure_folder(folder, kind, *, memory_budget_bytes=DEFAULT_MEMORY_BUDGET_BYTES):
+    """Measure in a fresh worker so per-folder RSS is not a prior folder's high-water mark."""
+    result = subprocess.run(
+        [sys.executable, "-m", __name__, str(folder), kind, str(memory_budget_bytes)],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode:
+        raise ValueError(f"measurement failed for {folder}: {result.stderr.strip()}")
+    return json.loads(result.stdout)
+
+
+if __name__ == "__main__":
+    try:
+        start_memory_watchdog(int(sys.argv[3]))
+        print(json.dumps(_measure_folder(sys.argv[1], sys.argv[2], int(sys.argv[3]))))
+    except (ValueError, OSError, OverflowError, MemoryError) as exc:
+        print(str(exc), file=sys.stderr)
+        raise SystemExit(2) from exc

@@ -34,9 +34,10 @@ are for the cloud guest:
 
 ```bash
 python -m scripts.corpus_v4.freeze_manifest SOURCE_DRAFT.yaml configs/corpus-v4.yaml
-python -m scripts.corpus_v4.fetch_native "$RUN_DIR/state/corpus" --state "$RUN_DIR/state"
+python -m scripts.corpus_v4.fetch_native "$RUN_DIR/state/corpus" --state "$RUN_DIR/state" \
+  --memory-budget-gib 32
 python -m scripts.corpus_v4.audit_fev_overlap "$RUN_DIR/state/corpus" \
-  "$RUN_DIR/state/audit" --state "$RUN_DIR/state"
+  "$RUN_DIR/state/audit" --state "$RUN_DIR/state" --memory-budget-gib 32
 ```
 
 The generator is deterministic, sorted by full folder name, and does not use
@@ -50,16 +51,41 @@ unlisted folders, unexpected nested paths and missing folders are refused
 before transfer. Every shard must match the Hub's size and LFS SHA256 (or Git
 blob SHA1 for a non-LFS file). A digest mismatch is an error, not an implicit
 repair or a silently accepted download. The per-folder receipt records these
-identities. Existing completed folders are rehashed before skip; measurements
-are regenerated to avoid trusting modified stats. Policy/revision mismatches in
+identities and the statistics digest. Existing completed folders are rehashed
+before skip; statistics are reused only when their digest, measurement version
+and measured memory requirements agree. Modified or legacy statistics are regenerated. Policy/revision mismatches in
 an existing corpus require a new root.
+
+The pinned tree contains 150 Parquet shards in exactly 121 dataset folders
+(62 univariate, 59 covariate), matching all 97 allowed and 24 quarantined
+manifest entries. Each shard sits directly inside its dataset folder; 115
+folders have one shard and six have multiple shards (up to 13). Inventory keeps
+all of them. Under the two data roots, only `train-*.parquet`,
+`validation-*.parquet`, `LICENSE.md` and `articles.csv` are accepted, at exactly
+`<root>/<dataset>/<file>`. Every folder must contain a training shard; side
+files cannot satisfy that requirement. Invalid paths are reported together
+before transfer. Root documentation, assets and `statistics/` are outside this
+folder inventory.
+
+Ten `LICENSE.md` files retain per-source licence records. Three `articles.csv`
+files in `nyc_subway_events`, `wikipedia_sports_fixtures` and
+`wikipedia_tv_episodes` retain Wikipedia attribution: the release README points
+to NOTICE, which describes the article/series mappings and dated revisions.
+These side files are fetched, verified, recorded in the same folder receipt,
+restored after interruptions and kept beside the data, including in quarantine.
+All 13 are non-LFS Git blobs in this revision, verified with the Git blob SHA1
+(including the blob header); the 150 shards use LFS SHA256. Side files are never
+parsed or included in row/value statistics or the content audit.
 
 Allowed data lands only in `corpus/univariate/<dataset>` and
 `corpus/covariates/<dataset>`. Quarantine lands only in
 `corpus/quarantine/{univariate,covariates}/<dataset>`. Pass the two explicit
 allowed roots to the trainer. Download staging and partial files live under
 `$RUN_DIR/state/downloads`, outside either reader root, and remain there after
-interruption. A folder is atomically renamed into place only after verification
+interruption. Hub downloads use `local_dir` regular files and transfer metadata,
+then rename the file into staging; no Hub blob cache or symlinks are created in
+state. Obsolete `.hub-cache` directories from earlier failed downloads are removed
+before transfer. A folder is atomically renamed into place only after verification
 and measurement. Corpus and download state must be on the same filesystem.
 Never pass `corpus/quarantine` to a trainer. Quarantine status never changes
 because a restart or an audit finishes.
@@ -72,10 +98,42 @@ columns and nonnumeric sequences fail. NaN/null observations remain missing.
 Original segment IDs and channel ordering are preserved; ingestion does not
 stitch, resample, flatten, or truncate native files.
 
+The metadata-only regression fixture
+`tests/test_corpus_v4/fixtures/simons-5f17ab8-tree.json` contains all 172 release
+paths, sizes and hashes, with no dataset payloads. Its paths come from the stored
+`simons_api.json`; sizes/Git oids/LFS oids come from `simons_tree.json` alongside
+it (the API capture has paths only). The stored `simons_manifest.json` is the
+release's `statistics/manifest.json`: its `files[].folder` set matches the
+frozen policy exactly. Dataset display names and `source` aliases can differ
+from folder names and are not used to infer paths. The breakdown CSVs describe
+public, private and synthetic training populations, so their totals are not
+acceptance counts for this public subset. They do not specify per-row lengths,
+Arrow schemas or exact frequency strings; these remain runtime checks. The
+README's segment IDs and optional metadata agree with the native validator;
+empty covariate lists are supported, as required by the NOTICE's seven clubs
+without schedule pages. Actual longest rows still require the cloud run; no row
+is truncated to fit a guard.
+
+Trainer compatibility was checked against upstream Simons commit
+`8e338e915d26c8960713889ef12ab1cf5c08d591`:
+`src/simons/training/data.py::corpus_files` selects only
+`<split>-*.parquet` in the supplied root or one dataset directory below it and
+rejects deeper Parquet nesting. The covariate loader in
+`src/simons/training/covariates/windows.py` uses the same selector. Licence,
+attribution, receipt and statistics files therefore cannot enter either loader.
+Supply the explicit `univariate/` and `covariates/` roots described above.
+
 Each folder has `stats.json`: rows and split counts, target variates, exact
 length histogram/min/max/mean, count of rows at least 16,384 steps, target and
 covariate observed counts, target observed share, frequency strings,
 `domain/subdomain` presence counts and covariate channel-count histogram.
+It also records `values` (targets plus covariates), `longest_row` (steps),
+`largest_row_bytes`, and maxima of row-group bytes, leaf values and rows.
+`measurement` records the strategy/version, wall seconds for the validation and
+statistics pass, the worker's peak RSS in bytes, configured budget and hard row
+byte limit. Each measurement runs in a fresh subprocess: its RSS is specific to
+that folder, not a previous folder's process high-water mark. Download/hash time
+and process startup are outside `measurement.wall_seconds`.
 The first training shard is representative only if it covers every observed
 training support value for variates/lengths/frequencies and each marginal total
 variation distance from all training shards is at most 0.10. This is a
@@ -155,33 +213,263 @@ an allowed match or an inconclusive allowed folder. Quarantined matches and
 inconclusive results remain reported without changing their manifest status.
 A clean quarantined folder is only a candidate for release by PR.
 
-Every run executes old controls and benchmark-derived as-is, scaled, cropped and
-hourly-parent/aggregated controls. The unrelated seasonal control must remain
+Each input/method/opportunity identity executes old controls and benchmark-derived
+as-is, scaled, cropped and hourly-parent/aggregated controls once. Completed
+controls are atomically checkpointed and reused across pool restarts. The unrelated seasonal control must remain
 negative. If no identifying benchmark series can support the plants, the run is
 invalid. Controls use the production matcher and the same information threshold.
 
-State is under `$RUN_DIR/state` (override with `--state`). SQLite spools benchmark
-histories to disk. A folder result is atomically checkpointed with the method,
+State is under `$RUN_DIR/state` (override with `--state`). SQLite stores benchmark
+metadata and signed 64-bit offsets into flat numeric/timestamp spool files.
+Histories are written in 65,536-point blocks and mapped for iteration; there is
+no per-history SQLite BLOB or 1 GB BLOB limit. SQLite's page cache is 8 MiB and
+temporary tables stay on disk. A folder result is atomically checkpointed with the method,
 manifest, benchmark content/revision, search budget and its current Parquet
 hashes. On restart benchmark identity is rebuilt, all corpus hashes are reread,
-completed identical folders resume, and controls run again. Incompletely
+completed identical folders resume, and completed controls with the same
+benchmark/method/opportunity identity resume. A changed opportunity bound reruns
+controls at the new threshold. Runtime failures are
+retried, including quarantined folders. When missing data is repaired and the
+opportunity bound increases, an identical clean result remains valid under the
+stricter information threshold and can resume; a reduced bound or a non-clean
+result with a changed bound requires a new scan. Matching thresholds are unchanged. Incompletely
 restored published folders are moved back into isolated staging after surviving
-files are rehashed; missing files are fetched again. Wrong existing hashes
-remain errors. No within-folder
-progress claim is made. Changing code requires a method-version bump when its
+files are rehashed; missing files are fetched again. Wrong existing hashes remain errors. Within-folder work is checkpointed per
+Parquet row group, with original shard row numbers retained. Changing code requires a method-version bump when its
 search semantics change; changing inputs automatically invalidates cached results.
 
-Parquet rows are streamed one at a time; numeric rows above two million values
-or row groups above 512 MiB / 32 million leaf values are refused before large
-row-group decoding. Series chunks use at most 65,536 points with a 512-point
-overlap; combined benchmark indices contain at most 262,144 points. Total hash
-postings are counted before the old matcher expands them; more than one million
-postings for a query is an explicit unresolved resource limit. The old explicit expansion and
-candidate caps remain; dropped candidate/offset coverage produces inconclusive.
-There is a 10,000-evidence-record guard per folder. Benchmark contents and audit
-state require disk in addition to the native corpus. Processing bounded benchmark-index batches
-trades repeated corpus reads for bounded memory;
-cloud wall time and peak RSS remain unmeasured.
+The default fetch process RSS budget and total audit worker budget are **32 GiB**
+on the 64 GB guest, leaving memory for the parent, benchmark loading, the
+operating system and uploads. Audit `--workers` defaults to `os.cpu_count()`
+(or one if unavailable); each disposable worker receives exactly
+`memory_budget_bytes // workers`. The total excludes the supervisor and gcloud.
+Use an appropriate total on larger machines, for example 256 GiB / 90 workers
+(2.844 GiB each), or 512 GiB / 180 workers (2.844 GiB each). A very small quotient
+can fail the RSS check at import/startup; no silent worker reduction is made. Override
+it with `--memory-budget-gib` on fetch and audit (fractions are accepted).
+The job generator accepts the same option; the guest can override it with
+`CORPUS_MEMORY_BUDGET_GIB`. Measurement and audit folder workers have a 10 ms
+RSS watchdog and check their high-water mark during processing. Exceeding the
+budget records measured peak RSS and configured bytes. Sampling can overshoot
+between checks; this is not a kernel-enforced memory limit.
+
+The native reader uses `ParquetFile(buffer_size=65536, pre_buffer=False)` and
+`iter_batches(batch_size=1, use_threads=False)`. Both options matter: a one-row
+batch with the default unbuffered input can still retain an entire compressed
+column chunk. Numeric values stay in Arrow-backed NumPy arrays, with no Python
+float list and no whole-row float64 conversion. Validation and exact counts use
+nonoverlapping 65,536-value blocks. Arrow still decodes an entire row, so the
+explicit hard row limit is decoded numeric storage no larger than the process
+budget (32 GiB by default): more cannot fit even without decoder overhead.
+A single-row group's footer can prove this before decoding; otherwise the row
+is checked after decoding, with the watchdog measuring actual decoder and
+consumer allocations. There is no speculative multiplier of row/group values. There
+is no row-group byte/value refusal and no two-million-value row refusal.
+Long rows, including the trainer's >=16,384-step rows, are retained intact.
+
+Offline PyArrow 24 measurements compared 4 versus 34 nested float64 rows, each
+2,100,001 steps: 67.2 versus 571.2 MB uncompressed in one group. Unbuffered
+Arrow-view peaks grew from 290 to 797 MB; buffered peaks were 229 MB for both.
+The old Python-list path peaked at 444 and 1,051 MB. The group is scaled down
+from ERA5's 3.91 GB/10,000 rows; the individual rows are deliberately longer.
+Regression fixtures also use the actual release types: nested float32 targets
+(68 long rows) and float64 targets plus two covariates (12 long rows). Each has
+a group above 512 MiB, a row above two million values, and measurement plus
+matching scans in subprocesses that assert peak RSS below **512 MiB**. These
+are synthetic measurements, not a measurement of the real corpus or Arrow 25.
+
+Audit series chunks retain 65,536 points and a 512-point overlap (0.79% extra
+work on long series). Fixed-bin reductions are lazy, preserving global bin phase
+and evidence offsets across chunks. Long-parent identification retains the
+existing precision, quantization, periodicity and strict-ramp gates using bounded
+passes. Frequency discovery projects only `freq`, in 4,096-row batches. Combined
+benchmark indices contain at most 262,144 points and 4,096 histories; unresolved
+event batches contain at most 128 histories. Batching
+adds passes without dropping coverage. Comparison reporting groups metadata
+by dataset, avoiding a Python loop over every indexed history for every query.
+Histogram totals are computed once per marginal, avoiding quadratic work over
+unique lengths. Counts and opportunity arithmetic use Python integers; Parquet
+counts and SQLite offsets are 64-bit. Groups are inspected once, including
+files with 199 groups; numeric groups are decoded sequentially.
+
+More than one million hash postings per query remains an explicit unresolved
+limit before the old matcher expands them. Candidate caps, 4,096 phase coverage,
+10,000 evidence records, tolerances and the 512-point overlap are unchanged;
+dropped coverage is inconclusive. Calendar aggregation still needs full
+benchmark timestamps and can be expensive. Each unit decodes its row group once into SQLite metadata plus native-dtype flat
+numeric scratch outside `state`. Later passes map those values without Arrow
+redecoding or another numeric Parquet read. Frequency discovery still projects
+`freq`, and provenance hashing still reads compressed shards. A bounded group
+of original benchmark batches probes each chunk in the same pass; its size is
+`max(1, min(4, worker_budget // (4 * 512 * MAX_INDEX_POINTS)))`. The 512-byte/point
+planning allowance reserves index construction space; the actual RSS watchdog
+remains authoritative. At the example 16/90/180-core budgets the group size is four.
+Benchmark metadata is filtered before histories are mapped, and dates are only
+materialized for benchmark-to-corpus aggregation. Query hashes are reused across
+resident indices and between posting preflight and legacy candidate discovery;
+the legacy functions execute unchanged, with an isolated memoized hash table.
+The nine benchmark stride indices (strides 2–4 and all phases) are also cached
+within a resident batch rather than reconstructed for every missing-data query.
+No shared matcher globals are changed.
+
+Units write compact journals, summing consecutive negative-query counters and
+flushing at each positive query. Merge heads contain only keys/file offsets; only the
+selected payload is decoded. Parent memory and open files do not multiply by
+875 potentially large positive payloads. The reducer restores the original frequency,
+benchmark-batch, shard, row-group, row, channel, phase and chunk order. It applies
+the original 10,000-record cutoff at the original query, including that query's
+coverage/comparison counts. A unit also stops after 10,000 local matches: its
+traversal is a subsequence of the global traversal, so any omitted work must
+follow the global cutoff. After a unit reaches its local cap, speculative queries are limited to its
+current resident batch group. Other units still finish their own work before
+folder reduction. Largest groups are scheduled first using numeric leaf counts plus row overhead.
+Completion order and worker count cannot reorder
+evidence or turn resource losses into clean coverage. Unsupported pairs keep the
+same skipped reasons; no domain crosswalk, threshold or phase is removed.
+
+`state/audit-units` holds atomic completion markers and SHA256-bound journals;
+only in-flight units need retry after interruption. A new worker count can reuse
+complete units. Runtime failures retry. The guest sets `CORPUS_AUDIT_STATE_URI`:
+the supervisor uploads each completed journal and then its marker, serially,
+before counting the unit done, and publishes completed controls before launching
+the pool. Periodic snapshots exclude live unit/control/folder checkpoint paths, so a delayed
+snapshot cannot overwrite a newer completion marker; the final sync runs after
+the pool exits. This closes the ten-minute snapshot gap for completed work. Upload
+failure fails the folder/attempt. Ordinary local runs omit this environment
+variable and make no cloud calls. A restart still rebuilds benchmark identity and
+rehashes corpus files. Disposable numeric scratch is not uploaded; it is removed
+when workers finish or terminate and rebuilt only for units requiring work.
+
+A failed speculative worker is checked with the original-order folder scanner
+in `audit_serial.py`, under the same per-worker RSS quota and without rerunning
+controls. This preserves a match at the legacy cutoff when a malformed or
+oversized row would only have been visited after that cutoff. Genuine failures
+before the cutoff still fail; upload failures remain attempt failures. The
+compatibility pass can reread the folder and add serial time on this rare failure
+path. A successful result is durably checkpointed by folder. Progress marks
+`status: fallback` / `serial_fallback: true`; its scanned/decoded counters describe
+the primary pool and exclude compatibility rechecks.
+
+`state/audit-progress.json` is atomically rewritten about once per second while
+the pool runs, with schema version 1, `units_total`, `units_done`, `units_failed`,
+`values_scanned` (pool matcher input points, including repeated phases/batches),
+`native_values_decoded`, `elapsed_seconds`, nullable
+`estimated_remaining_seconds`, and per-folder total/done/failed/status. Elapsed
+is pool wall time for the current invocation; ETA extrapolates completed unit
+throughput and is provisional for heterogeneous groups. The ten-minute state
+sync exposes progress in the bucket; journals/markers have immediate durability.
+
+A folder failure is checkpointed in `fetch-summary.json`, with its name and
+error, while later folders continue to download, validate and publish. The
+fetch CLI exits 2 after listing all failed folders. Completed folders rehash but
+do not redownload or remeasure unless inputs/statistics require it. Audit scans
+run in separate workers, record errors, continue, and retry failed checkpoints.
+`audit.json.failed_folders` includes runtime errors (also in quarantine) and
+non-clean allowed folders. Stable non-clean policy/coverage results can resume;
+restarting cannot change their policy meaning. The generated job runs audit
+even after fetch fails and exits nonzero after both stages; final uploads still
+include every completed folder and both summaries.
+
+## Audit cost model and the six-hour target
+
+The independent checkpoint/scheduling unit is one Parquet row group. The supplied
+pinned survey gives **150 shards, 875 units, 121 folders, 7,491,306 rows** and
+22.6 GB of compressed data. Its `groups` arrays describe only 215 groups; summing
+them is not the corpus total. Recorded numeric leaves give 6,287,711,751 values;
+filling each of the 660 omitted groups with its shard's reported maximum gives
+a conservative upper bound of 12,066,492,230. Thus the available metadata bounds
+numeric values at **6.29–12.07 billion**. The largest fully described group has
+977,638,380 values (ERA5); this is a material scheduling tail. Actual footer
+values, benchmark batch counts, frequency distributions, missingness and
+candidate density must be measured on the guest; 100 datasets alone determines
+none of those batch counts.
+
+For a nonempty channel of length `n`, identity search uses
+`q(n) = 1 + max(0, ceil((n - 65536) / 65024))` queries, with the original overlap.
+For a comparable fixed ratio `r`, fine-to-coarse search uses both sum and mean
+for every phase `p=0..r-1`, with length `max(0, (n-p)//r)`. Apply `q` separately
+to every nonempty variant. Unsupported ratios/origins still record the original
+coverage event, after the unchanged identifying-parent gate. Benchmark-to-corpus
+variants expand the index batch count instead. Let `B(u,c,b)` be the original
+number of bounded 262,144-point/4,096-history benchmark batches for a unit's
+corpus/benchmark frequency pair. A unit costs:
+
+```
+T(u) = Arrow_decode(Vu) + numeric_spool_IO(ceil(B/G) passes)
+     + sum over frequency pairs/resident groups [parent_identification(Vu)
+                                                + corpus_aggregation(Vu, ratio)]
+     + sum over frequency pairs/batches/queries [alpha + beta * query_points
+                                                + candidate/stride work]
+     + sum over original batches [index_build + benchmark_aggregation]
+     + journal/checkpoint/upload overhead
+T(N) >= max(sum(T(u))/N, max(T(u))) + serial setup/controls/reduction
+```
+
+`G` is the resident batch group size; hashes and aggregation preparation are
+shared within that group. It saves up to `G-1` numeric spool reads/preparations
+per group, while one-time decoding removes all repeated numeric Parquet passes.
+It does not divide the number of index comparisons by `G`. Short rows incur a
+per-query cost (`alpha`), so dividing all values by 65,536 understates runtime.
+Fixed aggregation must also account for input reduction work: for ratio `r`,
+`sum over phases/methods r * max(0, (n-p)//r)` approaches `2*r*n` fine input
+values read/added, although aggregated output approaches only `2*n` points.
+Sum and mean retain their original arithmetic and are separate variants. This
+corpus-side work is shared across the `G` resident batches. Benchmark-side
+aggregation/index preparation repeats per row-group unit, a cost of finer
+parallelism that the simple query-rate table does not include. Sharing prepared
+benchmark indices across units is another semantics-preserving follow-up.
+Missingness can activate the original stride searches; positive/dense candidates
+can cost much more than negative probes.
+
+Using W4a6's measured **0.035 s / 65,536-point negative query**, ignoring short-row
+and candidate overhead, one full-corpus identity batch costs **0.940–1.804 CPU
+hours**. The following are conditional compute estimates for an effective
+value-weighted batch/phase multiplier `B_eff`, before new hash savings, serial
+setup and IO. They are not a measured forecast of fev100:
+
+| B_eff | Ideal 16 cores (h) | Ideal 90 cores (h) | Ideal 180 cores (h) | Largest-group floor (h) |
+| --- | --- | --- | --- | --- |
+| 10 | 0.59–1.13 | 0.10–0.20 | 0.05–0.10 | 1.46 |
+| 100 | 5.88–11.28 | 1.04–2.00 | 0.52–1.00 | 14.62 |
+| 1000 | 58.76–112.76 | 10.45–20.05 | 5.22–10.02 | 146.17 |
+
+Predicted wall time must be at least the larger of the relevant ideal estimate
+and its unit tail, adjusted by measured query throughput. Even **90 or 180 cores
+cannot meet six hours at B_eff=100** under that baseline tail. No unconditional
+six-hour or fourteen-hour promise is supportable without the benchmark batches.
+If the measured tail remains above six hours, the next step is to decode a large
+group once into a shared, verified numeric spool and distribute bounded row
+ranges or frequency/batch groups across workers; ordered journals already
+support the required deterministic merge. This must retain every phase, stride,
+comparison and coverage event. It adds durable spool ownership/validation and
+must be tested before deployment; increasing cores alone does not remove the tail.
+
+An offline seeded probe with four 262,144-point indices measured 65,536-point
+queries at 0.0442 s originally, 0.0229 s/index with two resident batches and
+0.0156 s/index with four (about 65% less per index). A 96-point missing-data
+query took 1.359 s originally, 0.855 s with cold caches and 0.00785 s with warm
+stride caches; outputs were equal. With all four stride caches populated, the
+process peak was 786,743,296 bytes (750 MiB); this does not measure decoder or
+full-machine peaks on C3D. At the four-batch rate, the conditional B_eff=100 model
+has ideal 16/90/180-core compute of 2.62–5.02 / 0.46–0.89 / 0.23–0.45 hours,
+but the largest-group floor remains **6.51 hours on all three shapes**, before
+setup, IO and short-row work. Thus the six-hour target is still not established.
+
+A critical limitation of that microbenchmark: its 65,536-point negative queries
+hit the unchanged posting budget (`unresolved_rows=1`); 336/4,096-point probes
+also dropped groups/offsets. The latter took about 0.0066/0.147 s per index,
+respectively. These rates describe the existing capped method, not a completed
+clean search, and show that query cost is nonlinear in length/candidate density.
+The audit retains every such coverage loss as inconclusive. Forecasting real
+completion and release validity requires actual batch, length, mask and cap
+measurements; do not treat a fast capped negative as clean coverage.
+
+Peak worker RSS is bounded by `total_budget//N` with the existing sampled
+watchdog, plus possible between-sample overshoot. Peak machine memory also
+includes the supervisor, benchmark loading, OS/page cache and one serialized
+uploader; it is not established by the CPU model. Numeric scratch can approach
+4–8 bytes per concurrently active native value (up to 50–97 GB for all bounded
+corpus values), plus metadata, separate from compressed corpus and benchmarks.
 
 ## Cloud guest job and release
 
@@ -191,12 +479,75 @@ python -m scripts.corpus_v4.make_corpus_job FULL_REPO_SHA \
 bash -n job.sh
 ```
 
-The generated job installs the repository at the full SHA into a venv with the
-existing `bench` extra. NumPy/pandas/PyYAML are base dependencies;
+To move the audit to a larger guest without native data refetch:
+
+```bash
+python -m scripts.corpus_v4.make_corpus_job FULL_REPO_SHA \
+  gs://YOUR_BUCKET/corpus-v4 audit-only.sh --audit-only \
+  --workers 90 --memory-budget-gib 256
+bash -n audit-only.sh
+```
+
+Restore the same `STATE_URI` first, including the complete revision-scoped
+`benchmark-cache/<FEV_DATASETS_REVISION>` produced by the original audit. Audit-only
+sets `HF_HUB_OFFLINE=1` and `HF_DATASETS_OFFLINE=1`: it fails if benchmark cache
+inputs are unavailable and never downloads data from the Hub. Installation and
+Git provisioning still use their normal package/code sources. Corpus bytes come
+only from the published prefix. Before scanning, `verify_published` checks the
+corpus identity and all folders against the manifest, and every receipt's full
+file list, size and SHA256/Git-blob hash against the checked-in pinned inventory
+(`scripts/corpus_v4/pinned_inventory.json`, recorded at the same revision as the
+existing release-inventory fixture). It verifies stats hashes and refuses extra,
+missing, symlinked, tampered or misplaced data. Receipt claims cannot hide a
+missing shard. The verifier has no Hub client/download operation.
+
+Every audit-only invocation has a **new audit attempt ID** and the new code SHA.
+It preserves the original source attempt status before replacing the public
+gate, and writes `state/audit-provenance.json` with the verified receipt
+fingerprint, source prefix, source code SHA and `fetch_attempt_id`. The original
+fetch attempt may have an incomplete status because its audit was still running;
+complete verified receipts establish fetch completeness. A source audit-only
+status retains its original `fetch_attempt_id` on another restart. Both the new
+`attempt-status.json` and the new `audit.json` carry this link, while their
+`attempt_id` values must agree with each other, not with the fetch attempt.
+The job explicitly validates that relationship, current SHA, valid/exit-0 audit
+and no failed folders before publishing a complete success. Verification failure
+leaves the new attempt incomplete and cannot republish a restored successful
+audit. Audit-only uploads audit/status/state; it does not republish corpus bytes.
+Do not run competing writers at one corpus prefix; the orchestrator must stop
+the old combined job before starting its audit-only replacement.
+
+The generated job installs the repository at the full SHA into an editable venv
+with the existing `bench` extra. The package requires Python >=3.10, so the
+`pytorch-2-9-cu129-ubuntu-2204-nvidia-580` image's Python 3.10 is sufficient.
+The venv inherits system site packages. If the image lacks `ensurepip`, the job
+bootstraps `uv` with the image's pip into scratch space and uses it to create and
+seed the venv without downloading another interpreter. Both paths clear a
+half-built or previous venv on restart. A constraint derived from the image's
+own `torch.__version__` preserves its CUDA-matched torch, including the local
+version suffix; the preflight also checks torch's version and file path.
+
+Before fetching data, the job imports the fetch/audit modules and their lazy
+dependencies, verifies editable-install metadata and module paths against the
+checkout, and rechecks its HEAD against `REPO_SHA`. Metadata lookup excludes the
+checkout's source egg-info and respects the installed distributions' path order.
+The package and third-party dependencies are imported without stdin's implicit
+checkout path so it cannot hide stale site-packages code; the checkout is then
+added for the uninstalled `scripts.corpus_v4` modules, whose paths are checked too.
+Provenance must name an absolute local file URL, so an empty path cannot resolve
+to the current working directory. It records `pip freeze` in
+`RUN_DIR/state/environment.txt`. NumPy/pandas/PyYAML are base dependencies;
 PyArrow/datasets are in `bench`, and datasets already depends on huggingface_hub.
-There is no new runtime dependency. The guest provides Python, Git, gcloud,
-application-default Google credentials, `RUN_DIR` and `STATE_URI`. No credentials
-are embedded. The SHA must contain this implementation and frozen manifest.
+The guest provides Python with pip and torch, Git, gcloud, application-default
+Google credentials, `RUN_DIR` and `STATE_URI`. No credentials are embedded.
+The SHA must contain this implementation and frozen manifest.
+
+If `HOME` is empty or unset, the job sets it to `RUN_DIR/home` for startup-script
+execution as root. Default Hugging Face caches are under `RUN_DIR/hf-cache`,
+outside the periodically uploaded state tree. Native downloads have one regular
+file in staging or the published tree, with only transfer metadata alongside.
+The audit's explicit benchmark dataset cache remains resumable under state; it
+overrides the default dataset cache setting.
 
 The host restores `RUN_DIR/state` before invocation. The job syncs it every ten
 minutes and at exit; the host's final copy also covers guest preemption. Each attempt first invalidates the old final audit and publishes
