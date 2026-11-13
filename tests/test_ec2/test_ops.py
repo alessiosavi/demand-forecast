@@ -1084,6 +1084,16 @@ def running_real_chain(operator):
     )
     try:
         yield child
+    except subprocess.TimeoutExpired as exc:
+        # communicate's TimeoutExpired message omits its captured stderr. Keep
+        # the owner's periodic drain diagnostics in a hanging test's failure.
+        def text(data):
+            return data.decode(errors="replace") if isinstance(data, bytes) else data or ""
+
+        pytest.fail(
+            f"Local operator timed out after {exc.timeout}s\n"
+            f"stdout:\n{text(exc.stdout)}\nstderr:\n{text(exc.stderr)}"
+        )
     finally:
         # Also clean up the deliberately suspended supervisor/leaf on the old
         # implementation, so a failing regression never leaves fake transports.
@@ -1100,13 +1110,19 @@ def running_real_chain(operator):
 
 
 def process_alive(pid):
-    try:
-        os.kill(pid, 0)
-        if sys.platform == "linux":
-            return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z"
-    except (ProcessLookupError, FileNotFoundError):
-        return False
-    return True
+    # Darwin kill(pid, 0) succeeds for zombies. Give init a bounded opportunity
+    # to reap an orphan; a live leaked transport remains alive throughout.
+    end = time.monotonic() + (0.2 if sys.platform == "darwin" else 0)
+    while True:
+        try:
+            os.kill(pid, 0)
+            if sys.platform == "linux":
+                return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z"
+        except (ProcessLookupError, FileNotFoundError):
+            return False
+        if time.monotonic() >= end:
+            return True
+        time.sleep(0.005)
 
 
 def wait_for_stall(operator, child):

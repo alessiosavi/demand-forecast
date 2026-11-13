@@ -1197,7 +1197,24 @@ Each local operation has one process group, shared by its nested supervisors
 and SSH/SCP/rsync transports. Cancellation kills and waits for that entire group
 before copy-back or stop/reconcile proceeds; a shell exiting is insufficient.
 If local process death cannot be confirmed, the chain waits with its session
-open, retaining the independent guest deadline and AWS stop schedule.
+open. Every five seconds stderr identifies the local process group, the live
+member PIDs and states (or an unavailable inspection), and elapsed drain time.
+Membership inspection uses libproc/sysctl on macOS and `/proc` on Linux, with
+`ps` as a fallback when native inspection is unavailable.
+SIGINT/SIGTERM are deferred during this barrier; repeated Ctrl-C does not release
+the session. Inspect the reported group and terminate its live members by hand
+if necessary; restore process-inspection permission when membership is unknown.
+The original leader stays unreaped until no live member remains, reserving its
+group ID so cancellation cannot signal a subsequently recycled group. Nested
+supervisors must inherit a pipe lease held by the live outer owner; an old
+environment value alone cannot disable the barrier.
+The already-armed guest deadline still schedules guest shutdown independently
+of this local wait, and the AWS stop schedule remains at deadline + 20 minutes
+with the delivery conditions described above. Neither confirms local transport
+death, unblocks the operator, or proves an EC2 stop; the session stays open until
+local death is confirmed and the normal stop/reconcile path can run. Local
+daemonization/`setsid` (including SSH ControlPersist) can escape the group and is
+outside this cancellation guarantee.
 Cleanup has its own `STOP_TIMEOUT_SECONDS` budget (480
 seconds), with bounded guard calls and the SSH stop fallback. These limits supplement
 the existing guest deadline and AWS stop schedule. After capacity retry, the
