@@ -789,7 +789,9 @@ the full index, ETA calibration and interruption recovery/upload behavior.
 
 The small-index timings and completion estimates above are superseded by the
 subsequent cloud observation: 150,974 channels completed in 2,372 seconds with
-48 workers, including index loading, roughly 0.5 worker-seconds per channel.
+48 workers. That is 0.75 worker-seconds per channel if the whole time is counted;
+the time includes start-up (index loading was still in progress 450 seconds in),
+so the scanning cost alone was about 0.6 worker-seconds per channel.
 They did not establish a six-hour full-corpus finish. The following offline
 profile measures the discovered overhead; it does not establish cloud scaling.
 
