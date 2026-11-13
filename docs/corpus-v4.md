@@ -569,3 +569,218 @@ preserves that decision. Never move quarantine bytes into the allowed tree by
 hand. The cloud run still must measure native schema validity, actual sizes and
 counts, first-shard representativeness, long-row suitability, real overlaps,
 control success at real search scale, runtime, memory and transfer/restart safety.
+
+## Provisional endpoint sketch triage (W4s)
+
+`audit_sketch` produces **provisional triage, never clearance**. It cannot
+satisfy an audit or training release gate, even when execution and controls
+pass. A negative result is not evidence that the corpus has independent lineage.
+Existing audit semantics, numerical thresholds, manifest and generated audit
+jobs are unchanged. This baseline does not contain the Simons v4 training
+consumer: training gate integration remains an orchestrator check. The existing
+audit-only guest contract refuses a renamed sketch report because it lacks
+`valid` and `exit_code`; those fields are deliberately absent. Sketch output has
+`artifact_type: corpus-sketch-triage`, `provisional: true`,
+`release_eligible: false`, and a separate `execution_ok` diagnostic. Never rename
+its output to `audit.json` or publish it over the corpus attempt-status gate.
+
+Every numeric target and covariate is read with the buffered native reader,
+including quarantined folders. Each transient sketch records complete length,
+positional finite-mask digest, canonical float64 raw fingerprint, quantiles,
+zero/change fractions, longest positional run, and autocorrelation at lags 1
+and 7. Prefix and suffix fingerprints at 24, 64 and 256 positions use float32
+values and sign-canonical local z-scores quantised in .05 steps on two shifted
+grids. Float32 hashes catch round trips; local normalisation proposes positive
+and negative affine copies and shifts. Endpoint positions provide the crop
+offset. These grids improve recall but do not guarantee it across quantisation
+boundaries. No missing positions are compacted or imputed.
+
+Only benchmark keys persist: sorted 128-bit fingerprints plus owner and position
+occupy 32 bytes per posting, at most 20 postings and 44 feature bytes per benchmark
+channel (684 bytes/channel). Workers map immutable files and discard corpus
+sketches after each channel. The existing native reader and its memory watchdog
+remain in charge of buffered Arrow decoding and indivisible whole rows.
+
+Exact/endpoint hits propose original-array alignments. Before calling
+`audit_match.fit_segment`, the worker applies that verifier's own `nondegenerate`
+function to **the exact overlap and joint finite mask**, on both sides. A failure
+cannot become a verified match. Such pairs still enter proposed/unverified counts,
+the rejection histogram, and evidence, with `fit: null` and an explicit `shortcut`
+label; no coefficients or fit scores are invented. Exact positional masks and
+bounds key bounded caches; whole-channel degeneracy never substitutes for an
+aligned segment's decision. Other pairs retain every original numerical,
+short-period, calendar, strict-ramp and information gate. No threshold changes.
+
+Summary buckets use affine-invariant quantile shape and lag-1 correlation. Each
+worker records its closest neighbour as a deferred proposal. Folder assembly
+replays channels in native shard/row-group/row/column/channel order and applies
+the original adaptive top-20 admission rule. Thus worker count and interruption
+order cannot change which summary proposals count, the rejection histogram,
+match sample or ranking. Ranking keys are encoded once rather than repeatedly
+sorting/encoding all 20 records. Equal-key buckets still cap postings at 64 and
+record unresolved diagnostics. Metadata routing never excludes value pairs.
+
+The scheduling unit is a Parquet row group or bounded row range within a large
+group, across **all** folders, largest estimated numeric value count first.
+Ranges target at most 16M values from group metadata (8192 rows maximum, with an
+indivisible row allowed to exceed the estimate). Thus a billion-value group is
+spread across workers rather than leaving one worker with a multi-hour tail.
+The unchanged reader re-decodes each range's group prefix, skipping its sketch
+work. This repeats decoder/I/O work; a 1B-value group needs about 63 ranges, or roughly
+32 whole-group decodes in aggregate. The supplied reader/statistics timings are
+32.75s for era5's 1.987B values, 23.19s for m100-ipmi's 1.996B, and 549.88s for
+gpm-mergir's 2B. These demonstrate that verification was much slower than a single
+reader pass, but do not establish concurrent prefix-decoding cost. The 16M work
+unit amortizes that cost; finer 2M/512-row checkpoints separately bound lost work. Each unit has an identity-bound checkpoint and immutable gzip
+JSONL journal under `sketch/evidence/units`. Within a unit, closed fragments are
+checkpointed every 512 rows or 2M values, whichever comes first, after finishing
+the current row. An interruption loses only the last fragment's sketch work
+(plus one indivisible row). The unchanged reader may re-decode a completed prefix
+on resume; its fingerprints, lookups and verifications are reused. Fragment gzip
+headers fix timestamp/name, so completed bytes and summaries are deterministic.
+
+Folder `*.jsonl` journals are small **unit-reference JSONL** files, each line naming
+an immutable unit journal and SHA256. `evidence.format` distinguishes these from
+legacy full pair journals. Unit gzip files retain pair/cap evidence and deferred
+summary events; assembly records admitted counts, first 100 verified matches and
+best 20 unverified pairs. Deferred events excluded by the original admission rule
+do not count as proposals. Allowed and quarantined counts remain separate; a
+folder never becomes clean. Full completed journals and their referenced bytes
+are rehashed before reuse. Corrupt folder references can be rebuilt from valid
+unit checkpoints. Corrupt/missing unit evidence replays that unit or its valid
+fragments. Growing output, controls, benchmark downloads/spool and index builds
+live in a sibling scratch directory **outside state** and enter state only after
+closing and atomic rename. Scratch, state and output (including evidence/unit
+directories) must be on the same filesystem. Startup checks their devices before
+preparation or workers and rejects a different device with a clear error; separate
+filesystems are not supported.
+
+Controls select numerically eligible benchmark histories of 96–65,536 positions,
+without screening for retrieval success. Whole, positive/negative affine, shift,
+float32, prefix and suffix plants travel through the native reader, full crowded
+index, worker and verifier. Interior crops are a deliberate miss; a crop whose
+endpoint keys match its parent is skipped and named in `skipped_cases`, since a
+periodic interior can be a genuine endpoint-preserving copy. Positive plants
+are never screened for retrieval success. Constants,
+ramps and a calendar motif are negative controls. Correct benchmark and exact
+overlap are required. A passing outcome and its evidence persist in
+`state/sketch-controls.json`; unchanged resumes rehash and reuse it. Failed or
+corrupt controls rerun. Controls demonstrate only the planted instances; changed
+masks, unstable endpoints and all aggregation phases remain unsupported.
+Failed cases are named with their benchmark, exact-overlap outcome, verifier
+rejection reasons and retrieval diagnostics in JSON and Markdown. A prefix copy
+can be missed when its common endpoint postings are capped and the bounded
+summary shortlist does not propose the parent; planting a copy guarantees
+neither retrieval nor verification.
+
+The CLI first calls `verify_published` for the **whole** corpus, even with a folder
+selection. Benchmark reuse binds the pinned revision, complete task definitions,
+all local sources executed by benchmark preparation (`audit_sketch`,
+`audit_fev_overlap`, `native`, `matching`, task `specs`, `pretrain.audit`,
+`audit_match` and `audit_info`) and SHA256 of SQLite, values and timestamps;
+production refuses injected synthetic or incomplete benchmark spools. Index reuse binds benchmark
+identity, method/source and every index file hash. `state/sketch-input.json`
+records the full current scan contract and its fingerprint for inspection.
+Folder/unit reuse binds the complete manifest, **all corpus shard bytes**, full
+benchmark identity, index bytes, opportunity bound, method and implementation
+sources (sketch, verifier, information, matching, reader). Worker count, memory
+budget and selection do not change numerical identity. A source/input change,
+missing identity, malformed marker, result digest mismatch or evidence hash
+mismatch forces replay; excluded folders with unusable summaries fail closed.
+
+Legacy `sketch1` benchmark markers and folder summaries are not reused: they lack
+the complete loader-source contract. The next cloud run rescans all 121 folders.
+Resumes written by the current code continue to reuse matching, rehashed spool,
+index, control, unit and folder artifacts. No cloud reuse was established by the
+offline tests.
+
+Generate a separate guest job using the existing `RUN_DIR` / `STATE_URI` host
+restore/periodic/preemption-copy contract:
+
+```bash
+python -m scripts.corpus_v4.make_sketch_job FULL_REPO_SHA \
+  gs://veliu-forecast-train-us-east1/corpus-v4 \
+  gs://veliu-forecast-train-us-east1/reports/sketch2 sketch-job.sh \
+  --state-prefix gs://veliu-forecast-train-us-east1/runs/sketch2/state \
+  --workers 48 --memory-budget-gib 320 --skip-finished
+bash -n sketch-job.sh
+```
+
+Start this run with its own state URI and scan all folders. Subsequent resumes
+restore its complete state, including closed evidence files, as the host
+normally does. `--only-folders` selects folders eligible for scanning; every other folder must
+have a valid completed summary. Without `--skip-finished`, completed selected
+folders are rescanned, including their units and fragments; interrupted folders
+retain bounded-unit resume behavior. `--skip-finished` also reuses valid selected
+summaries. Ordinary invocations retain resume behavior for all folders. All
+folders remain in the assembled report and global opportunity bound. Selection
+does not authorize a partial corpus download or a smaller statistical bound.
+Generation checks destinations and folder syntax, and performs no cloud call.
+
+`state/sketch-progress.json` is atomically replaced every 30 seconds throughout
+setup and scanning, and on completion. It contains phase, units done/total,
+checkpointed values/channels (including partial units), per-folder progress,
+new values/minute and estimated seconds left. Reused units and recovered partial fragments are excluded
+from the throughput numerator. Metadata supplies estimated remaining values;
+ETA is null before new work completes and zero at successful completion. The
+generated job copies this small object directly to state/report GCS prefixes
+every minute, independent of the host's slower state copy. Final evidence
+publication precedes separate completion status; upload failure stays nonzero.
+No audit/attempt-status gate is written.
+
+The original unmeasured 100-minute forecast is withdrawn. The 90 supplied finished
+summaries contain 410.65M values, 60,742 channels and 2,828,309 proposals, with no
+verified match; 1,658,303 proposals failed non-identifying gates. Statistics total
+**11.0825B remaining values / 13.773M channels / 7.474M rows**, confirming the
+handoff's rounded 11.08B after normalizing quarantine paths. Reproduce the tiny synthetic profile without downloads:
+
+```bash
+OPENBLAS_NUM_THREADS=1 python -m tests.test_corpus_v4.test_audit_sketch_benchmark /tmp/sketch-bench
+```
+
+This compares locally available 0523bc6 code with the new scanner, using 120×336
+short channels, 24×8192 long channels and 36×8192 constant-heavy channels against
+64 tiny synthetic benchmark histories. It records per-channel/per-value time,
+decode/sketch/lookup/verification/emission/ranking/assembly, bytes and cProfile
+artifacts. Three fresh-process profiled repetitions per cell measured:
+
+| Shape | Old → new µs/channel | Old → new ns/value |
+|---|---:|---:|
+| 336-point short | 1265 → 1397 | 3766 → 4158 |
+| 8192-point long | 5223 → 5619 | 638 → 686 |
+| 8192-point constant-heavy | 16509 → 3913 | 2015 → 478 |
+
+The constant workload improved 4.22×: verification fell from 289 to 27ms and
+ranking from 162 to 8ms for 36 channels / 1728 pairs; compressed evidence fell
+from 1.48MB to 11KB in the direct-scan harness. Short/long informative shapes
+were 10%/8% slower because the precheck adds work; their dominant costs were
+sketching and benchmark mapping/verification, respectively. New-stage median
+milliseconds for short/long/constant were decode 11.3/6.7/6.8, sketch
+54.9/19.6/13.3, lookup 10.7/2.4/18.4, verification 35.9/47.6/27.2,
+benchmark mapping 38.7/47.6/11.2, emission 2.4/0.8/12.2 and assembly
+2.0/1.0/19.3. Profiling includes the reader watchdog; process import/index setup
+is excluded. These small workloads do not measure full-corpus range rereads.
+It cannot measure the full benchmark index, real distribution of
+masks/proposals, cold downloads or Spot/GCS throughput. Cloud observations were
+about 1M values per worker-minute; planning below allows **1–2×** overall speedup
+and 30–60 minutes for setup/transfer. These are conditional ranges, not promises:
+
+| Machine | Workers | Total RAM / process budget | Expected remaining pass |
+|---|---:|---:|---:|
+| n2d-standard-32 | 16 | 128 / 104 GiB | 6.3–12.7 h |
+| n2d-standard-64 | 32 | 256 / 208 GiB | 3.4–6.8 h |
+| n2d-standard-96 | 48 | 384 / 320 GiB | 2.4–4.9 h |
+| c3d-standard-16 | 8 | 64 / 52 GiB | 12.2–24.3 h |
+
+N2D 96 fits the stated 200-vCPU quota; C3D is limited to the stated 24-vCPU quota.
+[Google’s machine table](https://docs.cloud.google.com/compute/docs/general-purpose-machines#c3d_machine_types)
+lists C3D 16 then 30 vCPUs; the latter exceeds the 24-vCPU quota.
+C3D uses the same conservative per-worker rate because it was not measured.
+A few hours is plausible on N2D 96; a four-hour finish is **not established**.
+Candidate verification and per-channel overhead, rather than decoding alone,
+limit the estimate. More informative/masked proposals, oversized row groups,
+poor CPU scaling, evidence volume, disk/GCS contention, a cold benchmark load or
+preemption can exceed these ranges. Budget at least 500 GiB disk pending measured
+compressed evidence volume. The full cloud run must establish index build time,
+per-shape throughput, compressed evidence bytes, decoder RSS, controls against
+the full index, ETA calibration and interruption recovery/upload behavior.
