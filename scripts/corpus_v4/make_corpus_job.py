@@ -38,26 +38,39 @@ from importlib import import_module, metadata
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
-# Include lazy imports used by the fetcher and audit, without loading any data.
-for name in (
-    "huggingface_hub", "datasets", "fev", "numpy", "pandas", "pyarrow.parquet", "yaml",
-    "scripts.corpus_v4.fetch_native", "scripts.corpus_v4.audit_fev_overlap",
-):
-    import_module(name)
+root = Path(sys.argv[1]).resolve()
+# stdin gives the checkout an implicit import path. Prove the installation
+# works without it, so cwd cannot hide a stale package in site-packages.
+if sys.path[0] == "":
+    sys.path.pop(0)
+# An editable's .pth may also put the checkout on sys.path. Ignore its source
+# egg-info for metadata lookup, preserving precedence among installed copies.
+installed = next(metadata.distributions(
+    name="demand-forecast", path=[p for p in sys.path if Path(p).resolve() != root]
+), None)
+direct = json.loads(installed.read_text("direct_url.json") or "{}") if installed else {}
+url = urlparse(direct.get("url", ""))
+if (url.scheme != "file" or url.netloc not in ("", "localhost")
+        or not Path(unquote(url.path)).is_absolute()
+        or Path(unquote(url.path)).resolve() != root
+        or direct.get("dir_info", {}).get("editable") is not True):
+    raise RuntimeError("installed demand-forecast is not the pinned editable checkout")
 
 import demand_forecast
 import torch
 
-root = Path(sys.argv[1]).resolve()
 image = json.loads(Path(sys.argv[3]).read_text())
 if torch.__version__ != image["version"] or str(Path(torch.__file__).resolve()) != image["path"]:
     raise RuntimeError("torch is not the image's CUDA-matched package")
-direct = json.loads(metadata.distribution("demand-forecast").read_text("direct_url.json") or "{}")
-url = urlparse(direct.get("url", ""))
-if (url.scheme != "file" or Path(unquote(url.path)).resolve() != root
-        or direct.get("dir_info", {}).get("editable") is not True
-        or Path(demand_forecast.__file__).resolve() != root / "demand_forecast/__init__.py"):
+if Path(demand_forecast.__file__).resolve() != root / "demand_forecast/__init__.py":
     raise RuntimeError("installed demand-forecast is not the pinned editable checkout")
+# Include lazy imports used by the fetcher and audit, without loading any data.
+for name in (
+    "huggingface_hub", "datasets", "fev", "numpy", "pandas", "pyarrow.parquet", "yaml",
+):
+    import_module(name)
+# scripts/ is deliberately outside the installed package; load it from checkout.
+sys.path.insert(0, str(root))
 for name in ("scripts.corpus_v4.fetch_native", "scripts.corpus_v4.audit_fev_overlap"):
     if Path(import_module(name).__file__).resolve() != root / (name.replace(".", "/") + ".py"):
         raise RuntimeError("corpus module is not from the pinned checkout: " + name)

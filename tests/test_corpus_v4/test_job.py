@@ -93,7 +93,7 @@ def make_venv(target, clear):
         'export PATH="' + str(target / "bin") + ':$PATH"\n')
 if name == "git":
     if "rev-parse" in args:
-        print("a" * 40)
+        print(os.environ.get("CHECKOUT_HEAD", "a" * 40) if args[0] == "-C" else "a" * 40)
 elif name == "gcloud":
     pass
 elif name == "sleep":
@@ -121,7 +121,8 @@ elif args[:3] == ["-m", "pip", "install"]:
         target.mkdir(parents=True, exist_ok=True)
         shutil.copy2(__file__, target / "uv")
     elif os.environ.get("REPLACE_TORCH") == "1":
-        pathlib.Path(os.environ["PYTHONPATH"], "torch.py").write_text('__version__ = "0.0"\n')
+        pathlib.Path(os.environ["PYTHONPATH"].split(os.pathsep)[0], "torch.py").write_text(
+            '__version__ = "0.0"\n')
 elif args == ["-m", "pip", "freeze"]:
     print("torch==" + os.environ["IMAGE_TORCH_VERSION"])
     print("# fake installed environment")
@@ -138,7 +139,8 @@ else:
         path.write_text(tool)
         path.chmod(0o755)
     monkeypatch.setenv("PATH", f"{binary}:{os.environ['PATH']}")
-    monkeypatch.setenv("PYTHONPATH", str(modules))
+    # Model an editable .pth link after site-packages, as well as the implicit cwd.
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join((str(modules), str(checkout))))
     monkeypatch.setenv("FAKE_BIN", str(binary))
     monkeypatch.setenv("RUN_DIR", str(guest))
     monkeypatch.setenv("STATE_URI", "gs://fake-state/job")
@@ -217,6 +219,98 @@ def test_failed_preflight_stops_before_download(environment_guest, monkeypatch, 
     status = json.loads((guest / "state/attempt-status.json").read_text())
     assert not status["complete"]
     assert status["exit_code"] == result.returncode
+
+
+def test_preflight_accepts_editable_install_with_source_egg_info(environment_guest):
+    """Source metadata must not hide the installed editable's direct_url.json."""
+    guest, _, invoke = environment_guest
+    checkout = guest / f"corpus-repo-{'a' * 40}"
+    egg_info = checkout / "demand_forecast.egg-info"
+    egg_info.mkdir()
+    (egg_info / "PKG-INFO").write_text("Name: demand-forecast\nVersion: 2.0.0\n")
+    # No installer/network needed: the child runs real importlib.metadata over
+    # this source egg-info and the installed dist-info built by the fixture.
+    result, calls = invoke()
+    assert result.returncode == 0, result.stderr
+    assert any(call["args"][:2] == ["-m", "scripts.corpus_v4.fetch_native"] for call in calls)
+
+
+@pytest.mark.parametrize(
+    "broken",
+    ["non-editable", "other-editable", "missing", "stale-code", "relative-url", "remote-url"],
+)
+def test_preflight_rejects_wrong_install_despite_matching_cwd(environment_guest, broken):
+    """A checkout on sys.path[0] cannot stand in for a correct installation."""
+    guest, modules, invoke = environment_guest
+    checkout = guest / f"corpus-repo-{'a' * 40}"
+    direct_url = modules / "demand_forecast-2.0.0.dist-info/direct_url.json"
+    if broken == "non-editable":
+        direct_url.write_text(json.dumps({"url": checkout.as_uri(), "dir_info": {}}))
+    elif broken == "other-editable":
+        direct_url.write_text(json.dumps({"url": modules.as_uri(), "dir_info": {"editable": True}}))
+    elif broken == "missing":
+        direct_url.unlink()
+    elif broken in {"relative-url", "remote-url"}:
+        url = "file:" if broken == "relative-url" else "file://another-host" + checkout.as_posix()
+        direct_url.write_text(json.dumps({"url": url, "dir_info": {"editable": True}}))
+    else:
+        stale = modules / "demand_forecast"
+        stale.mkdir()
+        (stale / "__init__.py").touch()
+    result, calls = invoke()
+    assert result.returncode != 0, result.stdout
+    assert "pinned editable checkout" in result.stderr
+    assert not any(call["args"][:2] == ["-m", "scripts.corpus_v4.fetch_native"] for call in calls)
+
+
+@pytest.mark.parametrize("active_editable", [False, True])
+def test_preflight_respects_installed_metadata_precedence(
+    environment_guest, monkeypatch, active_editable
+):
+    """An inherited distribution cannot override the first installed copy."""
+    guest, modules, invoke = environment_guest
+    checkout = guest / f"corpus-repo-{'a' * 40}"
+    inherited = modules / "system-site-packages"
+    metadata = inherited / "demand_forecast-1.0.0.dist-info"
+    metadata.mkdir(parents=True)
+    (metadata / "METADATA").write_text("Name: demand-forecast\nVersion: 1.0.0\n")
+    for path, editable in (
+        (modules / "demand_forecast-2.0.0.dist-info", active_editable),
+        (metadata, not active_editable),
+    ):
+        (path / "direct_url.json").write_text(
+            json.dumps({"url": checkout.as_uri(), "dir_info": {"editable": editable}})
+        )
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join((str(modules), str(inherited), str(checkout))))
+    result, calls = invoke()
+    if active_editable:
+        assert result.returncode == 0, result.stderr
+    else:
+        assert result.returncode != 0
+        assert "pinned editable checkout" in result.stderr
+        assert not any(
+            call["args"][:2] == ["-m", "scripts.corpus_v4.fetch_native"] for call in calls
+        )
+
+
+@pytest.mark.parametrize("broken", ["fetch_native", "audit_fev_overlap", "head"])
+def test_preflight_rejects_wrong_corpus_source_or_head(environment_guest, monkeypatch, broken):
+    guest, modules, invoke = environment_guest
+    checkout = guest / f"corpus-repo-{'a' * 40}"
+    if broken == "head":
+        monkeypatch.setenv("CHECKOUT_HEAD", "b" * 40)
+        expected = "HEAD does not match REPO_SHA"
+    else:
+        stale = modules / f"{broken}.py"
+        stale.touch()
+        module = checkout / f"scripts/corpus_v4/{broken}.py"
+        module.unlink()
+        module.symlink_to(stale)
+        expected = "corpus module is not from the pinned checkout"
+    result, calls = invoke()
+    assert result.returncode != 0
+    assert expected in result.stderr
+    assert not any(call["args"][:2] == ["-m", "scripts.corpus_v4.fetch_native"] for call in calls)
 
 
 @pytest.mark.parametrize(

@@ -203,7 +203,13 @@ version suffix; the preflight also checks torch's version and file path.
 
 Before fetching data, the job imports the fetch/audit modules and their lazy
 dependencies, verifies editable-install metadata and module paths against the
-checkout, and rechecks its HEAD against `REPO_SHA`. It records `pip freeze` in
+checkout, and rechecks its HEAD against `REPO_SHA`. Metadata lookup excludes the
+checkout's source egg-info and respects the installed distributions' path order.
+The package and third-party dependencies are imported without stdin's implicit
+checkout path so it cannot hide stale site-packages code; the checkout is then
+added for the uninstalled `scripts.corpus_v4` modules, whose paths are checked too.
+Provenance must name an absolute local file URL, so an empty path cannot resolve
+to the current working directory. It records `pip freeze` in
 `RUN_DIR/state/environment.txt`. NumPy/pandas/PyYAML are base dependencies;
 PyArrow/datasets are in `bench`, and datasets already depends on huggingface_hub.
 The guest provides Python with pip and torch, Git, gcloud, application-default
