@@ -7,15 +7,22 @@ changed masks, rounding boundaries or any resampling/aggregation ancestry.
 from __future__ import annotations
 
 import argparse
+import bisect
+import gzip
 import hashlib
+import io
 import json
 import math
+import os
+import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -31,7 +38,6 @@ from scripts.corpus_v4.matching import MAX_PHASES, _repetitive, frequency
 from scripts.corpus_v4.native import (
     DEFAULT_MEMORY_BUDGET_BYTES,
     MemoryBudget,
-    atomic_json,
     digest,
     folder_path,
     iter_rows,
@@ -46,6 +52,10 @@ LENGTHS = (24, 64, 256)
 POSTING_CAP = 64
 TOP = 20
 MATCH_SAMPLE = 100
+CHECKPOINT_ROWS = 512
+CHECKPOINT_VALUES = 2_000_000
+UNIT_VALUES = 16_000_000
+UNIT_ROWS = 8192
 FEATURES = 11
 POSTING = np.dtype([("hi", "<u8"), ("lo", "<u8"), ("owner", "<i8"), ("pos", "<i8")])
 LIMITATIONS = [
@@ -56,6 +66,47 @@ LIMITATIONS = [
     "Common keys are capped and recorded; summary ranking is a bounded heuristic.",
     "Constants, ramps and calendar-only patterns are non-identifying by existing policy.",
 ]
+
+
+def _workspace(state):
+    path = Path(state).parent / ("." + Path(state).name + "-sketch-work")
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def atomic_json(path, value, *, scratch=None):
+    """Growing bytes live outside the periodically copied state tree."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    scratch = Path(scratch) if scratch else _workspace(path.parent)
+    scratch.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(dir=scratch)
+    try:
+        with os.fdopen(fd, "w") as stream:
+            json.dump(value, stream, sort_keys=True, indent=2, allow_nan=False)
+            stream.write("\n")
+        Path(name).replace(path)
+    finally:
+        Path(name).unlink(missing_ok=True)
+
+
+class _Ranking:
+    """Cache each evidence key once, retaining the original stable ordering."""
+
+    def __init__(self):
+        self.keys, self.records = [], []
+
+    def add(self, record):
+        key = _rank_key(record)
+        pos = bisect.bisect_right(self.keys, key)
+        if pos < TOP:
+            self.keys.insert(pos, key)
+            self.records.insert(pos, record)
+            del self.keys[TOP:]
+            del self.records[TOP:]
+
+    def admits(self, distance):
+        return len(self.records) < TOP or distance < self.records[-1]["distance"]
 
 
 def _fingerprint(value):
@@ -195,13 +246,59 @@ def compare_sketches(query, benchmark):
     return [candidates[k] for k in sorted(candidates)]
 
 
-def verify_candidate(x, y, candidate, *, opportunities, dimensions=None):
+def verify_candidate(
+    x,
+    y,
+    candidate,
+    *,
+    opportunities,
+    dimensions=None,
+    nonidentifying_shortcut=False,
+    cache=None,
+    benchmark_owner=None,
+    benchmark_cache=None,
+):
     """Reuse the original fit and every subsequent numerical identification gate.
 
     No Index/scan_group retrieval is reused. Original values and original masks
     are refitted over the endpoint alignment's entire overlap.
     """
     off = candidate.offset
+    if nonidentifying_shortcut:
+        start, end = max(0, off), min(len(x), len(y) + off)
+        if end - start >= old.WIN:
+            a, b = x[start:end], y[start - off : end - off]
+            both = np.isfinite(a) & np.isfinite(b)
+            if both.sum() >= old.WIN:
+                # Same alignment and joint mask as fit_segment. Whole-channel
+                # degeneracy is not generally hereditary under cropping/masking.
+                mask = np.packbits(both).tobytes()
+                memo = {} if cache is None or len(mask) > 8192 else cache
+                qa = ("query", start, end, mask)
+                qb = ("benchmark", benchmark_owner, start - off, end - off, mask)
+                if qa not in memo:
+                    memo[qa] = old.nondegenerate(a[both])
+                benchmark_memo = (
+                    memo if benchmark_cache is None or len(mask) > 8192 else benchmark_cache
+                )
+                if benchmark_memo is not memo and len(benchmark_memo) >= 1024:
+                    benchmark_memo.clear()
+                if qb not in benchmark_memo:
+                    benchmark_memo[qb] = old.nondegenerate(b[both])
+                ok_a, why_a = memo[qa]
+                ok_b, why_b = benchmark_memo[qb]
+                if not (ok_a and ok_b):
+                    return dict(
+                        verified=False,
+                        reason="nonidentifying:" + str([why_a, why_b]),
+                        proposal=candidate.reason,
+                        offset=off,
+                        distance=candidate.distance,
+                        fit=None,
+                        shortcut="verifier_nondegenerate_on_joint_overlap",
+                        information_threshold=audit_info.INFO_MARGIN_BITS
+                        + math.log2(max(1, opportunities)),
+                    )
     rec = old.fit_segment(x, y, max(0, off), min(len(x), len(y) + off), off)
     reason = "numerical_fit_rejected"
     if rec is not None:
@@ -250,6 +347,24 @@ def _spool_files(path):
     return [path, path.with_suffix(".values"), path.with_suffix(".stamps")]
 
 
+def _benchmark_sources():
+    # Local code executed by preparation, task loading, frequency normalization,
+    # spool writing and BenchmarkStore's sample eligibility checks. Keep this
+    # list with the call graph when adding loader/writer dependencies.
+    root = Path(__file__).resolve().parents[2]
+    names = (
+        "scripts/corpus_v4/audit_sketch.py",
+        "scripts/corpus_v4/audit_fev_overlap.py",
+        "scripts/corpus_v4/native.py",
+        "scripts/corpus_v4/matching.py",
+        "demand_forecast/bench/specs.py",
+        "demand_forecast/pretrain/audit.py",
+        "demand_forecast/pretrain/audit_match.py",
+        "demand_forecast/pretrain/audit_info.py",
+    )
+    return {name: digest(root / name) for name in names}
+
+
 def prepare_benchmarks(
     state, source=None, *, memory_budget_bytes=DEFAULT_MEMORY_BUDGET_BYTES, require_pinned=False
 ):
@@ -265,7 +380,7 @@ def prepare_benchmarks(
     contract = dict(
         revision=FEV_DATASETS_REVISION,
         tasks=[vars(t) for t in fev_bench_tasks("fev100")],
-        loader=digest(Path(__file__).with_name("audit_fev_overlap.py")),
+        sources=_benchmark_sources(),
     )
     saved = _saved_json(marker)
     injected = source is not None
@@ -286,12 +401,12 @@ def prepare_benchmarks(
     source = (
         source
         if source is not None
-        else load_benchmarks(state / "benchmark-cache" / FEV_DATASETS_REVISION)
+        else load_benchmarks(_workspace(state) / "benchmark-cache" / FEV_DATASETS_REVISION)
     )
     marker.unlink(missing_ok=True)
     # Recreate SQLite from scratch: DROP/CREATE changes SQLite's header counter
     # even for identical logical rows, which would otherwise alter resume keys.
-    staging = state / "sketch-benchmark-build"
+    staging = _workspace(state) / "sketch-benchmark-build"
     staging.mkdir(exist_ok=True)
     temporary = staging / path.name
     for file in _spool_files(temporary):
@@ -326,7 +441,7 @@ def _open_spool(path):
     return db
 
 
-def _series(db, path, owner):
+def _series(db, path, owner, *, calendar_dimensions=True):
     encoded, start, length, timed = db.execute(
         "SELECT meta, start, length, timed FROM series WHERE rowid=?", (int(owner),)
     ).fetchone()
@@ -339,7 +454,7 @@ def _series(db, path, owner):
         else np.empty(0)
     )
     dimensions = None
-    if timed and frequency(meta["freq"]) == ("calendar", "1ME"):
+    if calendar_dimensions and timed and frequency(meta["freq"]) == ("calendar", "1ME"):
         import pandas as pd
 
         stamps = np.memmap(
@@ -366,6 +481,9 @@ def build_index(spool, directory, identity, *, memory_budget_bytes):
     ):
         return saved
     marker.unlink(missing_ok=True)
+    destination = directory
+    directory = _workspace(directory.parent) / "index-build"
+    directory.mkdir(parents=True, exist_ok=True)
     budget = MemoryBudget(memory_budget_bytes)
     count = 0
     db = _open_spool(spool)
@@ -375,7 +493,7 @@ def build_index(spool, directory, identity, *, memory_budget_bytes):
             (directory / names[1]).open("wb") as features,
         ):
             for (owner,) in db.execute("SELECT rowid FROM series ORDER BY rowid"):
-                _, values, _ = _series(db, spool, owner)
+                _, values, _ = _series(db, spool, owner, calendar_dimensions=False)
                 rec = sketch(values)
                 rows = [
                     (int(token[:16], 16), int(token[16:], 16), owner, pos)
@@ -398,7 +516,9 @@ def build_index(spool, directory, identity, *, memory_budget_bytes):
             bytes=sum((directory / n).stat().st_size for n in names),
             files={n: digest(directory / n) for n in names},
         )
-        atomic_json(marker, saved)
+        for name in names:
+            (directory / name).replace(destination / name)
+        atomic_json(marker, saved, scratch=directory)
         return saved
     finally:
         db.close()
@@ -414,6 +534,7 @@ class SketchIndex:
         self.features = np.memmap(directory / "features.bin", dtype="<f4", mode="r").reshape(
             -1, FEATURES
         )
+        self.degeneracy = {}
         self.spool = Path(spool)
         self.db = _open_spool(spool)
 
@@ -514,147 +635,345 @@ def _rank_key(evidence):
     )
 
 
+def _assemble(entry, units, directory, *, scratch, control=False, control_benchmarks=None):
+    """Replay native order, including the original adaptive summary admission."""
+    directory = Path(directory)
+    final = directory / (_journal_name(entry) + ".jsonl")
+    fd, name = tempfile.mkstemp(dir=scratch)
+    counts, reasons = Counter(), Counter()
+    ranked, matches, control_evidence = _Ranking(), [], {}
+    control_diagnostics = {}
+    control_benchmarks = control_benchmarks or {}
+    aliases, sources = set(), set()
+
+    def diagnostic(evidence, reason):
+        if control:
+            item = evidence["corpus"]["item_id"]
+            control_diagnostics.setdefault(item, Counter())[reason] += 1
+
+    try:
+        with os.fdopen(fd, "w") as output:
+            for unit in units:
+                counts.update(unit["counts"])
+                aliases.update(unit["corpus_frequencies"])
+                sources.update(unit["corpus_sources"])
+                output.write(json.dumps(unit["evidence"], sort_keys=True) + "\n")
+                journal_path = directory / unit["evidence"]["file"]
+                with (
+                    gzip.open(journal_path, "rt")
+                    if journal_path.suffix == ".gz"
+                    else journal_path.open()
+                ) as stream:
+                    for line in stream:
+                        evidence = json.loads(line)
+                        if evidence.pop("summary_not_proposed", False):
+                            counts["summary_pairs_not_proposed"] += 1
+                            diagnostic(evidence, "summary_not_proposed")
+                            continue
+                        if evidence.pop("deferred_summary", False) and not ranked.admits(
+                            evidence["distance"]
+                        ):
+                            counts["summary_pairs_not_proposed"] += 1
+                            diagnostic(evidence, "summary_shortlist_pruned")
+                            continue
+                        if "unresolved" in evidence:
+                            counts["unresolved_buckets"] += 1
+                            reasons[evidence["unresolved"]["reason"]] += 1
+                            diagnostic(evidence, evidence["unresolved"]["reason"])
+                            continue
+                        counts["proposed_pairs"] += 1
+                        counts[
+                            "verified_matches" if evidence["verified"] else "unverified_candidates"
+                        ] += 1
+                        if evidence.get("shortcut"):
+                            counts["nonidentifying_pairs_skipped"] += 1
+                        if control and (
+                            evidence["verified"]
+                            or evidence["benchmark"]
+                            == control_benchmarks.get(evidence["corpus"]["item_id"])
+                        ):
+                            # Retain rejections only for the planted parent. The
+                            # full crowded index can produce many unrelated fits.
+                            control_evidence.setdefault(evidence["corpus"]["item_id"], []).append(
+                                evidence
+                            )
+                        if evidence["verified"]:
+                            if len(matches) < MATCH_SAMPLE:
+                                matches.append(evidence)
+                        else:
+                            reasons[evidence["reason"]] += 1
+                            ranked.add(evidence)
+        Path(name).replace(final)
+    finally:
+        Path(name).unlink(missing_ok=True)
+    result = dict(
+        folder=entry["folder"],
+        status=entry["status"],
+        counts=dict(sorted(counts.items())),
+        reasons=dict(sorted(reasons.items())),
+        matches=matches,
+        ranked_unverified=ranked.records,
+        evidence=dict(
+            file=final.name,
+            sha256=digest(final),
+            units=[u["evidence"] for u in units],
+            format="unit-reference-jsonl",
+        ),
+        match_sample_limit=MATCH_SAMPLE,
+        corpus_frequencies=sorted(aliases),
+        corpus_sources=sorted(sources),
+        lineage=entry.get("lineage", "unknown"),
+        domain=entry.get("domain", "unknown"),
+    )
+    if control:
+        result["control_evidence"] = control_evidence
+        result["control_diagnostics"] = control_diagnostics
+    return result
+
+
+class _UnitJournal:
+    """Bound lost sketch work within a large row group; never split a row.
+
+    Resume re-decodes the completed prefix with the unchanged buffered reader,
+    but skips its fingerprints, lookups and verification. Closed fragments are
+    immutable. Their boundaries do not enter the final journal or summary.
+    """
+
+    def __init__(self, request, path, scratch):
+        self.path, self.scratch = path, scratch
+        self.unit = request.get("unit")
+        self.identity = request.get("checkpoint_identity")
+        self.counts, self.aliases, self.sources = Counter(), set(), set()
+        self.parts, self.resume_row = [], -1
+        if self.unit and self.identity:
+            while True:
+                marker = self._marker(len(self.parts))
+                saved = _saved_result(marker, self.identity, path.parent)
+                if saved is None:
+                    break
+                self.parts.append(saved)
+                self.counts.update(saved["counts"])
+                self.aliases.update(saved["corpus_frequencies"])
+                self.sources.update(saved["corpus_sources"])
+                self.resume_row = saved["last_row"]
+        self.committed = self.counts.copy()
+        self.rows = 0
+        self._open()
+
+    def _marker(self, number):
+        return self.path.with_name(
+            self.path.name.removesuffix(".jsonl.gz") + f"-part{number:06d}.json"
+        )
+
+    def _open(self):
+        fd, name = tempfile.mkstemp(dir=self.scratch)
+        self.temporary = Path(name)
+        self.raw = os.fdopen(fd, "wb")
+        self.stream = io.TextIOWrapper(
+            gzip.GzipFile(filename="", mode="wb", fileobj=self.raw, mtime=0, compresslevel=1)
+        )
+
+    def _close_stream(self):
+        self.stream.close()
+        self.raw.close()
+
+    def write(self, record):
+        self.stream.write(json.dumps(record, sort_keys=True, allow_nan=False) + "\n")
+
+    def after_row(self, row):
+        self.resume_row = row
+        self.rows += 1
+        if self.unit and (
+            self.rows >= CHECKPOINT_ROWS
+            or self.counts["values"] - self.committed["values"] >= CHECKPOINT_VALUES
+        ):
+            self._commit()
+            self._open()
+
+    def _commit(self):
+        self._close_stream()
+        if not self.rows:
+            self.temporary.unlink(missing_ok=True)
+            return
+        marker = self._marker(len(self.parts))
+        evidence = marker.with_suffix(".jsonl.gz")
+        self.temporary.replace(evidence)
+        result = dict(
+            counts=dict(sorted((self.counts - self.committed).items())),
+            corpus_frequencies=sorted(self.aliases),
+            corpus_sources=sorted(self.sources),
+            last_row=self.resume_row,
+            evidence=dict(file=evidence.name, sha256=digest(evidence)),
+        )
+        atomic_json(
+            marker,
+            dict(identity=self.identity, result=result, result_digest=_fingerprint(result)),
+            scratch=self.scratch,
+        )
+        self.parts.append(result)
+        self.committed = self.counts.copy()
+        self.rows = 0
+
+    def finish(self):
+        if self.unit:
+            self._commit()
+            fd, name = tempfile.mkstemp(dir=self.scratch)
+            self.temporary = Path(name)
+            with os.fdopen(fd, "wb") as output:
+                for part in self.parts:
+                    with (self.path.parent / part["evidence"]["file"]).open("rb") as source:
+                        shutil.copyfileobj(source, output)
+            self.temporary.replace(self.path)
+        else:
+            self._close_stream()
+            self.temporary.replace(self.path)
+        return dict(
+            counts=dict(sorted(self.counts.items())),
+            corpus_frequencies=sorted(self.aliases),
+            corpus_sources=sorted(self.sources),
+            evidence=dict(file=self.path.name, sha256=digest(self.path)),
+        )
+
+    def close(self):
+        self._close_stream()
+        self.temporary.unlink(missing_ok=True)
+
+
 def scan_folder(request):
-    """Disposable worker: decode each native row once, publish evidence before marker."""
+    """Disposable row-group worker; only closed journals enter the copied tree."""
     budget = request["budget"]
     start_memory_watchdog(budget)
     entry = request["entry"]
-    name = _journal_name(entry)
     directory = Path(request["directory"])
-    path = directory / f"{name}.jsonl"
-    tmp = path.with_suffix(".jsonl.tmp")
+    directory.mkdir(parents=True, exist_ok=True)
+    scratch = Path(request.get("scratch") or _workspace(directory.parent))
+    scratch.mkdir(parents=True, exist_ok=True)
+    unit = request.get("unit")
+    suffix = "--" + unit["id"] if unit else "--scan"
+    path = directory / (_journal_name(entry) + suffix + ".jsonl.gz")
     index = SketchIndex(request["index"], request["spool"])
-    counts, reasons = Counter(), Counter()
-    matches, ranked, control_evidence = [], [], {}
-    aliases, sources = set(), set()
+    journal = _UnitJournal(request, path, scratch)
+    counts, aliases, sources = journal.counts, journal.aliases, journal.sources
     try:
-        with tmp.open("w") as stream:
 
-            def emit(record):
-                stream.write(json.dumps(record, sort_keys=True, allow_nan=False) + "\n")
+        def emit(record):
+            journal.write(record)
 
-            for rec in iter_rows(
-                request["folder_path"], entry["folder"].split("/")[0], memory_budget_bytes=budget
-            ):
-                row = rec["row"]
-                aliases.add(row["freq"])
-                sources.add(row["source"])
-                for column in ("target", "covariates"):
-                    for channel, values in enumerate(rec[column]):
-                        counts["channels"] += 1
-                        counts["values"] += len(values)
-                        computed = sketch(values)
-                        pairs, summary, heavy = index.lookup(computed)
-                        corpus = dict(
-                            item_id=row["item_id"],
-                            source=row["source"],
-                            freq=row["freq"],
-                            shard=rec["shard"],
-                            row=rec["row_index"],
-                            column=column,
-                            channel=channel,
+        for rec in iter_rows(
+            request["folder_path"],
+            entry["folder"].split("/")[0],
+            memory_budget_bytes=budget,
+            **({k: unit[k] for k in ("shard", "row_group")} if unit else {}),
+        ):
+            if unit and rec["row_index"] >= unit.get("row_end", math.inf):
+                break
+            if unit and rec["row_index"] < unit.get("row_start", 0):
+                continue
+            if rec["row_index"] <= journal.resume_row and journal.rows == 0:
+                continue
+            row = rec["row"]
+            aliases.add(row["freq"])
+            sources.add(row["source"])
+            for column in ("target", "covariates"):
+                for channel, values in enumerate(rec[column]):
+                    counts["channels"] += 1
+                    counts["values"] += len(values)
+                    computed = sketch(values)
+                    pairs, summary, heavy = index.lookup(computed)
+                    corpus = dict(
+                        item_id=row["item_id"],
+                        source=row["source"],
+                        freq=row["freq"],
+                        shard=rec["shard"],
+                        row=rec["row_index"],
+                        column=column,
+                        channel=channel,
+                    )
+                    for event in heavy:
+                        emit(dict(corpus=corpus, unresolved=event))
+                    seen, cache = set(), {}
+
+                    def verify(owner, proposal, deferred=False):
+                        seen.add((owner, proposal.offset))
+                        meta, benchmark, dims = index.series(owner)
+                        evidence = verify_candidate(
+                            values,
+                            benchmark,
+                            proposal,
+                            opportunities=request["opportunities"],
+                            dimensions=dims,
+                            nonidentifying_shortcut=request.get("nonidentifying_shortcut", True),
+                            cache=cache,
+                            benchmark_owner=owner,
+                            benchmark_cache=index.degeneracy,
                         )
-                        for event in heavy:
-                            counts["unresolved_buckets"] += 1
-                            reasons[event["reason"]] += 1
-                            emit(dict(corpus=corpus, unresolved=event))
-                        seen = set()
+                        evidence.update(
+                            corpus=corpus,
+                            benchmark=meta,
+                            transform=dict(
+                                method="identity",
+                                aggregation="unsupported",
+                                affine_query_to_benchmark=(evidence["fit"] or {}).get("coef"),
+                            ),
+                        )
+                        if deferred:
+                            evidence["deferred_summary"] = True
+                        emit(evidence)
 
-                        def verify(owner, proposal):
-                            seen.add((owner, proposal.offset))
-                            meta, benchmark, dims = index.series(owner)
-                            evidence = verify_candidate(
-                                values,
-                                benchmark,
-                                proposal,
-                                opportunities=request["opportunities"],
-                                dimensions=dims,
+                    for (owner, _), proposal in pairs:
+                        distance = float(
+                            np.linalg.norm(
+                                np.asarray(computed.features) - index.features[owner - 1]
                             )
-                            evidence.update(
-                                corpus=corpus,
-                                benchmark=meta,
-                                transform=dict(
-                                    method="identity",
-                                    aggregation="unsupported",
-                                    affine_query_to_benchmark=(evidence["fit"] or {}).get("coef"),
-                                ),
+                        )
+                        verify(owner, Candidate(proposal.offset, proposal.reason, distance))
+                    if summary:
+                        distances = np.linalg.norm(
+                            index.features[np.asarray(summary) - 1] - np.asarray(computed.features),
+                            axis=1,
+                        )
+                        best = min(range(len(summary)), key=lambda i: (distances[i], summary[i]))
+                        owner, distance = summary[best], float(distances[best])
+                        if (owner, 0) not in seen:
+                            verify(
+                                owner,
+                                Candidate(0, "summary_shortlist", distance),
+                                deferred=True,
                             )
-                            counts["proposed_pairs"] += 1
-                            counts[
-                                "verified_matches"
-                                if evidence["verified"]
-                                else "unverified_candidates"
-                            ] += 1
-                            emit(evidence)
-                            if evidence["verified"]:
-                                if len(matches) < MATCH_SAMPLE:
-                                    matches.append(evidence)
-                                if request.get("control"):
-                                    control_evidence.setdefault(row["item_id"], []).append(evidence)
-                            else:
-                                reasons[evidence["reason"]] += 1
-                                ranked.append(evidence)
-                                ranked.sort(key=_rank_key)
-                                del ranked[TOP:]
-                            return evidence
-
-                        for (owner, _), proposal in pairs:
-                            distance = float(
-                                np.linalg.norm(
-                                    np.asarray(computed.features) - index.features[owner - 1]
-                                )
-                            )
-                            verify(owner, Candidate(proposal.offset, proposal.reason, distance))
-                        # Summary proposals compete for a folder's bounded review list.
-                        # They never open an interior-crop search or all-pairs expansion.
-                        if summary:
-                            distances = np.linalg.norm(
-                                index.features[np.asarray(summary) - 1]
-                                - np.asarray(computed.features),
-                                axis=1,
-                            )
-                            best = min(
-                                range(len(summary)), key=lambda i: (distances[i], summary[i])
-                            )
-                            owner, distance = summary[best], float(distances[best])
-                            if (owner, 0) not in seen and (
-                                len(ranked) < TOP or distance < ranked[-1]["distance"]
-                            ):
-                                verify(owner, Candidate(0, "summary_shortlist", distance))
-                            else:
-                                counts["summary_pairs_not_proposed"] += 1
-                        MemoryBudget(budget).check(context="sketch corpus channel")
-        tmp.replace(path)
-        result = dict(
-            folder=entry["folder"],
-            status=entry["status"],
-            counts=dict(sorted(counts.items())),
-            reasons=dict(sorted(reasons.items())),
-            matches=matches,
-            ranked_unverified=ranked,
-            evidence=dict(file=path.name, sha256=digest(path)),
-            match_sample_limit=MATCH_SAMPLE,
-            corpus_frequencies=sorted(aliases),
-            corpus_sources=sorted(sources),
-            lineage=entry.get("lineage", "unknown"),
-            domain=entry.get("domain", "unknown"),
+                        else:
+                            event = dict(summary_not_proposed=True)
+                            if request.get("control"):
+                                event["corpus"] = corpus
+                            emit(event)
+                    MemoryBudget(budget).check(context="sketch corpus channel")
+            journal.after_row(rec["row_index"])
+            if unit and rec["row_index"] + 1 >= unit.get("row_end", math.inf):
+                break
+        result = journal.finish()
+        if unit:
+            return result
+        return _assemble(
+            entry,
+            [result],
+            directory,
+            scratch=scratch,
+            control=request.get("control", False),
+            control_benchmarks=request.get("control_benchmarks"),
         )
-        if request.get("control"):
-            result["control_evidence"] = control_evidence
-        return result
     finally:
+        journal.close()
         index.close()
 
 
 def _control_shards(spool, directory, opportunities):
-    """Plants selected numerically, before retrieval, with no self-search screening."""
+    """Select positive plants numerically; exclude endpoint-preserving negatives."""
     import pyarrow as pa
     import pyarrow.parquet as pq
 
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     db = _open_spool(spool)
-    rows, cases, selected = [], [], set()
+    rows, cases, skipped, selected = [], [], [], set()
     available = set()
     try:
         for (owner,) in db.execute("SELECT rowid FROM series ORDER BY rowid"):
@@ -701,6 +1020,20 @@ def _control_shards(spool, directory, opportunities):
             )
             for label, planted in variants.items():
                 item = f"plant-{owner}-{label}"
+                if label == "interior_miss" and compare_sketches(sketch(planted), sketch(values)):
+                    # A periodic interior can be an actual prefix/suffix copy.
+                    # Key screening excludes exactly the unsupported negative
+                    # premise, without an O(n * period) periodicity search or
+                    # screening any positive plant for retrieval success.
+                    skipped.append(
+                        dict(
+                            item_id=item,
+                            **{"class": label},
+                            benchmark=meta,
+                            reason="interior_endpoint_keys_match_parent",
+                        )
+                    )
+                    continue
                 rows.append(
                     dict(
                         item_id=item,
@@ -736,12 +1069,12 @@ def _control_shards(spool, directory, opportunities):
             cases.append(dict(item_id=label, **{"class": label}, expected=False, benchmark=None))
         path = directory / "train-controls.parquet"
         pq.write_table(pa.Table.from_pylist(rows), path)
-        return cases, sorted(available - selected)
+        return cases, sorted(available - selected), skipped
     finally:
         db.close()
 
 
-def _check_controls(cases, result, unplantable):
+def _check_controls(cases, result, unplantable, skipped=()):
     evidence = result.get("control_evidence", {})
     checked = []
     for case in cases:
@@ -749,19 +1082,44 @@ def _check_controls(cases, result, unplantable):
         records = [
             r for r in records if case["benchmark"] is None or r["benchmark"] == case["benchmark"]
         ]
+        verified = [r for r in records if r["verified"]]
         exact = [
             r
-            for r in records
+            for r in verified
             if r["fit"]["index_start"] == case.get("index_start")
             and r["fit"]["index_end"] == case.get("index_end")
             and r["fit"]["t_start"] == 0
             and r["fit"]["t_end"] == case.get("length")
         ]
-        ok = bool(exact) if case["expected"] else not records
-        checked.append(dict(**case, ok=ok, verified=len(records)))
+        ok = bool(exact) if case["expected"] else not verified
+        rejections = Counter(r["reason"] for r in records if not r["verified"])
+        if ok:
+            reason = "verified" if case["expected"] else "expected_miss"
+        elif not case["expected"]:
+            reason = "unexpected_verified_match"
+        elif verified:
+            reason = "expected_overlap_not_verified"
+        elif rejections:
+            reason = next(iter(rejections)) if len(rejections) == 1 else "verifier_rejected"
+        else:
+            reason = "expected_benchmark_not_proposed"
+        checked.append(
+            dict(
+                **case,
+                ok=ok,
+                verified=len(verified),
+                reason=reason,
+                rejection_reasons=dict(sorted(rejections.items())),
+                retrieval_reasons=dict(
+                    sorted(result.get("control_diagnostics", {}).get(case["item_id"], {}).items())
+                ),
+            )
+        )
     return dict(
         ok=any(c["expected"] for c in cases) and all(c["ok"] for c in checked),
         cases=checked,
+        failures=[c for c in checked if not c["ok"]],
+        skipped_cases=list(skipped),
         unplantable_datasets=unplantable,
         unsupported=[
             "all aggregation phases",
@@ -786,56 +1144,136 @@ def _execute(request):
     return json.loads(result.stdout)
 
 
-def _checkpoint(request, identity):
-    directory = Path(request["directory"])
-    name = _journal_name(request["entry"])
-    marker = directory / f"{name}.json"
+def _saved_result(marker, identity, directory):
     saved = _saved_json(marker)
-    if saved.get("identity") == identity and saved.get("result_digest") == _fingerprint(
-        saved.get("result")
+    result = saved.get("result")
+    if (
+        not isinstance(saved.get("identity"), str)
+        or not saved["identity"]
+        or saved["identity"] != identity
+        or not isinstance(result, dict)
+        or saved.get("result_digest") != _fingerprint(result)
     ):
-        result = saved["result"]
-        path = directory / result["evidence"]["file"]
-        if path.is_file() and digest(path) == result["evidence"]["sha256"]:
-            return result
-    result = _execute(request)
-    atomic_json(marker, dict(identity=identity, result=result, result_digest=_fingerprint(result)))
+        return None
+    evidence = result.get("evidence", {})
+    for item in [evidence, *evidence.get("units", [])]:
+        name = item.get("file", "")
+        path = Path(directory) / name
+        if not name or Path(name).is_absolute() or ".." in Path(name).parts:
+            return None
+        if not path.is_file() or digest(path) != item.get("sha256"):
+            return None
     return result
 
 
+def _checkpoint(request, identity):
+    directory = Path(request["directory"])
+    name = _journal_name(request["entry"])
+    if request.get("unit"):
+        name += "--" + request["unit"]["id"]
+    marker = directory / (name + ".json")
+    result = _saved_result(marker, identity, directory)
+    if result is None:
+        result = _execute(dict(request, checkpoint_identity=identity))
+        atomic_json(
+            marker,
+            dict(identity=identity, result=result, result_digest=_fingerprint(result)),
+            scratch=request.get("scratch"),
+        )
+    return result
+
+
+class _Progress:
+    def __init__(self, state):
+        self.path = Path(state) / "sketch-progress.json"
+        self.scratch = _workspace(state)
+        self.started = time.monotonic()
+        self.pending = {}
+        self.reused_values = 0
+        self.lock, self.stop = threading.Lock(), threading.Event()
+        self.record = dict(
+            phase="setup", units_done=0, units_total=0, channels_done=0, values_done=0, folders={}
+        )
+        self.publish()
+        self.thread = threading.Thread(target=self._heartbeat, daemon=True)
+        self.thread.start()
+
+    def publish(self):
+        with self.lock:
+            elapsed = max(1e-9, time.monotonic() - self.started)
+            snapshot = json.loads(json.dumps(self.record))
+            for (folder, _), (directory, prefix, identity) in self.pending.items():
+                for marker in Path(directory).glob(prefix + "-part*.json"):
+                    saved = _saved_json(marker)
+                    result = saved.get("result", {})
+                    if saved.get("identity") != identity or saved.get(
+                        "result_digest"
+                    ) != _fingerprint(result):
+                        continue
+                    for metric in ("values", "channels"):
+                        amount = result.get("counts", {}).get(metric, 0)
+                        snapshot[metric + "_done"] += amount
+                        snapshot["folders"][folder][metric + "_done"] += amount
+            values = snapshot["values_done"]
+            newly_done = max(0, values - self.reused_values)
+            done, total = snapshot["units_done"], snapshot["units_total"]
+            remaining = sum(
+                max(0, f["values_estimated"] - f["values_done"])
+                for f in snapshot["folders"].values()
+            )
+            snapshot.update(
+                elapsed_seconds=elapsed,
+                updated_unix=time.time(),
+                values_reused=self.reused_values,
+                values_per_minute=newly_done * 60 / elapsed,
+                estimated_seconds_left=0
+                if done == total and snapshot["phase"] == "complete"
+                else (remaining * elapsed / newly_done if newly_done else None),
+            )
+            atomic_json(self.path, snapshot, scratch=self.scratch)
+
+    def _heartbeat(self):
+        while not self.stop.wait(30):
+            self.publish()
+
+    def close(self):
+        self.stop.set()
+        self.thread.join()
+        self.publish()
+
+
 def prediction(index_bytes, benchmark_series):
-    """Conditional planning arithmetic, explicitly NOT a measured cloud forecast."""
+    """Empirically anchored planning ranges; no full-cloud speedup is claimed."""
     return dict(
-        machine="n2d-standard-32 (128 GiB), 16 workers initially",
         measured=False,
-        values=11_400_000_000,
-        channels=13_800_000,
-        benchmark_values=752_000_000,
-        seconds=dict(
-            decode_hash_and_statistics=2400,
-            endpoint_probes=1200,
-            benchmark_build=600,
-            verification_and_transfer=1800,
-        ),
-        predicted_wall_seconds=6000,
-        target_seconds=7200,
-        assumptions=[
-            "whole-machine 5M values/s including Arrow and statistics",
-            "whole-machine 12k channels/s for endpoint keys and lookups",
-            "benchmark extraction/build in 10 minutes; verification + transfers in 30 minutes",
-            "no dominant serial folder, huge common-key region, or slow cold benchmark download",
+        values=11_082_499_857,
+        channels=13_773_320,
+        observed_old_values_per_worker_minute=1_000_000,
+        assumed_overall_speedup=[1, 2],
+        setup_transfer_hours=[0.5, 1],
+        sizing=[
+            dict(machine="n2d-standard-32", workers=16, memory_budget_gib=104, hours=[6.3, 12.7]),
+            dict(machine="n2d-standard-64", workers=32, memory_budget_gib=208, hours=[3.4, 6.8]),
+            dict(machine="n2d-standard-96", workers=48, memory_budget_gib=320, hours=[2.4, 4.9]),
+            dict(machine="c3d-standard-16", workers=8, memory_budget_gib=52, hours=[12.2, 24.3]),
         ],
         index_bytes=index_bytes,
         benchmark_series=benchmark_series,
-        memory="index mapped/shared + at most 6 GiB RSS per worker + 8 GiB reserve; budget admission reduces workers",
-        disk="recommend 200 GiB persistent disk for corpus, benchmark cache, index and journals",
+        assumptions=[
+            "1M values per worker-minute from sketch1; 1–2x overall speedup is conditional",
+            "synthetic gains do not establish full-index, full-corpus throughput",
+            "independent row-group scheduling keeps physical cores busy; cloud CPU scaling unmeasured",
+            "C3D quota 24 admits standard-16; standard-30 exceeds quota",
+        ],
+        memory="mapped index charged to each worker; 8 GiB parent reserve; unchanged whole-row reader/watchdog",
+        disk="500 GiB pending measured compressed evidence volume",
         cloud_must_confirm=[
-            "full-index build time/bytes",
-            "largest-folder throughput and decoder peak RSS",
-            "candidate/verification rate and capped buckets",
-            "controls through full crowded index",
-            "GCS and cold benchmark transfer time",
-            "whole pass <=2h; otherwise revise forecast",
+            "full-index and controls time",
+            "per-shape candidate rate and throughput",
+            "evidence volume and transfer rate",
+            "RSS and largest-group tail",
+            "preemption recovery and status upload",
+            "four-hour finish is not established",
         ],
     )
 
@@ -856,53 +1294,42 @@ def _markdown(report):
         lines.append(
             f"| {folder['folder']} | {folder['status']} | {counts.get('channels', 0)} | {counts.get('verified_matches', 0)} | {counts.get('unverified_candidates', 0)} |"
         )
+    for case in report["controls"]["failures"]:
+        benchmark = case["benchmark"] or {}
+        parent = "/".join(str(benchmark.get(k, "")) for k in ("dataset", "item_id", "column"))
+        lines.append(
+            f"\nFailed control {case['item_id']} ({case['class']}, {parent}): {case['reason']}; "
+            f"retrieval={case['retrieval_reasons']}; rejections={case['rejection_reasons']}."
+        )
     lines.extend(
         [
             "",
             *LIMITATIONS,
             "",
-            "Conditional forecast: 100 minutes on n2d-standard-32; not measured. See JSON assumptions.",
-            "Every proposed pair was refitted on original values. Numerical similarity is evidence, not proof of provenance.",
+            "Conditional estimate: 2.4–4.9 hours on n2d-standard-96; full-cloud throughput unverified. See JSON assumptions.",
+            "Pairs certain to fail the verifier non-identifying gate are counted explicitly; other admitted pairs are refitted on original values. Numerical similarity is evidence, not proof of provenance.",
         ]
     )
     return "\n".join(lines) + "\n"
 
 
-def run_sketch(
+def _run_units(
     root,
     out,
     manifest,
-    benchmarks=None,
+    benchmarks,
     *,
-    state=None,
-    workers=1,
-    memory_budget_bytes=DEFAULT_MEMORY_BUDGET_BYTES,
-    require_pinned=False,
+    state,
+    workers,
+    memory_budget_bytes,
+    require_pinned,
+    nonidentifying_shortcut,
+    only_folders,
+    skip_finished,
+    progress,
 ):
-    """Run triage. Exit zero means execution/controls only, NEVER release permission.
-
-    Public CLI verifies published bytes before entering this function. Direct
-    calls support offline synthetic trees and still bind all shard bytes.
-    """
     import pyarrow.parquet as pq
 
-    validate_manifest(manifest)
-    if not isinstance(workers, int) or isinstance(workers, bool) or workers < 1:
-        raise ValueError("workers must be a positive integer")
-    MemoryBudget(memory_budget_bytes)
-    root, out = Path(root), Path(out)
-    state = Path(state or out / "state")
-    for destination in (state, out):
-        if (
-            root.resolve() == destination.resolve()
-            or root.resolve() in destination.resolve().parents
-        ):
-            raise ValueError("sidecars, state and reports must stay outside the corpus tree")
-    state.mkdir(parents=True, exist_ok=True)
-    out.mkdir(parents=True, exist_ok=True)
-    # Remove stale final reports even if preparation or a worker fails.
-    for name in ("sketch-report.json", "sketch-report.md"):
-        (out / name).unlink(missing_ok=True)
     spool, benchmark_identity = prepare_benchmarks(
         state, benchmarks, memory_budget_bytes=memory_budget_bytes, require_pinned=require_pinned
     )
@@ -910,18 +1337,53 @@ def run_sketch(
     built = build_index(
         spool, index_dir, benchmark_identity, memory_budget_bytes=memory_budget_bytes
     )
-    identities, corpus_bytes = {}, 0
-    for entry in manifest["folders"]:
+    identities, corpus_bytes, plans = {}, 0, {}
+    entries = sorted(manifest["folders"], key=lambda e: e["folder"])
+    selected = set(only_folders) if only_folders is not None else {e["folder"] for e in entries}
+    unknown = selected - {e["folder"] for e in entries}
+    if unknown:
+        raise ValueError(f"unknown only-folders: {sorted(unknown)}")
+    for entry in entries:
         files = sorted(folder_path(root, entry).glob("*.parquet"))
         if not files:
             raise ValueError(f"missing corpus shards: {entry['folder']}")
         identities[entry["folder"]] = {p.name: digest(p) for p in files}
-        for path in files:
-            parquet = pq.ParquetFile(path)
-            corpus_bytes += parquet.metadata.serialized_size + sum(
-                parquet.metadata.row_group(i).total_byte_size for i in range(parquet.num_row_groups)
-            )
-            parquet.close()
+        units = []
+        for shard in files:
+            row_offset = 0
+            with pq.ParquetFile(shard) as parquet:
+                corpus_bytes += parquet.metadata.serialized_size
+                for group in range(parquet.num_row_groups):
+                    meta = parquet.metadata.row_group(group)
+                    corpus_bytes += meta.total_byte_size
+                    values = sum(
+                        meta.column(i).num_values
+                        for i in range(meta.num_columns)
+                        if meta.column(i).path_in_schema.split(".")[0] in {"target", "covariates"}
+                    )
+                    # Bound the scheduling tail as well as the checkpoint loss.
+                    # Native reading stays unchanged; a range may re-decode its
+                    # group's prefix, but never fingerprints/verifies that prefix.
+                    per_row = max(1, math.ceil(values / max(1, meta.num_rows)))
+                    step = max(1, min(UNIT_ROWS, UNIT_VALUES // per_row))
+                    for start in range(0, meta.num_rows, step):
+                        end = min(meta.num_rows, start + step)
+                        name = f"{shard.stem}-rg{group:06d}"
+                        if start or end != meta.num_rows:
+                            name += f"-r{start:09d}-{end:09d}"
+                        units.append(
+                            dict(
+                                id=name,
+                                shard=shard.name,
+                                row_group=group,
+                                row_start=row_offset + start,
+                                row_end=row_offset + end,
+                                rows=end - start,
+                                values=per_row * (end - start),
+                            )
+                        )
+                    row_offset += meta.num_rows
+        plans[entry["folder"]] = units
     opportunities = (
         max(1, corpus_bytes) * max(1, benchmark_identity["points"]) * (2 * MAX_PHASES * 16)
     )
@@ -940,13 +1402,16 @@ def run_sketch(
             reader=digest(Path(__file__).with_name("native.py")),
         ),
     )
+    identity["nonidentifying_shortcut"] = nonidentifying_shortcut
     key = _fingerprint(identity)
-    sidecars = state / "sketch-controls"
-    # Controls are deliberately rerun on EVERY invocation, including resumes.
-    cases, unplantable = _control_shards(spool, sidecars, opportunities)
-    evidence_dir = out / "evidence"
-    evidence_dir.mkdir(exist_ok=True)
-    # Conservative admission: include the shared mapping in every worker quota.
+    atomic_json(
+        state / "sketch-input.json",
+        dict(identity=identity, fingerprint=key),
+        scratch=_workspace(state),
+    )
+    evidence_dir, unit_dir = out / "evidence", out / "evidence/units"
+    unit_dir.mkdir(parents=True, exist_ok=True)
+    scratch = _workspace(state)
     reserve = min(8 * 1024**3, memory_budget_bytes // 4)
     minimum = built["bytes"] + 256 * 1024**2
     active = min(workers, max(1, (memory_budget_bytes - reserve) // minimum))
@@ -955,20 +1420,48 @@ def run_sketch(
         raise ValueError("memory budget cannot admit one sketch worker and the mapped index")
     common = dict(
         directory=str(evidence_dir),
+        scratch=str(scratch),
         index=str(index_dir),
         spool=str(spool),
         opportunities=opportunities,
         budget=quota,
+        nonidentifying_shortcut=nonidentifying_shortcut,
     )
-    control_request = dict(
-        **common,
-        entry=dict(folder="univariate/controls", status="sidecar"),
-        folder_path=str(sidecars),
-        control=True,
-    )
-    controls = _check_controls(cases, _execute(control_request), unplantable)
-    db = _open_spool(spool)
+    controls_marker = state / "sketch-controls.json"
+    controls_key = _fingerprint(dict(identity=identity, shortcut=nonidentifying_shortcut))
+    cached_controls = _saved_json(controls_marker)
+    control_result = _saved_result(controls_marker, controls_key, evidence_dir)
+    if control_result is not None and cached_controls.get("controls_digest") == _fingerprint(
+        cached_controls.get("controls")
+    ):
+        controls = cached_controls["controls"]
+    else:
+        sidecars = scratch / "controls"
+        cases, unplantable, skipped = _control_shards(spool, sidecars, opportunities)
+        request = dict(
+            **common,
+            entry=dict(folder="univariate/controls", status="sidecar"),
+            folder_path=str(sidecars),
+            control=True,
+            control_benchmarks={c["item_id"]: c["benchmark"] for c in cases},
+        )
+        control_result = _execute(request)
+        controls = _check_controls(cases, control_result, unplantable, skipped)
+        # Failed controls are evidence, never reusable proof of execution.
+        if controls["ok"]:
+            atomic_json(
+                controls_marker,
+                dict(
+                    identity=controls_key,
+                    result=control_result,
+                    result_digest=_fingerprint(control_result),
+                    controls=controls,
+                    controls_digest=_fingerprint(controls),
+                ),
+                scratch=scratch,
+            )
     datasets = {}
+    db = _open_spool(spool)
     try:
         for (encoded,) in db.execute("SELECT meta FROM series"):
             meta = json.loads(encoded)
@@ -977,21 +1470,209 @@ def run_sketch(
             group["domains"].add(meta["domain"])
     finally:
         db.close()
-    entries = sorted(manifest["folders"], key=lambda e: e["folder"])
+    completed, requests, results = {}, [], {}
+    with progress.lock:
+        progress.record.update(
+            phase="scanning",
+            units_total=sum(len(u) for u in plans.values()),
+            folders={
+                e["folder"]: dict(
+                    units_done=0,
+                    units_total=len(plans[e["folder"]]),
+                    values_done=0,
+                    channels_done=0,
+                    values_estimated=sum(u["values"] for u in plans[e["folder"]]),
+                )
+                for e in entries
+            },
+        )
 
-    def run(entry):
-        request = dict(**common, entry=entry, folder_path=str(folder_path(root, entry)))
-        try:
-            result = _checkpoint(request, key)
-            result["routing"] = routing(
-                entry, datasets, result["corpus_frequencies"], result["corpus_sources"]
+    def advance(folder, result, units=1, unit_id=None):
+        with progress.lock:
+            if unit_id is not None:
+                progress.pending.pop((folder, unit_id), None)
+            f = progress.record["folders"][folder]
+            f["units_done"] += units
+            for name in ("values", "channels"):
+                amount = result["counts"].get(name, 0)
+                f[name + "_done"] += amount
+                progress.record[name + "_done"] += amount
+            progress.record["units_done"] += units
+
+    for entry in entries:
+        folder = entry["folder"]
+        marker = evidence_dir / (_journal_name(entry) + ".json")
+        finished = (
+            _saved_result(marker, key, evidence_dir)
+            if skip_finished or only_folders is None
+            else None
+        )
+        if finished is not None:
+            completed[folder] = finished
+            advance(folder, finished, len(plans[folder]))
+            continue
+        if folder not in selected:
+            raise ValueError(
+                f"unselected folder {folder}: no reusable finished summary with matching identity/evidence"
             )
-            return result
-        except (RuntimeError, OSError, ValueError) as exc:
-            return dict(folder=entry["folder"], status=entry["status"], error=str(exc))
+        results[folder] = {}
+        for unit in plans[folder]:
+            request = dict(
+                common,
+                directory=str(unit_dir),
+                entry=entry,
+                folder_path=str(folder_path(root, entry)),
+                unit=unit,
+            )
+            unit_key = _fingerprint(
+                dict(identity=identity, unit=unit, shortcut=nonidentifying_shortcut)
+            )
+            saved = _saved_result(
+                unit_dir / (_journal_name(entry) + "--" + unit["id"] + ".json"), unit_key, unit_dir
+            )
+            if saved is not None:
+                results[folder][unit["id"]] = saved
+                advance(folder, saved)
+            else:
+                requests.append((request, unit_key))
+    requests.sort(
+        key=lambda pair: (
+            -pair[0]["unit"]["values"],
+            pair[0]["entry"]["folder"],
+            pair[0]["unit"]["id"],
+        )
+    )
+    errors = {}
+    progress.reused_values = progress.record["values_done"]
+
+    def dispatch(request, unit_key):
+        unit_id = request["unit"]["id"]
+        prefix = _journal_name(request["entry"]) + "--" + unit_id
+        # Apply the worker's exact validation, outside the progress lock.
+        # Corrupt/missing fragments will be recomputed and must count as new.
+        number, reused = 0, 0
+        while True:
+            marker = Path(request["directory"]) / (prefix + f"-part{number:06d}.json")
+            saved = _saved_result(marker, unit_key, request["directory"])
+            if saved is None:
+                break
+            reused += saved["counts"].get("values", 0)
+            number += 1
+        with progress.lock:
+            progress.pending[(request["entry"]["folder"], unit_id)] = (
+                request["directory"],
+                prefix,
+                unit_key,
+            )
+            progress.reused_values += reused
+        return _checkpoint(request, unit_key)
 
     with ThreadPoolExecutor(max_workers=active) as pool:
-        folders = list(pool.map(run, entries))
+        futures = {
+            pool.submit(dispatch, request, unit_key): request for request, unit_key in requests
+        }
+        for future in as_completed(futures):
+            request = futures[future]
+            folder = request["entry"]["folder"]
+            try:
+                result = future.result()
+                results[folder][request["unit"]["id"]] = result
+                advance(folder, result, unit_id=request["unit"]["id"])
+            except (RuntimeError, OSError, ValueError) as exc:
+                errors.setdefault(folder, []).append(str(exc))
+    folders = []
+    for entry in entries:
+        folder = entry["folder"]
+        if folder in errors:
+            folders.append(
+                dict(folder=folder, status=entry["status"], error="; ".join(sorted(errors[folder])))
+            )
+            continue
+        if folder in completed:
+            result = completed[folder]
+        else:
+            units = []
+            for unit in plans[folder]:
+                rec = results[folder][unit["id"]]
+                rec = dict(
+                    rec, evidence=dict(rec["evidence"], file="units/" + rec["evidence"]["file"])
+                )
+                units.append(rec)
+            result = _assemble(entry, units, evidence_dir, scratch=scratch)
+            atomic_json(
+                evidence_dir / (_journal_name(entry) + ".json"),
+                dict(identity=key, result=result, result_digest=_fingerprint(result)),
+                scratch=scratch,
+            )
+        result["routing"] = routing(
+            entry, datasets, result["corpus_frequencies"], result["corpus_sources"]
+        )
+        folders.append(result)
+    return folders, controls, built, benchmark_identity, key
+
+
+def run_sketch(
+    root,
+    out,
+    manifest,
+    benchmarks=None,
+    *,
+    state=None,
+    workers=1,
+    memory_budget_bytes=DEFAULT_MEMORY_BUDGET_BYTES,
+    require_pinned=False,
+    nonidentifying_shortcut=True,
+    only_folders=None,
+    skip_finished=False,
+):
+    """Run triage. Exit zero means execution/controls only, NEVER release permission.
+
+    Public CLI verifies published bytes before entering this function. Direct
+    calls support offline synthetic trees and still bind all shard bytes.
+    """
+    validate_manifest(manifest)
+    if not isinstance(workers, int) or isinstance(workers, bool) or workers < 1:
+        raise ValueError("workers must be a positive integer")
+    MemoryBudget(memory_budget_bytes)
+    root, out = Path(root), Path(out)
+    state = Path(state or out / "state")
+    for destination in (state, out):
+        if (
+            root.resolve() == destination.resolve()
+            or root.resolve() in destination.resolve().parents
+        ):
+            raise ValueError("sidecars, state and reports must stay outside the corpus tree")
+    state.mkdir(parents=True, exist_ok=True)
+    out.mkdir(parents=True, exist_ok=True)
+    # Remove stale final reports even if preparation or a worker fails.
+    for name in ("sketch-report.json", "sketch-report.md"):
+        (out / name).unlink(missing_ok=True)
+    progress = _Progress(state)
+    try:
+        folders, controls, built, benchmark_identity, key = _run_units(
+            root,
+            out,
+            manifest,
+            benchmarks,
+            state=state,
+            workers=workers,
+            memory_budget_bytes=memory_budget_bytes,
+            require_pinned=require_pinned,
+            nonidentifying_shortcut=nonidentifying_shortcut,
+            only_folders=only_folders,
+            skip_finished=skip_finished,
+            progress=progress,
+        )
+        with progress.lock:
+            progress.record["phase"] = (
+                "complete" if all("error" not in f for f in folders) else "failed"
+            )
+    except BaseException:
+        with progress.lock:
+            progress.record["phase"] = "failed"
+        raise
+    finally:
+        progress.close()
     totals = {}
     for status in ("allowed", "quarantined"):
         counts = Counter()
@@ -1027,8 +1708,10 @@ def run_sketch(
             ranked_limit=TOP,
         ),
     )
-    atomic_json(out / "sketch-report.json", report)
-    (out / "sketch-report.md").write_text(_markdown(report))
+    atomic_json(out / "sketch-report.json", report, scratch=_workspace(state))
+    markdown = _workspace(state) / "sketch-report.md"
+    markdown.write_text(_markdown(report))
+    markdown.replace(out / "sketch-report.md")
     return report, 0 if execution_ok else 2
 
 
@@ -1039,6 +1722,12 @@ def main(argv=None):
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     parser.add_argument("--state", type=Path)
     parser.add_argument("--workers", type=int, default=16)
+    parser.add_argument(
+        "--only-folders",
+        nargs="+",
+        help="native folder paths; other folders require verified completed summaries",
+    )
+    parser.add_argument("--skip-finished", action="store_true")
     parser.add_argument(
         "--memory-budget-gib", type=memory_budget_arg, default=DEFAULT_MEMORY_BUDGET_BYTES
     )
@@ -1054,6 +1743,8 @@ def main(argv=None):
         workers=args.workers,
         memory_budget_bytes=args.memory_budget_gib,
         require_pinned=True,
+        only_folders=args.only_folders,
+        skip_finished=args.skip_finished,
     )
     print(
         f"PROVISIONAL triage: execution_ok={report['execution_ok']}; elapsed={time.monotonic() - started:.1f}s; NOT clearance"

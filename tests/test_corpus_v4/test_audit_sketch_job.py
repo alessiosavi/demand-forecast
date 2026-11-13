@@ -141,3 +141,39 @@ elif args[:2] == ["-m", "scripts.corpus_v4.audit_fev_overlap"]:""",
     assert all(
         not (c["name"] == "gcloud" and c["args"][-1].startswith("gs://fake-corpus")) for c in calls
     )
+
+
+def test_guest_passes_subset_flags_and_publishes_progress(tmp_path, monkeypatch):
+    guest, _, invoke = audit_job_tests.environment_guest.__wrapped__(tmp_path, monkeypatch)
+    tool = tmp_path / "bin/python3"
+    source = tool.read_text().replace(
+        'elif args[:2] == ["-m", "scripts.corpus_v4.audit_fev_overlap"]:',
+        """elif args[:2] == ["-m", "scripts.corpus_v4.audit_sketch"]:
+    assert args[args.index("--only-folders") + 1:] == ["univariate/gpm-mergir", "univariate/era5"]
+    assert "--skip-finished" in args
+    target = pathlib.Path(args[3])
+    state = pathlib.Path(args[args.index("--state") + 1])
+    (state / "sketch-progress.json").write_text('{"units_done": 1, "units_total": 2}')
+    (target / "sketch-report.json").write_text(json.dumps(dict(artifact_type="corpus-sketch-triage", provisional=True, release_eligible=False, execution_ok=True)))
+    (target / "sketch-report.md").write_text("PROVISIONAL")
+elif args[:2] == ["-m", "scripts.corpus_v4.audit_fev_overlap"]:""",
+    )
+    tool.write_text(source)
+    (tmp_path / "job.sh").write_text(
+        render(
+            "a" * 40,
+            "gs://fake-corpus/job",
+            "gs://fake-report/job",
+            only_folders=["univariate/gpm-mergir", "univariate/era5"],
+            skip_finished=True,
+        )
+    )
+    result, calls = invoke()
+    assert result.returncode == 0, result.stderr
+    assert any(
+        c["name"] == "gcloud"
+        and c["args"][:2] == ["storage", "cp"]
+        and c["args"][-1] == "gs://fake-report/job/sketch-progress.json"
+        for c in calls
+    )
+    assert (guest / "state/sketch-progress.json").is_file()

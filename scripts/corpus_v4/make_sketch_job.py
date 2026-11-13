@@ -33,6 +33,8 @@ def render(
     benchmark_state_prefix=None,
     workers=16,
     memory_budget_gib=104,
+    only_folders=None,
+    skip_finished=False,
 ):
     """Generate reviewable shell for the RUN_DIR/STATE_URI host runner contract.
 
@@ -54,6 +56,23 @@ def render(
         if _overlap(state_prefix, corpus_prefix) or _overlap(state_prefix, report_prefix):
             raise ValueError("state, report and corpus prefixes must be separate")
     benchmark_state_prefix = _prefix(benchmark_state_prefix) if benchmark_state_prefix else ""
+    if benchmark_state_prefix and any(
+        _overlap(benchmark_state_prefix, prefix)
+        for prefix in (corpus_prefix, report_prefix, state_prefix)
+        if prefix
+    ):
+        raise ValueError("benchmark state, state, report and corpus prefixes must be separate")
+    if only_folders is not None and (
+        not only_folders
+        or any(
+            not re.fullmatch(r"(?:univariate|covariates)/[A-Za-z0-9][A-Za-z0-9._-]*", f)
+            for f in only_folders
+        )
+    ):
+        raise ValueError("only-folders must be canonical native folder paths")
+    selection = " --skip-finished" if skip_finished else ""
+    if only_folders:
+        selection += " --only-folders " + " ".join(only_folders)
     expected_state = state_prefix or ""
     return f"""#!/usr/bin/env bash
 # PROVISIONAL triage only. This job cannot certify training or release.
@@ -66,9 +85,11 @@ REPORT_URI='{report_prefix}'
 EXPECTED_STATE_URI='{expected_state}'
 BENCHMARK_STATE_URI='{benchmark_state_prefix}'
 # Check external destinations before installation, transfer or publication.
-python3 - "$CORPUS_URI" "$REPORT_URI" "$STATE_URI" "$EXPECTED_STATE_URI" <<'SKETCH_DESTINATIONS'
+python3 - "$CORPUS_URI" "$REPORT_URI" "$STATE_URI" "$EXPECTED_STATE_URI" "$BENCHMARK_STATE_URI" <<'SKETCH_DESTINATIONS'
 import re, sys
 uris = [s.rstrip("/") for s in sys.argv[1:4]]
+if sys.argv[5]:
+    uris.append(sys.argv[5].rstrip("/"))
 for uri in uris:
     if not re.fullmatch(r"gs://[a-z0-9][a-z0-9._-]+(?:/[A-Za-z0-9._/-]+)?", uri):
         raise ValueError("invalid sketch destination")
@@ -93,15 +114,43 @@ CORPUS="$RUN_DIR/sketch-corpus"
 REPORT="$RUN_DIR/state/sketch"
 ATTEMPT_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 mkdir -p "$REPORT"
+STATUS_WORK="$RUN_DIR/sketch-status-work"
+mkdir -p "$STATUS_WORK"
+PROGRESS_PID=''
+publish_progress() {{
+    if [[ -f "$RUN_DIR/state/sketch-progress.json" ]]; then
+        gcloud storage cp "$RUN_DIR/state/sketch-progress.json" "$REPORT_URI/sketch-progress.json" || true
+        gcloud storage cp "$RUN_DIR/state/sketch-progress.json" "$STATE_URI/sketch-progress.json" || true
+    fi
+}}
+# Track the active child so cleanup also stops sleep/transfer, without orphans.
+progress_loop() {{
+    child=''
+    trap 'if [[ -n "$child" ]]; then kill "$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true; fi; exit 0' TERM INT
+    while true; do
+        sleep 60 &
+        child=$!
+        wait "$child" || break
+        for destination in "$REPORT_URI/sketch-progress.json" "$STATE_URI/sketch-progress.json"; do
+            if [[ -f "$RUN_DIR/state/sketch-progress.json" ]]; then
+                gcloud storage cp "$RUN_DIR/state/sketch-progress.json" "$destination" &
+                child=$!
+                wait "$child" || true
+            fi
+        done
+    done
+}}
+progress_loop >/dev/null 2>&1 &
+PROGRESS_PID=$!
 rm -f "$REPORT/sketch-report.json" "$REPORT/sketch-report.md"
 write_status() {{
-    python3 - "$REPORT/sketch-status.json" "$ATTEMPT_ID" "$REPO_SHA" "$1" <<'SKETCH_STATUS'
+    python3 - "$REPORT/sketch-status.json" "$ATTEMPT_ID" "$REPO_SHA" "$1" "$STATUS_WORK" <<'SKETCH_STATUS'
 import json, pathlib, sys
 path = pathlib.Path(sys.argv[1])
 record = dict(artifact_type="corpus-sketch-triage", provisional=True, release_eligible=False,
               attempt_id=sys.argv[2], repo_sha=sys.argv[3], process_exit_code=int(sys.argv[4]),
               execution_ok=sys.argv[4] == "0")
-tmp = path.with_suffix(".tmp")
+tmp = pathlib.Path(sys.argv[5]) / "status.tmp"
 tmp.write_text(json.dumps(record, sort_keys=True) + "\\n")
 tmp.replace(path)
 SKETCH_STATUS
@@ -110,6 +159,11 @@ finish() {{
     status=$?
     trap - EXIT
     set +e
+    if [[ -n "$PROGRESS_PID" ]]; then
+        kill "$PROGRESS_PID" 2>/dev/null
+        wait "$PROGRESS_PID" 2>/dev/null
+    fi
+    publish_progress
     # Evidence precedes the final completion status. Upload failures stay failures.
     gcloud storage rsync --recursive --exclude='[.]tmp$|sketch-status[.]json$' "$REPORT" "$REPORT_URI" || status=3
     gcloud storage rsync --recursive --exclude='[.]tmp$|sketch-status[.]json$' "$RUN_DIR/state" "$STATE_URI" || status=3
@@ -146,17 +200,20 @@ gcloud storage rsync --recursive "$CORPUS_URI" "$CORPUS"
 # Reuse old spool bytes only with a revision-bound identity marker.
 if [[ -n "$BENCHMARK_STATE_URI" && ! -f "$RUN_DIR/state/benchmark.sketch-identity.json" ]]; then
     if gcloud storage ls "$BENCHMARK_STATE_URI/benchmark.sketch-identity.json" >/dev/null 2>&1; then
+        mkdir -p "$RUN_DIR/sketch-benchmark-import"
         for name in benchmark.sqlite benchmark.values benchmark.stamps benchmark.sketch-identity.json; do
-            gcloud storage cp "$BENCHMARK_STATE_URI/$name" "$RUN_DIR/state/$name"
+            gcloud storage cp "$BENCHMARK_STATE_URI/$name" "$RUN_DIR/sketch-benchmark-import/$name"
+            mv "$RUN_DIR/sketch-benchmark-import/$name" "$RUN_DIR/state/$name"
         done
     else
         echo 'Benchmark spool has no verifiable identity marker; rebuild from pinned cache/loader.' >&2
-        gcloud storage rsync --recursive "$BENCHMARK_STATE_URI/benchmark-cache" "$RUN_DIR/state/benchmark-cache"
+        mkdir -p "$RUN_DIR/.state-sketch-work/benchmark-cache"
+        gcloud storage rsync --recursive "$BENCHMARK_STATE_URI/benchmark-cache" "$RUN_DIR/.state-sketch-work/benchmark-cache"
     fi
 fi
 # audit_sketch CLI invokes verify_published BEFORE any benchmark loading/scanning.
 python -m scripts.corpus_v4.audit_sketch "$CORPUS" "$REPORT" --state "$RUN_DIR/state" \\
-    --workers {workers} --memory-budget-gib {float(memory_budget_gib):g}
+    --workers {workers} --memory-budget-gib {float(memory_budget_gib):g}{selection}
 test -f "$REPORT/sketch-report.json"
 test -f "$REPORT/sketch-report.md"
 python - "$REPORT/sketch-report.json" <<'SKETCH_CONTRACT'
@@ -179,6 +236,8 @@ def main(argv=None):
     parser.add_argument("--state-prefix")
     parser.add_argument("--benchmark-state-prefix")
     parser.add_argument("--workers", type=int, default=16)
+    parser.add_argument("--only-folders", nargs="+")
+    parser.add_argument("--skip-finished", action="store_true")
     parser.add_argument("--memory-budget-gib", type=float, default=104)
     args = parser.parse_args(argv)
     source = render(
@@ -189,6 +248,8 @@ def main(argv=None):
         benchmark_state_prefix=args.benchmark_state_prefix,
         workers=args.workers,
         memory_budget_gib=args.memory_budget_gib,
+        only_folders=args.only_folders,
+        skip_finished=args.skip_finished,
     )
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(source)

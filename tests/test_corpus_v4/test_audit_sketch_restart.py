@@ -62,7 +62,7 @@ s.scan_folder(json.load(sys.stdin))
     assert code == 0 and resumed == clean
 
 
-def test_resume_rehashes_journal_and_always_reruns_controls(tmp_path, monkeypatch):
+def test_resume_reassembles_corrupt_journal_and_reuses_verified_controls(tmp_path, monkeypatch):
     root, state, out, benchmarks = fixture(tmp_path)
     before, _ = sketch.run_sketch(root, out, manifest(), benchmarks, state=state)
     journal = out / "evidence/univariate--demo.jsonl"
@@ -77,11 +77,11 @@ def test_resume_rehashes_journal_and_always_reruns_controls(tmp_path, monkeypatc
     monkeypatch.setattr(sketch, "_execute", observe)
     after, code = sketch.run_sketch(root, out, manifest(), state=state)
     assert code == 0 and before == after
-    assert calls == ["univariate/controls", "univariate/demo"]
+    assert calls == []
     calls.clear()
     same, code = sketch.run_sketch(root, out, manifest(), state=state)
     assert same == before and code == 0
-    assert calls == ["univariate/controls"]
+    assert calls == []
 
 
 def test_spool_requires_revision_and_byte_identity(tmp_path, monkeypatch):
@@ -225,6 +225,7 @@ def test_source_only_change_replays_old_numerical_decisions(tmp_path, monkeypatc
 
     monkeypatch.setattr(sketch, "digest", revised)
     monkeypatch.setattr(sketch, "_execute", observe)
+    monkeypatch.setattr(sketch, "load_benchmarks", lambda cache: iter(benchmarks))
     after, code = sketch.run_sketch(root, out, manifest(), state=state)
     assert code == 0
     assert index_files == json.loads((state / "sketch-index/index.json").read_text())["files"]
