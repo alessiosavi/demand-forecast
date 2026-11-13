@@ -1,7 +1,9 @@
 """Apply the reviewed patch set only to the exact, unmodified upstream pin."""
 
 import argparse
+import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 
@@ -21,8 +23,17 @@ def prepare(tree: Path, bundle: Path) -> None:
         raise ValueError("empty Simons patch set")
     command = ["git", "-C", str(tree), "apply"]
     paths = [str(p.resolve()) for p in patches]
-    subprocess.run([*command, "--check", *paths], check=True)
-    subprocess.run([*command, *paths], check=True)
+    # Later patches extend files introduced or changed by earlier patches. Check
+    # the complete series in scratch before making any change to the real tree.
+    with tempfile.TemporaryDirectory(prefix="simons-patch-check-") as scratch:
+        for name in ("src", "configs"):
+            shutil.copytree(tree / name, Path(scratch) / name)
+        for patch in paths:
+            check = ["git", "-C", scratch, "apply"]
+            subprocess.run([*check, "--check", patch], check=True)
+            subprocess.run([*check, patch], check=True)
+    for patch in paths:
+        subprocess.run([*command, patch], check=True)
 
 
 if __name__ == "__main__":
