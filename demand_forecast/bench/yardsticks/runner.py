@@ -9,7 +9,8 @@ import time
 import traceback
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
-from importlib.metadata import PackageNotFoundError, version
+from importlib.metadata import PackageNotFoundError, distribution, version
+from importlib.util import find_spec
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Protocol
@@ -24,6 +25,7 @@ from demand_forecast.bench.specs import dataset_fingerprint
 
 PROTOCOL_VERSION = 1
 FEV_SOURCE = "9cf943c388e5cfaf352175ea3c69e408b197d997"
+SIMONS_SOURCE = "8e338e915d26c8960713889ef12ab1cf5c08d591"
 DEFAULT_WEIGHTS = {
     "chronos2": ("amazon/chronos-2", "29ec3766d36d6f73f0696f85560a422f50e8498c"),
     "timestral": ("mistralai/Timestral-5M", "bdd20cfc15a3fea0e4cb5ccef37f8d3ca7aa335f"),
@@ -44,16 +46,26 @@ class Options:
     batch_size: int | None = None
     device: str = "cuda"
     weights_revision: str | None = None
+    processing: str | None = None
 
     def resolved(self) -> Options:
         """Validate choices and fill only published batching/context defaults."""
-        if self.model not in DEFAULT_WEIGHTS:
-            raise ValueError("model must be chronos2 or timestral")
+        if self.model not in (*DEFAULT_WEIGHTS, "simons"):
+            raise ValueError("model must be chronos2, timestral or simons")
+        if self.model == "simons":
+            if self.processing not in ("raw", "published"):
+                raise ValueError("Simons requires --processing raw|published")
+            if self.revision is not None:
+                raise ValueError(
+                    "Simons uses a local exported directory; --revision is unsupported"
+                )
+        elif self.processing is not None:
+            raise ValueError("--processing is supported only for Simons")
         if not self.model_name.strip():
             raise ValueError("model-name must be nonempty")
         if self.covariates not in ("all", "none") or self.cross_series not in ("on", "off"):
             raise ValueError("invalid covariates or cross-series switch")
-        if self.model == "timestral" and self.cross_series == "off":
+        if self.model != "chronos2" and self.cross_series == "off":
             raise ValueError("cross-series off is supported only for Chronos-2")
         if self.device not in ("cpu", "cuda"):
             raise ValueError("device must be cpu or cuda")
@@ -62,7 +74,9 @@ class Options:
             if value is not None and (isinstance(value, bool) or value < 1):
                 raise ValueError(f"{name} must be positive")
         return replace(
-            self, batch_size=self.batch_size or (100 if self.model == "chronos2" else 1024)
+            self,
+            batch_size=self.batch_size
+            or {"chronos2": 100, "timestral": 1024, "simons": 256}[self.model],
         )
 
 
@@ -113,6 +127,18 @@ def file_digest(path: Path) -> str:
 def resolve_weights(options: Options) -> Options:
     """Pin Hub aliases before model loading; content-hash local checkpoint files."""
     path = Path(options.weights).expanduser()
+    if options.model == "simons":
+        if not path.is_dir():
+            raise ValueError("Simons requires a local exported checkpoint directory")
+        names = ("config.json", "model.safetensors")
+        if any(not (path / name).is_file() for name in names):
+            raise ValueError("Simons export must contain config.json and model.safetensors")
+        return replace(
+            options,
+            weights=str(path.resolve()),
+            weights_revision="local-sha256:"
+            + digest({name: file_digest(path / name) for name in names}),
+        )
     if path.is_dir():
         files = {
             str(p.relative_to(path)): file_digest(p)
@@ -137,6 +163,41 @@ def resolve_weights(options: Options) -> Options:
     return replace(options, weights_revision=revision)
 
 
+def _options_payload(options: Options) -> dict:
+    values = asdict(options)
+    # Stage-1 manifests and summaries predate this Simons-only option. Keep their
+    # exact serialization so existing configuration/window hashes still resume.
+    if options.model != "simons":
+        values.pop("processing")
+    return values
+
+
+def _simons_implementation() -> dict:
+    # Distribution versions alone do not distinguish upstream commits or edits
+    # in editable installs. Inspect source without importing/loading the model.
+    commit = None
+    try:
+        direct_url = distribution("simons").read_text("direct_url.json")
+        if direct_url:
+            commit = json.loads(direct_url).get("vcs_info", {}).get("commit_id")
+    except PackageNotFoundError:
+        pass
+    try:
+        spec = find_spec("simons")
+    except ValueError:
+        # Recording modules injected by offline tests may have no __spec__.
+        spec = None
+    files = {}
+    if spec is not None and spec.origin is not None:
+        root = Path(spec.origin).parent
+        files = {
+            str(path.relative_to(root)): file_digest(path)
+            for path in sorted(root.rglob("*.py"))
+            if path.is_file()
+        }
+    return {"vcs_commit": commit, "source_sha256": digest(files) if files else None}
+
+
 def runtime_identity(options: Options) -> dict:
     """Include the inference implementation and numerical runtime in resume checks."""
     packages = {}
@@ -147,18 +208,24 @@ def runtime_identity(options: Options) -> dict:
         "pandas",
         "pyarrow",
         "torch",
-        "chronos-forecasting" if options.model == "chronos2" else "timestral",
+        {"chronos2": "chronos-forecasting", "timestral": "timestral", "simons": "simons"}[
+            options.model
+        ],
     ):
         try:
             packages[name] = version(name)
         except PackageNotFoundError:
             packages[name] = "not-installed"
-    return {
-        "options": asdict(options),
+    identity = {
+        "options": _options_payload(options),
         "packages": packages,
         "protocol_version": PROTOCOL_VERSION,
         "published_adapter_source": FEV_SOURCE,
     }
+    if options.model == "simons":
+        identity["simons_source"] = SIMONS_SOURCE
+        identity["simons_implementation"] = _simons_implementation()
+    return identity
 
 
 def _safe_name(name: str) -> None:
@@ -345,9 +412,11 @@ def read_window(
 
 
 def _adapter(options, task):
-    from .adapters import Chronos2Adapter, TimestralAdapter
+    from .adapters import Chronos2Adapter, SimonsAdapter, TimestralAdapter
 
-    return (Chronos2Adapter if options.model == "chronos2" else TimestralAdapter)(options, task)
+    return {"chronos2": Chronos2Adapter, "timestral": TimestralAdapter, "simons": SimonsAdapter}[
+        options.model
+    ](options, task)
 
 
 def run_yardstick(
@@ -400,6 +469,15 @@ def run_yardstick(
             ):
                 raise ValueError(f"{name}: run identity mismatch; task or dataset changed")
             windows = prepare_windows(task, options)
+            input_metadata = {}
+            if options.model == "simons":
+                # Count column occurrences per item/window, before the adapter
+                # splits oversized groups; no model load is needed on resume.
+                input_metadata["dropped_past_only_covariates"] = sum(
+                    len(item.past.keys() - item.future.keys())
+                    for window in windows
+                    for item in window.items
+                )
             # Include the median internally even for tasks requesting other levels.
             levels = sorted(set(task.quantile_levels) | {0.5})
             paths = [directory / f"window_{i}.npz" for i in range(len(windows))]
@@ -473,7 +551,8 @@ def run_yardstick(
                 run_identity=identity,
                 yardstick_protocol=PROTOCOL_VERSION,
                 configuration_identity=run["configuration_identity"],
-                **asdict(options),
+                **_options_payload(options),
+                **input_metadata,
             )
             # model is the adapter selector; model_name remains the user's label.
             record = {
@@ -484,6 +563,8 @@ def run_yardstick(
                 "levels": levels,
                 "window_sha256": {p.name: file_digest(p) for p in paths},
             }
+            if options.model == "simons":
+                record["input_metadata"] = input_metadata
             _save_failures(record_path, record)
             row = pd.DataFrame([summary])
             frame = row if frame.empty else pd.concat([frame, row], ignore_index=True)

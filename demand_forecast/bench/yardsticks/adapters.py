@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Portions adapted from autogluon/fev (Copyright Amazon.com, Inc. or its affiliates).
+# Simons conversion follows Abel-ai-lab/Simons (Copyright 2026 Abel AI Lab).
+# This product includes software developed at Abel AI Lab (https://abel.ai).
 # Modified for shared ablations and audit inputs; see LICENSE-APACHE-2.0.
 """Published fev adapters, with explicit shared-runner ablations.
 
@@ -10,12 +12,12 @@ fev implementation. Model libraries are imported only when loading weights.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 import pandas as pd
 
-from .runner import Options, WindowInput
+from .runner import SIMONS_SOURCE, Options, WindowInput
 
 
 def _numpy(value):
@@ -84,6 +86,102 @@ class Chronos2Adapter:
                 inputs=inputs, prediction_length=horizon, quantile_levels=levels, **kwargs
             )
             result.append([_numpy(a) for a in q])
+        return result
+
+
+class SimonsAdapter:
+    """Local Simons exports with isolated item groups and explicit processing."""
+
+    def __init__(self, options: Options, task):
+        self.options = options.resolved()
+        try:
+            from simons import Simons, forecast_series
+        except ImportError as exc:
+            raise ImportError(
+                "Simons inference is optional; install "
+                f"'simons @ git+https://github.com/Abel-ai-lab/Simons.git@{SIMONS_SOURCE}'"
+            ) from exc
+        self.model = Simons.from_pretrained(options.weights, device=options.device)
+        self.forecast_series = forecast_series
+        if options.processing == "raw":
+            # The public API accepts a views override only. Replace the frozen
+            # config in one operation (xreg_guard requires xreg) for all six rules.
+            # Learned covariate modules and intrinsic normalization are retained.
+            self.model.config = replace(
+                self.model.config,
+                views=False,
+                sign_clip=False,
+                integer_snap=False,
+                fit_row=False,
+                xreg=False,
+                xreg_guard=False,
+            )
+
+    def prepare(self, task):
+        """No dataset-wide category inference; upstream encodes each input window."""
+
+    def predict(
+        self, windows: list[WindowInput], horizon: int, levels: list[float]
+    ) -> list[list[np.ndarray]]:
+        """Match pinned fev quantile sorting/interpolation and known-covariate roles."""
+        result = []
+        model_levels = np.arange(1, 10) / 10
+        for window in windows:
+            series, covariates, sizes = [], [], []
+            for item in window.items:
+                target = item.target
+                if self.options.max_context is not None:
+                    target = target[:, -self.options.max_context :]
+                known = {}
+                if self.options.covariates == "all":
+                    for column, future in item.future.items():
+                        if len(future) < horizon:
+                            raise ValueError(
+                                f"{column}: known covariate is shorter than the horizon"
+                            )
+                        known[column] = np.concatenate(
+                            [
+                                np.asarray(item.past[column][-target.shape[-1] :], dtype=object),
+                                np.asarray(future[:horizon], dtype=object),
+                            ]
+                        )
+                # Contiguous blocks match forecast_items' MAX_VARIATES=32 split.
+                # Never concatenate targets from different fev items into a group.
+                blocks = [target[i : i + 32].astype(np.float32) for i in range(0, len(target), 32)]
+                series.extend(blocks)
+                covariates.extend([known or None] * len(blocks))
+                sizes.append(len(blocks))
+            outputs = self.forecast_series(
+                self.model,
+                series,
+                horizon,
+                future_covariates=covariates,
+                # Past-only covariates are unsupported. Counts live in run.json.
+                past_covariates=None,
+                shared_categories=False,
+                batch_size=self.options.batch_size,
+            )
+            if len(outputs) != len(series):
+                raise ValueError("Simons forecast group count mismatch")
+            values = []
+            for target, output in zip(series, outputs, strict=True):
+                q = np.sort(np.asarray(output), axis=-1)
+                if q.shape != (len(target), horizon, 9):
+                    raise ValueError("Simons forecast shape mismatch")
+                values.append(
+                    np.stack(
+                        [
+                            np.apply_along_axis(lambda a: np.interp(level, model_levels, a), -1, q)
+                            for level in levels
+                        ],
+                        axis=-1,
+                    )
+                )
+            items, start = [], 0
+            for size in sizes:
+                items.append(np.concatenate(values[start : start + size], axis=0))
+                start += size
+            result.append(items)
         return result
 
 
