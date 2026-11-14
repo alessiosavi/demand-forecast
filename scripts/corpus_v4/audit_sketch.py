@@ -45,12 +45,14 @@ from scripts.corpus_v4.native import (
 )
 from scripts.corpus_v4.verify_published import verify_published
 
-METHOD = "provisional-endpoints-1"
+METHOD = "provisional-endpoints-fidelity-2"
 ARTIFACT = "corpus-sketch-triage"
 LENGTHS = (24, 64, 256)
 POSTING_CAP = 64
 TOP = 20
 MATCH_SAMPLE = 100
+FIDELITY_RTOL = 0.005
+FIDELITY_FRACTION = 0.99
 CHECKPOINT_ROWS = 512
 CHECKPOINT_VALUES = 2_000_000
 UNIT_VALUES = 16_000_000
@@ -67,6 +69,9 @@ LIMITATIONS = [
     "No fixed-ratio or calendar aggregation is computed; every phase is unsupported.",
     "Common keys are capped and recorded; summary ranking is a bounded heuristic.",
     "Constants, ramps and calendar-only patterns are non-identifying by existing policy.",
+    "Fidelity requires benchmark variation, including outside the retrieval key; lost rare events can reject an otherwise 99%-equal pair.",
+    "Range-relative fidelity can miss small steps dwarfed by larger excursions; numerical conditioning and tiny modal groups can reject copies.",
+    "Numerical fidelity is not provenance; unchanged retrieval and information gates still exclude some true copies.",
 ]
 
 
@@ -248,6 +253,81 @@ def compare_sketches(query, benchmark):
     return [candidates[k] for k in sorted(candidates)]
 
 
+def _variation_fidelity(a, b, positions, overlap_length, proposal, fit):
+    """One global map must reproduce the benchmark's variation in every region.
+
+    Positions refer to the unmasked overlap. No absolute tolerance or r2 floor
+    enters this decision. Identity preserves the original 99%-agreement branch;
+    the modal median map resists edits at otherwise uninformative positions.
+    """
+    levels, counts = np.unique(b, return_counts=True)
+    mode = float(levels[counts.argmax()])
+    span = float(np.ptp(b))
+    events = np.abs(b - mode) > FIDELITY_RTOL * span
+    window = None
+    inside = np.zeros(len(b), dtype=bool)
+    side, _, width = proposal.partition("/")
+    if side in ("prefix", "suffix") and width.isdigit():
+        width = min(int(width), overlap_length)
+        window = [0, width] if side == "prefix" else [overlap_length - width, overlap_length]
+        inside = (positions >= window[0]) & (positions < window[1])
+    result = dict(
+        passed=False,
+        relative_tolerance=FIDELITY_RTOL,
+        minimum_fraction=FIDELITY_FRACTION,
+        benchmark_mode=mode,
+        benchmark_range=span,
+        retrieval_window=window,
+        off_modal_points=int(events.sum()),
+        off_modal_inside=int((events & inside).sum()) if window else None,
+        off_modal_outside=int((events & ~inside).sum()) if window else None,
+        maps=[],
+    )
+    if not span > 0 or not math.isfinite(span):
+        return result
+
+    def assess(method, predicted, parameters):
+        with np.errstate(over="ignore", invalid="ignore"):
+            reproduced = np.isfinite(predicted) & (np.abs(b - predicted) / span <= FIDELITY_RTOL)
+
+        def fraction(mask):
+            return float(reproduced[mask].mean()) if mask.any() else None
+
+        rec = dict(
+            method=method,
+            parameters=parameters,
+            reproduced_fraction=float(reproduced.mean()),
+            off_modal_fraction=fraction(events),
+            inside_off_modal_fraction=fraction(events & inside) if window else None,
+            outside_off_modal_fraction=fraction(events & ~inside) if window else None,
+        )
+        rec["passed"] = all(
+            value is None or value >= FIDELITY_FRACTION
+            for key, value in rec.items()
+            if key.endswith("fraction")
+        )
+        result["maps"].append(rec)
+        result["passed"] |= rec["passed"]
+
+    coef = fit["coef"]
+    with np.errstate(over="ignore", invalid="ignore"):
+        assess("least_squares", coef[0] * a + coef[1], dict(coef=coef))
+    if not result["passed"] and fit["exact_frac"] >= old.EXACT_FRACTION:
+        assess("identity", a, dict(coef=[1.0, 0.0]))
+    if not result["passed"] and events.any():
+        anchor = float(np.median(a[b == mode]))
+        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+            inverse_slope = float(np.median((a[events] - anchor) / (b[events] - mode)))
+            if math.isfinite(inverse_slope) and inverse_slope != 0:
+                # Anchored evaluation avoids cancellation from a large intercept.
+                assess(
+                    "modal_median",
+                    (a - anchor) / inverse_slope + mode,
+                    dict(corpus_anchor=anchor, benchmark_anchor=mode, inverse_slope=inverse_slope),
+                )
+    return result
+
+
 def verify_candidate(
     x,
     y,
@@ -260,7 +340,7 @@ def verify_candidate(
     benchmark_owner=None,
     benchmark_cache=None,
 ):
-    """Reuse the original fit and every subsequent numerical identification gate.
+    """Reuse every original gate, then require benchmark variation fidelity.
 
     No Index/scan_group retrieval is reused. Original values and original masks
     are refitted over the endpoint alignment's entire overlap.
@@ -297,19 +377,24 @@ def verify_candidate(
                         offset=off,
                         distance=candidate.distance,
                         fit=None,
+                        fidelity=None,
+                        old_rule_accepted=False,
                         shortcut="verifier_nondegenerate_on_joint_overlap",
                         information_threshold=audit_info.INFO_MARGIN_BITS
                         + math.log2(max(1, opportunities)),
                     )
     rec = old.fit_segment(x, y, max(0, off), min(len(x), len(y) + off), off)
     reason = "numerical_fit_rejected"
+    fidelity = None
     if rec is not None:
         rec.pop("_info_values", None)
+        a = x[rec["t_start"] : rec["t_end"]]
+        b = y[rec["index_start"] : rec["index_end"]]
+        finite = np.isfinite(a) & np.isfinite(b)
+        positions = np.flatnonzero(finite)
+        a, b = a[finite], b[finite]
+        fidelity = _variation_fidelity(a, b, positions, len(finite), candidate.reason, rec)
         if rec["is_copy"]:
-            a = x[rec["t_start"] : rec["t_end"]]
-            b = y[rec["index_start"] : rec["index_end"]]
-            finite = np.isfinite(a) & np.isfinite(b)
-            a, b = a[finite], b[finite]
             if dimensions is not None and old.calendar_pattern(
                 b, dimensions[rec["index_start"] : rec["index_end"]][finite]
             ):
@@ -334,6 +419,9 @@ def verify_candidate(
             k: (None if isinstance(v, float) and not math.isfinite(v) else v)
             for k, v in rec.items()
         }
+    old_rule_accepted = reason == "verified"
+    if old_rule_accepted and not fidelity["passed"]:
+        reason = "variation_fidelity_rejected"
     return dict(
         verified=reason == "verified",
         reason=reason,
@@ -341,6 +429,8 @@ def verify_candidate(
         offset=off,
         distance=candidate.distance,
         fit=rec,
+        fidelity=fidelity,
+        old_rule_accepted=old_rule_accepted,
         information_threshold=audit_info.INFO_MARGIN_BITS + math.log2(max(1, opportunities)),
     )
 
@@ -695,6 +785,7 @@ def _assemble(entry, units, directory, *, scratch, control=False, control_benchm
     fd, name = tempfile.mkstemp(dir=scratch)
     counts, reasons = Counter(), Counter()
     ranked, matches, control_evidence = _Ranking(), [], {}
+    fidelity_rejections = []
     control_diagnostics = {}
     control_benchmarks = control_benchmarks or {}
     aliases, sources = set(), set()
@@ -755,6 +846,10 @@ def _assemble(entry, units, directory, *, scratch, control=False, control_benchm
                                 matches.append(evidence)
                         else:
                             reasons[evidence["reason"]] += 1
+                            if evidence["reason"] == "variation_fidelity_rejected":
+                                counts["fidelity_rejections"] += 1
+                                if len(fidelity_rejections) < MATCH_SAMPLE:
+                                    fidelity_rejections.append(evidence)
                             ranked.add(evidence)
         Path(name).replace(final)
     finally:
@@ -765,6 +860,7 @@ def _assemble(entry, units, directory, *, scratch, control=False, control_benchm
         counts=dict(sorted(counts.items())),
         reasons=dict(sorted(reasons.items())),
         matches=matches,
+        fidelity_rejections=fidelity_rejections,
         ranked_unverified=ranked.records,
         evidence=dict(
             file=final.name,
@@ -1021,6 +1117,56 @@ def scan_folder(request):
         index.close()
 
 
+def _fidelity_plants(values):
+    """Shape-specific plants; eligibility is checked by the unchanged old gates."""
+    finite = np.isfinite(values)
+    levels, counts = np.unique(values[finite], return_counts=True)
+    if len(levels) != 2:
+        return None, {}
+    mode = levels[counts.argmax()]
+    events = finite & (values != mode)
+    if np.array_equal(levels, [0, 1]) and events.sum() <= len(values) * 0.005:
+        kind = "sparse_flag"
+    elif np.isclose(levels[1] - levels[0], 0.01, rtol=0.01, atol=0):
+        kind = "cent_step"
+    else:
+        return None, {}
+    # Preserve both endpoints and every benchmark event in the edited plants.
+    modal = np.flatnonzero(finite & ~events)
+    eligible = modal[(modal >= 256) & (modal < len(values) - 256)]
+    n_edits = len(values) // 100
+    if not n_edits or len(eligible) < n_edits:
+        return kind, {}
+    span = float(levels[1] - levels[0])
+    edited = values.copy()
+    edited[eligible[:n_edits]] += 20 * span
+    affine_edited = values * 2.5 + 7
+    affine_edited[eligible[:n_edits]] += (0.001 if kind == "sparse_flag" else 2) * span
+    variants = dict(
+        exact=(values, True),
+        affine_positive=(values * 2.5 + 7, True),
+        affine_negative=(values * -1.75 - 3, True),
+        edited_1pct=(edited, True),
+        affine_edited_1pct=(affine_edited, True),
+    )
+    negative = values.copy()
+    if kind == "sparse_flag":
+        widths = [w for w in LENGTHS if events[:w].sum() == 1]
+        if widths and len(eligible) >= 3:
+            width = widths[0]
+            negative[width:] = np.where(finite[width:], mode, np.nan)
+            negative[eligible[-3:]] = mode + span * np.array([2, 3, 4])
+            variants["coincidence"] = (negative, False)
+    else:
+        # Same run pattern in the key, independent run pattern afterwards.
+        rng = np.random.default_rng(418)
+        runs = rng.integers(4, 32, len(values))
+        negative[256:] = np.repeat(levels[np.arange(len(values)) % 2], runs)[: len(values) - 256]
+        negative[~finite] = np.nan
+        variants["coincidence"] = (negative, False)
+    return kind, variants
+
+
 def _control_shards(spool, directory, opportunities):
     """Select positive plants numerically; exclude endpoint-preserving negatives."""
     import pyarrow as pa
@@ -1030,12 +1176,52 @@ def _control_shards(spool, directory, opportunities):
     directory.mkdir(parents=True, exist_ok=True)
     db = _open_spool(spool)
     rows, cases, skipped, selected = [], [], [], set()
+    fidelity_selected = set()
     available = set()
+
+    def add_case(owner, meta, label, planted, expected, index_start=0):
+        item = f"plant-{owner}-{label}"
+        rows.append(
+            dict(
+                item_id=item,
+                source="benchmark-sidecar-control",
+                freq=meta["freq"] or "unknown",
+                target=[planted.tolist()],
+            )
+        )
+        cases.append(
+            dict(
+                item_id=item,
+                **{"class": label},
+                benchmark=meta,
+                expected=expected,
+                index_start=index_start,
+                index_end=index_start + len(planted),
+                length=len(planted),
+            )
+        )
+
     try:
         for (owner,) in db.execute("SELECT rowid FROM series ORDER BY rowid"):
             meta, values, dimensions = _series(db, spool, owner)
             available.add(meta["dataset"])
-            if meta["dataset"] in selected or not 96 <= len(values) <= 65536:
+            if not 96 <= len(values) <= 65536:
+                continue
+            if len(fidelity_selected) < 2:
+                kind, variants = _fidelity_plants(values)
+                if variants and kind not in fidelity_selected:
+                    admitted = verify_candidate(
+                        values,
+                        values,
+                        Candidate(0, "raw"),
+                        opportunities=opportunities,
+                        dimensions=dimensions,
+                    )["old_rule_accepted"]
+                    if admitted:
+                        fidelity_selected.add(kind)
+                        for label, (planted, expected) in variants.items():
+                            add_case(owner, meta, f"fidelity_{kind}_{label}", planted, expected)
+            if meta["dataset"] in selected:
                 continue
             eligible = True
             for start, end in (
@@ -1090,24 +1276,13 @@ def _control_shards(spool, directory, opportunities):
                         )
                     )
                     continue
-                rows.append(
-                    dict(
-                        item_id=item,
-                        source="benchmark-sidecar-control",
-                        freq=meta["freq"] or "unknown",
-                        target=[planted.tolist()],
-                    )
-                )
-                cases.append(
-                    dict(
-                        item_id=item,
-                        **{"class": label},
-                        benchmark=meta,
-                        expected=label != "interior_miss",
-                        index_start=cut if label == "suffix" else 0,
-                        index_end=len(values) if label == "suffix" else len(planted),
-                        length=len(planted),
-                    )
+                add_case(
+                    owner,
+                    meta,
+                    label,
+                    planted,
+                    label != "interior_miss",
+                    cut if label == "suffix" else 0,
                 )
         for label, values in (
             ("constant", np.ones(512)),
@@ -1378,13 +1553,13 @@ def _markdown(report):
         "",
         f"Execution and controls passed: {report['execution_ok']}. Release eligible: false.",
         "",
-        "| Folder | Policy | Channels | Verified | Unverified |",
-        "|---|---|---:|---:|---:|",
+        "| Folder | Policy | Channels | Verified | Unverified | Fidelity rejected |",
+        "|---|---|---:|---:|---:|---:|",
     ]
     for folder in report["folders"]:
         counts = folder.get("counts", {})
         lines.append(
-            f"| {folder['folder']} | {folder['status']} | {counts.get('channels', 0)} | {counts.get('verified_matches', 0)} | {counts.get('unverified_candidates', 0)} |"
+            f"| {folder['folder']} | {folder['status']} | {counts.get('channels', 0)} | {counts.get('verified_matches', 0)} | {counts.get('unverified_candidates', 0)} | {counts.get('fidelity_rejections', 0)} |"
         )
     for case in report["controls"]["failures"]:
         benchmark = case["benchmark"] or {}
@@ -1814,6 +1989,12 @@ def run_sketch(
             statistics="length, positional mask/raw digests, quantiles, zeros, changes, longest run, acf(1,7)",
             posting_cap=POSTING_CAP,
             ranked_limit=TOP,
+            fidelity=dict(
+                relative_tolerance=FIDELITY_RTOL,
+                minimum_fraction=FIDELITY_FRACTION,
+                maps=["least_squares", "identity", "modal_median"],
+                regions=["whole", "inside_endpoint", "outside_endpoint"],
+            ),
         ),
     )
     atomic_json(out / "sketch-report.json", report, scratch=_workspace(state))
