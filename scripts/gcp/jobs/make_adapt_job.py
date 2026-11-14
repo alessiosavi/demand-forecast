@@ -697,10 +697,12 @@ def generate(
     if not patches:
         raise ValueError("missing patch bundle")
     files = {p.relative_to(BUNDLE).as_posix(): p.read_text() for p in [*paths, *patches]}
-    packed = gzip.compress(json.dumps(files, sort_keys=True).encode(), mtime=0)
-    bundle_sha = hashlib.sha256(packed).hexdigest()
-    guest = gzip.compress(GUEST.encode(), mtime=0)
-    guest_sha = hashlib.sha256(guest).hexdigest()
+    content = json.dumps(files, sort_keys=True).encode()
+    bundle_sha = hashlib.sha256(content).hexdigest()
+    packed = gzip.compress(content, mtime=0)
+    guest_content = GUEST.encode()
+    guest_sha = hashlib.sha256(guest_content).hexdigest()
+    guest = gzip.compress(guest_content, mtime=0)
     config = dict(
         name=name,
         repo_sha=repo_sha,
@@ -745,8 +747,8 @@ root = pathlib.Path(sys.argv[1])
 for encoded, expected, target in (("{base64.b64encode(guest).decode()}", "{guest_sha}", "adapt.py"),
                                    ("{base64.b64encode(packed).decode()}", "{bundle_sha}", None)):
     payload = base64.b64decode(encoded)
-    assert hashlib.sha256(payload).hexdigest() == expected
     content = gzip.decompress(payload)
+    assert hashlib.sha256(content).hexdigest() == expected
     if target:
         (root / target).write_bytes(content)
     else:

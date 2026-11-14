@@ -129,7 +129,14 @@ Jobs fetch upstream source, never model weights.
 Hub and datasets offline modes prevent implicit model/dataset downloads. The
 patch bundle is embedded, so the job does not need credentials for our repository.
 The supplied repository SHA records provenance; the embedded bundle SHA records
-the exact patch bytes, including changes not yet committed when generated.
+the SHA-256 of the uncompressed, sorted-key JSON of the bundle members, including
+changes not yet committed when generated. Gzip is transport only: the guest
+decompresses the payload and verifies that digest before extracting members.
+Identical sources have the same digest across Python/zlib versions and compression
+levels. This changes the digest value from jobs generated before this change,
+which hashed compressed bytes; old digest values are not accepted by the new
+bundle verifier. This does not make old training state incompatible: the existing
+resume checks tolerate changed bundle provenance, as described below.
 
 The guest restores `<STATE_URI>/` to `$RUN_DIR/state/`, copies it back every ten
 minutes, and once more on exit. The job itself neither creates machines nor
@@ -353,7 +360,8 @@ Use a separate state prefix for each recipe and N. Full 25M/12M generated shell
 is covered by e5959bb golden hashes, with these explicit byte exceptions:
 embedded bundle/digest (new patch and installer), identity checks on the fast
 completion path, removal of stale local audit receipts before corpus sync,
-and HOME/kernel-cache defaults. Full training recipe settings are unchanged.
+HOME/kernel-cache defaults, and bundle verification over uncompressed bytes.
+Full training recipe settings are unchanged.
 Already-generated jobs and the two existing patches are not edited.
 
 ## Corpus audit gate
@@ -436,6 +444,14 @@ weights do not imply a new exposure pass.
 `scripts/gcp/jobs/make_score_job.py` generates one self-contained executable job
 for the same guest contract. Generation is offline. Choose a **published repository
 commit containing the Simons yardstick adapter**; the chain branch predates it.
+The embedded guest SHA-256 covers its uncompressed Python source bytes. The guest
+decompresses and verifies those bytes before writing the scoring program; gzip
+settings and Python/zlib versions do not affect its identity digest.
+The digest differs from jobs generated before this change, which hashed compressed
+bytes. The input identity check refuses such scoring state under the same name,
+except for the existing compatibility path accepting the `139f3f7` guest digest.
+No additional old-digest compatibility is introduced; use a new name/state prefix
+for refused state.
 For example, with operator-supplied immutable revisions and input hashes:
 
 ```bash
