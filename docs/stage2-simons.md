@@ -475,8 +475,11 @@ downloads them again. A completed marker's early exit checks only recorded state
 it does not contact the checkpoint source or detect changes there. Use a new score
 name/state prefix to score a changed checkpoint. The task YAML and optional
 one-name-per-line selection require SHA-256 hashes. Omit both names switches to
-select the complete YAML. `--max-context N` is the only extra inference switch;
-it must be a positive integer.
+select the complete YAML. `--max-context N` must be a positive integer.
+`--covariates {all,none}` defaults to `all`; for Simons, `none` withholds both
+the history and future of known covariates, rather than applying a future-only mask.
+The covariates choice is part of the input identity, so changing it requires a
+new score name/state prefix.
 
 The job starts with the training environment's system-site-packages venv and uv
 fallback for missing ensurepip. The full yardstick requirements cannot run on
