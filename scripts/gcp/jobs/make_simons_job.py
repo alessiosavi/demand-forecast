@@ -14,6 +14,63 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 BUNDLE = ROOT / "third_party/simons"
 LEGS = ("stage1", "stage2", "stage3", "stage4", "stage4-long", "qualify", "export")
+OVERRIDE_LEGS = {
+    "covariate_weight": ("stage3", "stage4", "stage4-long"),
+    "covariate_mix": ("stage3", "stage4", "stage4-long"),
+    "long_weight": ("stage4", "stage4-long"),
+}
+
+
+def canonical_condition(name, overrides):
+    """Encode the closed set of fork overrides independently of input spelling."""
+    if name is None and not overrides:
+        return None
+    if name is None or not overrides:
+        raise ValueError("condition and overrides require both or neither")
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,31}", name):
+        raise ValueError("invalid condition name")
+    values = {}
+    for item in overrides:
+        key, separator, value = item.partition("=")
+        if not separator or key not in OVERRIDE_LEGS or key in values:
+            raise ValueError("unknown or duplicate override key")
+        try:
+            numbers = [float(x) for x in value.split(",")]
+        except ValueError as error:
+            raise ValueError("override must contain finite numbers") from error
+        if not all(math.isfinite(x) for x in numbers):
+            raise ValueError("override must contain finite numbers")
+        if key == "covariate_mix":
+            if (
+                len(numbers) != 3
+                or any(x < 0 or x > 1 for x in numbers)
+                or abs(sum(numbers) - 1) > 1e-9
+            ):
+                raise ValueError("covariate_mix requires three shares summing to one")
+        elif len(numbers) != 1 or not 0 < numbers[0] <= 1:
+            raise ValueError("override weight must be in (0, 1]")
+        values[key] = ",".join(repr(x) for x in numbers)
+    return {"name": name, "overrides": dict(sorted(values.items()))}
+
+
+def validate_fork_options(size, leg, recipe, condition, override, attempt, unsafe, corpus_uri):
+    result = canonical_condition(condition, override)
+    if result is not None or attempt is not None:
+        if (
+            size != "25m"
+            or recipe != "full"
+            or leg not in (*OVERRIDE_LEGS["covariate_weight"], "export")
+        ):
+            raise ValueError("fork flags require 25m full stage3, stage4, stage4-long or export")
+    if attempt is not None:
+        if not isinstance(attempt, str) or not attempt.strip():
+            raise ValueError("provisional attempt id must be nonempty")
+        if unsafe:
+            raise ValueError("provisional and qualification corpus flags are mutually exclusive")
+        if not corpus_uri:
+            raise ValueError("provisional receipt requires a corpus URI")
+    return result
+
 
 ENVIRONMENT = r"""# Keep the image's CUDA-matched torch, including its local version suffix.
 python3 - "$scratch/image-torch.json" "$scratch/torch-constraint.txt" <<'SIMONS_IMAGE'
@@ -92,6 +149,9 @@ def generate(
     recipe="full",
     screen_updates=None,
     unsafe_qualification_allow_unaudited_corpus=False,
+    condition=None,
+    override=None,
+    provisional_unaudited_corpus_attempt=None,
 ):
     """Return executable shell text embedding the complete pinned source patch bundle."""
     pin = (BUNDLE / "PINNED").read_text().strip()
@@ -112,6 +172,16 @@ def generate(
         raise ValueError("invalid seed, micro-batches, warm-up or checkpoint minutes")
     if recipe not in ("full", "screen"):
         raise ValueError("invalid recipe")
+    condition_record = validate_fork_options(
+        size,
+        leg,
+        recipe,
+        condition,
+        override,
+        provisional_unaudited_corpus_attempt,
+        unsafe_qualification_allow_unaudited_corpus,
+        corpus_uri,
+    )
     if size == "60m" and recipe == "screen":
         raise ValueError("60M short schedule needs a registered protocol")
     if screen_updates is not None and recipe != "screen":
@@ -172,6 +242,15 @@ def generate(
         arguments += ["--recipe", recipe, "--screen-updates", str(screen_updates)]
     if unsafe_qualification_allow_unaudited_corpus:
         arguments += ["--unsafe-qualification-allow-unaudited-corpus"]
+    if condition_record is not None:
+        arguments += ["--condition", condition_record["name"]]
+        for key, value in condition_record["overrides"].items():
+            arguments += ["--override", f"{key}={value}"]
+    if provisional_unaudited_corpus_attempt is not None:
+        arguments += [
+            "--provisional-unaudited-corpus-attempt",
+            provisional_unaudited_corpus_attempt,
+        ]
     if qualify_step is not None:
         arguments += ["--qualify-step", str(qualify_step)]
     if corpus_uri:
@@ -200,6 +279,56 @@ try:
         for key, value in (("size", {size!r}), ("seed", {seed!r}), ("upstream_pin", {pin!r})):
             if key in saved and saved[key] != value:
                 raise ValueError("experiment identity changed")
+    # Compare all available identity records, including the marker when a
+    # manifest is present. A refusal falls through to the guest's full checks.
+    condition = {condition_record!r}
+    attempt = {provisional_unaudited_corpus_attempt!r}
+    uri = {corpus_uri!r}
+    provisional = None if attempt is None else dict(provisional=True,
+        warning="UNAUDITED_CORPUS_PROVISIONAL", attempt_id=attempt, corpus_uri=uri.rstrip("/"))
+    records = [r for r in (saved, marker.get("job_identity")) if r is not None]
+    if "condition" in marker or "corpus_release" in marker:
+        records.append(dict(condition=marker.get("condition"), corpus_release=marker.get("corpus_release")))
+    records.extend(marker.get("member_job_identities", []))
+    records.extend(dict(condition=marker.get("condition"), corpus_release=receipt)
+                   for receipt in marker.get("member_corpus_releases", []))
+    if sys.argv[2] == "export":
+        for leg in ("stage4", "stage4-long"):
+            for name in ("identity.json", "completed.json"):
+                path = root.parent / leg / name
+                if path.is_file():
+                    member = json.loads(path.read_text())
+                    if name == "identity.json":
+                        records.append(member)
+                    else:
+                        if member.get("job_identity") is not None:
+                            records.append(member["job_identity"])
+                        if "condition" in member or "corpus_release" in member:
+                            records.append(dict(condition=member.get("condition"),
+                                                corpus_release=member.get("corpus_release")))
+    if not records and (condition is not None or provisional is not None):
+        raise ValueError("missing fork identity")
+    receipts = []
+    for record in records:
+        if record.get("condition") != condition:
+            raise ValueError("condition identity changed")
+        receipt = record.get("corpus_release")
+        if provisional is not None or (receipt or {{}}).get("provisional"):
+            # Status values come from the guest's corpus handshake, not job arguments.
+            if (provisional is None or not isinstance(receipt, dict)
+                    or set(receipt) != {{*provisional, "attempt_complete", "attempt_exit_code"}}
+                    or any(receipt[key] != value for key, value in provisional.items())):
+                raise ValueError("provisional receipt identity changed")
+        receipts.append(receipt)
+    if receipts and condition is not None and any(r != receipts[0] for r in receipts):
+        raise ValueError("condition receipt records disagree")
+    audited = [r for r in receipts if r is not None]
+    if audited and any(r != audited[0] for r in audited):
+        raise ValueError("corpus receipt records disagree")
+    if condition is not None or provisional is not None:
+        # A digest authenticates bytes, not agreement with the embedded identity.
+        # Let the patched guest read checkpoints before accepting fork completion.
+        raise ValueError("fork completion requires embedded identity verification")
     if sys.argv[2] == "export":
         names = ["config.json", "model.safetensors"]
         valid = all((root / n).stat().st_size == marker["artifacts"][n] > 0 for n in names)
@@ -281,6 +410,9 @@ def main():
     parser.add_argument("--recipe", choices=["full", "screen"], default="full")
     parser.add_argument("--screen-updates", type=int)
     parser.add_argument("--unsafe-qualification-allow-unaudited-corpus", action="store_true")
+    parser.add_argument("--condition")
+    parser.add_argument("--override", action="append")
+    parser.add_argument("--provisional-unaudited-corpus-attempt")
     parser.add_argument("--leg", required=True, choices=LEGS)
     parser.add_argument("--seed", required=True, type=int)
     parser.add_argument("--micro-batches", type=int, default=1)

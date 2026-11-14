@@ -29,6 +29,12 @@ The complete upstream change set is:
   selection). Reuses the earlier durable checkpoint helpers. The previous
   three patches remain unchanged.
 
+- `0005-fork-conditions.patch`: add fork conditions for legs 3-5 and the export
+  (a named condition with overrides of a closed list of covariate-pass keys,
+  applied after the leg's YAML is loaded), the labelled provisional corpus
+  receipt, their identity records, and the transition, resume, completion and
+  export-member checks. The previous four patches remain unchanged.
+
 `prepare.py TREE BUNDLE` verifies the exact upstream HEAD and rejects source or
 config drift. It checks and applies the ordered series to a temporary source copy before
 applying any patch to the supplied tree. This allows later patches to extend
