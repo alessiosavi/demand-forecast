@@ -296,6 +296,8 @@ def test_cancellation_reports_before_signal_and_nested_reap(
 
             def checked_terminate():
                 check_cancellation(os.getpgrp())
+                # The nested path names the direct child it ends, not the shared group.
+                assert f"terminating nested local process {child.pid}" in messages[-1]
                 terminate()
 
             def checked_wait(timeout=None):

@@ -32,7 +32,7 @@ def diagnostic(message):
         pass  # A closed diagnostic pipe must never release the death barrier.
 
 
-def diagnose_cancellation(group, error, pending):
+def diagnose_cancellation(group, error, pending, nested_child=None):
     if isinstance(error, subprocess.TimeoutExpired):
         reason = f"Time limit ({error.timeout:g}s) reached"
     elif pending is not None:
@@ -41,7 +41,14 @@ def diagnose_cancellation(group, error, pending):
         reason = "Command interrupted"
     else:
         reason = f"Command failed ({type(error).__name__})"
-    diagnostic(f"{reason}; terminating local process group {group}")
+    if nested_child is None:
+        diagnostic(f"{reason}; terminating local process group {group}")
+    else:
+        # A nested supervisor only ends its direct child; the owner ends the group.
+        diagnostic(
+            f"{reason}; terminating nested local process {nested_child}; "
+            f"the owning supervisor ends local process group {group}"
+        )
 
 
 def observe_exit(pid, block=False):
@@ -471,7 +478,9 @@ def run_process(argv, seconds, **kwargs):
                         stdout, stderr = child.communicate(timeout=seconds)
                 except BaseException as exc:
                     if child.returncode is None:
-                        diagnose_cancellation(os.getpgrp(), exc, interrupts.pending)
+                        diagnose_cancellation(
+                            os.getpgrp(), exc, interrupts.pending, nested_child=child.pid
+                        )
                     raise
                 finally:
                     # Only the owner may signal the shared group.
