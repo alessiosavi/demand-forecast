@@ -609,7 +609,52 @@ the rejection histogram, and evidence, with `fit: null` and an explicit `shortcu
 label; no coefficients or fit scores are invented. Exact positional masks and
 bounds key bounded caches; whole-channel degeneracy never substitutes for an
 aligned segment's decision. Other pairs retain every original numerical,
-short-period, calendar, strict-ramp and information gate. No threshold changes.
+short-period, calendar, strict-ramp and information gate. Those thresholds and
+the content audit remain unchanged.
+
+Method **`provisional-endpoints-fidelity-2`** adds a final variation requirement
+after all those gates accept. On the same aligned, jointly finite original
+arrays, let `R` be the benchmark's range and `m` its exact mode (the lowest
+level breaks ties). A position is reproduced when the mapped corpus value is
+within `0.005 * R` of the benchmark; there is **no absolute tolerance floor**.
+Benchmark events are positions more than `0.005 * R` from `m`. One global map
+must reproduce at least **99% of all positions and 99% of events**. For a
+prefix/suffix proposal it must also reproduce 99% of events **inside and
+outside that retrieval window separately**. Window positions precede finite
+mask compaction. An empty event region has a null fraction and adds no
+constraint; an exact copy need not have events outside its key. Raw and summary
+proposals use the whole overlap. A zero or nonfinite benchmark range fails.
+
+The check first assesses the existing least-squares map. If necessary, it also
+assesses identity when the old raw-agreement branch applies, then a robust
+affine map. For the latter, `c` is the median corpus value at benchmark modal
+positions, and `q` is the median of `(corpus-c)/(benchmark-m)` over events;
+the map is `(corpus-c)/q + m`, requiring finite, nonzero `q`. This anchored
+form avoids a large intercept subtraction. This permits positive or negative
+affine scales without a slope threshold, and tolerates edits at modal positions
+that otherwise destroy least squares. Each assessed map must independently
+meet every fraction requirement; different regions cannot choose different
+maps. An r² cutoff alone would wrongly reject copies with a few large edits.
+All old gates must still pass, so this cannot recover a noisy affine copy
+already rejected by the old residual rule.
+
+Every record reaching a fit contains `fidelity`: range, mode, event counts,
+window, assessed maps/parameters, reproduced fractions and pass status. A
+pre-fit rejection has `fidelity: null`. `old_rule_accepted` records acceptance
+by all old gates. A subsequent failure has reason `variation_fidelity_rejected`,
+increments `counts.fidelity_rejections` (also part of unverified counts), and
+enters the folder's separate `fidelity_rejections` sample, capped at the same
+100 records as `matches`. Complete records remain in the unit journals.
+
+Fidelity limitations: deleting more than 1% of benchmark events can reject a
+pair with fewer than 1% total edits. This is intentional: a sparse flag whose
+rare events were replaced does not reproduce benchmark variation. The check
+cannot distinguish that array from an unrelated flag with those same values.
+Small steps dwarfed by a larger excursion can fall below the relative
+tolerance. Tiny modal groups, contaminated modal anchors, rounding and poorly
+conditioned maps can reject genuine copies. This is a descriptive fidelity
+requirement, not a calibrated collision probability or proof of provenance;
+existing information/retrieval exclusions still apply.
 
 Summary buckets use affine-invariant quantile shape and lag-1 correlation. Each
 worker records its closest neighbour as a deferred proposal. Folder assembly
@@ -642,8 +687,8 @@ headers fix timestamp/name, so completed bytes and summaries are deterministic.
 Folder `*.jsonl` journals are small **unit-reference JSONL** files, each line naming
 an immutable unit journal and SHA256. `evidence.format` distinguishes these from
 legacy full pair journals. Unit gzip files retain pair/cap evidence and deferred
-summary events; assembly records admitted counts, first 100 verified matches and
-best 20 unverified pairs. Deferred events excluded by the original admission rule
+summary events; assembly records admitted counts, first 100 verified matches,
+first 100 fidelity rejections and best 20 unverified pairs. Deferred events excluded by the original admission rule
 do not count as proposals. Allowed and quarantined counts remain separate; a
 folder never becomes clean. Full completed journals and their referenced bytes
 are rehashed before reuse. Corrupt folder references can be rebuilt from valid
@@ -672,6 +717,19 @@ rejection reasons and retrieval diagnostics in JSON and Markdown. A prefix copy
 can be missed when its common endpoint postings are capped and the bounded
 summary shortlist does not propose the parent; planting a copy guarantees
 neither retrieval nor verification.
+
+The sidecar also selects independently eligible sparse binary flags and
+two-level prices with approximately one-cent steps, when present in the
+benchmark spool. Shape-labelled `fidelity_sparse_flag_*` and
+`fidelity_cent_step_*` classes plant exact, positive/negative affine, 1%-edited
+and affine-edited copies, preserving benchmark events and sampled endpoints.
+The raw edited copies change modal positions by 20 ranges; affine edits stay
+within the old residual tolerance. Coincidence negatives share a key's event
+or run pattern and differ afterwards. They pass through the same production
+reader/index/worker/verifier and report outcomes by class. Selection does not
+weaken information gates; absent/ineligible shapes are not evidence of coverage.
+Offline regression tests synthesize the levels, modes and event positions from
+refit2's sparse pair 11 and price pair 6, without copying source observations.
 
 The CLI first calls `verify_published` for the **whole** corpus, even with a folder
 selection. Benchmark reuse binds the pinned revision, complete task definitions,
@@ -838,11 +896,17 @@ and 0.281681 → 0.009237 for 8,000 points. The 400-point breakdown is:
 | Journal write | 0.000293 | 0.000114 |
 | Everything else | 0.001294 | 0.000654 |
 
-All ten before/after comparisons (four lengths and controls, twice each) matched
-compressed journals, assembled evidence and folder results byte for byte. The
-19 control cases passed, including 14 verified plants; their outcome reports
-also matched exactly. Measurements ran alongside the offline test suite, so
-these are local wall times with competing CPU activity, not a cloud forecast.
+When that profile was measured, both sides ran method `provisional-endpoints-1`:
+all ten before/after comparisons (four lengths and controls, twice each) matched
+compressed journals, assembled evidence and folder results byte for byte, and
+the 19 control cases passed, including 14 verified plants, with identical
+outcome reports. That statement is about the lookup and history-load change
+only. The current scanner is method `provisional-endpoints-fidelity-2`: its
+records carry fidelity statistics, so running the command above against the
+`b1e07de` baseline now reports a cross-method comparison with the expected
+differences instead of byte identity; byte identity holds only between two
+scanners of the same method. Measurements ran alongside the offline test suite,
+so these are local wall times with competing CPU activity, not a cloud forecast.
 
 The 400-point fixture emits 6.979 records/channel versus the supplied worldtrace
 part's 6.078 (+14.8%); numerical fits are 3.458 versus 2.895 (+19.5%), shortcuts
@@ -851,7 +915,8 @@ Median capped postings are 9,011 versus 9,632. Endpoint proposals are predominan
 24-point hits, underrepresenting the real 64/256-point families. Other fixture
 names describe channel lengths, rather than calibrated folder distributions.
 
-Two result-preserving changes remove the measured costs:
+Two changes, result-preserving under the method they were measured with
+(`provisional-endpoints-1`), remove the measured costs:
 
 - The old structured `hi/lo` view retained the 32-byte posting stride with
   16 bytes of padding. NumPy packed the entire index on each of two searches
@@ -876,12 +941,16 @@ the per-channel query cache has at most 1,217 entries of that mask size (under
 page cache remains 8 MiB. Indivisible large histories and decoder allocations
 still face the unchanged RSS budget checks/watchdog.
 
-The harness compares compressed journals, assembled evidence and complete folder
-results byte for byte. A separate masked/monthly control fixture checks verified
-plants and negative controls, including their full evidence and outcome reports.
-Source-bound production reuse identities still change with the implementation;
-old state must rebuild/replay, and production report fingerprints consequently
-change. No proposal family, posting cap, shortcut policy or verifier gate changes.
+For two scanners of the same method the harness compares compressed journals,
+assembled evidence and complete folder results byte for byte; across methods it
+reports the differences instead. A separate masked/monthly control fixture checks
+verified plants and negative controls, including their full evidence and outcome
+reports. Source-bound production reuse identities still change with the
+implementation; old state must rebuild/replay, and production report fingerprints
+consequently change. The lookup and history-load change itself altered no proposal
+family, posting cap, shortcut policy or verifier gate; the later method
+`provisional-endpoints-fidelity-2` adds the variation-fidelity requirement after
+the existing gates, as described in the method section.
 Cold storage, real owner/mask distributions, long numerical fits and 48-worker
 memory-bandwidth contention require a fresh cloud measurement before forecasting
 the full run.

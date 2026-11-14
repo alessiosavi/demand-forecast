@@ -6,6 +6,9 @@ python -m scripts.corpus_v4.profile_sketch /private/tmp/sketch-profile \
 
 Save the pre-change audit_sketch.py separately for --baseline. No Git mutation
 or source-identity bypass is involved. Timings exclude fixture/index preparation.
+Same-method runs require byte-identical journals. Different method versions
+report their byte differences without treating intentional schema/rule changes
+as a performance regression; inspect their counts as well as their timings.
 """
 
 from __future__ import annotations
@@ -266,6 +269,8 @@ def main(argv=None):
     if min(args.groups, args.decoys, args.repeats, args.channel_scale) <= 0:
         parser.error("groups, decoys, repeats and channel-scale must be positive")
     args.out.mkdir(parents=True)
+    baseline_method = _module(args.baseline).METHOD
+    same_method = baseline_method == current.METHOD
     spool, identity = current.prepare_benchmarks(
         args.out / "state", _benchmarks(args.seed, args.groups, args.decoys)
     )
@@ -273,6 +278,7 @@ def main(argv=None):
     current.build_index(spool, index, identity, memory_budget_bytes=4 * 1024**3)
     postings = _pad_index(index, args.index_postings)
     measurements = []
+    comparisons = []
     workloads = []
     for shape, length, channels in MIXES:
         channels = max(1, round(channels * args.channel_scale))
@@ -320,8 +326,14 @@ def main(argv=None):
             comparison = _compare(
                 args.out / f"{shape}-before-{repeat}", args.out / f"{shape}-after-{repeat}"
             )
+            comparison.update(
+                before_method=baseline_method,
+                after_method=current.METHOD,
+                cross_method=not same_method,
+            )
+            comparisons.append(comparison)
             print(json.dumps(dict(shape=shape, repeat=repeat, comparison=comparison)), flush=True)
-            if not comparison["identical"]:
+            if same_method and not comparison["identical"]:
                 raise AssertionError(comparison)
     worldtrace = next(r for r in measurements if r["shape"] == "worldtrace")
     actual_mix = {
@@ -340,7 +352,8 @@ def main(argv=None):
             k: 100 * (v / reference_mix[k] - 1) for k, v in actual_mix.items()
         },
         measurements=measurements,
-        journals_byte_identical=True,
+        journals_byte_identical=all(c["identical"] for c in comparisons),
+        journal_comparisons=comparisons,
         limitations=[
             "Index padding models byte size, not a million distinct numerical histories.",
             "Explicit wall timers include instrumentation overhead; cold downloads and multi-worker scaling are unmeasured.",
