@@ -464,7 +464,7 @@ def test_full_shell_matches_e5959bb_except_listed_changes(jobs, size):
         # Existing fast completion now checks identity, so full/screen cannot mix.
         if leg != "qualify":
             start = text.index('    identity_path = root / "identity.json"')
-            end = text.index('    if sys.argv[2] == "export":', start)
+            end = text.index('    if sys.argv[2] == "export":\n        names =', start)
             text = text[:start] + text[end:]
         # A repeated local run must not retain receipts missing at the remote prefix.
         text = text.replace(

@@ -292,13 +292,20 @@ try:
     records.extend(marker.get("member_job_identities", []))
     records.extend(dict(condition=marker.get("condition"), corpus_release=receipt)
                    for receipt in marker.get("member_corpus_releases", []))
-    if (condition is not None or provisional is not None) and sys.argv[2] == "export":
+    if sys.argv[2] == "export":
         for leg in ("stage4", "stage4-long"):
             for name in ("identity.json", "completed.json"):
                 path = root.parent / leg / name
                 if path.is_file():
                     member = json.loads(path.read_text())
-                    records.append(member if name == "identity.json" else member["job_identity"])
+                    if name == "identity.json":
+                        records.append(member)
+                    else:
+                        if member.get("job_identity") is not None:
+                            records.append(member["job_identity"])
+                        if "condition" in member or "corpus_release" in member:
+                            records.append(dict(condition=member.get("condition"),
+                                                corpus_release=member.get("corpus_release")))
     if not records and (condition is not None or provisional is not None):
         raise ValueError("missing fork identity")
     receipts = []

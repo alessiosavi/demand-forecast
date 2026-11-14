@@ -226,14 +226,28 @@ diff --git a/src/simons/training/screen.py b/src/simons/training/screen.py
      name, updates = mode(args)
      if (saved.get("recipe_name", "full"), saved.get("screen_updates")) != (name, updates):
          raise ValueError("recipe identity changed; use a separate STATE_URI")
-@@ -115,6 +122,7 @@
+@@ -109,13 +116,20 @@
+         and saved.get("corpus_uri") is not None
+         and hasattr(args, "corpus_uri")
+     ):
+-        if saved["corpus_uri"] != args.corpus_uri:
++        saved_uri, requested_uri = saved["corpus_uri"], args.corpus_uri
++        if (saved.get("corpus_release") or {}).get("provisional"):
++            saved_uri, requested_uri = saved_uri.rstrip("/"), requested_uri.rstrip("/")
++        if saved_uri != requested_uri:
+             raise ValueError("corpus identity changed")
+
  
  def compatible_resume(saved, expected):
      """Retain original full-run provenance, adding the first audited receipt if absent."""
 +    agree([saved, expected])
      old, new = copy.deepcopy(saved), copy.deepcopy(expected)
++    for record in (old, new):
++        if (record.get("corpus_release") or {}).get("provisional"):
++            record["corpus_uri"] = record["corpus_uri"].rstrip("/")
      for key in ("repo_sha", "bundle_sha256"):
          new[key] = old.get(key)
+     if "corpus_release" not in old and "corpus_release" in new:
 diff --git a/src/simons/training/spot_job.py b/src/simons/training/spot_job.py
 --- a/src/simons/training/spot_job.py
 +++ b/src/simons/training/spot_job.py
@@ -281,17 +295,19 @@ diff --git a/src/simons/training/spot_job.py b/src/simons/training/spot_job.py
      if recipe_name == "screen":
          settings.update(screen_settings(root, leg, 25000 if screen_updates is None else screen_updates))
      elif recipe_name != "full" or screen_updates is not None:
-@@ -151,6 +165,9 @@
+@@ -151,6 +165,11 @@
          "corpus_uri": args.corpus_uri,
          "recipe": raw,
      }
++    if provisional_receipt(args) is not None:
++        result["corpus_uri"] = result["corpus_uri"].rstrip("/")
 +    condition = job_condition(args)
 +    if condition is not None:
 +        result["condition"] = condition
      name, updates = mode(args)
      if name == "screen":
          result.update(recipe_name=name, screen_updates=updates)
-@@ -162,6 +179,8 @@
+@@ -162,6 +181,8 @@
  def run_leg(args):
      state = Path(args.run_dir) / "state"
      directory = state / args.leg
@@ -300,7 +316,7 @@ diff --git a/src/simons/training/spot_job.py b/src/simons/training/spot_job.py
      if getattr(args, "unsafe_qualification_allow_unaudited_corpus", False):
          raise ValueError("unsafe corpus override is qualification-only")
      # Completed jobs are no-ops even when local corpus/install scratch has disappeared.
-@@ -169,22 +188,30 @@
+@@ -169,22 +190,30 @@
          try:
              final = completed_checkpoint(directory)
              saved = read_checkpoint(final).get("job_identity")
@@ -332,7 +348,7 @@ diff --git a/src/simons/training/spot_job.py b/src/simons/training/spot_job.py
          manifest_path = directory / "identity.json"
          if manifest_path.exists():
              manifest = json.loads(manifest_path.read_text())
-@@ -205,14 +232,14 @@
+@@ -205,14 +234,14 @@
      else:
          raw = recipe(
              args.root, state, args.corpus, args.size, args.leg, args.seed, args.micro_batches,
@@ -349,7 +365,7 @@ diff --git a/src/simons/training/spot_job.py b/src/simons/training/spot_job.py
              receipt = saved.get("corpus_release")
              if receipt is not None and receipt != args.corpus_release:
                  raise ValueError("corpus audit identity changed between legs")
-@@ -269,6 +296,7 @@
+@@ -269,6 +298,7 @@
      atomic_json(
          directory / "completed.json",
          {
@@ -357,26 +373,30 @@ diff --git a/src/simons/training/spot_job.py b/src/simons/training/spot_job.py
              "checkpoint": FINAL_NAME,
              "step": step,
              "bytes": final.stat().st_size,
-@@ -289,6 +317,18 @@
+@@ -289,6 +319,22 @@
  
      state = Path(args.run_dir) / "state"
      destination = state / "export"
 +    job_condition(args)
 +    records = check_records(destination, args)
-+    if job_condition(args) is not None or provisional_receipt(args) is not None:
-+        for leg in ("stage4", "stage4-long"):
-+            member = state / leg
-+            records.extend(check_records(member, args))
++    for leg in ("stage4", "stage4-long"):
++        member = state / leg
++        records.extend(check_records(member, args))
++        checkpoint = member / FINAL_NAME
++        if not checkpoint.is_file():
 +            checkpoint = latest_checkpoint(member)
-+            if checkpoint is not None:
-+                saved = read_checkpoint(checkpoint).get("job_identity")
-+                check_fork_identity(saved or {}, args)
-+                records.extend(check_records(member, args, embedded=saved))
++        if checkpoint is not None:
++            saved = read_checkpoint(checkpoint).get("job_identity")
++            check_fork_identity(saved or {}, args)
++            records.extend(check_records(member, args, embedded=saved))
++    try:
 +        agree(records)
++    except ForkIdentityError as error:
++        raise ForkIdentityError(f"soup members have different corpus audit identities: {error}") from error
      if (destination / "completed.json").is_file():
          try:
              marker = json.loads((destination / "completed.json").read_text())
-@@ -298,11 +338,15 @@
+@@ -298,11 +344,15 @@
                  for n in ("config.json", "model.safetensors")
              ):
                  return 0
@@ -392,7 +412,7 @@ diff --git a/src/simons/training/spot_job.py b/src/simons/training/spot_job.py
          if saved is None and mode(args)[0] == "screen":
              raise ValueError("missing screen member identity")
          if saved is not None:
-@@ -321,6 +365,9 @@
+@@ -321,6 +371,9 @@
      atomic_json(
          destination / "completed.json",
          {
@@ -402,7 +422,7 @@ diff --git a/src/simons/training/spot_job.py b/src/simons/training/spot_job.py
              "members": [str(p) for p in paths],
              "job_identity": {**(read_checkpoint(paths[0]).get("job_identity") or {}),
                               "recipe_name": mode(args)[0], "screen_updates": mode(args)[1]},
-@@ -339,6 +386,7 @@
+@@ -339,6 +392,7 @@
      """A child process isolates OOM retries from CUDA state and worker-prefetch queues."""
      from simons.training.qualification import Measurement
  
@@ -410,7 +430,7 @@ diff --git a/src/simons/training/spot_job.py b/src/simons/training/spot_job.py
      directory = Path(args.run_dir)
      state = directory / "state"
      receipt = (corpus_release(args.corpus, qualification_only=getattr(
-@@ -402,6 +450,7 @@
+@@ -402,6 +456,7 @@
  
  
  def qualify(args):
@@ -418,7 +438,7 @@ diff --git a/src/simons/training/spot_job.py b/src/simons/training/spot_job.py
      directory = Path(args.run_dir) / "state" / "qualify"
      directory.mkdir(parents=True, exist_ok=True)
      result_path = directory / f"{args.name}.json"
-@@ -469,6 +518,9 @@
+@@ -469,6 +524,9 @@
      parser.add_argument("--recipe", choices=["full", "screen"], default="full")
      parser.add_argument("--screen-updates", type=int)
      parser.add_argument("--unsafe-qualification-allow-unaudited-corpus", action="store_true")
@@ -428,7 +448,7 @@ diff --git a/src/simons/training/spot_job.py b/src/simons/training/spot_job.py
      parser.add_argument("--root", type=Path, required=True)
      parser.add_argument("--run-dir", type=Path, default=os.environ.get("RUN_DIR"), required=False)
      parser.add_argument("--corpus", type=Path)
-@@ -505,6 +557,11 @@
+@@ -505,6 +563,11 @@
          parser.error("--screen-updates must be >= 100")
      if args.unsafe_qualification_allow_unaudited_corpus and args.leg != "qualify":
          parser.error("unsafe corpus override is qualification-only")

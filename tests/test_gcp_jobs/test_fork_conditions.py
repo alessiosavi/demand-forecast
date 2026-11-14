@@ -743,3 +743,243 @@ def test_completed_export_checks_available_member_records(jobs, upstream, tmp_pa
     with pytest.raises(ValueError, match="condition|receipt"):
         spot_job.run_export(args)
     assert snapshot(tmp_path / "state") == before
+
+
+@pytest.mark.parametrize("entrypoint", ["shell", "guest"])
+@pytest.mark.parametrize("manifest", [True, False])
+@pytest.mark.parametrize(
+    "change",
+    [
+        None,
+        "condition",
+        "provisional",
+        "both",
+        "audited-receipt",
+        "legacy-audited",
+        "marker-condition",
+        "marker-receipt",
+    ],
+)
+def test_unflagged_completed_export_checks_members(
+    jobs, upstream, tmp_path, monkeypatch, entrypoint, manifest, change
+):
+    from simons.training import spot_job
+
+    for leg in ("stage4", "stage4-long"):
+        write_stage(tmp_path, leg, parent(leg, AUDITED, None), model=True, manifest=manifest)
+    args = job_args(tmp_path, upstream, leg="export")
+    assert spot_job.run_export(args) == 0
+    if change in ("marker-condition", "marker-receipt"):
+        path = tmp_path / "state/stage4-long/completed.json"
+        marker = json.loads(path.read_text())
+        if change == "marker-condition":
+            marker["condition"] = CONDITION
+        else:
+            marker["corpus_release"] = PROVISIONAL
+        path.write_text(json.dumps(marker))
+    elif change is not None:
+        receipt = PROVISIONAL if change in ("provisional", "both") else AUDITED
+        condition = CONDITION if change in ("condition", "both") else None
+        if change == "audited-receipt":
+            receipt = {**AUDITED, "audit_sha256": "b" * 64}
+        elif change == "legacy-audited":
+            receipt = None
+        write_stage(
+            tmp_path,
+            "stage4-long",
+            parent("stage4-long", receipt, condition),
+            model=True,
+            manifest=manifest,
+        )
+    before = snapshot(tmp_path / "state")
+    incompatible = change not in (None, "legacy-audited")
+    if entrypoint == "shell":
+        script = (
+            jobs.generate(
+                **options(
+                    leg="export",
+                    condition=None,
+                    override=[],
+                    provisional_unaudited_corpus_attempt=None,
+                )
+            ).split("scratch=$(mktemp", 1)[0]
+            + "echo continue\n"
+        )
+        result = subprocess.run(
+            ["bash"],
+            input=script,
+            text=True,
+            capture_output=True,
+            env={**os.environ, "RUN_DIR": str(tmp_path), "STATE_URI": "gs://offline"},
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == ("continue\n" if incompatible else "")
+    else:
+        monkeypatch.setattr(spot_job, "export", lambda *a: pytest.fail("export was rebuilt"))
+        if incompatible:
+            with pytest.raises(ValueError, match="condition|receipt"):
+                spot_job.run_export(args)
+        else:
+            assert spot_job.run_export(args) == 0
+    assert snapshot(tmp_path / "state") == before
+
+
+@pytest.mark.parametrize("saved_uri,next_uri", [(URI + "/", URI), (URI, URI + "/")])
+@pytest.mark.parametrize("leg", ["stage4", "stage4-long"])
+def test_provisional_continuation_accepts_equivalent_corpus_uri(
+    upstream, tmp_path, monkeypatch, saved_uri, next_uri, leg
+):
+    from simons.training import spot_job
+    from simons.training.trainer import write_checkpoint
+
+    release(tmp_path / "corpus")
+    (tmp_path / "corpus/audit.json").unlink()
+    saved = parent()
+    saved["corpus_uri"] = saved_uri
+    saved["recipe"]["training"]["covariate_weight"] = 0.05
+    write_stage(tmp_path, "stage3", saved)
+    before = snapshot(tmp_path / "state/stage3")
+    args = job_args(
+        tmp_path,
+        upstream,
+        leg=leg,
+        corpus_uri=next_uri,
+        condition="cov-w2",
+        override=["covariate_weight=.05"],
+        provisional_unaudited_corpus_attempt="tiny",
+    )
+    called = []
+
+    def train(path, output, **kwargs):
+        called.append(kwargs)
+        assert kwargs["resume"] is None
+        final = kwargs["checkpoint_dir"] / "checkpoint-final.pt"
+        write_checkpoint(
+            final, {**checkpoint_payload(57600), "job_identity": kwargs["checkpoint_metadata"]}
+        )
+        return final
+
+    monkeypatch.setattr(spot_job, "train", train)
+    assert spot_job.run_leg(args) == 0
+    assert len(called) == 1
+    identity = json.loads((tmp_path / "state" / leg / "identity.json").read_text())
+    assert identity["corpus_uri"] == URI
+    assert identity["condition"] == CONDITION
+    assert identity["corpus_release"] == PROVISIONAL
+    assert snapshot(tmp_path / "state/stage3") == before
+
+
+@pytest.mark.parametrize(
+    "saved_uri,next_uri",
+    [(URI, URI), (URI + "/", URI + "/"), (URI + "/", URI), (URI, URI + "/")],
+)
+@pytest.mark.parametrize("manifest", [True, False])
+def test_partial_resume_trains_with_unchanged_fork_metadata(
+    upstream, tmp_path, monkeypatch, saved_uri, next_uri, manifest
+):
+    import yaml
+    from simons.training import spot_job
+    from simons.training.trainer import read_checkpoint, write_checkpoint
+
+    release(tmp_path / "corpus")
+    (tmp_path / "corpus/audit.json").unlink()
+    saved = parent()
+    saved["corpus_uri"] = saved_uri
+    saved["recipe"]["training"]["covariate_weight"] = 0.05
+    checkpoint = write_stage(
+        tmp_path, "stage3", saved, step=35000, completed=False, manifest=manifest
+    )
+    args = job_args(
+        tmp_path,
+        upstream,
+        corpus_uri=next_uri,
+        condition="cov-w2",
+        override=["covariate_weight=.05"],
+        provisional_unaudited_corpus_attempt="tiny",
+    )
+    expected_raw = copy.deepcopy(saved["recipe"])
+    expected_raw["training"].update(
+        micro_batches=1,
+        warm_start=str(tmp_path / "state/stage2"),
+        data=str(tmp_path / "corpus/univariate"),
+        covariate_data=str(tmp_path / "corpus/covariates"),
+    )
+    expected_identity = {**saved, "corpus_uri": URI}
+    called = []
+
+    def train(path, output, **kwargs):
+        called.append(kwargs)
+        assert kwargs["resume"] == checkpoint
+        assert read_checkpoint(kwargs["resume"])["step"] == 35000
+        assert yaml.safe_load(path.read_text()) == expected_raw
+        assert kwargs["checkpoint_metadata"] == expected_identity
+        final = kwargs["checkpoint_dir"] / "checkpoint-final.pt"
+        write_checkpoint(
+            final, {**checkpoint_payload(57600), "job_identity": kwargs["checkpoint_metadata"]}
+        )
+        return final
+
+    monkeypatch.setattr(spot_job, "train", train)
+    assert spot_job.run_leg(args) == 0
+    assert len(called) == 1
+    directory = tmp_path / "state/stage3"
+    assert json.loads((directory / "identity.json").read_text()) == expected_identity
+    marker = json.loads((directory / "completed.json").read_text())
+    assert marker["job_identity"] == expected_identity
+    assert marker["condition"] == CONDITION
+    assert marker["corpus_release"] == PROVISIONAL
+    assert read_checkpoint(directory / "checkpoint-final.pt")["job_identity"] == expected_identity
+
+
+@pytest.mark.parametrize("manifest", [True, False])
+@pytest.mark.parametrize(
+    "change", ["drop-condition", "change-condition", "drop-flag", "change-attempt"]
+)
+def test_partial_resume_refuses_changed_fork(upstream, tmp_path, monkeypatch, manifest, change):
+    from simons.training import spot_job
+
+    release(tmp_path / "corpus")
+    saved = parent()
+    saved["recipe"]["training"]["covariate_weight"] = 0.05
+    write_stage(tmp_path, "stage3", saved, step=35000, completed=False, manifest=manifest)
+    args = job_args(
+        tmp_path,
+        upstream,
+        condition="cov-w2",
+        override=["covariate_weight=.05"],
+        provisional_unaudited_corpus_attempt="tiny",
+    )
+    if change == "drop-condition":
+        args.condition, args.override = None, []
+    elif change == "change-condition":
+        args.override = ["covariate_weight=.1"]
+    elif change == "drop-flag":
+        args.provisional_unaudited_corpus_attempt = None
+    else:
+        args.provisional_unaudited_corpus_attempt = "other"
+    monkeypatch.setattr(spot_job, "train", lambda *a, **kw: pytest.fail("training began"))
+    before = snapshot(tmp_path / "state")
+    with pytest.raises(ValueError, match="condition|receipt|provisional"):
+        spot_job.run_leg(args)
+    assert snapshot(tmp_path / "state") == before
+
+
+@pytest.mark.parametrize("saved_uri,next_uri", [(URI + "/", URI), (URI, URI + "/")])
+def test_provisional_resume_comparison_normalizes_corpus_uri(upstream, saved_uri, next_uri):
+    from simons.training.screen import compatible_resume
+
+    saved = {**parent(), "corpus_uri": saved_uri}
+    expected = {**copy.deepcopy(saved), "corpus_uri": next_uri}
+    before = copy.deepcopy((saved, expected))
+    assert compatible_resume(saved, expected) == {**saved, "corpus_uri": URI}
+    assert (saved, expected) == before
+
+
+def test_reference_corpus_uri_comparisons_remain_literal(upstream, tmp_path):
+    from simons.training.screen import check_identity, compatible_resume
+
+    saved = {**parent(receipt=AUDITED, condition=None), "corpus_uri": URI + "/"}
+    with pytest.raises(ValueError, match="corpus identity changed"):
+        check_identity(saved, job_args(tmp_path, upstream))
+    with pytest.raises(ValueError, match="experiment identity changed"):
+        compatible_resume(saved, {**saved, "corpus_uri": URI})
