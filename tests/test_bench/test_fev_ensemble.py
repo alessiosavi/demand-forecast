@@ -676,3 +676,202 @@ def test_root_configuration_binding_is_persisted_and_checked_on_resume(
     with pytest.raises(ValueError, match="ensemble.*identity|members.*identity"):
         ensemble(tasks, members, out)
     assert snapshot(out) == before
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [{}, {"model": "simons", "processing": "raw"}, {"model": "simons", "processing": "published"}],
+)
+def test_completed_ensemble_is_auditable_and_report_cli_is_complete(
+    scenario, make_member, tmp_path, changes
+):
+    from demand_forecast.bench.yardsticks.audit import audit_report
+    from scripts.fev_report import main
+
+    tasks, _, _ = scenario
+    members = [make_member(0, **changes), make_member(1, 2, **changes)]
+    out = tmp_path / "average"
+    frame = ensemble(tasks, members, out)
+    report, issues = audit_report(out, tasks, "average")
+    assert issues == []
+    assert f"SQL={frame.SQL.iloc[0]}" in report
+    assert "Complete:" in report
+    report_path = tmp_path / "report.md"
+    assert (
+        main(
+            [
+                "--run-dir",
+                str(out),
+                "--model-name",
+                "average",
+                "--tasks",
+                str(tmp_path / "tasks.yaml"),
+                "--out",
+                str(report_path),
+            ]
+        )
+        == 0
+    )
+    assert "Complete:" in report_path.read_text()
+
+
+def test_ensemble_auditor_reports_tampered_averaged_window(scenario, make_member, tmp_path):
+    from demand_forecast.bench.yardsticks.audit import audit_report
+
+    tasks, _, _ = scenario
+    members = [make_member(0), make_member(1)]
+    out = tmp_path / "average"
+    ensemble(tasks, members, out)
+    path = out / tasks[0].task_name / "window_0.npz"
+    with np.load(path) as saved:
+        payload = {key: saved[key] for key in saved.files}
+    payload["arrays"] += 10
+    np.savez(path, **payload)
+    report, issues = audit_report(out, tasks, "average")
+    assert any("window_0.npz: checksum mismatch" in issue for issue in issues)
+    assert "Incomplete" in report
+
+
+@pytest.mark.parametrize("keep_going", [False, True])
+def test_completed_ensemble_rejects_changed_dataset_before_skip(
+    scenario, make_member, tmp_path, keep_going, capsys
+):
+    from datasets import Dataset
+
+    from scripts.fev_ensemble import main
+
+    tasks, _, _ = scenario
+    members = [make_member(0), make_member(1)]
+    out = tmp_path / "average"
+    ensemble(tasks, members, out)
+    before = snapshot(out)
+    path = tasks[0].dataset_path
+    data = Dataset.from_parquet(path)
+    data.map(lambda row: {"target": [value + 100 for value in row["target"]]}).to_parquet(path)
+    capsys.readouterr()
+    assert (
+        main(
+            [
+                "--members",
+                *map(str, members),
+                "--model-name",
+                "average",
+                "--tasks",
+                str(tmp_path / "tasks.yaml"),
+                "--out-dir",
+                str(out),
+                *(["--keep-going"] if keep_going else []),
+            ]
+        )
+        != 0
+    )
+    assert "Skipping completed task" not in capsys.readouterr().out
+    assert {key: value for key, value in snapshot(out).items() if key != "failures.json"} == before
+    failure = json.loads((out / "failures.json").read_text())[tasks[0].task_name]
+    assert "fingerprint" in failure["message"]
+
+
+@pytest.mark.parametrize("keep_going", [False, True])
+@pytest.mark.parametrize("failure", ["member_validation", "window_validation", "scoring"])
+@pytest.mark.parametrize(
+    "damage", ["missing_window", "hash", "missing_record", "malformed_record", "summary"]
+)
+def test_incomplete_ensemble_removes_stale_row_before_failed_retry(
+    scenario, make_member, tmp_path, monkeypatch, keep_going, failure, damage
+):
+    from scripts.fev_ensemble import main
+
+    tasks, _, _ = scenario
+    task = tasks[0]
+    members = [make_member(0), make_member(1)]
+    out = tmp_path / "average"
+    frame = ensemble(tasks, members, out)
+    # Keep an unrelated row to detect over-broad removal on a failed retry.
+    other = frame.assign(task="unselected")
+    pd.concat([frame, other], ignore_index=True).to_csv(out / "summaries.csv", index=False)
+    directory = out / task.task_name
+    if damage == "missing_window":
+        (directory / "window_0.npz").unlink()
+    elif damage == "hash":
+        with (directory / "window_0.npz").open("ab") as stream:
+            stream.write(b"damaged")
+    elif damage == "missing_record":
+        (directory / "run.json").unlink()
+    elif damage == "malformed_record":
+        (directory / "run.json").write_text("{")
+    else:
+        frame.loc[0, "SQL"] += 1
+        pd.concat([frame, other], ignore_index=True).to_csv(out / "summaries.csv", index=False)
+
+    if failure == "member_validation":
+        (members[0] / "summaries.csv").unlink()
+    elif failure == "window_validation":
+        with (members[0] / task.task_name / "window_0.npz").open("ab") as stream:
+            stream.write(b"damaged source")
+    else:
+
+        def fail_scoring(*args, **kwargs):
+            # The stale row must already be gone when scoring begins.
+            assert task.task_name not in pd.read_csv(out / "summaries.csv").task.tolist()
+            raise ValueError("synthetic scoring failure")
+
+        monkeypatch.setattr(fev.Task, "evaluation_summary", fail_scoring)
+
+    assert (
+        main(
+            [
+                "--members",
+                *map(str, members),
+                "--model-name",
+                "average",
+                "--tasks",
+                str(tmp_path / "tasks.yaml"),
+                "--out-dir",
+                str(out),
+                *(["--keep-going"] if keep_going else []),
+            ]
+        )
+        != 0
+    )
+    remaining = pd.read_csv(out / "summaries.csv", float_precision="round_trip")
+    pd.testing.assert_frame_equal(remaining, other.reset_index(drop=True))
+    failure_record = json.loads((out / "failures.json").read_text())[task.task_name]
+    if failure == "member_validation":
+        assert failure_record["run_identity"] is None
+        assert "missing summary" in failure_record["message"]
+    elif failure == "window_validation":
+        assert "sha256" in failure_record["message"]
+    else:
+        assert failure_record["message"] == "synthetic scoring failure"
+
+
+def test_nan_member_metrics_are_scored_and_ensemble_resume_is_noop(
+    scenario, make_member, tmp_path, monkeypatch
+):
+    from datasets import Dataset
+
+    tasks, _, _ = scenario
+    path = tasks[0].dataset_path
+    data = Dataset.from_parquet(path)
+    data.map(
+        lambda row: {
+            "target": [10.0] * len(row["target"]),
+            "other": [20.0] * len(row["other"]),
+        }
+    ).to_parquet(path)
+    members = [make_member(0), make_member(1)]
+    source = pd.read_csv(members[0] / "summaries.csv", float_precision="round_trip")
+    metrics = ["test_error", "SQL", "MASE", *[key for key in source if key.startswith("SQL[")]]
+    assert source[metrics].isna().all().all()
+    record = json.loads((members[0] / tasks[0].task_name / "run.json").read_text())
+    assert not runner._summary_matches(source.iloc[0], record["summary"])
+    out = tmp_path / "average"
+    frame = ensemble(tasks, members, out)
+    assert len(frame) == 1 and frame[metrics].isna().all().all()
+    assert not frame.attrs["failed_tasks"]
+    assert not (out / "failures.json").exists()
+    before = snapshot(out)
+    monkeypatch.setattr(fev.Task, "evaluation_summary", lambda *a, **kw: pytest.fail("rescored"))
+    resumed = ensemble(tasks, members, out)
+    assert not resumed.attrs["failed_tasks"]
+    assert snapshot(out) == before

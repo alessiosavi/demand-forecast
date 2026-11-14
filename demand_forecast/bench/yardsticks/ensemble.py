@@ -36,12 +36,14 @@ from .runner import (
     Options,
     _safe_name,
     _save_window,
-    _summary_matches,
     digest,
     fev_predictions,
     file_digest,
     prepare_windows,
     read_window,
+)
+from .runner import (
+    _summary_matches as _runner_summary_matches,
 )
 
 # Allow only these member-specific differences. All other configuration keys,
@@ -50,6 +52,19 @@ MEMBER_OPTION_KEYS = frozenset({"weights", "revision", "weights_revision", "mode
 EVALUATION_OPTION_KEYS = frozenset(
     {"model", "processing", "covariates", "cross_series", "max_context", "batch_size", "device"}
 )
+
+
+def _summary_matches(row, expected):
+    """Keep runner comparisons strict, allowing undefined metrics to round-trip."""
+    defined = {}
+    for key, value in expected.items():
+        if isinstance(value, float) and np.isnan(value):
+            actual = row.get(key)
+            if not isinstance(actual, (float, np.floating)) or not np.isnan(actual):
+                return False
+        else:
+            defined[key] = value
+    return _runner_summary_matches(row, defined)
 
 
 def _evaluation_configuration(configuration: dict) -> dict:
@@ -193,20 +208,37 @@ def _read_member(directory: Path, task, configuration: dict) -> dict:
     return record
 
 
-def _completed(directory: Path, identity: str, rows: pd.DataFrame, count: int) -> bool:
+def _completed(directory: Path, identity: str | None, rows: pd.DataFrame, count: int) -> bool:
+    """Check output evidence even when member validation cannot supply an identity."""
     path = directory / "run.json"
-    if not path.exists():
+    try:
+        record = json.loads(path.read_text())
+    except (OSError, ValueError):
         return False
-    record = json.loads(path.read_text())
-    if record.get("run_identity") != identity:
+    if not isinstance(record, dict):
+        return False
+    if identity is not None and record.get("run_identity") != identity:
         raise ValueError(f"{path}: ensemble identity mismatch; use a new out-dir")
     if len(rows) != 1 or not record.get("summary"):
         return False
-    if not _summary_matches(rows.iloc[0], record["summary"]):
-        return False
     try:
+        configuration = record["configuration"]
+        config_id = configuration["configuration_identity"]
+        payload = {
+            key: record[key] for key in ("configuration_identity", "task", "dataset_fingerprint")
+        }
+        if (
+            digest({k: v for k, v in configuration.items() if k != "configuration_identity"})
+            != config_id
+            or record["configuration_identity"] != config_id
+            or record["run_identity"] != digest(payload)
+            or record["summary"].get("run_identity") != record["run_identity"]
+            or record["summary"].get("configuration_identity") != config_id
+            or not _summary_matches(rows.iloc[0], record["summary"])
+        ):
+            return False
         return _window_hashes(directory, count) == record.get("window_sha256")
-    except (OSError, ValueError):
+    except (AttributeError, KeyError, OSError, TypeError, ValueError):
         return False
 
 
@@ -281,6 +313,14 @@ def run_ensemble(
         raise ValueError("identical weights digests; use --allow-identical-members to reproduce")
     evaluation_configuration = _evaluation_configuration(configurations[0])
     weights = [1 / len(members)] * len(members)
+    options = {
+        **configurations[0]["options"],
+        "model": "ensemble",
+        "model_name": model_name,
+        "weights": json.dumps([str(p) for p in members]),
+        "revision": None,
+        "weights_revision": digest({"members": revisions}),
+    }
     run = {
         "ensemble_version": 1,
         "members": [str(p) for p in members],
@@ -311,7 +351,14 @@ def run_ensemble(
     for task in tasks:
         name, identity = task.task_name, None
         selected = (frame.task == name) & (frame.model_name == model_name)
+        rows = frame.loc[selected]
         directory = out_dir / name
+        # Decide from the output's own evidence before member validation: an
+        # incomplete retry must not retain a successful row if validation fails.
+        if not _completed(directory, None, rows, task.num_windows):
+            frame = frame.loc[~selected]
+            if summary_path.exists():
+                _save_summaries(frame, summary_path)
         try:
             records = [
                 _read_member(member, task, configuration)
@@ -330,7 +377,12 @@ def run_ensemble(
                 }
                 for member, record in zip(members, records, strict=True)
             ]
-            configuration = {**run, "evaluation": evaluation, "members": sources}
+            configuration = {
+                **run,
+                "evaluation": evaluation,
+                "members": sources,
+                "options": options,
+            }
             configuration.pop("configuration_identity")
             configuration["configuration_identity"] = digest(configuration)
             payload = {
@@ -347,8 +399,10 @@ def run_ensemble(
             continue
         # An output identity conflict is a refusal, not a failed evaluation that
         # should remove an already successful row or alter its audit evidence.
-        completed = _completed(directory, identity, frame.loc[selected], task.num_windows)
+        completed = _completed(directory, identity, rows, task.num_windows)
         try:
+            if dataset_fingerprint(task) != evaluation["dataset_fingerprint"]:
+                raise ValueError(f"{name}: task dataset fingerprint differs from members")
             if completed:
                 # No deserialization is needed on a no-op resume, but corrupt
                 # sources must still fail without altering the completed output.
@@ -360,9 +414,6 @@ def run_ensemble(
                     del failures[name]
                     _save_failures(failure_path, failures)
                 continue
-            if dataset_fingerprint(task) != evaluation["dataset_fingerprint"]:
-                raise ValueError(f"{name}: task dataset fingerprint differs from members")
-            options = records[0]["configuration"]["options"]
             windows = prepare_windows(task, Options(**options))
             if len(windows) != task.num_windows:
                 raise ValueError(f"{name}: task window count differs")
@@ -384,14 +435,7 @@ def run_ensemble(
                 run_identity=identity,
                 yardstick_protocol=PROTOCOL_VERSION,
                 configuration_identity=configuration["configuration_identity"],
-                **{
-                    **options,
-                    "model": "ensemble",
-                    "model_name": model_name,
-                    "weights": json.dumps([str(p) for p in members]),
-                    "revision": None,
-                    "weights_revision": digest({"members": revisions}),
-                },
+                **options,
                 **evaluation["input_metadata"],
             )
             directory.mkdir(parents=True, exist_ok=True)
@@ -414,7 +458,6 @@ def run_ensemble(
                 record["input_metadata"] = evaluation["input_metadata"]
             _save_failures(directory / "run.json", record)
             row = pd.DataFrame([summary])
-            frame = frame.loc[~selected]
             frame = row if frame.empty else pd.concat([frame, row], ignore_index=True)
             _save_summaries(frame, summary_path)
             if name in failures:
