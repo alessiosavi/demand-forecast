@@ -60,7 +60,10 @@ def read_object(path):
 def restored_config(config, root):
     # Recovery-only fixes remain compatible with the guest shipped in 139f3f7.
     # Preserve its recorded identity, including the adapter's checkpoint path.
+    if config.get("covariates", "all") != "all":
+        return config
     legacy = dict(config, guest_sha256="a726e1e81f4ad804683b5164aebbf38aefb2107a7983a0b4faad8b1de200916f")
+    legacy.pop("covariates", None)
     if legacy in (read_object(root / "inputs.json"), read_object(root / "completed.json").get("inputs")):
         return legacy
     return config
@@ -294,6 +297,8 @@ def score(config, root, scratch, repo, python):
             command += ["--names", selection]
         if config["max_context"] is not None:
             command += ["--max-context", str(config["max_context"])]
+        if config.get("covariates", "all") == "none":
+            command += ["--covariates", "none"]
         start = time.monotonic()
         log = root / (mode + ".log")
         with log.open("w") as stream:
@@ -384,6 +389,7 @@ def generate(
     names_sha256=None,
     processing="both",
     max_context=None,
+    covariates="all",
 ):
     """Validate inputs and return a shell job, without fetching code, data or cloud state."""
     _sha(repo_sha, 40, "repo SHA")
@@ -415,6 +421,8 @@ def generate(
         _sha(names_sha256, 64, "names sha256")
     if processing not in ("raw", "published", "both"):
         raise ValueError("processing must be raw, published or both")
+    if covariates not in ("all", "none"):
+        raise ValueError("covariates must be all or none")
     if max_context is not None and (type(max_context) is not int or max_context < 1):
         raise ValueError("max-context must be a positive integer")
     content = GUEST.encode()
@@ -433,6 +441,7 @@ def generate(
         names_sha256=names_sha256,
         modes=["raw", "published"] if processing == "both" else [processing],
         max_context=max_context,
+        covariates=covariates,
         guest_sha256=guest_sha,
     )
     encoded_config = base64.b64encode(json.dumps(config, sort_keys=True).encode()).decode()
@@ -520,6 +529,7 @@ def main():
         parser.add_argument("--" + key)
     parser.add_argument("--processing", choices=["raw", "published", "both"], default="both")
     parser.add_argument("--max-context", type=int)
+    parser.add_argument("--covariates", choices=["all", "none"], default="all")
     parser.add_argument("--output", required=True, type=Path)
     args = vars(parser.parse_args())
     output = args.pop("output")
