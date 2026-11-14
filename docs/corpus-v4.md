@@ -915,7 +915,8 @@ Median capped postings are 9,011 versus 9,632. Endpoint proposals are predominan
 24-point hits, underrepresenting the real 64/256-point families. Other fixture
 names describe channel lengths, rather than calibrated folder distributions.
 
-Two result-preserving changes remove the measured costs:
+Two changes, result-preserving under the method they were measured with
+(`provisional-endpoints-1`), remove the measured costs:
 
 - The old structured `hi/lo` view retained the 32-byte posting stride with
   16 bytes of padding. NumPy packed the entire index on each of two searches
@@ -940,12 +941,16 @@ the per-channel query cache has at most 1,217 entries of that mask size (under
 page cache remains 8 MiB. Indivisible large histories and decoder allocations
 still face the unchanged RSS budget checks/watchdog.
 
-The harness compares compressed journals, assembled evidence and complete folder
-results byte for byte. A separate masked/monthly control fixture checks verified
-plants and negative controls, including their full evidence and outcome reports.
-Source-bound production reuse identities still change with the implementation;
-old state must rebuild/replay, and production report fingerprints consequently
-change. No proposal family, posting cap, shortcut policy or verifier gate changes.
+For two scanners of the same method the harness compares compressed journals,
+assembled evidence and complete folder results byte for byte; across methods it
+reports the differences instead. A separate masked/monthly control fixture checks
+verified plants and negative controls, including their full evidence and outcome
+reports. Source-bound production reuse identities still change with the
+implementation; old state must rebuild/replay, and production report fingerprints
+consequently change. The lookup and history-load change itself altered no proposal
+family, posting cap, shortcut policy or verifier gate; the later method
+`provisional-endpoints-fidelity-2` adds the variation-fidelity requirement after
+the existing gates, as described in the method section.
 Cold storage, real owner/mask distributions, long numerical fits and 48-worker
 memory-bandwidth contention require a fresh cloud measurement before forecasting
 the full run.
