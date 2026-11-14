@@ -503,6 +503,14 @@ and applies every embedded patch through `prepare.py`, and installs that tree
 editable alongside this repository. It verifies the dependency pins, CUDA, and
 both the imported Simons and trainer paths, then records pip freeze and runtime
 facts before downloading inputs or loading datasets.
+The embedded patch digest is SHA-256 of the uncompressed, sorted-key JSON of its
+members; the guest digest is SHA-256 of its uncompressed Python source bytes.
+The guest decompresses and verifies each payload before writing its contents.
+Gzip settings and Python/zlib versions do not affect these identities. Both
+digest values differ from those in jobs generated before this change, which
+hashed compressed bytes. Existing adaptation state is refused by the input
+identity check when used with a newly generated job from the same sources;
+use a new name/state prefix. There is no fallback accepting an old digest.
 
 Each task builds one bundle, scores the frozen base once per requested mode,
 then runs the Cartesian product of arms, multipliers and seeds from that base.

@@ -138,8 +138,9 @@ def generate(
     if not patches:
         raise ValueError("missing upstream patch set")
     files = {str(p.relative_to(BUNDLE)): p.read_text() for p in [*paths, *patches]}
-    packed = gzip.compress(json.dumps(files, sort_keys=True).encode(), mtime=0)
-    digest = hashlib.sha256(packed).hexdigest()
+    content = json.dumps(files, sort_keys=True).encode()
+    digest = hashlib.sha256(content).hexdigest()
+    packed = gzip.compress(content, mtime=0)
     payload = base64.b64encode(packed).decode()
     arguments = [
         "--leg",
@@ -254,9 +255,10 @@ mkdir -p "$RUN_DIR/state"
 python3 - "$scratch/bundle" <<'SIMONS_BUNDLE'
 import base64, gzip, hashlib, json, pathlib, sys
 packed = base64.b64decode("{payload}")
-assert hashlib.sha256(packed).hexdigest() == "{digest}"
+content = gzip.decompress(packed)
+assert hashlib.sha256(content).hexdigest() == "{digest}"
 root = pathlib.Path(sys.argv[1])
-for name, content in json.loads(gzip.decompress(packed)).items():
+for name, content in json.loads(content).items():
     path = root / name
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content)

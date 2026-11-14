@@ -417,8 +417,9 @@ def generate(
         raise ValueError("processing must be raw, published or both")
     if max_context is not None and (type(max_context) is not int or max_context < 1):
         raise ValueError("max-context must be a positive integer")
-    payload = gzip.compress(GUEST.encode(), mtime=0)
-    guest_sha = hashlib.sha256(payload).hexdigest()
+    content = GUEST.encode()
+    guest_sha = hashlib.sha256(content).hexdigest()
+    payload = gzip.compress(content, mtime=0)
     config = dict(
         name=name,
         repo_sha=repo_sha,
@@ -458,8 +459,9 @@ python3 - "$scratch" <<'SCORE_BUNDLE'
 import base64, gzip, hashlib, pathlib, sys
 root = pathlib.Path(sys.argv[1])
 packed = base64.b64decode("{encoded_guest}")
-assert hashlib.sha256(packed).hexdigest() == "{guest_sha}"
-(root / "score.py").write_bytes(gzip.decompress(packed))
+content = gzip.decompress(packed)
+assert hashlib.sha256(content).hexdigest() == "{guest_sha}"
+(root / "score.py").write_bytes(content)
 (root / "inputs.json").write_bytes(base64.b64decode("{encoded_config}"))
 SCORE_BUNDLE
 repo="$scratch/repository"

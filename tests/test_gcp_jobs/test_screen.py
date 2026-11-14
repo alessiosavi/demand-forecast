@@ -447,6 +447,12 @@ def test_full_shell_matches_e5959bb_except_listed_changes(jobs, size):
         # New patch/installer bytes necessarily change embedded payload and bundle digest.
         text = re.sub(r'base64.b64decode\("[^"\n]+"\)', 'base64.b64decode("PAYLOAD")', text)
         text = re.sub(r"\b[0-9a-f]{64}\b", "BUNDLE_DIGEST", text)
+        # Bundle verification now covers decompressed bytes rather than gzip transport.
+        text = text.replace("content = gzip.decompress(packed)\n", "")
+        text = text.replace("hashlib.sha256(content)", "hashlib.sha256(packed)")
+        text = text.replace(
+            "json.loads(content).items()", "json.loads(gzip.decompress(packed)).items()"
+        )
         # Explicit cache defaults fix the measured guest startup warning.
         cache = (
             'export HOME="${HOME:-$RUN_DIR/home}"\n'
