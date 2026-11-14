@@ -896,11 +896,17 @@ and 0.281681 → 0.009237 for 8,000 points. The 400-point breakdown is:
 | Journal write | 0.000293 | 0.000114 |
 | Everything else | 0.001294 | 0.000654 |
 
-All ten before/after comparisons (four lengths and controls, twice each) matched
-compressed journals, assembled evidence and folder results byte for byte. The
-19 control cases passed, including 14 verified plants; their outcome reports
-also matched exactly. Measurements ran alongside the offline test suite, so
-these are local wall times with competing CPU activity, not a cloud forecast.
+When that profile was measured, both sides ran method `provisional-endpoints-1`:
+all ten before/after comparisons (four lengths and controls, twice each) matched
+compressed journals, assembled evidence and folder results byte for byte, and
+the 19 control cases passed, including 14 verified plants, with identical
+outcome reports. That statement is about the lookup and history-load change
+only. The current scanner is method `provisional-endpoints-fidelity-2`: its
+records carry fidelity statistics, so running the command above against the
+`b1e07de` baseline now reports a cross-method comparison with the expected
+differences instead of byte identity; byte identity holds only between two
+scanners of the same method. Measurements ran alongside the offline test suite,
+so these are local wall times with competing CPU activity, not a cloud forecast.
 
 The 400-point fixture emits 6.979 records/channel versus the supplied worldtrace
 part's 6.078 (+14.8%); numerical fits are 3.458 versus 2.895 (+19.5%), shortcuts
