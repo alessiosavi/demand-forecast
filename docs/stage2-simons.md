@@ -475,8 +475,11 @@ downloads them again. A completed marker's early exit checks only recorded state
 it does not contact the checkpoint source or detect changes there. Use a new score
 name/state prefix to score a changed checkpoint. The task YAML and optional
 one-name-per-line selection require SHA-256 hashes. Omit both names switches to
-select the complete YAML. `--max-context N` is the only extra inference switch;
-it must be a positive integer.
+select the complete YAML. `--max-context N` must be a positive integer.
+`--covariates {all,none}` defaults to `all`; for Simons, `none` withholds both
+the history and future of known covariates, rather than applying a future-only mask.
+The covariates choice is part of the input identity, so changing it requires a
+new score name/state prefix.
 
 The job starts with the training environment's system-site-packages venv and uv
 fallback for missing ensurepip. The full yardstick requirements cannot run on
@@ -513,7 +516,8 @@ freshly downloaded hashes match the marker's independent copy. Without independe
 evidence, damaged identity or checkpoint hashes cause refusal to overwrite state.
 Changed inputs, or downloaded checkpoint contents that differ from trusted
 recorded hashes, cause refusal. State written by the `139f3f7` guest retains its
-input identity and checkpoint path through these recovery fixes. This is evidence
+input identity and checkpoint path through these recovery fixes only when resumed
+with the default `--covariates all`. This is evidence
 consistency checking, not a fresh recomputation of fev scores. There is no
 concurrent-writer lock: use one guest per score name/state prefix. GPU execution,
 numerical parity, memory fit

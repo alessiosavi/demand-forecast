@@ -64,6 +64,7 @@ def arguments(**overrides):
         {"name": "a/b"},
         {"name": "_probe"},
         {"processing": "other"},
+        {"covariates": "other"},
         {"max_context": 0},
         {"max_context": True},
         {"max_context": "1; exit 0"},
@@ -80,6 +81,31 @@ def test_generated_shell_is_valid(score_jobs, tmp_path, processing):
     path.write_text(score_jobs.generate(**arguments(processing=processing)))
     result = subprocess.run(["bash", "-n", str(path)], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("covariates", [None, "all", "none", "other"])
+def test_covariates_cli(tmp_path, covariates):
+    output = tmp_path / "job.sh"
+    command = [sys.executable, str(ROOT / "scripts/gcp/jobs/make_score_job.py")]
+    for name, value in arguments().items():
+        command += ["--" + name.replace("_", "-"), value]
+    command += ["--output", str(output)]
+    if covariates is not None:
+        command += ["--covariates", covariates]
+    result = subprocess.run(command, capture_output=True, text=True)
+    if covariates == "other":
+        assert result.returncode == 2 and "invalid choice" in result.stderr
+        assert not output.exists()
+        return
+    assert result.returncode == 0, result.stderr
+    assert os.access(output, os.X_OK)
+    snippet = output.read_text().split("<<'SCORE_BUNDLE'\n", 1)[1].split("\nSCORE_BUNDLE\n", 1)[0]
+    result = subprocess.run(
+        [sys.executable, "-", str(tmp_path)], input=snippet, capture_output=True, text=True
+    )
+    assert result.returncode == 0, result.stderr
+    config = json.loads((tmp_path / "inputs.json").read_text())
+    assert config["covariates"] == (covariates or "all")
 
 
 @pytest.fixture
@@ -328,6 +354,44 @@ def test_both_modes_completion_early_exit_and_changed_inputs(machine):
     result = run({**options, "max_context": 1024})
     assert result.returncode != 0 and "different inputs" in result.stderr
     assert (state / "completed.json").read_bytes() == saved
+
+
+@pytest.mark.parametrize(
+    ("options", "expected"),
+    [({}, "all"), ({"covariates": "all"}, "all"), ({"covariates": "none"}, "none")],
+)
+def test_covariates_recorded_and_forwarded_to_scorer(machine, options, expected):
+    run, state, events, _ = machine
+    result = run(options)
+    assert result.returncode == 0, result.stderr
+    assert json.loads((state / "inputs.json").read_text())["covariates"] == expected
+    marker = json.loads((state / "completed.json").read_text())
+    assert marker["inputs"]["covariates"] == expected
+    calls = [event for event in events() if event[0] == "score"]
+    assert [event[1] for event in calls] == ["raw", "published"]
+    for _, _, command, _ in calls:
+        if expected == "none":
+            index = command.index("--covariates")
+            assert command[index : index + 2] == ["--covariates", "none"]
+        else:
+            assert "--covariates" not in command
+
+
+@pytest.mark.parametrize(("recorded", "resumed"), [("all", "none"), ("none", "all")])
+@pytest.mark.parametrize("with_marker", [False, True])
+def test_changed_covariates_refused_on_resume(machine, recorded, resumed, with_marker):
+    run, state, events, _ = machine
+    result = run({"covariates": recorded})
+    assert result.returncode == 0, result.stderr
+    marker = state / "completed.json"
+    if not with_marker:
+        marker.unlink()
+    saved = {path: path.read_bytes() for path in state.rglob("*") if path.is_file()}
+    before = len(events())
+    result = run({"covariates": resumed})
+    assert result.returncode != 0 and "different inputs" in result.stderr
+    assert {path: path.read_bytes() for path in state.rglob("*") if path.is_file()} == saved
+    assert not any(event[0] in ["score", "git", "gcloud", "uv"] for event in events()[before:])
 
 
 def test_failed_task_attempts_both_modes_and_resumes(machine):
@@ -604,6 +668,7 @@ def test_139f3f7_state_keeps_its_identity_and_checkpoint_path(machine, failed, i
     assert run(FAIL_TASK="1" if failed else "0").returncode == int(failed)
     identity = state / "inputs.json"
     config = json.loads(identity.read_text())
+    config.pop("covariates")
     config["guest_sha256"] = "a726e1e81f4ad804683b5164aebbf38aefb2107a7983a0b4faad8b1de200916f"
     identity.write_text(json.dumps(config, sort_keys=True) + "\n")
     marker_path = state / "completed.json"
@@ -617,6 +682,7 @@ def test_139f3f7_state_keeps_its_identity_and_checkpoint_path(machine, failed, i
     result = run()
     assert result.returncode == 0, result.stderr
     assert json.loads(identity.read_text()) == config
+    assert json.loads(marker_path.read_text())["inputs"] == config
     calls = [e for e in events()[before:] if e[0] == "score"]
     if failed:
         expected = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()
@@ -628,6 +694,32 @@ def test_139f3f7_state_keeps_its_identity_and_checkpoint_path(machine, failed, i
         )
     else:
         assert not any(e[0] in ["score", "git", "gcloud"] for e in events()[before:])
+
+
+@pytest.mark.parametrize("with_marker", [False, True])
+def test_139f3f7_state_refuses_covariates_none_without_changes(machine, with_marker):
+    run, state, events, _ = machine
+    result = run()
+    assert result.returncode == 0, result.stderr
+    identity = state / "inputs.json"
+    config = json.loads(identity.read_text())
+    config.pop("covariates")
+    config["guest_sha256"] = "a726e1e81f4ad804683b5164aebbf38aefb2107a7983a0b4faad8b1de200916f"
+    identity.write_text(json.dumps(config, sort_keys=True) + "\n")
+    marker_path = state / "completed.json"
+    if with_marker:
+        marker = json.loads(marker_path.read_text())
+        marker["inputs"] = config
+        marker["artifacts"]["inputs.json"] = hashlib.sha256(identity.read_bytes()).hexdigest()
+        marker_path.write_text(json.dumps(marker))
+    else:
+        marker_path.unlink()
+    saved = {path: path.read_bytes() for path in state.rglob("*") if path.is_file()}
+    before = len(events())
+    result = run({"covariates": "none"})
+    assert result.returncode != 0 and "no valid input identity" in result.stderr
+    assert {path: path.read_bytes() for path in state.rglob("*") if path.is_file()} == saved
+    assert not any(e[0] in ["score", "git", "gcloud", "uv"] for e in events()[before:])
 
 
 def test_unknown_guest_identity_is_refused(machine):
