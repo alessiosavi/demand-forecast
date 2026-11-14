@@ -1134,7 +1134,8 @@ def _fidelity_plants(values):
     # Preserve both endpoints and every benchmark event in the edited plants.
     modal = np.flatnonzero(finite & ~events)
     eligible = modal[(modal >= 256) & (modal < len(values) - 256)]
-    n_edits = len(values) // 100
+    # The verifier's fractions are taken over finite pairs, so 1% is of those.
+    n_edits = int(finite.sum()) // 100
     if not n_edits or len(eligible) < n_edits:
         return kind, {}
     span = float(levels[1] - levels[0])

@@ -303,3 +303,19 @@ def test_fidelity_rejections_have_their_own_capped_sample(tmp_path, monkeypatch)
     assert folder["matches"] == []
     assert len(folder["fidelity_rejections"]) == folder["match_sample_limit"] == 1
     assert folder["fidelity_rejections"][0]["old_rule_accepted"]
+
+
+def test_edited_plants_change_one_percent_of_the_finite_points():
+    # Missing benchmark values shrink the compared overlap; 1% of the raw length
+    # would exceed the verifier's 99% fraction and fail a correct scanner's control.
+    values = np.zeros(2000)
+    values[[300, 700, 1100, 1500]] = 1.0
+    values[[10, 20, 30, 40, 50]] = np.nan
+    kind, variants = s._fidelity_plants(values)
+    finite = np.isfinite(values)
+    assert kind == "sparse_flag"
+    for name in ("edited_1pct", "affine_edited_1pct"):
+        planted, expected = variants[name]
+        reference = values if name == "edited_1pct" else values * 2.5 + 7
+        changed = int((planted[finite] != reference[finite]).sum())
+        assert expected and 0 < changed <= int(finite.sum()) // 100
