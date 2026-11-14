@@ -332,12 +332,14 @@ def _markdown(payload):
     s = payload["summary"]
     lines = [
         f"Pairs with r² ≥ 0.5 in either direction: {s['r2_at_least_half']}/{s['records']}",
-        f"Pairs with strong off-modal association outside retrieval window: {s['strong_outside_retrieval_window']}/{s['records']}",
+        f"Pairs with strong off-modal association outside retrieval window: {s['strong_outside_retrieval_window']}/{s['records_with_retrieval_window']}"
+        f" records with a recognized window ({s['records'] - s['records_with_retrieval_window']} of {s['records']} have none or did not align and are not counted here)",
         f"Pairs differing from reported r² by > 0.01: {s['r2_differs_over_001']}/{s['records']}",
         "",
         "Strong association is descriptive, not a significance test: φ ≥ 0.5 (large positive association), shared ≥ 4 (exclude single-event coincidences), and n ≥ 32 finite outside-window pairs (exclude tiny remainders).",
         "E = a·b/n; φ = (n·k − a·b)/√(a·b·(n−a)·(n−b)); hypergeometric upper tail = P(K ≥ k | n,a,b). Serial dependence and retrieval selection prevent interpreting this reference tail as calibrated significance.",
         "Full-overlap exact modes define off-modal events in every region; degenerate φ and empty-region statistics are undefined. prefix/N excludes the first N unmasked overlap positions; suffix/N excludes the last N. Other proposals: whole overlap only, excluded from the outside-window headline.",
+        "The window is that of the one proposal the fingerprint pass recorded for the offset; if several key sizes matched, positions outside the recorded window can still lie inside another matched key.",
         "",
         f"artifact_type: {payload['artifact_type']}",
         "provisional: true",
@@ -526,6 +528,9 @@ def run_refit(report, corpus, spool, out, *, report_path=None, repo_commit=None)
             and outside["finite_pairs"] >= STRONG_ASSOCIATION["min_finite_pairs"]
             for r in good
             for outside in [r["retrieval_window"]["outside"]]
+        ),
+        records_with_retrieval_window=sum(
+            r["retrieval_window"]["outside"] is not None for r in good
         ),
         strong_association_thresholds=STRONG_ASSOCIATION,
         r2_differs_over_001=sum(

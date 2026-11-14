@@ -291,6 +291,8 @@ def test_other_proposals_report_only_whole_overlap(tmp_path, proposal):
     assert rec["retrieval_window"]["outside"] is None
     assert rec["retrieval_end_run"] is None
     assert payload["summary"]["strong_outside_retrieval_window"] == 0
+    # Records without a recognized window are not part of the headline's denominator.
+    assert payload["summary"]["records_with_retrieval_window"] == 0
     assert "whole overlap only" in (args[3] / "refit.md").read_text()
 
 
