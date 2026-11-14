@@ -393,6 +393,80 @@ carry `qualification_only: true`; the receipt is marked
 flag, are rejected as predecessors. Production training/export reject the
 flag. Qualification output must use a separate state prefix.
 
+## Fork conditions and provisional corpus attempts (25M full)
+
+For a variant of legs 3–5, use a fresh state prefix containing only a copy of
+the completed `stage2/{checkpoint-final.pt,completed.json,identity.json}`. Keep
+the job URI distinct and do not copy root terminal markers. Older stage2
+identities without a corpus receipt or condition are accepted; the size, seed,
+upstream pin, recipe and checkpoint integrity checks still apply.
+
+Pass the same condition and complete override list to stage3, stage4,
+stage4-long and export, for example:
+
+```bash
+--size 25m --recipe full --condition cov-w2 --override covariate_weight=0.05
+```
+
+Condition names match `[a-z0-9][a-z0-9-]{0,31}`. A condition requires at least
+one override; overrides require a condition, and duplicate keys are refused.
+The closed override list is `covariate_weight` (finite, greater than zero and
+at most one), `covariate_mix` (three finite shares in [0,1], summing to one
+within 1e-9), and `long_weight` (finite, greater than zero and at most one).
+Mix order is synthetic effects, sibling pairs, real known-future windows.
+Identity values use `repr(float(value))`, with mix values joined by commas.
+Training receives numeric weights and the canonical mix string.
+
+`covariate_weight` and `covariate_mix` apply to the main covariate pass in all
+three corpus legs. `long_weight` applies only to stage4 and stage4-long; its
+presence in the condition is recorded but adds no key to stage3. The long pass
+remains real-only. Each applicable key must already exist in the upstream YAML.
+All other recipe values, including clocks, context/LR schedules, warm start
+and seeds, retain the reference settings. Conditions are refused for other
+sizes, screen recipes, stage1, stage2 and qualification, by generator and guest.
+
+To use a labelled unaudited corpus attempt, additionally pass to each corpus
+leg and export:
+
+```bash
+--provisional-unaudited-corpus-attempt ATTEMPT_ID --corpus-uri gs://BUCKET/corpus
+```
+
+This flag has the same size/recipe/leg restrictions and is mutually exclusive
+with the qualification-only unsafe flag. It still requires corpus layout
+validation and `attempt-status.json` with `complete: true`, integer exit code
+zero and the specified attempt ID. It does not read `audit.json`. The receipt
+is `{"provisional": true, "warning": "UNAUDITED_CORPUS_PROVISIONAL",
+"attempt_id": "ATTEMPT_ID", "corpus_uri": "gs://BUCKET/corpus"}`; trailing
+slashes are removed from the receipt URI. Without this flag the audit gate is
+unchanged. A condition can also use an audited corpus, and provisional mode
+can be used without a condition.
+
+Only a receipt-free, condition-free stage2 parent can start a new provisional
+fork. An audited or legacy corpus-trained checkpoint cannot adopt provisional
+mode. Later legs, same-stage resumes, completed-job shortcuts and both export
+members must match the condition and provisional receipt exactly; dropping a
+flag fails. Manifests, checkpoint identities, completion records and export
+member records are checked before recovery writes. An incompatible export is
+refused, preserving its files. The existing legacy-to-audited resume migration
+and legacy-plus-audited export exception remain available without a condition
+or provisional receipt.
+
+Fork completions pass through the installed guest so it can compare embedded
+checkpoint identities; the shell's dependency-free shortcut remains available
+for reference jobs. Fork jobs still perform installation; corpus-reading legs
+also sync the corpus before the guest confirms completion.
+
+The condition and receipt label live in training identities/checkpoints and
+the export completion record, including its member identities. Scoring and
+adaptation jobs fetch only weights and config and do not propagate either
+label. The operator must label results obtained from a provisional export.
+
+Patch 0005 changes the embedded bundle digest because its source bytes are
+part of bundle identity. Existing full-recipe golden tests retain their
+explicit bundle/digest and completion-identity-check exceptions; reference
+training settings are unchanged.
+
 ## Scalar exposure and replay records
 
 `exposure` in each training JSONL loss record, training checkpoint,

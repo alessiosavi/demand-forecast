@@ -1,0 +1,442 @@
+diff --git a/src/simons/training/fork_conditions.py b/src/simons/training/fork_conditions.py
+new file mode 100644
+--- /dev/null
++++ b/src/simons/training/fork_conditions.py
+@@ -0,0 +1,168 @@
++"""Condition and provisional receipt contracts, independent of training dependencies."""
++
++import json
++import math
++import re
++from pathlib import Path
++
++OVERRIDE_LEGS = {
++    "covariate_weight": ("stage3", "stage4", "stage4-long"),
++    "covariate_mix": ("stage3", "stage4", "stage4-long"),
++    "long_weight": ("stage4", "stage4-long"),
++}
++
++
++def canonical_condition(name, overrides):
++    """Encode the closed set of fork overrides independently of input spelling."""
++    if name is None and not overrides:
++        return None
++    if name is None or not overrides:
++        raise ValueError("condition and overrides require both or neither")
++    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,31}", name):
++        raise ValueError("invalid condition name")
++    values = {}
++    for item in overrides:
++        key, separator, value = item.partition("=")
++        if not separator or key not in OVERRIDE_LEGS or key in values:
++            raise ValueError("unknown or duplicate override key")
++        try:
++            numbers = [float(x) for x in value.split(",")]
++        except ValueError as error:
++            raise ValueError("override must contain finite numbers") from error
++        if not all(math.isfinite(x) for x in numbers):
++            raise ValueError("override must contain finite numbers")
++        if key == "covariate_mix":
++            if (
++                len(numbers) != 3
++                or any(x < 0 or x > 1 for x in numbers)
++                or abs(sum(numbers) - 1) > 1e-9
++            ):
++                raise ValueError("covariate_mix requires three shares summing to one")
++        elif len(numbers) != 1 or not 0 < numbers[0] <= 1:
++            raise ValueError("override weight must be in (0, 1]")
++        values[key] = ",".join(repr(x) for x in numbers)
++    return {"name": name, "overrides": dict(sorted(values.items()))}
++
++
++def validate_fork_options(size, leg, recipe, condition, override, attempt, unsafe, corpus_uri):
++    result = canonical_condition(condition, override)
++    if result is not None or attempt is not None:
++        if (
++            size != "25m"
++            or recipe != "full"
++            or leg not in (*OVERRIDE_LEGS["covariate_weight"], "export")
++        ):
++            raise ValueError("fork flags require 25m full stage3, stage4, stage4-long or export")
++    if attempt is not None:
++        if not isinstance(attempt, str) or not attempt.strip():
++            raise ValueError("provisional attempt id must be nonempty")
++        if unsafe:
++            raise ValueError("provisional and qualification corpus flags are mutually exclusive")
++        if not corpus_uri:
++            raise ValueError("provisional receipt requires a corpus URI")
++    return result
++
++
++class ForkIdentityError(ValueError):
++    """A provenance refusal must never be treated as recoverable artifact damage."""
++
++
++def job_condition(args):
++    return validate_fork_options(
++        getattr(args, "size", None),
++        getattr(args, "leg", None),
++        getattr(args, "recipe", "full"),
++        getattr(args, "condition", None),
++        getattr(args, "override", None),
++        getattr(args, "provisional_unaudited_corpus_attempt", None),
++        getattr(args, "unsafe_qualification_allow_unaudited_corpus", False),
++        getattr(args, "corpus_uri", None),
++    )
++
++
++def provisional_receipt(args):
++    attempt = getattr(args, "provisional_unaudited_corpus_attempt", None)
++    if attempt is None:
++        return None
++    uri = getattr(args, "corpus_uri", None)
++    if not isinstance(uri, str) or not re.fullmatch(r"gs://[A-Za-z0-9._-]+(?:/[^\r\n]*)?", uri):
++        raise ValueError("provisional receipt requires a corpus URI")
++    return {
++        "provisional": True,
++        "warning": "UNAUDITED_CORPUS_PROVISIONAL",
++        "attempt_id": attempt,
++        "corpus_uri": uri.rstrip("/"),
++    }
++
++
++def check_fork_identity(saved, args, predecessor=False):
++    condition = job_condition(args)
++    # This exception is only for a fresh stage3's synthetic stage2 parent.
++    stage2_parent = (
++        predecessor
++        and getattr(args, "leg", None) == "stage3"
++        and saved.get("leg") == "stage2"
++        and saved.get("condition") is None
++        and saved.get("corpus_release") is None
++    )
++    if saved.get("condition") != condition and not stage2_parent:
++        raise ForkIdentityError("condition identity changed; use a separate STATE_URI")
++    receipt = saved.get("corpus_release")
++    desired = provisional_receipt(args)
++    if desired is not None or (receipt or {}).get("provisional"):
++        if receipt != desired and not stage2_parent:
++            raise ForkIdentityError(
++                "provisional receipt identity changed; use a separate STATE_URI"
++            )
++
++
++def agree(records):
++    """No condition/provisional migration; retain the old missing-to-audited exception."""
++    if not records:
++        return
++    condition = records[0].get("condition")
++    receipts = [r.get("corpus_release") for r in records]
++    if any(r.get("condition") != condition for r in records):
++        raise ForkIdentityError("condition identity changed: records disagree")
++    strict = condition is not None or any((r or {}).get("provisional") for r in receipts)
++    compared = receipts if strict else [r for r in receipts if r is not None]
++    if compared and any(r != compared[0] for r in compared):
++        raise ForkIdentityError("corpus receipt identity changed: records disagree")
++
++
++def check_records(directory, args=None, embedded=None):
++    """Read authoritative metadata before any recovery writes or no-op decisions."""
++    root = Path(directory)
++    records = []
++    for name in ("identity.json", "completed.json"):
++        try:
++            record = json.loads((root / name).read_text())
++        except (OSError, ValueError):
++            continue  # Artifact recovery may repair an absent or interrupted JSON file.
++        if name == "identity.json":
++            records.append(record)
++            continue
++        nested = record.get("job_identity")
++        if nested is not None:
++            records.append(nested)
++        if "condition" in record or "corpus_release" in record:
++            records.append(
++                {
++                    "condition": record.get("condition"),
++                    "corpus_release": record.get("corpus_release"),
++                }
++            )
++        members = record.get("member_job_identities", [])
++        records.extend(members)
++        if "member_corpus_releases" in record:
++            records.extend(
++                {"condition": record.get("condition"), "corpus_release": receipt}
++                for receipt in record["member_corpus_releases"]
++            )
++    if embedded is not None:
++        records.append(embedded)
++    agree(records)
++    if args is not None:
++        for record in records:
++            check_fork_identity(record, args)
++    return records
+diff --git a/src/simons/training/screen.py b/src/simons/training/screen.py
+--- a/src/simons/training/screen.py
++++ b/src/simons/training/screen.py
+@@ -4,6 +4,8 @@
+ import hashlib
+ import json
+ from pathlib import Path
++
++from simons.training.fork_conditions import agree, check_fork_identity
+ 
+ FULL_UPDATES = 120208
+ 
+@@ -52,15 +54,13 @@
+     return out
+ 
+ 
+-def corpus_release(corpus, qualification_only=False):
++def corpus_release(corpus, qualification_only=False, provisional=None):
+     """Fail closed on the corpus-v4 release handshake; hash the exact audit bytes."""
+     if qualification_only:
+         return {"qualification_only": True, "warning": "UNSAFE_UNAUDITED_CORPUS"}
+     try:
+         root = Path(corpus)
+         status = json.loads((root / "attempt-status.json").read_bytes())
+-        data = (root / "audit.json").read_bytes()
+-        audit = json.loads(data)
+         attempt = status["attempt_id"]
+         if not isinstance(attempt, str) or not attempt.strip():
+             raise ValueError("missing attempt id")
+@@ -70,6 +70,12 @@
+             or status["exit_code"] != 0
+         ):
+             raise ValueError("attempt is incomplete or failed")
++        if provisional is not None:
++            if attempt != provisional["attempt_id"]:
++                raise ValueError("provisional attempt id differs from corpus status")
++            return provisional
++        data = (root / "audit.json").read_bytes()
++        audit = json.loads(data)
+         if audit.get("attempt_id") != attempt or audit.get("valid") is not True:
+             raise ValueError("audit is invalid or belongs to another attempt")
+         if type(audit.get("exit_code")) is not int or audit["exit_code"] != 0:
+@@ -94,10 +100,11 @@
+     return name, (25000 if updates is None else updates) if name == "screen" else None
+ 
+ 
+-def check_identity(saved, args):
++def check_identity(saved, args, predecessor=False):
+     """Legacy identities mean full; provenance revisions may change across legs."""
+     if saved.get("qualification_only") or saved.get("corpus_release", {}).get("qualification_only"):
+         raise ValueError("qualification-only output cannot be a predecessor")
++    check_fork_identity(saved, args, predecessor=predecessor)
+     name, updates = mode(args)
+     if (saved.get("recipe_name", "full"), saved.get("screen_updates")) != (name, updates):
+         raise ValueError("recipe identity changed; use a separate STATE_URI")
+@@ -115,6 +122,7 @@
+ 
+ def compatible_resume(saved, expected):
+     """Retain original full-run provenance, adding the first audited receipt if absent."""
++    agree([saved, expected])
+     old, new = copy.deepcopy(saved), copy.deepcopy(expected)
+     for key in ("repo_sha", "bundle_sha256"):
+         new[key] = old.get(key)
+diff --git a/src/simons/training/spot_job.py b/src/simons/training/spot_job.py
+--- a/src/simons/training/spot_job.py
++++ b/src/simons/training/spot_job.py
+@@ -15,6 +15,10 @@
+ import yaml
+ 
+ from simons.training import config, schedule
++from simons.training.fork_conditions import (
++    ForkIdentityError, OVERRIDE_LEGS, agree, check_fork_identity, check_records,
++    job_condition, provisional_receipt, validate_fork_options,
++)
+ from simons.training.screen import (check_identity, compatible_resume, corpus_release, mode,
+                                     screen_settings)
+ from simons.training.reliability import (
+@@ -66,6 +70,7 @@
+         raise ValueError("qualification-only output cannot be a predecessor")
+     if payload.get("job_identity", {}).get("qualification_only"):
+         raise ValueError("qualification-only output cannot be a predecessor")
++    check_records(directory, embedded=payload.get("job_identity"))
+     return path
+ 
+ 
+@@ -88,7 +93,7 @@
+ 
+ 
+ def recipe(root, state, corpus, size, leg, seed, micro_batches,
+-           recipe_name="full", screen_updates=None):
++           recipe_name="full", screen_updates=None, condition=None):
+     """Copy the upstream YAML; width is the *only* model edit for 12m."""
+     if size == "60m" and recipe_name == "screen":
+         raise ValueError("60M short schedule needs a registered protocol")
+@@ -97,6 +102,15 @@
+     if size == "12m":
+         raw["model"]["width"] = 264
+     settings = raw["training"]
++    if condition is not None:
++        condition = validate_fork_options(size, leg, recipe_name, condition["name"],
++            [f"{key}={value}" for key, value in condition["overrides"].items()], None, False, None)
++        for key, value in condition["overrides"].items():
++            if leg not in OVERRIDE_LEGS[key]:
++                continue
++            if key not in settings:
++                raise ValueError(f"condition override missing from upstream YAML: {key}")
++            settings[key] = value if key == "covariate_mix" else float(value)
+     if recipe_name == "screen":
+         settings.update(screen_settings(root, leg, 25000 if screen_updates is None else screen_updates))
+     elif recipe_name != "full" or screen_updates is not None:
+@@ -151,6 +165,9 @@
+         "corpus_uri": args.corpus_uri,
+         "recipe": raw,
+     }
++    condition = job_condition(args)
++    if condition is not None:
++        result["condition"] = condition
+     name, updates = mode(args)
+     if name == "screen":
+         result.update(recipe_name=name, screen_updates=updates)
+@@ -162,6 +179,8 @@
+ def run_leg(args):
+     state = Path(args.run_dir) / "state"
+     directory = state / args.leg
++    job_condition(args)
++    check_records(directory, args)
+     if getattr(args, "unsafe_qualification_allow_unaudited_corpus", False):
+         raise ValueError("unsafe corpus override is qualification-only")
+     # Completed jobs are no-ops even when local corpus/install scratch has disappeared.
+@@ -169,22 +188,30 @@
+         try:
+             final = completed_checkpoint(directory)
+             saved = read_checkpoint(final).get("job_identity")
++            check_records(directory, args, embedded=saved)
++            if saved is None:
++                check_fork_identity({}, args)
+             if saved is None and mode(args)[0] == "screen":
+                 raise ValueError("missing screen identity")
+             if saved is not None:
+                 check_identity(saved, args)
+             prune_checkpoints(directory)
+             return 0
++        except ForkIdentityError:
++            raise
+         except (OSError, ValueError, KeyError, RuntimeError, EOFError, pickle.UnpicklingError):
+             pass  # A marker can arrive before its large checkpoint during an interrupted upload.
+     paths = corpus_paths(args.corpus, args.leg)
+-    args.corpus_release = (corpus_release(args.corpus)
++    args.corpus_release = (corpus_release(args.corpus, provisional=provisional_receipt(args))
+                            if args.leg in ("stage3", "stage4", "stage4-long") else None)
+     checkpoint = latest_checkpoint(directory)
+     # On resume no predecessor is required: the checkpoint owns model and optimizer.
+     # recipe() resolves the predecessor only for a new leg.
+     if checkpoint is not None:
+         saved_identity = read_checkpoint(checkpoint).get("job_identity")
++        check_records(directory, args, embedded=saved_identity)
++        if saved_identity is None:
++            check_fork_identity({}, args)
+         manifest_path = directory / "identity.json"
+         if manifest_path.exists():
+             manifest = json.loads(manifest_path.read_text())
+@@ -205,14 +232,14 @@
+     else:
+         raw = recipe(
+             args.root, state, args.corpus, args.size, args.leg, args.seed, args.micro_batches,
+-            recipe_name=mode(args)[0], screen_updates=mode(args)[1]
++            recipe_name=mode(args)[0], screen_updates=mode(args)[1], condition=job_condition(args)
+         )
+         previous_path = raw["training"].get("warm_start")
+         if previous_path is not None:
+             saved = read_checkpoint(previous_path).get("job_identity")
+             if saved is None:
+                 raise ValueError("predecessor has no experiment identity")
+-            check_identity(saved, args)
++            check_identity(saved, args, predecessor=True)
+             receipt = saved.get("corpus_release")
+             if receipt is not None and receipt != args.corpus_release:
+                 raise ValueError("corpus audit identity changed between legs")
+@@ -269,6 +296,7 @@
+     atomic_json(
+         directory / "completed.json",
+         {
++            **({"condition": job_identity["condition"]} if (job_identity or {}).get("condition") is not None else {}),
+             "checkpoint": FINAL_NAME,
+             "step": step,
+             "bytes": final.stat().st_size,
+@@ -289,6 +317,18 @@
+ 
+     state = Path(args.run_dir) / "state"
+     destination = state / "export"
++    job_condition(args)
++    records = check_records(destination, args)
++    if job_condition(args) is not None or provisional_receipt(args) is not None:
++        for leg in ("stage4", "stage4-long"):
++            member = state / leg
++            records.extend(check_records(member, args))
++            checkpoint = latest_checkpoint(member)
++            if checkpoint is not None:
++                saved = read_checkpoint(checkpoint).get("job_identity")
++                check_fork_identity(saved or {}, args)
++                records.extend(check_records(member, args, embedded=saved))
++        agree(records)
+     if (destination / "completed.json").is_file():
+         try:
+             marker = json.loads((destination / "completed.json").read_text())
+@@ -298,11 +338,15 @@
+                 for n in ("config.json", "model.safetensors")
+             ):
+                 return 0
++        except ForkIdentityError:
++            raise
+         except (OSError, KeyError, ValueError, TypeError):
+             pass
+     paths = [completed_checkpoint(state / leg) for leg in ("stage4", "stage4-long")]
+     for path in paths:
+         saved = read_checkpoint(path).get("job_identity")
++        if saved is None:
++            check_fork_identity({}, args)
+         if saved is None and mode(args)[0] == "screen":
+             raise ValueError("missing screen member identity")
+         if saved is not None:
+@@ -321,6 +365,9 @@
+     atomic_json(
+         destination / "completed.json",
+         {
++            **({"condition": job_condition(args)} if job_condition(args) is not None else {}),
++            **({"member_job_identities": [read_checkpoint(p).get("job_identity") for p in paths]}
++               if job_condition(args) is not None or provisional_receipt(args) is not None else {}),
+             "members": [str(p) for p in paths],
+             "job_identity": {**(read_checkpoint(paths[0]).get("job_identity") or {}),
+                              "recipe_name": mode(args)[0], "screen_updates": mode(args)[1]},
+@@ -339,6 +386,7 @@
+     """A child process isolates OOM retries from CUDA state and worker-prefetch queues."""
+     from simons.training.qualification import Measurement
+ 
++    job_condition(args)
+     directory = Path(args.run_dir)
+     state = directory / "state"
+     receipt = (corpus_release(args.corpus, qualification_only=getattr(
+@@ -402,6 +450,7 @@
+ 
+ 
+ def qualify(args):
++    job_condition(args)
+     directory = Path(args.run_dir) / "state" / "qualify"
+     directory.mkdir(parents=True, exist_ok=True)
+     result_path = directory / f"{args.name}.json"
+@@ -469,6 +518,9 @@
+     parser.add_argument("--recipe", choices=["full", "screen"], default="full")
+     parser.add_argument("--screen-updates", type=int)
+     parser.add_argument("--unsafe-qualification-allow-unaudited-corpus", action="store_true")
++    parser.add_argument("--condition")
++    parser.add_argument("--override", action="append")
++    parser.add_argument("--provisional-unaudited-corpus-attempt")
+     parser.add_argument("--root", type=Path, required=True)
+     parser.add_argument("--run-dir", type=Path, default=os.environ.get("RUN_DIR"), required=False)
+     parser.add_argument("--corpus", type=Path)
+@@ -505,6 +557,11 @@
+         parser.error("--screen-updates must be >= 100")
+     if args.unsafe_qualification_allow_unaudited_corpus and args.leg != "qualify":
+         parser.error("unsafe corpus override is qualification-only")
++    try:
++        job_condition(args)
++        provisional_receipt(args)
++    except ValueError as error:
++        parser.error(str(error))
+     Path(args.run_dir).mkdir(parents=True, exist_ok=True)
+     if args.leg == "qualify":
+         return qualify_once(args) if args.qualify_child else qualify(args)
