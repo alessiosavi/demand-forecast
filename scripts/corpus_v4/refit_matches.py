@@ -4,14 +4,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
+from scipy.stats import hypergeom
 
 from scripts.corpus_v4.audit_sketch import _open_spool, _series
-from scripts.corpus_v4.native import atomic_json, iter_rows
+from scripts.corpus_v4.native import atomic_json, digest, iter_rows
+
+STRONG_ASSOCIATION = dict(min_phi=0.5, min_shared=4, min_finite_pairs=32)
+AFFINE_RTOL = AFFINE_ATOL = 1e-10
 
 
 def _records(report):
@@ -203,11 +208,86 @@ def _stats(values):
     )
 
 
+def _association(ao, bo):
+    """Fixed full-overlap modes; the tail is a reference, not a calibrated test."""
+    n = len(ao)
+    a, b, k = int(ao.sum()), int(bo.sum()), int((ao & bo).sum())
+    denominator = math.sqrt(a * b * (n - a) * (n - b))
+    return dict(
+        finite_pairs=n,
+        corpus_count=a,
+        benchmark_count=b,
+        intersection_count=k,
+        expected_intersection=a * b / n if n else None,
+        phi=(n * k - a * b) / denominator if denominator else None,
+        hypergeom_upper_tail=float(hypergeom.sf(k - 1, n, a, b)) if n else None,
+    )
+
+
+def _retrieval_window(proposal, positions, raw_pairs, ao, bo):
+    match = re.fullmatch(r"(prefix|suffix)/([1-9][0-9]*)", proposal or "")
+    window = dict(proposal=proposal, inside=None, outside=None)
+    if match is None:
+        window["note"] = "whole overlap only: proposal has no recognized retrieval window"
+        return window
+    end, length = match[1], int(match[2])
+    start, stop = (
+        (0, min(length, raw_pairs)) if end == "prefix" else (max(0, raw_pairs - length), raw_pairs)
+    )
+    inside = (positions >= start) & (positions < stop)
+    window.update(
+        end=end,
+        requested_pairs=length,
+        position_start=start,
+        position_end=stop,
+        inside=_association(ao[inside], bo[inside]),
+        outside=_association(ao[~inside], bo[~inside]),
+    )
+    return window
+
+
+def _retrieval_end_run(a, b, positions, raw_pairs, window):
+    """Maximal endpoint-connected agreement on finite pairs, with gaps retained."""
+    if "end" not in window:
+        return None
+    suffix = window["end"] == "suffix"
+    x, y = (a[::-1], b[::-1]) if suffix else (a, b)
+    different = np.flatnonzero(x != x[0])
+    slope = float((y[different[0]] - y[0]) / (x[different[0]] - x[0])) if len(different) else 0.0
+    predicted = y[0] + slope * (x - x[0])
+
+    def span(agrees):
+        failures = np.flatnonzero(~agrees)
+        count = int(failures[0]) if len(failures) else len(x)
+        return dict(
+            finite_pairs=count,
+            position_start=int(positions[len(x) - count - 1]) + 1
+            if suffix and count < len(x)
+            else 0,
+            position_end=int(positions[count]) if not suffix and count < len(x) else raw_pairs,
+        )
+
+    affine = span(np.isclose(y, predicted, rtol=AFFINE_RTOL, atol=AFFINE_ATOL))
+    affine["coef"] = [slope, float(y[0] - slope * x[0])]
+    return dict(
+        end=window["end"],
+        position_convention="half-open positions in the unmasked overlap; nonfinite pairs skipped",
+        affine_rtol=AFFINE_RTOL,
+        affine_atol=AFFINE_ATOL,
+        affine=affine,
+        exact=span(x == y),
+    )
+
+
 def _measure(record, x, y, result):
     a, b, positions = _align(record, x, y, result["alignment"])
     astat, bstat = _stats(a), _stats(b)
     ao, bo = a != astat["mode"], b != bstat["mode"]
-    na, nb, common = int(ao.sum()), int(bo.sum()), int((ao & bo).sum())
+    nb, common = int(bo.sum()), int((ao & bo).sum())
+    association = _association(ao, bo)
+    window = _retrieval_window(
+        record.get("proposal"), positions, result["alignment"]["raw_pairs"], ao, bo
+    )
 
     def pairs(indices):
         return [
@@ -230,13 +310,14 @@ def _measure(record, x, y, result):
         corpus_stats=astat,
         benchmark_stats=bstat,
         off_modal=dict(
+            **association,
             corpus_positions=positions[ao].tolist(),
             benchmark_positions=positions[bo].tolist(),
-            corpus_count=na,
-            benchmark_count=nb,
-            intersection_count=common,
-            expected_intersection=na * nb / len(a),
             benchmark_reproduced_frac=common / nb if nb else None,
+        ),
+        retrieval_window=window,
+        retrieval_end_run=_retrieval_end_run(
+            a, b, positions, result["alignment"]["raw_pairs"], window
         ),
         exact_equal_frac=float(np.mean(a == b)),
         first_pairs=pairs(range(min(120, len(a)))),
@@ -251,8 +332,25 @@ def _markdown(payload):
     s = payload["summary"]
     lines = [
         f"Pairs with r² ≥ 0.5 in either direction: {s['r2_at_least_half']}/{s['records']}",
-        f"Pairs reproducing > half the benchmark off-modal positions: {s['majority_benchmark_off_modal']}/{s['records']}",
+        f"Pairs with strong off-modal association outside retrieval window: {s['strong_outside_retrieval_window']}/{s['records']}",
         f"Pairs differing from reported r² by > 0.01: {s['r2_differs_over_001']}/{s['records']}",
+        "",
+        "Strong association is descriptive, not a significance test: φ ≥ 0.5 (large positive association), shared ≥ 4 (exclude single-event coincidences), and n ≥ 32 finite outside-window pairs (exclude tiny remainders).",
+        "E = a·b/n; φ = (n·k − a·b)/√(a·b·(n−a)·(n−b)); hypergeometric upper tail = P(K ≥ k | n,a,b). Serial dependence and retrieval selection prevent interpreting this reference tail as calibrated significance.",
+        "Full-overlap exact modes define off-modal events in every region; degenerate φ and empty-region statistics are undefined. prefix/N excludes the first N unmasked overlap positions; suffix/N excludes the last N. Other proposals: whole overlap only, excluded from the outside-window headline.",
+        "",
+        f"artifact_type: {payload['artifact_type']}",
+        "provisional: true",
+        "release_eligible: false",
+        f"input_fingerprint: {json.dumps(payload['input_fingerprint'], sort_keys=True)}",
+        f"benchmark_revision: {json.dumps(payload['benchmark_revision'], sort_keys=True)}",
+        f"method (source report): {json.dumps(payload['method'], sort_keys=True)}",
+        f"repository_commit: {payload['repository_commit'] or 'not supplied'}",
+        "",
+        "Input files (SHA256):",
+        "```json",
+        json.dumps(payload["provenance"], sort_keys=True, indent=2),
+        "```",
         "",
         f"Alignment failures: {s['alignment_failures']}. Off-modal overlap counts shared event positions, not matching amplitudes.",
         "Modes use exact values (ties: smallest value); r²/Pearson are undefined for constant targets/series. Positions retain missing-value gaps.",
@@ -292,11 +390,85 @@ def _markdown(payload):
         else:
             row += ["—"] * 10 + ["ERROR: " + cell(rec["error"])]
         lines.append("| " + " | ".join(row) + " |")
+    for i, rec in enumerate(payload["records"], 1):
+        if not rec["alignment_ok"]:
+            continue
+        window = rec["retrieval_window"]
+        lines += [
+            "",
+            f"Pair {i}, proposal: {cell(window['proposal'])}",
+            "",
+            "| Region | n | Off C (a) | Off B (b) | Shared (k) | Expected (E) | φ | Hypergeometric upper tail |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+        for label, stats in (
+            ("whole overlap", rec["off_modal"]),
+            ("inside retrieval window", window["inside"]),
+            ("outside retrieval window", window["outside"]),
+        ):
+            if stats is not None:
+                lines.append(
+                    "| "
+                    + " | ".join(
+                        [label]
+                        + [
+                            number(stats[k])
+                            for k in (
+                                "finite_pairs",
+                                "corpus_count",
+                                "benchmark_count",
+                                "intersection_count",
+                                "expected_intersection",
+                                "phi",
+                                "hypergeom_upper_tail",
+                            )
+                        ]
+                    )
+                    + " |"
+                )
+        run = rec["retrieval_end_run"]
+        if run is None:
+            lines.append(window["note"])
+            continue
+        lines.append(
+            f"Retrieval window positions [{window['position_start']}, {window['position_end']}); longest runs from the {run['end']} end on finite pairs (half-open unmasked positions, gaps retained):"
+        )
+        for label in ("affine", "exact"):
+            span = run[label]
+            lines.append(
+                f"{label}: [{span['position_start']}, {span['position_end']}), {span['finite_pairs']} finite pairs."
+            )
+        lines.append(
+            f"Affine B←C coefficients: {run['affine']['coef']}; rtol={run['affine_rtol']}, atol={run['affine_atol']} (floating-point agreement). Exact equality has no tolerance."
+        )
     return "\n".join(lines) + "\n"
 
 
-def run_refit(report, corpus, spool, out):
+def _file_evidence(path, *, name=None):
+    evidence = dict(path=name or str(path), sha256=None)
+    try:
+        evidence["sha256"] = digest(path)
+    except OSError as exc:
+        evidence["error"] = str(exc)
+    return evidence
+
+
+def run_refit(report, corpus, spool, out, *, report_path=None, repo_commit=None):
     records = list(_records(report))
+    shards = set()
+    for folder, record in records:
+        try:
+            shards.add(_shard_path(folder, record))
+        except ValueError:
+            pass  # _load_corpus records invalid paths as per-record failures.
+    provenance = dict(
+        report=_file_evidence(report_path)
+        if report_path is not None
+        else dict(sha256=None, error="report path not supplied"),
+        spool_sqlite=_file_evidence(spool),
+        spool_values=_file_evidence(Path(spool).with_suffix(".values")),
+        shards=[_file_evidence(Path(corpus) / path, name=path) for path in sorted(shards)],
+    )
     channels, errors = _load_corpus(corpus, records)
     results = []
     db = None
@@ -346,14 +518,37 @@ def run_refit(report, corpus, spool, out):
             )
             for r in good
         ),
-        majority_benchmark_off_modal=sum(
-            (r["off_modal"]["benchmark_reproduced_frac"] or 0) > 0.5 for r in good
+        strong_outside_retrieval_window=sum(
+            outside is not None
+            and outside["phi"] is not None
+            and outside["phi"] >= STRONG_ASSOCIATION["min_phi"]
+            and outside["intersection_count"] >= STRONG_ASSOCIATION["min_shared"]
+            and outside["finite_pairs"] >= STRONG_ASSOCIATION["min_finite_pairs"]
+            for r in good
+            for outside in [r["retrieval_window"]["outside"]]
         ),
+        strong_association_thresholds=STRONG_ASSOCIATION,
         r2_differs_over_001=sum(
             r["r2_delta"] is not None and abs(r["r2_delta"]) > 0.01 for r in good
         ),
     )
-    payload = dict(summary=summary, records=results)
+    payload = dict(
+        artifact_type="corpus-match-refit",
+        provisional=True,
+        release_eligible=False,
+        input_fingerprint=report.get("input_fingerprint"),
+        benchmark_revision=report.get("benchmark_revision"),
+        method=report.get("method"),
+        repository_commit=repo_commit,
+        association_interpretation=(
+            "Off-modal associations and strong-pair thresholds are descriptive, not a significance test. "
+            "All regions use full-overlap exact modes. Hypergeometric upper tails are fixed-marginal "
+            "references, uncalibrated under serial dependence and retrieval selection."
+        ),
+        provenance=provenance,
+        summary=summary,
+        records=results,
+    )
     out = Path(out)
     atomic_json(out / "refit.json", payload)
     temporary = out / "refit.md.tmp"
@@ -368,8 +563,16 @@ def main(argv=None):
     parser.add_argument("corpus", type=Path)
     parser.add_argument("spool", type=Path, help="benchmark.sqlite")
     parser.add_argument("out", type=Path)
+    parser.add_argument("--repo-commit", help="repository commit supplied by the pinned job")
     args = parser.parse_args(argv)
-    return run_refit(json.loads(args.report.read_text()), args.corpus, args.spool, args.out)
+    return run_refit(
+        json.loads(args.report.read_text()),
+        args.corpus,
+        args.spool,
+        args.out,
+        report_path=args.report,
+        repo_commit=args.repo_commit,
+    )
 
 
 if __name__ == "__main__":

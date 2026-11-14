@@ -91,7 +91,7 @@ while IFS= read -r shard; do
     gcloud storage cp "$CORPUS_URI/$shard" "$CORPUS/$shard"
 done < "$WORK/shards.txt"
 # Nonzero alignment status still reaches finish(), which publishes both reports.
-python -m scripts.corpus_v4.refit_matches "$WORK/report.json" "$CORPUS" "$WORK/benchmark.sqlite" "$RUN_DIR/state"
+python -m scripts.corpus_v4.refit_matches "$WORK/report.json" "$CORPUS" "$WORK/benchmark.sqlite" "$RUN_DIR/state" --repo-commit "$REPO_SHA"
 test -f "$RUN_DIR/state/refit.json"
 test -f "$RUN_DIR/state/refit.md"
 """
