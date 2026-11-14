@@ -1199,7 +1199,8 @@ before copy-back or stop/reconcile proceeds; a shell exiting is insufficient.
 If local process death cannot be confirmed, the chain waits with its session
 open. Healthy commands whose group is empty on the first inspection produce no
 `process_control` stderr; cancellation reports the time limit or interrupt and
-group immediately, and a killed nested child is reported before its final reap.
+group immediately, and a killed nested child's reap reports immediately and
+every five seconds until it completes.
 The first unconfirmed drain reports the group, live member PIDs and states (or
 unavailable inspection), elapsed time and any signal refusal before waiting,
 then repeats every five seconds while death remains unconfirmed.
@@ -1217,6 +1218,9 @@ setup and cleanup and can raise through I/O only inside the guarded wait; it
 switches back to deferral before raising. The first saved interrupt is delivered
 once, after draining and restoring the original handlers, and takes precedence
 over a timeout or failure (which is chained as its cause).
+SIGINT/SIGTERM queued during masked restoration are consumed and folded into
+that saved interrupt before unmasking; a signal after unmasking is a new operator
+action handled by the caller.
 Repeated Ctrl-C does not release
 the session. Inspect the reported group and terminate its live members by hand
 if necessary; restore process-inspection permission when membership is unknown.
@@ -1225,10 +1229,13 @@ group ID so cancellation cannot signal a subsequently recycled group. Exclusive
 child reaping and the default SIGCHLD disposition are required. If another waiter
 reaps the leader, ownership cannot recover: `LeaderIdentityLost` is reported once,
 no further group signal or inspection is allowed, and the caller proceeds to its
-remote cleanup with local death unconfirmed. Live or unknown membership with an
+remote cleanup with local death unconfirmed. This is the one diagnosed case
+where `run_process` raises without being able to prove the group is gone.
+Live or unknown membership with an
 intact leader still retains the barrier. Diagnostics are synchronous; they do
-not promise a heartbeat through a blocked syscall or stderr write, or a finite
-cleanup budget while group death remains unconfirmed. Nested
+not promise a heartbeat through a syscall blocked in native inspection, the `ps`
+fallback or a stderr write, or a finite cleanup budget while group death remains
+unconfirmed. Nested
 supervisors must inherit a pipe lease held by the live outer owner; an old
 environment value alone cannot disable the barrier. This protects against
 accidental stale environment values and recycled descriptors, not an adversary

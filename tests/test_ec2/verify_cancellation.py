@@ -20,6 +20,9 @@ import traceback
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "scripts/ec2/ops"))
+from process_identity import darwin_process_info  # noqa: E402
+
 CASES = {
     "checkout": {"stall_contains": "git checkout"},
     "dispatch": {"stall_contains": "dispatch-job.sh"},
@@ -81,16 +84,30 @@ def stress_worker(out, rounds, cases):
     return int(any(row["outcome"] != "passed" for row in records))
 
 
-def process_snapshot():
-    """Live PID -> (PPID, creation identity); never execute ps."""
-    result = {}
+def process_snapshot(tracked=()):
+    """Return live PID -> (PPID, identity, PGID), plus unresolved tracked IDs.
+
+    Include tracked IDs even when enumeration omits them. A missing libproc
+    record alone cannot prove death; sysctl must confirm exit or PID reuse.
+    """
+    result, unresolved = {}, {}
     if sys.platform == "linux":
-        for entry in Path("/proc").iterdir():
-            if not entry.name.isdigit():
-                continue
+        pids = {int(entry.name) for entry in Path("/proc").iterdir() if entry.name.isdigit()}
+        for pid in pids | set(tracked):
+            entry = Path("/proc") / str(pid)
             try:
                 fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
             except FileNotFoundError:
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    continue
+                if pid in tracked:
+                    unresolved[pid] = f"Unable to inspect visible process {pid}"
+                continue
+            except OSError as exc:
+                if pid in tracked:
+                    unresolved[pid] = f"Unable to inspect process {pid}: {exc}"
                 continue
             live = fields[0] != "Z"
             if not live:
@@ -106,6 +123,12 @@ def process_snapshot():
                     try:
                         (entry / "stat").read_text()
                     except FileNotFoundError:
+                        try:
+                            os.kill(pid, 0)
+                        except ProcessLookupError:
+                            continue
+                        if pid in tracked:
+                            unresolved[pid] = f"Unable to inspect visible process {pid}"
                         continue
                     live = True  # A visible leader with unavailable tasks is unknown.
             if live:
@@ -119,39 +142,69 @@ def process_snapshot():
             ctypes.c_void_p,
             ctypes.c_int,
         ]
+        lib.proc_pidinfo.restype = ctypes.c_int
+        lib.proc_listpids.argtypes = [ctypes.c_uint, ctypes.c_uint, ctypes.c_void_p, ctypes.c_int]
+        lib.proc_listpids.restype = ctypes.c_int
         capacity = 4096
         while True:
             pids = (ctypes.c_int * capacity)()
             used = lib.proc_listpids(1, 0, pids, ctypes.sizeof(pids))
-            if used <= 0:
+            if used <= 0 or used > ctypes.sizeof(pids) or used % ctypes.sizeof(ctypes.c_int):
                 raise OSError("Unable to enumerate processes")
             if used < ctypes.sizeof(pids):
                 break
             capacity *= 2
-        for pid in pids[: used // ctypes.sizeof(ctypes.c_int)]:
+        for pid in set(pids[: used // ctypes.sizeof(ctypes.c_int)]) | set(tracked):
+            if not pid:
+                continue
             info = (ctypes.c_uint32 * 34)()  # 136-byte proc_bsdinfo, flavor 3.
-            if lib.proc_pidinfo(pid, 3, 0, info, ctypes.sizeof(info)) == ctypes.sizeof(info):
-                if info[1] != 5:
-                    result[pid] = (info[4], tuple(info[30:34]), info[25])
+            copied = lib.proc_pidinfo(pid, 3, 0, info, ctypes.sizeof(info))
+            if copied != ctypes.sizeof(info) or info[3] != pid:
+                if pid not in tracked:
+                    continue  # Unrelated processes may belong to other users.
+                try:
+                    secondary = darwin_process_info(pid)
+                except (OSError, ValueError) as exc:
+                    unresolved[pid] = f"Unable to inspect process {pid}: {exc}"
+                    continue
+                if secondary is None:
+                    continue
+                state, identity = secondary
+                if state == 5 or (identity is not None and identity != tracked[pid]):
+                    continue
+                unresolved[pid] = f"Unable to inspect live process {pid} (state={state})"
+                continue
+            if info[1] != 5:
+                result[pid] = (info[4], tuple(info[30:34]), info[25])
     else:
         raise RuntimeError("Leftover inspection requires Linux /proc or Darwin libproc")
-    return result
+    return result, unresolved
 
 
 class ProcessTracker:
     def __init__(self, group_log):
-        self.known = {os.getpid(): process_snapshot()[os.getpid()][1]}
+        self.known = {os.getpid(): process_snapshot()[0][os.getpid()][1]}
         self.stop = threading.Event()
         self.errors = []
+        self.notes = []
+        self.unresolved = {}
         self.thread = threading.Thread(target=self.watch, daemon=True)
         self.group_log = group_log
 
     def scan(self):
-        snapshot = process_snapshot()
+        snapshot, unresolved = process_snapshot(self.known)
         # Groups are recorded synchronously by the spawning test process.
         # A surviving orphan remains in its group even if its original
         # ancestry vanishes entirely between periodic snapshots.
         groups = {int(row) for row in self.group_log.read_text().splitlines() if row.isdigit()}
+        self.unresolved = unresolved
+        for message in unresolved.values():
+            self.note(message)
+        self.known = {
+            pid: identity
+            for pid, identity in self.known.items()
+            if pid in unresolved or snapshot.get(pid, (None, None))[1] == identity
+        }
         parents = {
             pid
             for pid, identity in self.known.items()
@@ -178,8 +231,27 @@ class ProcessTracker:
             try:
                 self.scan()
             except Exception as exc:
-                self.errors.append(str(exc))
-                return
+                self.note(str(exc))
+
+    def note(self, message):
+        if message not in self.notes:
+            self.notes.append(message)
+
+    def finish(self, timeout=1.0):
+        """Only inspection failures remaining after bounded final retries fail."""
+        deadline = time.monotonic() + timeout
+        leftovers = []
+        while True:
+            try:
+                leftovers = self.scan()
+                errors = list(self.unresolved.values())
+            except Exception as exc:
+                self.note(str(exc))
+                errors = [str(exc)]
+            if not errors or time.monotonic() >= deadline:
+                self.errors = errors
+                return leftovers
+            time.sleep(min(0.1, max(0, deadline - time.monotonic())))
 
 
 def run_command(argv, log, timeout=900, cwd=ROOT):
@@ -348,8 +420,9 @@ subprocess.Popen.__init__ = spawn
     finally:
         tracker.stop.set()
         tracker.thread.join()
-        result["leftover_pids"] = tracker.scan()
+        result["leftover_pids"] = tracker.finish()
         result["inspection_errors"] = tracker.errors
+        result["inspection_notes"] = tracker.notes
         result["registered_groups"] = len(set(group_log.read_text().splitlines()))
         for key, value in previous.items():
             if value is None:

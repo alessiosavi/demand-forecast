@@ -1,4 +1,8 @@
-"""Owned subprocess groups, including descendants and interrupted callers."""
+"""Owned subprocess groups, including descendants and interrupted callers.
+
+Synchronous diagnostics cannot report through a syscall blocked in native
+inspection, the ps fallback, or a stderr write.
+"""
 
 import ctypes
 import errno
@@ -316,6 +320,24 @@ def scope_fd():
     return None
 
 
+def reap_nested(child):
+    """Retain the barrier, with drain-cadence diagnostics, until the reap completes."""
+    started = diagnostic_at = time.monotonic()
+    while True:
+        now = time.monotonic()
+        if now >= diagnostic_at:
+            diagnostic(
+                f"Waiting to reap killed nested local process {child.pid}: "
+                f"elapsed={now - started:.1f}s; session retained"
+            )
+            diagnostic_at = now + DRAIN_DIAGNOSTIC_SECONDS
+        try:
+            child.wait(timeout=0.05)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+
+
 class PinnedOutput:
     """Drain pipes while observing exit, without Popen's implicit leader reap."""
 
@@ -384,6 +406,11 @@ class PinnedOutput:
 
 
 def run_process(argv, seconds, **kwargs):
+    """Run and drain the owned group before returning or delivering an interrupt.
+
+    LeaderIdentityLost is the one diagnosed case that raises without being able
+    to prove the group is gone; another waiter has invalidated exclusive reaping.
+    """
     seconds = float(seconds)
     if not 0 < seconds < float("inf"):
         raise ValueError("Command timeout must be positive and finite")
@@ -422,7 +449,19 @@ def run_process(argv, seconds, **kwargs):
                 lease = os.pipe()
                 fd = lease[0]
                 os.set_blocking(fd, False)
-                command = [sys.executable, __file__, str(fd), *argv]
+                # Python ignores these signals on startup, undoing Popen's
+                # restore_signals. False must preserve inherited ignores, but
+                # other dispositions become default across the final exec.
+                defaults = ",".join(
+                    str(int(sig))
+                    for name in ("SIGPIPE", "SIGXFZ", "SIGXFSZ")
+                    if (sig := getattr(signal, name, None)) is not None
+                    and (
+                        kwargs.get("restore_signals", True)
+                        or signal.getsignal(sig) != signal.SIG_IGN
+                    )
+                )
+                command = [sys.executable, __file__, str(fd), defaults, *argv]
                 env.pop(SCOPE, None)
             kwargs["pass_fds"] = tuple(set(kwargs.get("pass_fds", ())) | {fd})
             child = subprocess.Popen(command, start_new_session=not nested, env=env, **kwargs)
@@ -445,8 +484,7 @@ def run_process(argv, seconds, **kwargs):
                             child.wait(timeout=1)
                         except subprocess.TimeoutExpired:
                             child.kill()
-                            diagnostic(f"Waiting to reap killed nested local process {child.pid}")
-                            child.wait()
+                            reap_nested(child)
             else:
                 with PinnedOutput(child) as output:
                     completed = False
@@ -583,6 +621,11 @@ def deferred_interrupts():
         try:
             with blocked_interrupts():
                 interrupts.restore()
+                # Both signals can be queued while dispositions are restored.
+                # Consume only the pending operator signals, with the mask still
+                # held, so unmasking cannot leak a second exception to the caller.
+                for sig in signal.sigpending() & INTERRUPTS:
+                    interrupts.dispatch(signal.sigwait({sig}), None)
         finally:
             # Also runs on exceptional exits, only after the barrier and restore.
             interrupts.deliver(error)
@@ -607,4 +650,6 @@ if __name__ == "__main__":
     fd = int(sys.argv[1])
     info = os.fstat(fd)
     os.environ[SCOPE] = f"{os.getpgrp()}:{fd}:{info.st_dev}:{info.st_ino}"
-    os.execvpe(sys.argv[2], sys.argv[2:], os.environ)
+    for signum in filter(None, sys.argv[2].split(",")):
+        signal.signal(int(signum), signal.SIG_DFL)
+    os.execvpe(sys.argv[3], sys.argv[3:], os.environ)

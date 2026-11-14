@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+from process_identity import kill_owned
 
 ROOT = Path(__file__).resolve().parents[2]
 OPS = ROOT / "scripts/ec2/ops"
@@ -23,6 +24,7 @@ OPS = ROOT / "scripts/ec2/ops"
 STUB = r"""
 import ctypes, json, os, shlex, signal, sys, time
 from pathlib import Path
+from process_identity import process_identity
 name = Path(sys.argv[0]).name
 args = sys.argv[1:]
 state_path = Path(os.environ["STUB_STATE"])
@@ -39,6 +41,8 @@ def finish(rc=0):
 def stall():
     state["stalled_pid"] = os.getpid()
     state["stalled_ppid"] = os.getppid()
+    state["stalled_pid_identity"] = process_identity(os.getpid())
+    state["stalled_ppid_identity"] = process_identity(os.getppid())
     if state.get("suspend_supervisor"):
         os.kill(os.getppid(), signal.SIGSTOP)
     save()
@@ -274,7 +278,9 @@ class Operator:
             STUB_STATE=str(self.state_path),
             STUB_CALLS=str(self.calls_path),
             TEST_DEADLINE=self.deadline,
-            PYTHONPATH=str(OPS) + os.pathsep + self.env.get("PYTHONPATH", ""),
+            PYTHONPATH=os.pathsep.join(
+                (str(OPS), str(Path(__file__).parent), self.env.get("PYTHONPATH", ""))
+            ),
         )
         for name in ("aws", "ssh", "scp", "rsync", "sleep", "curl"):
             self.executable(self.bin / name, f"#!{sys.executable}\n" + STUB)
@@ -1114,10 +1120,7 @@ def running_real_chain(operator):
         state = json.loads(operator.state_path.read_text())
         for field in ("stalled_pid", "stalled_ppid"):
             if pid := state.get(field):
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+                kill_owned(pid, state.get(field + "_identity"))
         if child.poll() is None:
             child.kill()
         child.communicate(timeout=30)
@@ -1176,7 +1179,8 @@ def wait_for_stall(operator, child):
     end = time.monotonic() + 120
     while not json.loads(operator.state_path.read_text()).get("stalled_pid"):
         if child.poll() is not None or time.monotonic() >= end:
-            child.kill()
+            if child.poll() is None:
+                child.kill()
             out, err = child.communicate(timeout=30)
             pytest.fail(
                 f"Transport never became ready; exit={child.returncode}\nstdout:\n{out}\nstderr:\n{err}"

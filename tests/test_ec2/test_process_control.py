@@ -4,6 +4,7 @@ import ctypes
 import importlib.util
 import inspect
 import os
+import select
 import selectors
 import signal
 import subprocess
@@ -12,6 +13,7 @@ import time
 from pathlib import Path
 
 import pytest
+from process_identity import kill_owned
 
 
 @pytest.fixture
@@ -21,6 +23,38 @@ def control():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def cleanup_child(child, *, group=False):
+    """An unreaped, exclusively waited child pins its PID and group identity."""
+    if child.returncode is None:
+        try:
+            observe_exit(child.pid)
+        except ChildProcessError:
+            return
+        try:
+            if group:
+                os.killpg(child.pid, signal.SIGKILL)
+            else:
+                child.kill()
+        except ProcessLookupError:
+            pass
+        type(child).wait(child)
+
+
+def wait_for_ready(fd):
+    assert select.select([fd], [], [], 120)[0], "Child never announced readiness"
+    assert os.read(fd, 1) == b"R", "Child exited before announcing readiness"
+
+
+@pytest.fixture
+def readiness():
+    pipe = os.pipe()
+    try:
+        yield pipe
+    finally:
+        for fd in pipe:
+            os.close(fd)
 
 
 def test_healthy_command_has_no_process_control_stderr(control, capsys):
@@ -36,6 +70,119 @@ def test_healthy_command_has_no_process_control_stderr(control, capsys):
     assert result.stdout == "hello\n"
     assert result.stderr == ""
     assert capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize("restore", [None, True, False], ids=["default", "restore", "inherit"])
+@pytest.mark.parametrize("inherited", [signal.SIG_IGN, signal.SIG_DFL], ids=["ignored", "default"])
+def test_exec_wrapper_preserves_popen_sigpipe_behavior(control, restore, inherited):
+    argv = ["/bin/bash", "-c", "kill -PIPE $$; printf survived"]
+    options = {} if restore is None else {"restore_signals": restore}
+    previous = signal.signal(signal.SIGPIPE, inherited)
+    try:
+        direct = subprocess.run(argv, capture_output=True, **options)
+        wrapped = control.run_process(argv, 30, stdout=subprocess.PIPE, **options)
+        assert direct.returncode == (
+            0 if restore is False and inherited == signal.SIG_IGN else -signal.SIGPIPE
+        )
+        assert wrapped.returncode == direct.returncode
+        assert wrapped.stdout == direct.stdout
+    finally:
+        signal.signal(signal.SIGPIPE, previous)
+
+
+def test_nested_killed_child_reap_reports_every_five_seconds(control, monkeypatch, capsys):
+    elapsed = 0
+    killed = False
+    messages = []
+
+    class Child:
+        pid = 456
+        returncode = None
+        stdin = stdout = stderr = None
+
+        def communicate(self, timeout):
+            raise subprocess.TimeoutExpired("nested", timeout)
+
+        def terminate(self):
+            pass
+
+        def kill(self):
+            nonlocal killed
+            killed = True
+
+        def wait(self, timeout=None):
+            nonlocal elapsed
+            if not killed:
+                raise subprocess.TimeoutExpired("nested", timeout)
+            assert timeout is not None, "Killed nested child must never use an unbounded wait"
+            messages.append(capsys.readouterr().err)
+            if elapsed == 10:
+                raise ProbeStopError()
+            elapsed += 5
+            raise subprocess.TimeoutExpired("nested", timeout)
+
+    monkeypatch.setattr(control, "scope_fd", lambda: 123)
+    monkeypatch.setenv(control.SCOPE, "nested-test")
+    monkeypatch.setattr(control.subprocess, "Popen", lambda *_args, **_kwargs: Child())
+    monkeypatch.setattr(control.time, "monotonic", lambda: elapsed)
+    with pytest.raises(ProbeStopError):
+        control.run_process(["nested"], 30)
+    report = "".join(messages)
+    assert report.count("Waiting to reap killed nested local process 456") == 3
+    assert all(f"elapsed={tick:.1f}s" in report for tick in (0, 5, 10))
+    assert report.count("session retained") == 3
+
+
+@pytest.mark.parametrize("saved", [False, True], ids=["queued-only", "already-saved"])
+@pytest.mark.parametrize("reverse", [False, True], ids=["int-term", "term-int"])
+def test_masked_restore_coalesces_both_signals_before_caller_cleanup(control, saved, reverse):
+    # Isolate the old implementation's second raising signal from pytest itself.
+    queued = (
+        (int(signal.SIGTERM), int(signal.SIGINT))
+        if reverse
+        else (int(signal.SIGINT), int(signal.SIGTERM))
+    )
+    script = f"""
+import signal, os, sys
+sys.path.insert(0, {str(Path(control.__file__).parent)!r})
+import process_control as control
+deliveries = []
+def handler(signum, frame):
+    deliveries.append(signum)
+    raise InterruptedError('operator')
+for sig in control.INTERRUPTS:
+    signal.signal(sig, handler)
+restore = control.InterruptDeferral.restore
+sent = []
+def queue(self):
+    restore(self)
+    for sig in {queued!r}:
+        os.kill(os.getpid(), sig)
+        sent.append(sig)
+control.InterruptDeferral.restore = queue
+drain = control.drain_group
+def save_then_drain(child):
+    if {saved!r}:
+        os.kill(os.getpid(), signal.SIGINT)
+    drain(child)
+control.drain_group = save_then_drain
+cleaned = False
+try:
+    try:
+        control.run_process(['/bin/true'], 30)
+    except InterruptedError:
+        with control.cleanup_signals():
+            cleaned = True
+except InterruptedError:
+    pass
+assert len(sent) == 2, sent
+assert len(deliveries) == 1, deliveries
+assert cleaned, 'Leftover interrupt prevented caller cleanup entry'
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, timeout=30
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_drain_retries_unconfirmed_group_kill(control, monkeypatch):
@@ -57,11 +204,7 @@ def test_drain_retries_unconfirmed_group_kill(control, monkeypatch):
         control.drain_group(child)
         assert child.poll() is not None
     finally:
-        try:
-            killpg(child.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        child.wait()
+        cleanup_child(child, group=True)
 
 
 @pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM])
@@ -70,10 +213,12 @@ def test_first_interrupt_during_drain_is_delivered_after_death(control, monkeypa
     drain = control.drain_group
     previous = {sig: signal.signal(sig, control.interrupted) for sig in control.INTERRUPTS}
     killed = []
+    sent = []
 
     def interrupt_then_drain(child):
         for _ in range(count):
             os.kill(os.getpid(), signum)
+            sent.append(signum)
         drain(child)
         killed.append(child.poll() is not None)
 
@@ -82,6 +227,7 @@ def test_first_interrupt_during_drain_is_delivered_after_death(control, monkeypa
         with pytest.raises(InterruptedError):
             control.run_process([sys.executable, "-c", "pass"], 30)
         assert killed == [True]
+        assert len(sent) == count
     finally:
         for sig, handler in previous.items():
             signal.signal(sig, handler)
@@ -145,18 +291,24 @@ def test_cancellation_reports_before_signal_and_nested_reap(
         children.append(child)
         if nested:
             terminate, wait = child.terminate, child.wait
+            grace_expired = False
+            reap_reported = False
 
             def checked_terminate():
                 check_cancellation(os.getpgrp())
                 terminate()
 
             def checked_wait(timeout=None):
-                if timeout is not None:
+                nonlocal grace_expired, reap_reported
+                if not grace_expired:
+                    grace_expired = True
                     raise subprocess.TimeoutExpired(child.args, timeout)
-                message = capsys.readouterr().err
-                assert f"Waiting to reap killed nested local process {child.pid}" in message
-                messages.append(message)
-                return wait()
+                if not reap_reported:
+                    message = capsys.readouterr().err
+                    assert f"Waiting to reap killed nested local process {child.pid}" in message
+                    messages.append(message)
+                    reap_reported = True
+                return wait(timeout=timeout)
 
             child.communicate = fail_wait
             child.terminate = checked_terminate
@@ -176,24 +328,25 @@ def test_cancellation_reports_before_signal_and_nested_reap(
         for sig, handler in previous.items():
             signal.signal(sig, handler)
         for child in children:
-            if child.returncode is None:
-                child.kill()
-                popen.wait(child)
+            cleanup_child(child)
         for fd in lease:
             os.close(fd)
 
 
 def test_successful_shell_exit_still_drains_background_descendant(control):
-    script = """
+    script = f"""
 import subprocess, sys
+sys.path.insert(0, {str(Path(__file__).parent)!r})
+from process_identity import process_identity
 child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-print(child.pid)
+print(child.pid, process_identity(child.pid))
 """
     result = control.run_process(
         [sys.executable, "-c", script], 30, stdout=subprocess.PIPE, text=True
     )
-    pid = int(result.stdout)
+    raw_pid, identity = result.stdout.split()
+    pid = int(raw_pid)
     try:
         assert result.returncode == 0
         from test_ops import process_alive
@@ -201,10 +354,7 @@ print(child.pid)
         alive = process_alive(pid)
         assert not alive, f"Background descendant {pid} outlived its operation"
     finally:
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        kill_owned(pid, None if identity == "None" else identity)
 
 
 class ProbeStopError(Exception):
@@ -245,7 +395,9 @@ def zombie_scan(monkeypatch, control, child):
 
 
 @pytest.mark.parametrize("mode", ["success", "term-exit", "grace-expiry"])
-def test_group_signals_and_scans_keep_original_leader_unreaped(control, monkeypatch, mode):
+def test_group_signals_and_scans_keep_original_leader_unreaped(
+    control, monkeypatch, mode, readiness
+):
     popen, killpg = subprocess.Popen, os.killpg
     children, observations = [], []
 
@@ -253,6 +405,7 @@ def test_group_signals_and_scans_keep_original_leader_unreaped(control, monkeypa
         child = popen(*args, **kwargs)
         children.append(child)
         zombie_scan(monkeypatch, control, child)
+        wait_for_ready(readiness[0])
         return child
 
     def pinned_signal(group, sig):
@@ -272,21 +425,32 @@ def test_group_signals_and_scans_keep_original_leader_unreaped(control, monkeypa
             "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"
         ),
     }[mode]
+    # Install SIGTERM's disposition before acknowledging readiness. The real
+    # 0.1s deadline starts only after this handshake, excluding interpreter boot.
+    ready = f"import os; os.write({readiness[1]}, b'R'); "
+    script = (
+        script.replace("time.sleep(60)", ready + "time.sleep(60)")
+        if mode != "success"
+        else ready + script
+    )
     try:
         if mode != "success":
             with pytest.raises(subprocess.TimeoutExpired):
-                control.run_process([sys.executable, "-c", script], 0.1)
+                control.run_process([sys.executable, "-c", script], 0.1, pass_fds=(readiness[1],))
         else:
-            assert control.run_process([sys.executable, "-c", script], 5).returncode == 0
+            assert (
+                control.run_process(
+                    [sys.executable, "-c", script], 5, pass_fds=(readiness[1],)
+                ).returncode
+                == 0
+            )
         assert signal.SIGKILL in observations
         assert children[0].returncode is not None
         with pytest.raises(ChildProcessError):
             observe_exit(children[0].pid)
     finally:
         for child in children:
-            if child.returncode is None:
-                child.kill()
-                child.wait()
+            cleanup_child(child)
 
 
 @pytest.mark.parametrize("boundary", ["spawn", "raising"])
@@ -338,9 +502,7 @@ def test_interrupt_at_deferral_transition_cannot_skip_drain(control, monkeypatch
         for sig, handler in previous.items():
             signal.signal(sig, handler)
         for child in children:
-            if child.returncode is None:
-                child.kill()
-                child.wait()
+            cleanup_child(child)
 
 
 def test_zombie_only_eperm_reaches_reap(control, monkeypatch):
@@ -456,34 +618,7 @@ def test_unconfirmed_drain_reports_periodically_and_does_not_reap(
 
 
 @pytest.mark.parametrize("text", [False, True])
-def test_pinned_capture_drains_both_full_pipes(control, monkeypatch, text):
-    popen = subprocess.Popen
-
-    def spawn(*args, **kwargs):
-        child = popen(*args, **kwargs)
-        zombie_scan(monkeypatch, control, child)
-        return child
-
-    monkeypatch.setattr(control.subprocess, "Popen", spawn)
-    script = (
-        "import sys; "
-        "sys.stdout.buffer.write(b'x'*262144+b'\\r\\n'); "
-        "sys.stderr.buffer.write(b'y'*262144+b'\\r\\n')"
-    )
-    result = control.run_process(
-        [sys.executable, "-c", script],
-        5,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=text,
-    )
-    assert result.returncode == 0
-    assert result.stdout == ("x" * 262144 + "\n" if text else b"x" * 262144 + b"\r\n")
-    assert result.stderr == ("y" * 262144 + "\n" if text else b"y" * 262144 + b"\r\n")
-
-
-@pytest.mark.parametrize("shell", [False, True], ids=["exec", "shell-substitution"])
-def test_live_lease_keeps_nested_transport_in_same_group(control, monkeypatch, capsys, shell):
+def test_pinned_capture_drains_both_full_pipes(control, monkeypatch, text, readiness):
     popen = subprocess.Popen
     children = []
 
@@ -491,16 +626,67 @@ def test_live_lease_keeps_nested_transport_in_same_group(control, monkeypatch, c
         child = popen(*args, **kwargs)
         children.append(child)
         zombie_scan(monkeypatch, control, child)
+        wait_for_ready(readiness[0])
+        return child
+
+    monkeypatch.setattr(control.subprocess, "Popen", spawn)
+    script = (
+        f"import os,sys; os.write({readiness[1]}, b'R'); "
+        "sys.stdout.buffer.write(b'x'*262144+b'\\r\\n'); "
+        "sys.stderr.buffer.write(b'y'*262144+b'\\r\\n')"
+    )
+    try:
+        result = control.run_process(
+            [sys.executable, "-c", script],
+            5,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=text,
+            pass_fds=(readiness[1],),
+        )
+    finally:
+        for child in children:
+            cleanup_child(child)
+    assert result.returncode == 0
+    assert result.stdout == ("x" * 262144 + "\n" if text else b"x" * 262144 + b"\r\n")
+    assert result.stderr == ("y" * 262144 + "\n" if text else b"y" * 262144 + b"\r\n")
+
+
+@pytest.mark.parametrize("shell", [False, True], ids=["exec", "shell-substitution"])
+def test_live_lease_keeps_nested_transport_in_same_group(
+    control, monkeypatch, capsys, shell, readiness
+):
+    popen = subprocess.Popen
+    children = []
+
+    def spawn(*args, **kwargs):
+        child = popen(*args, **kwargs)
+        children.append(child)
+        zombie_scan(monkeypatch, control, child)
+        wait_for_ready(readiness[0])
         return child
 
     monkeypatch.setattr(control.subprocess, "Popen", spawn)
     script = f"""
-import os, subprocess, sys
+import os, select, subprocess, sys
 sys.path.insert(0, {str(Path(control.__file__).parent)!r})
 import process_control as control
 assert control.scope_fd() is not None, 'Owner lease did not survive exec'
-result = control.run_process([sys.executable, '-c', 'import os; print(os.getpgrp())'],
-                             5, stdout=subprocess.PIPE, text=True)
+read_fd, write_fd = os.pipe()
+popen = subprocess.Popen
+def spawn(*args, **kwargs):
+    child = popen(*args, **kwargs)
+    assert select.select([read_fd], [], [], 120)[0], 'Nested child never became ready'
+    assert os.read(read_fd, 1) == b'R'
+    return child
+control.subprocess.Popen = spawn
+os.write({readiness[1]}, b'R')
+command = [sys.executable, '-c', f'import os; os.write({{write_fd}}, b"R"); print(os.getpgrp())']
+try:
+    result = control.run_process(command, 5, stdout=subprocess.PIPE, text=True, pass_fds=(write_fd,))
+finally:
+    os.close(read_fd)
+    os.close(write_fd)
 assert result.returncode == 0
 print(os.getpgrp(), result.stdout.strip())
 """
@@ -514,9 +700,18 @@ print(os.getpgrp(), result.stdout.strip())
             sys.executable,
             script,
         ]
-    result = control.run_process(
-        command, 10, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-    )
+    try:
+        result = control.run_process(
+            command,
+            10,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            pass_fds=(readiness[1],),
+        )
+    finally:
+        for child in children:
+            cleanup_child(child)
     assert result.returncode == 0
     assert result.stdout.split() == [str(children[0].pid)] * 2
     assert result.stderr == ""
@@ -645,8 +840,7 @@ def test_native_membership_includes_live_and_excludes_zombie_without_ps(control,
         assert control.group_members(child.pid) == []
         assert child.returncode is None  # Inspection did not reap the pin.
     finally:
-        child.kill()
-        child.wait()
+        cleanup_child(child)
 
 
 @pytest.mark.parametrize(
@@ -822,7 +1016,7 @@ def test_repeated_transition_signals_use_one_dispatcher_and_deliver_after_reap(
     control, monkeypatch, boundary
 ):
     popen, change_handler, drain = subprocess.Popen, signal.signal, control.drain_group
-    children, deliveries, swaps = [], [], []
+    children, deliveries, swaps, sent = [], [], [], []
     fired = False
     previous = {sig: signal.getsignal(sig) for sig in control.INTERRUPTS}
 
@@ -836,7 +1030,9 @@ def test_repeated_transition_signals_use_one_dispatcher_and_deliver_after_reap(
         nonlocal fired
         if not fired:
             fired = True
-            for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGINT):
+            signals = (signal.SIGINT, signal.SIGTERM, signal.SIGINT)
+            for sig in signals if boundary in ("reap", "restore") else signals[:1]:
+                sent.append(sig)
                 os.kill(os.getpid(), sig)
 
     def spawn(*args, **kwargs):
@@ -861,6 +1057,12 @@ def test_repeated_transition_signals_use_one_dispatcher_and_deliver_after_reap(
     def record_drain(child):
         if boundary == "drain":
             fire()
+        if fired:
+            # The first signal can raise out of fire(). Send the remaining
+            # operator actions independently, after the drain defers delivery.
+            for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGINT)[len(sent) :]:
+                sent.append(sig)
+                os.kill(os.getpid(), sig)
         return drain(child)
 
     lines, start = inspect.getsourcelines(control.InterruptDeferral.raising)
@@ -902,6 +1104,7 @@ def test_repeated_transition_signals_use_one_dispatcher_and_deliver_after_reap(
         with pytest.raises(InterruptedError, match="operator wins"):
             control.run_process([sys.executable, "-c", "pass"], 30)
         assert fired
+        assert sent == [signal.SIGINT, signal.SIGTERM, signal.SIGINT]
         assert deliveries == [signal.SIGINT]
         assert all(swaps.count(sig) == 2 for sig in previous), swaps
         assert children[0].returncode is not None
@@ -910,9 +1113,7 @@ def test_repeated_transition_signals_use_one_dispatcher_and_deliver_after_reap(
         for sig, original in previous.items():
             change_handler(sig, original)
         for child in children:
-            if child.returncode is None:
-                child.kill()
-                child.wait()
+            cleanup_child(child)
 
 
 @pytest.mark.parametrize(
@@ -921,13 +1122,15 @@ def test_repeated_transition_signals_use_one_dispatcher_and_deliver_after_reap(
 def test_interrupt_during_timeout_drain_wins_and_chains_timeout(control, monkeypatch, failure):
     drain = control.drain_group
     previous = {sig: signal.signal(sig, control.interrupted) for sig in control.INTERRUPTS}
+    sent = []
 
     def timeout(_output, _seconds):
         raise failure
 
     def interrupt_and_drain(child):
-        os.kill(os.getpid(), signal.SIGINT)
-        os.kill(os.getpid(), signal.SIGTERM)
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            os.kill(os.getpid(), sig)
+            sent.append(sig)
         drain(child)
 
     monkeypatch.setattr(control.PinnedOutput, "wait", timeout)
@@ -936,6 +1139,7 @@ def test_interrupt_during_timeout_drain_wins_and_chains_timeout(control, monkeyp
         with pytest.raises(InterruptedError) as caught:
             control.run_process([sys.executable, "-c", "pass"], 30)
         assert caught.value.__cause__ is failure
+        assert sent == [signal.SIGINT, signal.SIGTERM]
     finally:
         for sig, original in previous.items():
             signal.signal(sig, original)
@@ -1033,6 +1237,5 @@ ctypes.CDLL(None).pthread_exit(None)
         members = control.native_group_members(child.pid)
         assert members is not None and any(member.startswith(f"{tid}(") for member in members)
     finally:
-        os.killpg(child.pid, signal.SIGKILL)
-        child.wait()
+        cleanup_child(child, group=True)
         child.stdout.close()
