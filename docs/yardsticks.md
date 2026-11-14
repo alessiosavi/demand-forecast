@@ -177,6 +177,30 @@ rebuilt from intact recorded windows. A model is never loaded for complete tasks
 Local weight directories are content-hashed; Hub aliases resolve to commit SHAs.
 The default IDs above use the pinned SHAs even when `--revision` is omitted.
 
+## Averaging completed yardstick runs
+
+`scripts/fev_ensemble.py` averages saved forecasts with equal member weights,
+then recomputes fev scores from the averaged windows without loading models:
+
+```bash
+python scripts/fev_ensemble.py --members results/seed-1 results/seed-2 \
+  --tasks shifted.yaml --names @names.txt --model-name average \
+  --out-dir results/average
+```
+
+Supply at least two complete yardstick runs with matching tasks, dataset
+fingerprints, quantiles, input ordering and evaluation settings. Each member
+needs its root `yardstick.json`, matching per-task `run.json`, summary row and
+saved windows with valid hashes, and no recorded task failure. Checkpoint
+digests must differ unless `--allow-identical-members` is used for reproduction.
+Members must have been scored by the same evaluation code, including adapters
+and scorer: their recorded identities do not hash this repository's evaluation
+code. Scoring and auditing still require access to the task data. Audit the
+output with `fev_report.py` and the same task YAML and selection as above.
+
+This differs from the older `scripts/fev_ensemble_runs.py`, which consumes the
+training/bundle runner's saved format rather than yardstick artifacts.
+
 ## Reproduction limits
 
 The published Chronos CSV records fev 0.8.0, and Timestral records 0.11.0.dev0;
