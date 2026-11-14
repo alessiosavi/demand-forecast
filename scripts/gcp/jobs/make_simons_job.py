@@ -314,7 +314,10 @@ try:
             raise ValueError("condition identity changed")
         receipt = record.get("corpus_release")
         if provisional is not None or (receipt or {{}}).get("provisional"):
-            if receipt != provisional:
+            # Status values come from the guest's corpus handshake, not job arguments.
+            if (provisional is None or not isinstance(receipt, dict)
+                    or set(receipt) != {{*provisional, "attempt_complete", "attempt_exit_code"}}
+                    or any(receipt[key] != value for key, value in provisional.items())):
                 raise ValueError("provisional receipt identity changed")
         receipts.append(receipt)
     if receipts and condition is not None and any(r != receipts[0] for r in receipts):

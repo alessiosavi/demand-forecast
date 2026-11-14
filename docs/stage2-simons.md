@@ -434,10 +434,14 @@ leg and export:
 
 This flag has the same size/recipe/leg restrictions and is mutually exclusive
 with the qualification-only unsafe flag. It still requires corpus layout
-validation and `attempt-status.json` with `complete: true`, integer exit code
-zero and the specified attempt ID. It does not read `audit.json`. The receipt
+validation and a parseable `attempt-status.json` with a nonempty string attempt
+ID matching the specified ID, plus both `complete` and `exit_code` keys. Their
+values are recorded verbatim; an incomplete or failed attempt is accepted in
+provisional mode, including `complete: false` and `exit_code: -1` when the
+content audit never finished. It does not read `audit.json`. The receipt
 is `{"provisional": true, "warning": "UNAUDITED_CORPUS_PROVISIONAL",
-"attempt_id": "ATTEMPT_ID", "corpus_uri": "gs://BUCKET/corpus"}`; trailing
+"attempt_id": "ATTEMPT_ID", "corpus_uri": "gs://BUCKET/corpus",
+"attempt_complete": false, "attempt_exit_code": -1}` for that status; trailing
 slashes are removed from the receipt URI. Without this flag the audit gate is
 unchanged. A condition can also use an audited corpus, and provisional mode
 can be used without a condition.
@@ -446,14 +450,17 @@ Only a receipt-free, condition-free stage2 parent can start a new provisional
 fork. An audited or legacy corpus-trained checkpoint cannot adopt provisional
 mode. Later legs, same-stage resumes, completed-job shortcuts and both export
 members must match the condition and provisional receipt exactly; dropping a
-flag fails. Manifests, checkpoint identities, completion records and export
-member records are checked before recovery writes. An incompatible export is
+flag or changing either recorded status value fails. Manifests, checkpoint
+identities, completion records and export member records are checked before
+recovery writes. An incompatible export is
 refused, preserving its files. The existing legacy-to-audited resume migration
 and legacy-plus-audited export exception remain available without a condition
 or provisional receipt.
 
-Fork completions pass through the installed guest so it can compare embedded
-checkpoint identities; the shell's dependency-free shortcut remains available
+Fork completions pass through the installed guest so it can compare whole
+receipts and embedded checkpoint identities. The shell checks the receipt
+fields known from job arguments and agreement between stored records, then
+defers to the guest; the shell's dependency-free shortcut remains available
 for reference jobs. Fork jobs still perform installation; corpus-reading legs
 also sync the corpus before the guest confirms completion.
 

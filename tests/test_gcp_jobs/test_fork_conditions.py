@@ -20,6 +20,8 @@ PROVISIONAL = {
     "warning": "UNAUDITED_CORPUS_PROVISIONAL",
     "attempt_id": "tiny",
     "corpus_uri": URI,
+    "attempt_complete": True,
+    "attempt_exit_code": 0,
 }
 AUDITED = {"attempt_id": "tiny", "audit_sha256": "a" * 64}
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -327,29 +329,139 @@ def test_transition_rows(
 
 
 @pytest.mark.parametrize(
-    "changes",
+    "status",
     [
-        {"attempt_id": "other"},
-        {"complete": False},
-        {"exit_code": 1},
-        {"exit_code": False},
-        {"attempt_id": ""},
+        dict(attempt_id="other", complete=True, exit_code=0),
+        dict(attempt_id="", complete=True, exit_code=0),
+        dict(attempt_id=" ", complete=True, exit_code=0),
+        dict(attempt_id=17, complete=True, exit_code=0),
+        dict(complete=True, exit_code=0),
+        dict(attempt_id="tiny", exit_code=0),
+        dict(attempt_id="tiny", complete=True),
+        [],
+        "not JSON",
         None,
     ],
 )
-def test_provisional_keeps_status_gate(upstream, tmp_path, changes):
+def test_provisional_refuses_malformed_or_mismatched_status(upstream, tmp_path, status):
     from simons.training import spot_job
 
     release(tmp_path / "corpus")
-    status = tmp_path / "corpus/attempt-status.json"
-    if changes is None:
-        status.unlink()
+    path = tmp_path / "corpus/attempt-status.json"
+    if status is None:
+        path.unlink()
     else:
-        status.write_text(json.dumps(dict(attempt_id="tiny", complete=True, exit_code=0) | changes))
+        path.write_text(status if isinstance(status, str) else json.dumps(status))
     args = job_args(tmp_path, upstream, provisional_unaudited_corpus_attempt="tiny")
     with pytest.raises(ValueError, match="corpus.*gate"):
         spot_job.run_leg(args)
     assert not (tmp_path / "state").exists()
+
+
+@pytest.mark.parametrize("complete,exit_code", [(False, -1), (True, 0)])
+def test_provisional_stage3_accepts_real_corpus_status(
+    upstream, tmp_path, monkeypatch, complete, exit_code
+):
+    from simons.training import spot_job
+    from simons.training.trainer import read_checkpoint, write_checkpoint
+
+    release(tmp_path / "corpus")
+    status = json.loads((FIXTURES / "control-corpus-attempt-status.json").read_text())
+    status.update(complete=complete, exit_code=exit_code)
+    (tmp_path / "corpus/attempt-status.json").write_text(json.dumps(status))
+    (tmp_path / "corpus/audit.json").write_bytes(b"not JSON")
+    write_stage(tmp_path, "stage2", parent("stage2", None, None))
+    args = job_args(
+        tmp_path,
+        upstream,
+        corpus_uri=URI + "/",
+        condition="cov-w2",
+        override=["covariate_weight=.05"],
+        provisional_unaudited_corpus_attempt="20261113T114417Z-1990",
+    )
+
+    def train(path, output, **kwargs):
+        final = kwargs["checkpoint_dir"] / "checkpoint-final.pt"
+        write_checkpoint(
+            final, {**checkpoint_payload(57600), "job_identity": kwargs["checkpoint_metadata"]}
+        )
+        return final
+
+    monkeypatch.setattr(spot_job, "train", train)
+    assert spot_job.run_leg(args) == 0
+    expected = {
+        "provisional": True,
+        "warning": "UNAUDITED_CORPUS_PROVISIONAL",
+        "attempt_id": "20261113T114417Z-1990",
+        "corpus_uri": URI,
+        "attempt_complete": complete,
+        "attempt_exit_code": exit_code,
+    }
+    directory = tmp_path / "state/stage3"
+    identity = json.loads((directory / "identity.json").read_text())
+    marker = json.loads((directory / "completed.json").read_text())
+    assert identity["corpus_release"] == expected
+    assert identity["corpus_release"]["attempt_complete"] is complete
+    assert type(identity["corpus_release"]["attempt_exit_code"]) is int
+    assert marker["corpus_release"] == marker["job_identity"]["corpus_release"] == expected
+    assert read_checkpoint(directory / "checkpoint-final.pt")["job_identity"] == identity
+
+
+def test_real_corpus_status_refused_without_provisional_flag(upstream, tmp_path, monkeypatch):
+    from simons.training import spot_job
+
+    release(tmp_path / "corpus")
+    (tmp_path / "corpus/attempt-status.json").write_bytes(
+        (FIXTURES / "control-corpus-attempt-status.json").read_bytes()
+    )
+    write_stage(tmp_path, "stage2", parent("stage2", None, None))
+    before = snapshot(tmp_path / "state")
+    monkeypatch.setattr(spot_job, "train", lambda *a, **kw: pytest.fail("training began"))
+    with pytest.raises(ValueError, match="corpus audit gate: attempt is incomplete or failed"):
+        spot_job.run_leg(job_args(tmp_path, upstream))
+    assert snapshot(tmp_path / "state") == before
+
+
+@pytest.mark.parametrize("leg", ["stage3", "stage4", "stage4-long"])
+@pytest.mark.parametrize("field,value", [("complete", True), ("exit_code", 0)])
+@pytest.mark.parametrize("manifest", [False, True])
+@pytest.mark.parametrize("conditioned", [False, True])
+def test_changed_provisional_status_refuses_resume_and_later_legs(
+    upstream, tmp_path, monkeypatch, leg, field, value, manifest, conditioned
+):
+    from simons.training import spot_job
+
+    release(tmp_path / "corpus")
+    status = json.loads((FIXTURES / "control-corpus-attempt-status.json").read_text())
+    receipt = {
+        **PROVISIONAL,
+        "attempt_id": status["attempt_id"],
+        "attempt_complete": False,
+        "attempt_exit_code": -1,
+    }
+    write_stage(
+        tmp_path,
+        "stage3",
+        parent(receipt=receipt, condition=CONDITION if conditioned else None),
+        step=35000 if leg == "stage3" else 57600,
+        completed=leg != "stage3",
+        manifest=manifest,
+    )
+    status[field] = value
+    (tmp_path / "corpus/attempt-status.json").write_text(json.dumps(status))
+    args = job_args(
+        tmp_path,
+        upstream,
+        leg=leg,
+        condition="cov-w2" if conditioned else None,
+        override=["covariate_weight=.05"] if conditioned else [],
+        provisional_unaudited_corpus_attempt=status["attempt_id"],
+    )
+    monkeypatch.setattr(spot_job, "train", lambda *a, **kw: pytest.fail("training began"))
+    before = snapshot(tmp_path / "state")
+    with pytest.raises(ValueError, match="receipt|corpus audit identity"):
+        spot_job.run_leg(args)
+    assert snapshot(tmp_path / "state") == before
 
 
 @pytest.mark.parametrize("conditioned,flag", [(True, False), (False, True)])
@@ -500,11 +612,16 @@ def test_shell_shortcut_checks_all_records(jobs, tmp_path, leg, manifest, change
     assert snapshot(directory) == before
 
 
-@pytest.mark.parametrize("difference", [None, "condition", "receipt", "uri", "legacy", "audited"])
-def test_export_pair_and_record(upstream, tmp_path, difference):
+@pytest.mark.parametrize("complete,exit_code", [(True, 0), (False, -1)])
+@pytest.mark.parametrize(
+    "difference",
+    [None, "condition", "receipt", "uri", "legacy", "audited", "complete", "exit-code"],
+)
+def test_export_pair_and_record(upstream, tmp_path, difference, complete, exit_code):
     from simons.training import spot_job
 
-    first, second = parent("stage4"), parent("stage4-long")
+    receipt = {**PROVISIONAL, "attempt_complete": complete, "attempt_exit_code": exit_code}
+    first, second = parent("stage4", receipt), parent("stage4-long", receipt)
     if difference == "condition":
         second["condition"]["name"] = "other"
     elif difference == "receipt":
@@ -515,6 +632,10 @@ def test_export_pair_and_record(upstream, tmp_path, difference):
         del second["corpus_release"]
     elif difference == "audited":
         second["corpus_release"] = AUDITED
+    elif difference == "complete":
+        second["corpus_release"]["attempt_complete"] = not complete
+    elif difference == "exit-code":
+        second["corpus_release"]["attempt_exit_code"] = exit_code + 1
     for leg, saved in (("stage4", first), ("stage4-long", second)):
         write_stage(tmp_path, leg, saved, model=True)
     args = job_args(
@@ -534,8 +655,8 @@ def test_export_pair_and_record(upstream, tmp_path, difference):
         assert spot_job.run_export(args) == 0
         marker = json.loads((tmp_path / "state/export/completed.json").read_text())
         assert marker["condition"] == marker["job_identity"]["condition"] == CONDITION
-        assert marker["corpus_release"] == PROVISIONAL
-        assert marker["member_corpus_releases"] == [PROVISIONAL, PROVISIONAL]
+        assert marker["corpus_release"] == receipt
+        assert marker["member_corpus_releases"] == [receipt, receipt]
         assert all(m["condition"] == CONDITION for m in marker["member_job_identities"])
 
 
@@ -549,6 +670,8 @@ def test_export_pair_and_record(upstream, tmp_path, difference):
         "nested-condition",
         "top-receipt",
         "member-receipt",
+        "top-complete",
+        "member-exit-code",
     ],
 )
 def test_incompatible_completed_export_never_rebuilt(upstream, tmp_path, artifacts, change):
@@ -584,6 +707,10 @@ def test_incompatible_completed_export_never_rebuilt(upstream, tmp_path, artifac
         marker["job_identity"]["condition"]["name"] = "other"
     elif change == "top-receipt":
         marker["corpus_release"]["attempt_id"] = "other"
+    elif change == "top-complete":
+        marker["corpus_release"]["attempt_complete"] = False
+    elif change == "member-exit-code":
+        marker["member_corpus_releases"][1]["attempt_exit_code"] = -1
     else:
         marker["member_corpus_releases"][1]["corpus_uri"] = "gs://other/corpus"
     (directory / "completed.json").write_text(json.dumps(marker))
@@ -664,14 +791,59 @@ def test_shell_checks_disagreeing_audited_records(jobs, tmp_path):
     assert result.returncode != 0 or result.stdout == "continue\n"
 
 
-def test_shell_defers_fork_checkpoint_identity_verification(jobs, upstream, tmp_path):
+@pytest.mark.parametrize("leg", ["stage3", "export"])
+@pytest.mark.parametrize("manifest", [False, True])
+def test_matching_provisional_completion_defers_to_guest(
+    jobs, upstream, tmp_path, monkeypatch, leg, manifest
+):
+    from simons.training import spot_job
+
+    receipt = {**PROVISIONAL, "attempt_complete": False, "attempt_exit_code": -1}
+    args = job_args(
+        tmp_path,
+        upstream,
+        leg=leg,
+        condition="cov-w2",
+        override=["covariate_weight=.05"],
+        provisional_unaudited_corpus_attempt="tiny",
+    )
+    if leg == "export":
+        for member in ("stage4", "stage4-long"):
+            write_stage(tmp_path, member, parent(member, receipt), model=True, manifest=manifest)
+        assert spot_job.run_export(args) == 0
+    else:
+        write_stage(tmp_path, leg, parent(leg, receipt), manifest=manifest)
+    before = snapshot(tmp_path / "state")
+    script = jobs.generate(**options(leg=leg)).split("scratch=$(mktemp", 1)[0] + "echo continue\n"
+    result = subprocess.run(
+        ["bash"],
+        input=script,
+        text=True,
+        capture_output=True,
+        env={**os.environ, "RUN_DIR": str(tmp_path), "STATE_URI": "gs://offline"},
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "continue\n"
+    monkeypatch.setattr(spot_job, "train", lambda *a, **kw: pytest.fail("training began"))
+    monkeypatch.setattr(spot_job, "export", lambda *a: pytest.fail("export was rebuilt"))
+    assert (spot_job.run_export if leg == "export" else spot_job.run_leg)(args) == 0
+    assert snapshot(tmp_path / "state") == before
+
+
+@pytest.mark.parametrize("change", ["condition", "complete", "exit-code"])
+def test_shell_defers_fork_checkpoint_identity_verification(jobs, upstream, tmp_path, change):
     from simons.training import spot_job
     from simons.training.reliability import checkpoint_hash
     from simons.training.trainer import read_checkpoint, write_checkpoint
 
     path = write_stage(tmp_path, "stage3", parent())
     payload = read_checkpoint(path)
-    payload["job_identity"]["condition"]["name"] = "other"
+    if change == "condition":
+        payload["job_identity"]["condition"]["name"] = "other"
+    elif change == "complete":
+        payload["job_identity"]["corpus_release"]["attempt_complete"] = False
+    else:
+        payload["job_identity"]["corpus_release"]["attempt_exit_code"] = -1
     write_checkpoint(path, payload)
     marker_path = path.parent / "completed.json"
     marker = json.loads(marker_path.read_text())
@@ -694,7 +866,7 @@ def test_shell_defers_fork_checkpoint_identity_verification(jobs, upstream, tmp_
         override=["covariate_weight=.05"],
         provisional_unaudited_corpus_attempt="tiny",
     )
-    with pytest.raises(ValueError, match="condition"):
+    with pytest.raises(ValueError, match="condition|receipt"):
         spot_job.run_leg(args)
     assert snapshot(tmp_path / "state") == before
 
@@ -874,16 +1046,21 @@ def test_provisional_continuation_accepts_equivalent_corpus_uri(
     [(URI, URI), (URI + "/", URI + "/"), (URI + "/", URI), (URI, URI + "/")],
 )
 @pytest.mark.parametrize("manifest", [True, False])
+@pytest.mark.parametrize("complete,exit_code", [(True, 0), (False, -1)])
 def test_partial_resume_trains_with_unchanged_fork_metadata(
-    upstream, tmp_path, monkeypatch, saved_uri, next_uri, manifest
+    upstream, tmp_path, monkeypatch, saved_uri, next_uri, manifest, complete, exit_code
 ):
     import yaml
     from simons.training import spot_job
     from simons.training.trainer import read_checkpoint, write_checkpoint
 
     release(tmp_path / "corpus")
+    (tmp_path / "corpus/attempt-status.json").write_text(
+        json.dumps(dict(attempt_id="tiny", complete=complete, exit_code=exit_code))
+    )
     (tmp_path / "corpus/audit.json").unlink()
     saved = parent()
+    saved["corpus_release"].update(attempt_complete=complete, attempt_exit_code=exit_code)
     saved["corpus_uri"] = saved_uri
     saved["recipe"]["training"]["covariate_weight"] = 0.05
     checkpoint = write_stage(
@@ -927,7 +1104,7 @@ def test_partial_resume_trains_with_unchanged_fork_metadata(
     marker = json.loads((directory / "completed.json").read_text())
     assert marker["job_identity"] == expected_identity
     assert marker["condition"] == CONDITION
-    assert marker["corpus_release"] == PROVISIONAL
+    assert marker["corpus_release"] == saved["corpus_release"]
     assert read_checkpoint(directory / "checkpoint-final.pt")["job_identity"] == expected_identity
 
 

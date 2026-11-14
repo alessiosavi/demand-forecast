@@ -2,7 +2,7 @@ diff --git a/src/simons/training/fork_conditions.py b/src/simons/training/fork_c
 new file mode 100644
 --- /dev/null
 +++ b/src/simons/training/fork_conditions.py
-@@ -0,0 +1,168 @@
+@@ -0,0 +1,177 @@
 +"""Condition and provisional receipt contracts, independent of training dependencies."""
 +
 +import json
@@ -115,7 +115,16 @@ new file mode 100644
 +    receipt = saved.get("corpus_release")
 +    desired = provisional_receipt(args)
 +    if desired is not None or (receipt or {}).get("provisional"):
-+        if receipt != desired and not stage2_parent:
++        # Arguments know only the receipt's mode, attempt and URI. The status
++        # values must exist; agree(), compatible_resume() and the predecessor
++        # gate compare whole receipts, including these values, when available.
++        matches = (
++            desired is not None
++            and isinstance(receipt, dict)
++            and set(receipt) == {*desired, "attempt_complete", "attempt_exit_code"}
++            and all(receipt[key] == value for key, value in desired.items())
++        )
++        if not matches and not stage2_parent:
 +            raise ForkIdentityError(
 +                "provisional receipt identity changed; use a separate STATE_URI"
 +            )
@@ -183,7 +192,7 @@ diff --git a/src/simons/training/screen.py b/src/simons/training/screen.py
  
  FULL_UPDATES = 120208
  
-@@ -52,15 +54,13 @@
+@@ -52,24 +54,32 @@
      return out
  
  
@@ -200,20 +209,26 @@ diff --git a/src/simons/training/screen.py b/src/simons/training/screen.py
          attempt = status["attempt_id"]
          if not isinstance(attempt, str) or not attempt.strip():
              raise ValueError("missing attempt id")
-@@ -70,6 +70,12 @@
-             or status["exit_code"] != 0
-         ):
-             raise ValueError("attempt is incomplete or failed")
 +        if provisional is not None:
 +            if attempt != provisional["attempt_id"]:
 +                raise ValueError("provisional attempt id differs from corpus status")
-+            return provisional
++            return {
++                **provisional,
++                "attempt_complete": status["complete"],
++                "attempt_exit_code": status["exit_code"],
++            }
+         if (
+             status.get("complete") is not True
+             or type(status.get("exit_code")) is not int
+             or status["exit_code"] != 0
+         ):
+             raise ValueError("attempt is incomplete or failed")
 +        data = (root / "audit.json").read_bytes()
 +        audit = json.loads(data)
          if audit.get("attempt_id") != attempt or audit.get("valid") is not True:
              raise ValueError("audit is invalid or belongs to another attempt")
          if type(audit.get("exit_code")) is not int or audit["exit_code"] != 0:
-@@ -94,10 +100,11 @@
+@@ -94,10 +104,11 @@
      return name, (25000 if updates is None else updates) if name == "screen" else None
  
  
@@ -226,7 +241,7 @@ diff --git a/src/simons/training/screen.py b/src/simons/training/screen.py
      name, updates = mode(args)
      if (saved.get("recipe_name", "full"), saved.get("screen_updates")) != (name, updates):
          raise ValueError("recipe identity changed; use a separate STATE_URI")
-@@ -109,13 +116,20 @@
+@@ -109,13 +120,20 @@
          and saved.get("corpus_uri") is not None
          and hasattr(args, "corpus_uri")
      ):
