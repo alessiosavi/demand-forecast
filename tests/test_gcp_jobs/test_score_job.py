@@ -668,6 +668,7 @@ def test_139f3f7_state_keeps_its_identity_and_checkpoint_path(machine, failed, i
     assert run(FAIL_TASK="1" if failed else "0").returncode == int(failed)
     identity = state / "inputs.json"
     config = json.loads(identity.read_text())
+    config.pop("covariates")
     config["guest_sha256"] = "a726e1e81f4ad804683b5164aebbf38aefb2107a7983a0b4faad8b1de200916f"
     identity.write_text(json.dumps(config, sort_keys=True) + "\n")
     marker_path = state / "completed.json"
@@ -681,6 +682,7 @@ def test_139f3f7_state_keeps_its_identity_and_checkpoint_path(machine, failed, i
     result = run()
     assert result.returncode == 0, result.stderr
     assert json.loads(identity.read_text()) == config
+    assert json.loads(marker_path.read_text())["inputs"] == config
     calls = [e for e in events()[before:] if e[0] == "score"]
     if failed:
         expected = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()
@@ -692,6 +694,32 @@ def test_139f3f7_state_keeps_its_identity_and_checkpoint_path(machine, failed, i
         )
     else:
         assert not any(e[0] in ["score", "git", "gcloud"] for e in events()[before:])
+
+
+@pytest.mark.parametrize("with_marker", [False, True])
+def test_139f3f7_state_refuses_covariates_none_without_changes(machine, with_marker):
+    run, state, events, _ = machine
+    result = run()
+    assert result.returncode == 0, result.stderr
+    identity = state / "inputs.json"
+    config = json.loads(identity.read_text())
+    config.pop("covariates")
+    config["guest_sha256"] = "a726e1e81f4ad804683b5164aebbf38aefb2107a7983a0b4faad8b1de200916f"
+    identity.write_text(json.dumps(config, sort_keys=True) + "\n")
+    marker_path = state / "completed.json"
+    if with_marker:
+        marker = json.loads(marker_path.read_text())
+        marker["inputs"] = config
+        marker["artifacts"]["inputs.json"] = hashlib.sha256(identity.read_bytes()).hexdigest()
+        marker_path.write_text(json.dumps(marker))
+    else:
+        marker_path.unlink()
+    saved = {path: path.read_bytes() for path in state.rglob("*") if path.is_file()}
+    before = len(events())
+    result = run({"covariates": "none"})
+    assert result.returncode != 0 and "no valid input identity" in result.stderr
+    assert {path: path.read_bytes() for path in state.rglob("*") if path.is_file()} == saved
+    assert not any(e[0] in ["score", "git", "gcloud", "uv"] for e in events()[before:])
 
 
 def test_unknown_guest_identity_is_refused(machine):

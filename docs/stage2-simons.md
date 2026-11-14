@@ -516,7 +516,8 @@ freshly downloaded hashes match the marker's independent copy. Without independe
 evidence, damaged identity or checkpoint hashes cause refusal to overwrite state.
 Changed inputs, or downloaded checkpoint contents that differ from trusted
 recorded hashes, cause refusal. State written by the `139f3f7` guest retains its
-input identity and checkpoint path through these recovery fixes. This is evidence
+input identity and checkpoint path through these recovery fixes only when resumed
+with the default `--covariates all`. This is evidence
 consistency checking, not a fresh recomputation of fev scores. There is no
 concurrent-writer lock: use one guest per score name/state prefix. GPU execution,
 numerical parity, memory fit

@@ -60,7 +60,10 @@ def read_object(path):
 def restored_config(config, root):
     # Recovery-only fixes remain compatible with the guest shipped in 139f3f7.
     # Preserve its recorded identity, including the adapter's checkpoint path.
+    if config.get("covariates", "all") != "all":
+        return config
     legacy = dict(config, guest_sha256="a726e1e81f4ad804683b5164aebbf38aefb2107a7983a0b4faad8b1de200916f")
+    legacy.pop("covariates", None)
     if legacy in (read_object(root / "inputs.json"), read_object(root / "completed.json").get("inputs")):
         return legacy
     return config
@@ -294,7 +297,7 @@ def score(config, root, scratch, repo, python):
             command += ["--names", selection]
         if config["max_context"] is not None:
             command += ["--max-context", str(config["max_context"])]
-        if config["covariates"] == "none":
+        if config.get("covariates", "all") == "none":
             command += ["--covariates", "none"]
         start = time.monotonic()
         log = root / (mode + ".log")
