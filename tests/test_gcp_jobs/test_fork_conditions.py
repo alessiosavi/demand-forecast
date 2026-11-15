@@ -1160,3 +1160,430 @@ def test_reference_corpus_uri_comparisons_remain_literal(upstream, tmp_path):
         check_identity(saved, job_args(tmp_path, upstream))
     with pytest.raises(ValueError, match="experiment identity changed"):
         compatible_resume(saved, {**saved, "corpus_uri": URI})
+
+
+STATUS_TYPE_CHANGES = [
+    pytest.param("attempt_complete", False, 0, id="false-to-zero"),
+    pytest.param("attempt_complete", True, 1, id="true-to-one"),
+    pytest.param("attempt_exit_code", -1, -1.0, id="int-to-float"),
+]
+
+
+def fork_args(root, upstream, **changes):
+    return job_args(
+        root,
+        upstream,
+        **(
+            dict(
+                condition="cov-w2",
+                override=["covariate_weight=.05"],
+                provisional_unaudited_corpus_attempt="tiny",
+            )
+            | changes
+        ),
+    )
+
+
+def finish_training(path, output, **kwargs):
+    """Replace only GPU training; keep guest validation and publication real."""
+    from simons.training.trainer import write_checkpoint
+
+    final = kwargs["checkpoint_dir"] / "checkpoint-final.pt"
+    write_checkpoint(
+        final, {**checkpoint_payload(57600), "job_identity": kwargs["checkpoint_metadata"]}
+    )
+    return final
+
+
+@pytest.mark.parametrize("recipe_name", ["full", "screen"])
+def test_reference_marker_only_stage_recovery_keeps_current_audit(
+    upstream, tmp_path, monkeypatch, recipe_name
+):
+    import yaml
+    from simons.training import spot_job
+    from simons.training.trainer import write_checkpoint
+
+    release(tmp_path / "corpus")
+    old = spot_job.corpus_release(tmp_path / "corpus")
+    args = job_args(tmp_path, upstream, recipe=recipe_name)
+    legacy_parent = parent("stage2", None, None)
+    if recipe_name == "screen":
+        legacy_parent.update(recipe_name="screen", screen_updates=25000)
+    write_stage(tmp_path, "stage2", legacy_parent)
+    raw = spot_job.recipe(
+        upstream,
+        tmp_path / "state",
+        args.corpus,
+        "25m",
+        "stage3",
+        11,
+        1,
+        recipe_name=recipe_name,
+    )
+    args.corpus_release = old
+    saved = spot_job.identity(args, raw)
+    path = write_stage(tmp_path, "stage3", saved, step=raw["training"]["steps"])
+    path.unlink()
+    (path.parent / "identity.json").unlink()
+    assert set(snapshot(path.parent)) == {"completed.json"}
+    audit_path = tmp_path / "corpus/audit.json"
+    audit = json.loads(audit_path.read_text())
+    audit["note"] = "different valid audit"
+    audit_path.write_text(json.dumps(audit))
+    current = spot_job.corpus_release(args.corpus)
+    assert current != old
+    parent_before = snapshot(tmp_path / "state/stage2")
+
+    def train(path, output, **kwargs):
+        final = kwargs["checkpoint_dir"] / "checkpoint-final.pt"
+        steps = yaml.safe_load(path.read_text())["training"]["steps"]
+        write_checkpoint(
+            final, {**checkpoint_payload(steps), "job_identity": kwargs["checkpoint_metadata"]}
+        )
+        return final
+
+    monkeypatch.setattr(spot_job, "train", train)
+    assert spot_job.run_leg(args) == 0
+    directory = tmp_path / "state/stage3"
+    marker = json.loads((directory / "completed.json").read_text())
+    identity = json.loads((directory / "identity.json").read_text())
+    assert marker["job_identity"] == identity
+    assert marker["corpus_release"] == identity["corpus_release"] == current
+    assert path.is_file()
+    assert snapshot(tmp_path / "state/stage2") == parent_before
+
+
+@pytest.mark.parametrize("recipe_name", ["full", "screen"])
+@pytest.mark.parametrize("members", ["legacy", "same-audit", "different-audit"])
+def test_reference_marker_only_export_recovery_keeps_audited_rules(
+    upstream, tmp_path, recipe_name, members
+):
+    from simons.training import spot_job
+    from simons.training.fork_conditions import ForkIdentityError
+
+    def write_members(receipt):
+        for leg in ("stage4", "stage4-long"):
+            saved = parent(leg, receipt, None)
+            if recipe_name == "screen":
+                saved.update(recipe_name="screen", screen_updates=25000)
+            write_stage(tmp_path, leg, saved, model=True)
+
+    write_members(AUDITED)
+    args = job_args(tmp_path, upstream, leg="export", recipe=recipe_name)
+    assert spot_job.run_export(args) == 0
+    directory = tmp_path / "state/export"
+    for name in ("config.json", "model.safetensors"):
+        (directory / name).unlink()
+    assert set(snapshot(directory)) == {"completed.json"}
+    receipt = {
+        "legacy": None,
+        "same-audit": AUDITED,
+        "different-audit": {**AUDITED, "audit_sha256": "b" * 64},
+    }[members]
+    write_members(receipt)
+    before = snapshot(tmp_path / "state")
+    if members == "different-audit":
+        with pytest.raises(ForkIdentityError, match="receipt"):
+            spot_job.run_export(args)
+        assert snapshot(tmp_path / "state") == before
+    else:
+        assert spot_job.run_export(args) == 0
+        marker = json.loads((directory / "completed.json").read_text())
+        assert marker["corpus_release"] == receipt
+        assert marker["member_corpus_releases"] == [receipt, receipt]
+        assert (directory / "model.safetensors").stat().st_size > 0
+        after = snapshot(tmp_path / "state")
+        assert all(
+            after[name] == data for name, data in before.items() if not name.startswith("export/")
+        )
+
+
+@pytest.mark.parametrize(
+    "change", ["equal", "values", "false-to-zero", "true-to-one", "int-to-float"]
+)
+def test_marker_only_stage_recovery_compares_full_receipt(
+    jobs, upstream, tmp_path, monkeypatch, change
+):
+    from simons.training import spot_job
+    from simons.training.fork_conditions import ForkIdentityError
+
+    release(tmp_path / "corpus")
+    old = {**PROVISIONAL, "attempt_complete": False, "attempt_exit_code": -1}
+    if change == "true-to-one":
+        old["attempt_complete"] = True
+    current = {
+        "equal": old,
+        "values": PROVISIONAL,
+        "false-to-zero": {**old, "attempt_complete": 0},
+        "true-to-one": {**old, "attempt_complete": 1},
+        "int-to-float": {**old, "attempt_exit_code": -1.0},
+    }[change]
+    (tmp_path / "corpus/attempt-status.json").write_text(
+        json.dumps(
+            dict(
+                attempt_id="tiny",
+                complete=current["attempt_complete"],
+                exit_code=current["attempt_exit_code"],
+            )
+        )
+    )
+    write_stage(tmp_path, "stage2", parent("stage2", None, None))
+    path = write_stage(tmp_path, "stage3", parent(receipt=old), step=57600)
+    path.unlink()
+    (path.parent / "identity.json").unlink()
+    assert set(snapshot(path.parent)) == {"completed.json"}
+    before = snapshot(tmp_path / "state")
+    script = jobs.generate(**options()).split("scratch=$(mktemp", 1)[0] + "echo continue\n"
+    result = subprocess.run(
+        ["bash"],
+        input=script,
+        text=True,
+        capture_output=True,
+        env={**os.environ, "RUN_DIR": str(tmp_path), "STATE_URI": "gs://offline"},
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "continue\n"
+    monkeypatch.setattr(spot_job, "train", finish_training)
+    if change != "equal":
+        with pytest.raises(ForkIdentityError, match="receipt"):
+            spot_job.run_leg(fork_args(tmp_path, upstream))
+        assert snapshot(tmp_path / "state") == before
+    else:
+        assert spot_job.run_leg(fork_args(tmp_path, upstream)) == 0
+        saved = json.loads((path.parent / "identity.json").read_text())
+        assert saved["corpus_release"] == old
+        assert path.is_file()
+
+
+@pytest.mark.parametrize(
+    "change", ["equal", "values", "false-to-zero", "true-to-one", "int-to-float"]
+)
+def test_marker_only_export_recovery_compares_member_receipt(upstream, tmp_path, change):
+    from simons.training import spot_job
+    from simons.training.fork_conditions import ForkIdentityError
+
+    old = {**PROVISIONAL, "attempt_complete": False, "attempt_exit_code": -1}
+    if change == "true-to-one":
+        old["attempt_complete"] = True
+    current = {
+        "equal": old,
+        "values": PROVISIONAL,
+        "false-to-zero": {**old, "attempt_complete": 0},
+        "true-to-one": {**old, "attempt_complete": 1},
+        "int-to-float": {**old, "attempt_exit_code": -1.0},
+    }[change]
+    for leg in ("stage4", "stage4-long"):
+        write_stage(tmp_path, leg, parent(leg, old), model=True)
+    args = fork_args(tmp_path, upstream, leg="export")
+    assert spot_job.run_export(args) == 0
+    directory = tmp_path / "state/export"
+    for name in ("config.json", "model.safetensors"):
+        (directory / name).unlink()
+    assert set(snapshot(directory)) == {"completed.json"}
+    if change != "equal":
+        for leg in ("stage4", "stage4-long"):
+            write_stage(tmp_path, leg, parent(leg, current), model=True)
+    before = snapshot(tmp_path / "state")
+    if change != "equal":
+        with pytest.raises(ForkIdentityError, match="receipt"):
+            spot_job.run_export(args)
+        assert snapshot(tmp_path / "state") == before
+    else:
+        assert spot_job.run_export(args) == 0
+        marker = json.loads((directory / "completed.json").read_text())
+        assert marker["corpus_release"] == old
+        assert (directory / "model.safetensors").stat().st_size > 0
+
+
+@pytest.mark.parametrize("field,old,new", STATUS_TYPE_CHANGES)
+@pytest.mark.parametrize("manifest", [False, True])
+@pytest.mark.parametrize("leg", ["stage3", "stage4", "stage4-long"])
+def test_provisional_status_types_refused_on_resume_and_predecessor(
+    upstream, tmp_path, monkeypatch, field, old, new, manifest, leg
+):
+    from simons.training import spot_job
+    from simons.training.fork_conditions import ForkIdentityError
+
+    release(tmp_path / "corpus")
+    receipt = {**PROVISIONAL, field: old}
+    saved = parent(receipt=receipt)
+    saved["recipe"]["training"]["covariate_weight"] = 0.05
+    write_stage(
+        tmp_path,
+        "stage3",
+        saved,
+        step=35000 if leg == "stage3" else 57600,
+        completed=leg != "stage3",
+        manifest=manifest,
+    )
+    current = {**receipt, field: new}
+    (tmp_path / "corpus/attempt-status.json").write_text(
+        json.dumps(
+            dict(
+                attempt_id="tiny",
+                complete=current["attempt_complete"],
+                exit_code=current["attempt_exit_code"],
+            )
+        )
+    )
+    monkeypatch.setattr(spot_job, "train", finish_training)
+    before = snapshot(tmp_path / "state")
+    with pytest.raises(ForkIdentityError, match="receipt|corpus audit identity"):
+        spot_job.run_leg(fork_args(tmp_path, upstream, leg=leg))
+    assert snapshot(tmp_path / "state") == before
+
+
+@pytest.mark.parametrize("field,old,new", STATUS_TYPE_CHANGES)
+@pytest.mark.parametrize(
+    "source", ["manifest", "top", "nested", "member-identity", "member-receipt", "embedded"]
+)
+def test_provisional_status_types_refused_between_records(
+    upstream, tmp_path, field, old, new, source
+):
+    from simons.training.fork_conditions import ForkIdentityError, check_records
+    from simons.training.screen import compatible_resume
+
+    saved = parent(receipt={**PROVISIONAL, field: old})
+    changed = copy.deepcopy(saved)
+    changed["corpus_release"][field] = new
+    (tmp_path / "identity.json").write_text(json.dumps(saved))
+    marker = {
+        "condition": CONDITION,
+        "corpus_release": saved["corpus_release"],
+        "job_identity": saved,
+        "member_job_identities": [saved],
+        "member_corpus_releases": [saved["corpus_release"]],
+    }
+    embedded = saved
+    if source == "manifest":
+        (tmp_path / "identity.json").write_text(json.dumps(changed))
+    elif source == "top":
+        marker["corpus_release"] = changed["corpus_release"]
+    elif source == "nested":
+        marker["job_identity"] = changed
+    elif source == "member-identity":
+        marker["member_job_identities"] = [changed]
+    elif source == "member-receipt":
+        marker["member_corpus_releases"] = [changed["corpus_release"]]
+    else:
+        embedded = changed
+    (tmp_path / "completed.json").write_text(json.dumps(marker))
+    before = snapshot(tmp_path)
+    with pytest.raises(ForkIdentityError, match="receipt"):
+        check_records(tmp_path, fork_args(tmp_path, upstream), embedded=embedded)
+    assert snapshot(tmp_path) == before
+    with pytest.raises(ForkIdentityError, match="receipt"):
+        compatible_resume(saved, changed)
+
+
+@pytest.mark.parametrize("field,old,new", STATUS_TYPE_CHANGES)
+@pytest.mark.parametrize("completed_export", [False, True])
+def test_provisional_status_types_refused_between_export_members(
+    jobs, upstream, tmp_path, field, old, new, completed_export
+):
+    from simons.training import spot_job
+    from simons.training.fork_conditions import ForkIdentityError
+
+    receipt = {**PROVISIONAL, field: old}
+    for leg in ("stage4", "stage4-long"):
+        write_stage(tmp_path, leg, parent(leg, receipt), model=True)
+    args = fork_args(tmp_path, upstream, leg="export")
+    if completed_export:
+        assert spot_job.run_export(args) == 0
+    write_stage(tmp_path, "stage4-long", parent("stage4-long", {**receipt, field: new}), model=True)
+    before = snapshot(tmp_path / "state")
+    script = (
+        jobs.generate(**options(leg="export")).split("scratch=$(mktemp", 1)[0] + "echo continue\n"
+    )
+    result = subprocess.run(
+        ["bash"],
+        input=script,
+        text=True,
+        capture_output=True,
+        env={**os.environ, "RUN_DIR": str(tmp_path), "STATE_URI": "gs://offline"},
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "continue\n"
+    with pytest.raises(ForkIdentityError, match="receipt"):
+        spot_job.run_export(args)
+    assert snapshot(tmp_path / "state") == before
+
+
+def test_provisional_mode_type_refused_by_argument_check(upstream, tmp_path):
+    from simons.training.fork_conditions import ForkIdentityError, check_fork_identity
+
+    saved = parent(receipt={**PROVISIONAL, "provisional": 1})
+    with pytest.raises(ForkIdentityError, match="receipt"):
+        check_fork_identity(saved, fork_args(tmp_path, upstream))
+
+
+def restore_81f46d9_stage(root, leg, *, manifest, completed, model=False):
+    """Frozen identity/marker from 81f46d9; checkpoint encoding is unchanged.
+
+    The fixture was regenerated with recipe(), identity() and complete_leg() from
+    the exact base bundle, including recipe()'s seed override. Only the checksum/
+    size reflect the local payload.
+    No current identity or completion builder supplies expected records.
+    """
+    from simons.training.reliability import checkpoint_hash
+
+    fixture = json.loads((FIXTURES / "provisional-state-81f46d9.json").read_text())
+    record = fixture["stages"][leg]
+    saved = record["identity"]
+    path = write_stage(
+        root,
+        leg,
+        saved,
+        step=57600 if completed else 35000,
+        completed=False,
+        manifest=manifest,
+        model=model,
+    )
+    if completed:
+        path = path.rename(path.parent / "checkpoint-final.pt")
+        marker = record["completion"]
+        marker.update(bytes=path.stat().st_size, sha256=checkpoint_hash(path))
+        (path.parent / "completed.json").write_text(json.dumps(marker))
+    return saved, path
+
+
+@pytest.mark.parametrize("use", ["resume", "predecessor", "member"])
+@pytest.mark.parametrize("manifest", [False, True])
+def test_81f46d9_provisional_state_remains_usable(upstream, tmp_path, monkeypatch, use, manifest):
+    from simons.training import spot_job
+    from simons.training.trainer import read_checkpoint
+
+    release(tmp_path / "corpus")
+    (tmp_path / "corpus/attempt-status.json").write_text(
+        json.dumps(dict(attempt_id="tiny", complete=False, exit_code=-1))
+    )
+    (tmp_path / "corpus/audit.json").unlink()
+    legs = ("stage4", "stage4-long") if use == "member" else ("stage3",)
+    for leg in legs:
+        saved, path = restore_81f46d9_stage(
+            tmp_path,
+            leg,
+            manifest=manifest,
+            completed=use != "resume",
+            model=use == "member",
+        )
+    before = snapshot(tmp_path / "state")
+    next_leg = {"resume": "stage3", "predecessor": "stage4", "member": "export"}[use]
+    monkeypatch.setattr(spot_job, "train", finish_training)
+    args = fork_args(tmp_path, upstream, leg=next_leg)
+    assert (spot_job.run_export if use == "member" else spot_job.run_leg)(args) == 0
+    directory = tmp_path / "state" / next_leg
+    marker = json.loads((directory / "completed.json").read_text())
+    assert marker["condition"] == CONDITION
+    assert json.dumps(marker["corpus_release"], sort_keys=True) == json.dumps(
+        saved["corpus_release"], sort_keys=True
+    )
+    if use == "resume":
+        assert read_checkpoint(directory / "checkpoint-final.pt")["job_identity"] == saved
+        assert json.loads((directory / "identity.json").read_text()) == saved
+    else:
+        after = snapshot(tmp_path / "state")
+        assert all(after[name] == contents for name, contents in before.items())
+    if use == "member":
+        assert marker["member_corpus_releases"] == [saved["corpus_release"]] * 2
+        assert (directory / "model.safetensors").stat().st_size > 0

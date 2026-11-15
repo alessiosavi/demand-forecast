@@ -553,7 +553,9 @@ The host restores `RUN_DIR/state` before invocation. The job syncs it every ten
 minutes and at exit; the host's final copy also covers guest preemption. Each attempt first invalidates the old final audit and publishes
 `attempt-status.json` with a unique attempt ID and repository SHA. The final
 audit carries the same attempt ID. Consumers must require matching IDs, a
-complete status with exit 0, a valid audit and clean allowed folders; an old
+complete status with exit 0, a valid audit and clean allowed folders (the labelled
+exception for provisional variant training legs is described in
+[Fork conditions and provisional corpus attempts](stage2-simons.md#fork-conditions-and-provisional-corpus-attempts-25m-full)); an old
 `audit.json` at an object-store prefix is insufficient. Its exit
 trap uploads the entire corpus (including per-folder stats and receipts) and
 `audit.json`, even after an audit failure. A final upload failure exits nonzero.
