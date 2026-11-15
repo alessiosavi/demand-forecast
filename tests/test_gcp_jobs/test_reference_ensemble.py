@@ -24,7 +24,9 @@ from tests.test_bench.test_yardsticks import (
 )
 
 
-@pytest.mark.parametrize("model,batch_size", [("timestral", 1024), ("chronos2", 100)])
+@pytest.mark.parametrize(
+    "model,batch_size", [("timestral", 1024), ("chronos2", 100), ("ciproto", 1)]
+)
 @pytest.mark.parametrize("simons_first", [True, False])
 def test_mixed_raw_reference_mean(scenario, make_member, tmp_path, model, batch_size, simons_first):
     tasks, _, _ = scenario
@@ -71,7 +73,7 @@ def test_mixed_members_keep_evaluation_guards(scenario, make_member, tmp_path, m
         ensemble(tasks, [simons, reference], tmp_path / "rejected")
 
 
-@pytest.mark.parametrize("model", ["timestral", "chronos2"])
+@pytest.mark.parametrize("model", ["timestral", "chronos2", "ciproto"])
 @pytest.mark.parametrize(
     "change", ["simons_source", "simons_implementation", "simons", "batch_size"]
 )
@@ -103,7 +105,12 @@ def test_mixed_members_reject_different_simons_configurations(
 
 
 @pytest.mark.parametrize(
-    "model,package", [("timestral", "timestral"), ("chronos2", "chronos-forecasting")]
+    "model,package",
+    [
+        ("timestral", "timestral"),
+        ("chronos2", "chronos-forecasting"),
+        ("ciproto", "continuousintelligence"),
+    ],
 )
 def test_mixed_members_reject_different_same_model_reference_packages(
     scenario, make_member, tmp_path, monkeypatch, model, package
@@ -126,7 +133,7 @@ def test_mixed_members_reject_different_same_model_reference_packages(
     assert not out.exists()
 
 
-@pytest.mark.parametrize("model", ["timestral", "chronos2"])
+@pytest.mark.parametrize("model", ["timestral", "chronos2", "ciproto"])
 def test_mixed_members_accept_matching_simons_configurations(
     scenario, make_member, tmp_path, model
 ):
@@ -142,7 +149,7 @@ def test_mixed_members_accept_matching_simons_configurations(
     assert record["weights"] == [1 / 3] * 3
 
 
-@pytest.mark.parametrize("model", ["timestral", "chronos2"])
+@pytest.mark.parametrize("model", ["timestral", "chronos2", "ciproto"])
 def test_mixed_members_reject_different_same_model_covariate_reports(
     scenario, make_member, tmp_path, model
 ):
@@ -166,7 +173,7 @@ def test_mixed_members_reject_different_same_model_covariate_reports(
     assert not (out / tasks[0].task_name / "run.json").exists()
 
 
-@pytest.mark.parametrize("model", ["timestral", "chronos2"])
+@pytest.mark.parametrize("model", ["timestral", "chronos2", "ciproto"])
 @pytest.mark.parametrize("change", ["fingerprint", "window_ids"])
 def test_mixed_members_reject_different_task_windows(
     scenario, make_member, tmp_path, monkeypatch, model, change

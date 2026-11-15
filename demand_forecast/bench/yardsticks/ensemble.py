@@ -91,7 +91,7 @@ def _evaluation_configuration(configuration: dict, *, mixed_models: bool = False
         evaluation["configuration"]["packages"] = {
             key: value
             for key, value in configuration["packages"].items()
-            if key not in {"simons", "timestral", "chronos-forecasting"}
+            if key not in {"simons", "timestral", "chronos-forecasting", "continuousintelligence"}
         }
     return evaluation
 
@@ -161,7 +161,7 @@ def _bind_members(members: list[Path]) -> list[dict]:
     models = {configuration["options"]["model"] for configuration in configurations}
     mixed_models = len(models) > 1
     if mixed_models and (
-        not models <= {"simons", "timestral", "chronos2"}
+        not models <= {"simons", "timestral", "chronos2", "ciproto"}
         or any(c["options"].get("processing", "raw") != "raw" for c in configurations)
     ):
         raise ValueError("mixed models require native reference outputs and Simons raw")

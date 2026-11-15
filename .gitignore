@@ -148,6 +148,7 @@ plotly/
 *.png
 *.txt
 !requirements-yardsticks.txt
+!/requirements-yardsticks-ciproto.txt
 metafeatures*.csv
 predictions.csv
 metrics.json

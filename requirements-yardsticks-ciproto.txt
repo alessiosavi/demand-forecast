@@ -1,0 +1,15 @@
+# Isolated CPython 3.10 ci-proto environment. Install torch's cu128 wheel first.
+# Keep recorded scoring/runtime pins aligned with requirements-yardsticks.txt.
+# CI-Proto requires Hub >=1; omit other models and Transformers (Hub <1).
+continuousintelligence==0.1.0
+fev==0.10.0
+torch==2.8.0
+numpy==2.2.6
+pandas==2.2.3
+datasets==3.6.0
+pyarrow==20.0.0
+scikit-learn==1.6.1
+scipy==1.15.3
+einops==0.8.1
+huggingface-hub==1.0.1
+safetensors==0.6.2

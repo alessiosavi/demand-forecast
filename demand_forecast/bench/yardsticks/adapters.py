@@ -5,7 +5,7 @@
 # Modified for shared ablations and audit inputs; see LICENSE-APACHE-2.0.
 """Published fev adapters, with explicit shared-runner ablations.
 
-Settings/preprocessing follow autogluon/fev@9cf943c models/{chronos-2,timestral}.
+Settings/preprocessing follow autogluon/fev@9cf943c models/{chronos-2,timestral,ci-proto}.
 Timestral batching and categorical typing are adapted from its Apache-2.0
 fev implementation. The Simons adapter follows Abel-ai-lab/Simons@8e338e9
 benchmarks/fev_bench.py (Apache-2.0). Model libraries are imported only when
@@ -24,6 +24,186 @@ from .runner import SIMONS_SOURCE, Options, WindowInput
 
 def _numpy(value):
     return value.detach().double().cpu().numpy()
+
+
+class CIProtoAdapter:
+    """Published CI-Proto calls, including timestamps, categories and static inputs."""
+
+    max_context = 16384
+
+    def __init__(self, options: Options, task, *, model=None):
+        self.options = options
+        if model is None:
+            import continuousintelligence as ci
+            import torch
+
+            model = ci.load_model(
+                options.weights,
+                device=options.device,
+                revision=options.weights_revision
+                if not options.weights_revision
+                or not options.weights_revision.startswith("local-sha256:")
+                else None,
+            )
+            model.forecast(torch.sin(torch.arange(512, dtype=torch.float32) / 8)[None], horizon=32)
+        self.model = model
+        self.prepare(task)
+
+    def prepare(self, task):
+        """Infer only text vocabularies on full data; boolean/numeric inputs stay numeric."""
+        import pyarrow as pa
+        import pyarrow.compute as pc
+
+        full = task.load_full_dataset()
+        self.task_name, self.freq = task.task_name, task.freq
+        if 0.5 not in task.quantile_levels:
+            raise ValueError(
+                f"task {task.task_name!r} has no 0.5 quantile level for the point forecast"
+            )
+        self.known, self.past_only, self.text_values = [], [], {}
+        if self.options.covariates == "all":
+            self.known = list(task.known_dynamic_columns)
+            self.past_only = list(task.past_dynamic_columns)
+            table = full.with_format("arrow")[:]
+            for name in self.known + self.past_only:
+                kind = table.schema.field(name).type.value_type
+                if not (
+                    pa.types.is_floating(kind)
+                    or pa.types.is_integer(kind)
+                    or pa.types.is_boolean(kind)
+                ):
+                    values = pc.list_flatten(table.column(name)).unique().to_pylist()
+                    self.text_values[name] = tuple(sorted(str(v) for v in values if v is not None))
+
+    def _values(self, name, values):
+        if name not in self.text_values:
+            return np.asarray(values, dtype=np.float64)
+        import pyarrow as pa
+        import pyarrow.compute as pc
+
+        return (
+            pc.index_in(
+                pa.array(values).cast(pa.string()),
+                value_set=pa.array(self.text_values[name], pa.string()),
+            )
+            .cast(pa.float64())
+            .to_numpy(zero_copy_only=False)
+        )
+
+    @staticmethod
+    def _left_padded(rows, fill):
+        length = max(len(row) for row in rows)
+        padded = np.full((len(rows), length), fill, dtype=rows[0].dtype)
+        for i, row in enumerate(rows):
+            padded[i, length - len(row) :] = row
+        return padded
+
+    def _inputs(self, window, horizon):
+        import torch
+
+        cap = min(self.max_context, self.options.max_context or self.max_context)
+        histories = [item.target[:, -cap:] for item in window.items]
+        times, past, future = [], [], []
+        for item, history in zip(window.items, histories, strict=True):
+            if item.timestamps is None:
+                raise ValueError("ci-proto requires past and future timestamps")
+            times.append(item.timestamps[-(history.shape[-1] + horizon) :])
+            past.append([self._values(c, item.past[c][-cap:]) for c in self.past_only])
+            future.append(
+                [
+                    np.concatenate(
+                        [self._values(c, item.past[c][-cap:]), self._values(c, item.future[c])]
+                    )
+                    for c in self.known
+                ]
+            )
+        options = {
+            "categorical_past": tuple(
+                i for i, c in enumerate(self.past_only) if c in self.text_values
+            ),
+            "categorical_future": tuple(
+                i for i, c in enumerate(self.known) if c in self.text_values
+            ),
+            "freq": self.freq,
+        }
+        if len(window.targets) == 1:
+            if self.past_only:
+                options["past_covariates"] = torch.from_numpy(
+                    np.stack(
+                        [
+                            self._left_padded([rows[k] for rows in past], np.nan)
+                            for k in range(len(self.past_only))
+                        ],
+                        axis=1,
+                    )
+                )
+            if self.known:
+                options["future_covariates"] = torch.from_numpy(
+                    np.stack(
+                        [
+                            self._left_padded([rows[k] for rows in future], np.nan)
+                            for k in range(len(self.known))
+                        ],
+                        axis=1,
+                    )
+                )
+            static = {
+                c: [item.static[c] for item in window.items] for c in (window.items[0].static or {})
+            }
+            return [
+                {
+                    "history": torch.from_numpy(
+                        self._left_padded([h[0] for h in histories], np.nan)
+                    ),
+                    "timestamps": torch.from_numpy(
+                        self._left_padded(times, np.iinfo(np.int64).min)
+                    ),
+                    "series_ids": window.ids,
+                    "static_features": static or None,
+                    **options,
+                }
+            ]
+        inputs = []
+        for i, history in enumerate(histories):
+            if self.past_only:
+                options["past_covariates"] = torch.from_numpy(np.stack(past[i]))
+            if self.known:
+                options["future_covariates"] = torch.from_numpy(np.stack(future[i]))
+            inputs.append(
+                {
+                    "history": torch.from_numpy(history),
+                    "timestamps": torch.from_numpy(times[i]),
+                    **options,
+                }
+            )
+        return inputs
+
+    def predict(
+        self, windows: list[WindowInput], horizon: int, levels: list[float]
+    ) -> list[list[np.ndarray]]:
+        """Select native heads within 1e-6; batch univariate series once per window."""
+        columns = []
+        for level in levels:
+            matches = [
+                i
+                for i, candidate in enumerate(self.model.quantiles.tolist())
+                if abs(candidate - level) < 1e-6
+            ]
+            if not matches:
+                raise ValueError(
+                    f"task {self.task_name!r} needs quantile level {level}, which the model lacks"
+                )
+            columns.append(matches[0])
+        result = []
+        for window in windows:
+            forecasts = [
+                _numpy(self.model.forecast(horizon=horizon, **item))
+                for item in self._inputs(window, horizon)
+            ]
+            if len(window.targets) == 1:
+                forecasts = [q[None] for q in forecasts[0]]
+            result.append([q[:, columns, :].transpose(0, 2, 1) for q in forecasts])
+        return result
 
 
 class Chronos2Adapter:

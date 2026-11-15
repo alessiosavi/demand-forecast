@@ -29,6 +29,7 @@ SIMONS_SOURCE = "8e338e915d26c8960713889ef12ab1cf5c08d591"
 DEFAULT_WEIGHTS = {
     "chronos2": ("amazon/chronos-2", "29ec3766d36d6f73f0696f85560a422f50e8498c"),
     "timestral": ("mistralai/Timestral-5M", "bdd20cfc15a3fea0e4cb5ccef37f8d3ca7aa335f"),
+    "ciproto": ("ContinuousIntelligence/ci-proto", "ee3031351a151e3f6febf8c62b53e6ea1008bef6"),
 }
 
 
@@ -51,7 +52,7 @@ class Options:
     def resolved(self) -> Options:
         """Validate choices and fill only published batching/context defaults."""
         if self.model not in (*DEFAULT_WEIGHTS, "simons"):
-            raise ValueError("model must be chronos2, timestral or simons")
+            raise ValueError("model must be chronos2, timestral, ciproto or simons")
         if self.model == "simons":
             if self.processing not in ("raw", "published"):
                 raise ValueError("Simons requires --processing raw|published")
@@ -73,10 +74,12 @@ class Options:
             value = getattr(self, name)
             if value is not None and (isinstance(value, bool) or value < 1):
                 raise ValueError(f"{name} must be positive")
+        if self.model == "ciproto" and self.batch_size not in (None, 1):
+            raise ValueError("ci-proto uses published window/series batching; batch-size must be 1")
         return replace(
             self,
             batch_size=self.batch_size
-            or {"chronos2": 100, "timestral": 1024, "simons": 256}[self.model],
+            or {"chronos2": 100, "timestral": 1024, "simons": 256, "ciproto": 1}[self.model],
         )
 
 
@@ -89,6 +92,8 @@ class SeriesInput:
     target: np.ndarray
     past: dict[str, np.ndarray]
     future: dict[str, np.ndarray]
+    timestamps: np.ndarray | None = None
+    static: dict | None = None
 
 
 @dataclass
@@ -208,9 +213,12 @@ def runtime_identity(options: Options) -> dict:
         "pandas",
         "pyarrow",
         "torch",
-        {"chronos2": "chronos-forecasting", "timestral": "timestral", "simons": "simons"}[
-            options.model
-        ],
+        {
+            "chronos2": "chronos-forecasting",
+            "timestral": "timestral",
+            "simons": "simons",
+            "ciproto": "continuousintelligence",
+        }[options.model],
     ):
         try:
             packages[name] = version(name)
@@ -304,6 +312,16 @@ def prepare_windows(task, options: Options) -> list[WindowInput]:
     targets = list(task.target_columns)
     for window in task.iter_windows():
         past, future = window.get_input_data()
+        if options.model == "ciproto":
+            import pyarrow as pa
+
+            past_table = past.with_format("arrow")[:]
+            future_table = future.with_format("arrow")[:]
+            if not past_table.column(task.id_column).equals(future_table.column(task.id_column)):
+                raise ValueError(f"task {task.task_name!r} has different past/future series orders")
+            # NumPy-formatted datasets rows downcast Arrow float64 to float32.
+            # Arrow's Python rows preserve precision for targets and dynamics.
+            past, future = past_table.to_pylist(), future_table.to_pylist()
         future_by_id = {str(row[task.id_column]): row for row in future}
         ids, items = [], []
         for i, row in enumerate(past):
@@ -328,8 +346,25 @@ def prepare_windows(task, options: Options) -> list[WindowInput]:
                         )
                     )
             else:
+                metadata = {}
+                if options.model == "ciproto":
+                    times = [
+                        table.column(task.timestamp_column)[i]
+                        .values.cast(pa.timestamp("ns"))
+                        .to_numpy(zero_copy_only=False)
+                        .astype(np.int64)
+                        for table in (past_table, future_table)
+                    ]
+                    metadata = {
+                        "timestamps": np.concatenate([times[0][start:], times[1]]),
+                        "static": {c: past_table.column(c)[i].as_py() for c in task.static_columns}
+                        if options.covariates == "all"
+                        else {},
+                    }
                 items.append(
-                    SeriesInput(i, tuple(range(len(targets))), target[:, start:], history, known)
+                    SeriesInput(
+                        i, tuple(range(len(targets))), target[:, start:], history, known, **metadata
+                    )
                 )
         if len(set(ids)) != len(ids):
             raise ValueError("duplicate fev item ids")
@@ -412,11 +447,14 @@ def read_window(
 
 
 def _adapter(options, task):
-    from .adapters import Chronos2Adapter, SimonsAdapter, TimestralAdapter
+    from .adapters import Chronos2Adapter, CIProtoAdapter, SimonsAdapter, TimestralAdapter
 
-    return {"chronos2": Chronos2Adapter, "timestral": TimestralAdapter, "simons": SimonsAdapter}[
-        options.model
-    ](options, task)
+    return {
+        "chronos2": Chronos2Adapter,
+        "timestral": TimestralAdapter,
+        "simons": SimonsAdapter,
+        "ciproto": CIProtoAdapter,
+    }[options.model](options, task)
 
 
 def run_yardstick(
