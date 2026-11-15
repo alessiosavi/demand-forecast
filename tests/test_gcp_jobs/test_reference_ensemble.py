@@ -72,6 +72,101 @@ def test_mixed_members_keep_evaluation_guards(scenario, make_member, tmp_path, m
 
 
 @pytest.mark.parametrize("model", ["timestral", "chronos2"])
+@pytest.mark.parametrize(
+    "change", ["simons_source", "simons_implementation", "simons", "batch_size"]
+)
+def test_mixed_members_reject_different_simons_configurations(
+    scenario, make_member, tmp_path, monkeypatch, model, change
+):
+    tasks, _, _ = scenario
+    reference = make_member(0, model=model)
+    first = make_member(1, model="simons", processing="raw")
+    original = runner.runtime_identity
+
+    def runtime(options):
+        identity = original(options)
+        if change == "simons":
+            identity["packages"]["simons"] = "changed"
+        elif change == "simons_implementation":
+            identity["simons_implementation"]["source_sha256"] = "changed"
+        elif change == "simons_source":
+            identity["simons_source"] = "changed"
+        return identity
+
+    monkeypatch.setattr(runner, "runtime_identity", runtime)
+    changes = {"batch_size": 7} if change == "batch_size" else {}
+    second = make_member(2, model="simons", processing="raw", **changes)
+    out = tmp_path / "rejected"
+    with pytest.raises(ValueError, match="evaluation.*identity"):
+        ensemble(tasks, [reference, first, second], out)
+    assert not out.exists()
+
+
+@pytest.mark.parametrize(
+    "model,package", [("timestral", "timestral"), ("chronos2", "chronos-forecasting")]
+)
+def test_mixed_members_reject_different_same_model_reference_packages(
+    scenario, make_member, tmp_path, monkeypatch, model, package
+):
+    tasks, _, _ = scenario
+    simons = make_member(0, model="simons", processing="raw")
+    first = make_member(1, model=model)
+    original = runner.runtime_identity
+
+    def runtime(options):
+        identity = original(options)
+        identity["packages"][package] = "changed"
+        return identity
+
+    monkeypatch.setattr(runner, "runtime_identity", runtime)
+    second = make_member(2, model=model)
+    out = tmp_path / "rejected"
+    with pytest.raises(ValueError, match="evaluation.*identity"):
+        ensemble(tasks, [simons, first, second], out)
+    assert not out.exists()
+
+
+@pytest.mark.parametrize("model", ["timestral", "chronos2"])
+def test_mixed_members_accept_matching_simons_configurations(
+    scenario, make_member, tmp_path, model
+):
+    tasks, _, _ = scenario
+    first = make_member(0, model="simons", processing="raw")
+    reference = make_member(1, 4, model=model)
+    second = make_member(2, 2, model="simons", processing="raw")
+    out = tmp_path / "average"
+    frame = ensemble(tasks, [first, reference, second], out)
+    expected = pd.read_csv(second / "summaries.csv")
+    np.testing.assert_allclose(frame.test_error, expected.test_error, rtol=0, atol=1e-14)
+    record = json.loads((out / tasks[0].task_name / "run.json").read_text())
+    assert record["weights"] == [1 / 3] * 3
+
+
+@pytest.mark.parametrize("model", ["timestral", "chronos2"])
+def test_mixed_members_reject_different_same_model_covariate_reports(
+    scenario, make_member, tmp_path, model
+):
+    tasks, _, _ = scenario
+    reference = make_member(0, model=model)
+    first = make_member(1, model="simons", processing="raw")
+    second = make_member(2, model="simons", processing="raw")
+    path = second / tasks[0].task_name / "run.json"
+    record = json.loads(path.read_text())
+    key = "dropped_past_only_covariates"
+    record["input_metadata"][key] += 1
+    record["summary"][key] += 1
+    path.write_text(json.dumps(record))
+    summary_path = second / "summaries.csv"
+    summary = pd.read_csv(summary_path, float_precision="round_trip")
+    summary[key] += 1
+    summary.to_csv(summary_path, index=False)
+    out = tmp_path / "rejected"
+    with pytest.raises(ValueError, match="evaluation.*identity"):
+        ensemble(tasks, [reference, first, second], out)
+    assert not (out / tasks[0].task_name / "run.json").exists()
+
+
+@pytest.mark.parametrize("model", ["timestral", "chronos2"])
 @pytest.mark.parametrize("change", ["fingerprint", "window_ids"])
 def test_mixed_members_reject_different_task_windows(
     scenario, make_member, tmp_path, monkeypatch, model, change

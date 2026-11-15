@@ -175,8 +175,15 @@ def _bind_members(members: list[Path]) -> list[dict]:
             ):
                 raise ValueError(f"{path}: task configuration differs from root manifest")
     evaluation = _evaluation_configuration(configurations[0], mixed_models=mixed_models)
-    for directory, configuration in zip(members[1:], configurations[1:], strict=True):
-        if _evaluation_configuration(configuration, mixed_models=mixed_models) != evaluation:
+    model_evaluations = {}
+    for directory, configuration in zip(members, configurations, strict=True):
+        model = configuration["options"]["model"]
+        full_evaluation = _evaluation_configuration(configuration)
+        # Relaxation across models must never weaken checks within one model.
+        if (
+            full_evaluation != model_evaluations.setdefault(model, full_evaluation)
+            or _evaluation_configuration(configuration, mixed_models=mixed_models) != evaluation
+        ):
             raise ValueError(f"{directory}: evaluation identity differs")
     return configurations
 
@@ -393,8 +400,14 @@ def run_ensemble(
                 for member, configuration in zip(members, configurations, strict=True)
             ]
             task_evaluation = evaluation_identity(records[0], mixed_models=mixed_models)
-            for member, record in zip(members[1:], records[1:], strict=True):
-                if evaluation_identity(record, mixed_models=mixed_models) != task_evaluation:
+            model_task_evaluations = {}
+            for member, record in zip(members, records, strict=True):
+                model = record["configuration"]["options"]["model"]
+                full_evaluation = evaluation_identity(record)
+                if (
+                    full_evaluation != model_task_evaluations.setdefault(model, full_evaluation)
+                    or evaluation_identity(record, mixed_models=mixed_models) != task_evaluation
+                ):
                     raise ValueError(f"{name}: {member}: evaluation identity differs")
             evaluation = {**evaluation_configuration, **task_evaluation}
             sources = [

@@ -209,8 +209,10 @@ and nondefault `--processing`, and save their native output in `raw` only.
 `--covariates all|none` and `--max-context` apply to every model. To average these
 runs with Simons, generate the ensemble job with `--processing raw`; member
 tasks, covariates, context limits and scoring runtime must match. Model-specific
-packages, native batching and Simons's dropped-covariate reporting may differ.
-The mean uses fixed, equal weights.
+packages, native batching and Simons's dropped-covariate report may differ across
+models, never between two runs of the same model. Runs of the same model must
+share the full evaluation configuration and per-task evaluation identity,
+including the inference implementation. The mean uses fixed, equal weights.
 
 ## Averaging completed yardstick runs
 
