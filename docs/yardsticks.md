@@ -198,6 +198,23 @@ and scorer: their recorded identities do not hash this repository's evaluation
 code. Scoring and auditing still require access to the task data. Audit the
 output with `fev_report.py` and the same task YAML and selection as above.
 
+**Cloud route.** Generate an offline guest job with
+`scripts/gcp/jobs/make_ensemble_job.py --name average --repo-sha <40-hex> --tasks-uri
+gs://bucket/tasks.yaml --tasks-sha256 <64-hex> --member-uri
+gs://bucket/state/score/seed-1 --member-uri gs://bucket/state/score/seed-2 --output
+average.sh` (optionally `--names-uri` plus `--names-sha256`, and
+`--processing raw|published|both`). It requires completed members with matching
+evaluation code, task selection and evaluation settings, distinct names and
+weight hashes, and verified manifests with no missing or unlisted mode files.
+Before averaging, it scores the first member against itself with the job's
+scorer and checks every shared metric (NaN equals NaN; rtol `1e-9`, atol `1e-12`).
+The job needs task data access but no GPU, model weights or Simons install.
+Under `RUN_DIR/state/ensemble/<name>/`, it saves configuration, environment,
+task inputs, member identity files, `parity/<mode>.json`, mode outputs/statuses
+and a hashed `completed.json`. Downloaded member forecasts and parity outputs
+stay in scratch. Restored jobs use the averaging script's own completion checks
+to reuse partial results; a fully verified state exits before installation.
+
 This differs from the older `scripts/fev_ensemble_runs.py`, which consumes the
 training/bundle runner's saved format rather than yardstick artifacts.
 
