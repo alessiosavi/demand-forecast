@@ -435,9 +435,27 @@ def _guest(model):
             shutil.copyfile(cached, download / filename)""",
                 ),
                 (
+                    "ci-proto build prerequisites",
+                    """def environment(config, root, scratch, python):
+    from importlib import metadata""",
+                    """def environment(config, root, scratch, python):
+    import sysconfig
+    include = pathlib.Path(sysconfig.get_paths()["include"])
+    if not (include / "Python.h").is_file():
+        raise ValueError("ci-proto requires Python.h in interpreter include directory: " + str(include))
+    if not any(shutil.which(name) for name in ("gcc", "clang", "cc")):
+        raise ValueError("ci-proto requires a C compiler (gcc, clang or cc) for Triton helpers")
+    from importlib import metadata""",
+                ),
+                (
+                    "ci-proto interpreter evidence",
+                    '    facts = {"python": sys.version.split()[0],',
+                    '    facts = {"python_include": str(include), "python": sys.version.split()[0],',
+                ),
+                (
                     "runtime decision",
                     "Python 3.12 provisioned for stage-1 pins; scipy 1.16.3 requires >=3.11; image cp310 torch cannot be reused",
-                    "Python 3.10 retained; isolated ci-proto pins use scipy 1.15.3 and Hub 1.0.1; torch remains 2.8.0+cu128",
+                    "Managed Python 3.10 provisioned with C headers; isolated ci-proto pins use scipy 1.15.3 and Hub 1.0.1; torch remains 2.8.0+cu128",
                 ),
             ]
         )
@@ -483,16 +501,20 @@ fi
             "",
         ),
         (
-            "stdlib venv isolation",
-            'if ! python3 -m venv --system-site-packages "$scratch/venv"; then',
-            'if ! python3 -m venv "$scratch/venv"; then',
-        ),
-        (
-            "uv venv isolation",
-            r'''"$scratch/uv-bootstrap/bin/uv" venv --clear --seed --system-site-packages \
-        --python "$(command -v python3)" --no-python-downloads "$scratch/venv"''',
-            r'''"$scratch/uv-bootstrap/bin/uv" venv --clear --seed \
-        --python "$(command -v python3)" --no-python-downloads "$scratch/venv"''',
+            "managed interpreter block",
+            r"""# Start with the training job's proven system-site-packages / ensurepip fallback.
+if ! python3 -m venv --system-site-packages "$scratch/venv"; then
+    bootstrap_uv
+    "$scratch/uv-bootstrap/bin/uv" venv --clear --seed --system-site-packages \
+        --python "$(command -v python3)" --no-python-downloads "$scratch/venv"
+fi
+""",
+            r"""# Triton compiles C helpers at runtime; managed CPython includes Python.h.
+bootstrap_uv
+"$scratch/uv-bootstrap/bin/uv" python install 3.10
+"$scratch/uv-bootstrap/bin/uv" venv --clear --seed \
+    --python 3.10 --managed-python "$scratch/venv"
+""",
         ),
         (
             "requirements file",
@@ -673,7 +695,7 @@ guest "$python" environment
 guest "$python" score
 '''
     if model == "ciproto":
-        # The image runs CPython 3.10. Avoid inherited inference packages whose
+        # Use managed CPython with headers and avoid inherited packages whose
         # Hub <1 requirement conflicts with continuousintelligence's Hub >=1.
         script = _ciproto_shell(script)
     return script

@@ -9,6 +9,7 @@ import os
 import shutil
 import subprocess
 import sys
+import sysconfig
 import textwrap
 from pathlib import Path
 
@@ -164,17 +165,18 @@ fi
 """,
         ),
         (
-            "stdlib venv isolation",
-            'if ! python3 -m venv --system-site-packages "$scratch/venv"; then',
-        ),
-        (
-            "uv venv isolation",
-            r'''"$scratch/uv-bootstrap/bin/uv" venv --clear --seed --system-site-packages \
-        --python "$(command -v python3)" --no-python-downloads "$scratch/venv"''',
+            "managed interpreter block",
+            r"""# Start with the training job's proven system-site-packages / ensurepip fallback.
+if ! python3 -m venv --system-site-packages "$scratch/venv"; then
+    bootstrap_uv
+    "$scratch/uv-bootstrap/bin/uv" venv --clear --seed --system-site-packages \
+        --python "$(command -v python3)" --no-python-downloads "$scratch/venv"
+fi
+""",
         ),
         ("requirements file", '"$repo/requirements-yardsticks.txt"'),
     ],
-    ids=["python-upgrade", "stdlib-venv", "uv-venv", "requirements"],
+    ids=["python-upgrade", "managed-interpreter", "requirements"],
 )
 def test_ciproto_shell_refuses_template_drift(score_jobs, count, target, snippet):
     script = score_jobs.generate(**reference_arguments("chronos2"))
@@ -193,6 +195,15 @@ def test_ciproto_shell_requires_isolation_and_own_requirements(score_jobs, extra
     template = score_jobs.generate(**reference_arguments("chronos2"))
     with pytest.raises(RuntimeError):
         score_jobs._ciproto_shell(template + extra)
+
+
+def test_ciproto_shell_requires_managed_python310(score_jobs):
+    script = score_jobs.generate(**reference_arguments("ciproto"))
+    assert '"$scratch/uv-bootstrap/bin/uv" python install 3.10' in script
+    assert '--python 3.10 --managed-python "$scratch/venv"' in script
+    assert "python3 -m venv" not in script
+    assert "$(command -v python3)" not in script
+    assert "--python 3.12" not in script
 
 
 @pytest.mark.parametrize("model", ["simons", "timestral", "chronos2", "ciproto", "unknown"])
@@ -435,6 +446,7 @@ def machine(score_jobs, tmp_path):
     (bins / "uv").write_text(
         "#!/bin/bash\n"
         'printf \'["uv", "%s"]\\n\' "$*" >> "$EVENTS"\n'
+        'if [[ $1 == python && $2 == install ]]; then exit "${UV_PYTHON_INSTALL_STATUS:-0}"; fi\n'
         'if [[ $1 == venv ]]; then exec "$FAKE_PYTHON" --fake-venv "${@: -1}"; fi\n'
     )
     (bins / "git").write_text(
@@ -599,12 +611,47 @@ def test_ciproto_guest_python310_bundle_and_recovery(machine):
         for name in filenames
     )
     assert not any(e[0] == "uv" and "--python 3.12" in str(e) for e in events())
+    runtime = json.loads((state / "environment.txt").read_text().split("\n# runtime ")[1])
+    assert runtime["python"] == sys.version.split()[0]
+    assert runtime["python_include"] == sysconfig.get_paths()["include"]
     installs = [e for e in events() if e[:4] == ["python", "-m", "pip", "install"]]
     assert any(any("requirements-yardsticks-ciproto.txt" in arg for arg in e) for e in installs)
     (state / "raw/alpha/window_0.npz").unlink()
     (cloud / "export/tta.json").write_bytes(b"changed calibration")
     result = run(options)
     assert result.returncode != 0 and "different checkpoint contents" in result.stderr
+
+
+@pytest.mark.parametrize("missing", ["header", "compiler"])
+def test_ciproto_missing_build_prerequisite_fails_before_scoring(machine, missing):
+    run, _, events, cloud = machine
+    include = cloud.parent / "include"
+    include.mkdir()
+    packages = cloud.parent / "packages"
+    (packages / "sysconfig.py").write_text(
+        f"def get_paths(): return {{'include': {str(include)!r}}}\n"
+    )
+    if missing == "compiler":
+        (include / "Python.h").touch()
+        (packages / "sitecustomize.py").write_text("import shutil\nshutil.which = lambda _: None\n")
+    options = reference_arguments("ciproto")
+    options.pop("name")
+    result = run(options)
+    assert result.returncode != 0
+    assert ("Python.h" if missing == "header" else "C compiler") in result.stderr
+    if missing == "header":
+        assert str(include) in result.stderr
+    assert not any(e[0] == "score" for e in events())
+
+
+def test_ciproto_managed_python_failure_has_no_system_fallback(machine):
+    run, _, events, _ = machine
+    options = reference_arguments("ciproto")
+    options.pop("name")
+    result = run(options, UV_PYTHON_INSTALL_STATUS="1", FAIL_VENV="0")
+    assert result.returncode != 0
+    assert not any(e[0] == "score" for e in events())
+    assert not any(e[:3] == ["python", "-m", "venv"] for e in events())
 
 
 def test_ciproto_missing_long_checkpoint_fails_before_scoring(machine):
