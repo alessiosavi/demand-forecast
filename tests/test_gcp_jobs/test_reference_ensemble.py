@@ -1,0 +1,93 @@
+"""Mix native reference forecasts and Simons raw forecasts on local fev windows."""
+
+import json
+
+import numpy as np
+import pandas as pd
+import pytest
+
+pytest.importorskip("fev")
+
+from demand_forecast.bench.yardsticks import runner  # noqa: E402
+from tests.test_bench.test_fev_ensemble import (  # noqa: E402
+    ensemble,
+    rewrite_window,
+)
+from tests.test_bench.test_fev_ensemble import (
+    make_member as make_member,
+)
+from tests.test_bench.test_yardsticks import (  # noqa: E402
+    offline_only as offline_only,
+)
+from tests.test_bench.test_yardsticks import (
+    scenario as scenario,
+)
+
+
+@pytest.mark.parametrize("model,batch_size", [("timestral", 1024), ("chronos2", 100)])
+@pytest.mark.parametrize("simons_first", [True, False])
+def test_mixed_raw_reference_mean(scenario, make_member, tmp_path, model, batch_size, simons_first):
+    tasks, _, _ = scenario
+    simons = make_member(int(not simons_first), model="simons", processing="raw")
+    reference = make_member(int(simons_first), 2, model=model, batch_size=batch_size)
+    expected = make_member(2, 1)
+    out = tmp_path / "average"
+    frame = ensemble(tasks, [simons, reference], out)
+    scores = pd.read_csv(expected / "summaries.csv")
+    assert frame.test_error.iloc[0] == scores.test_error.iloc[0]
+    record = json.loads((out / tasks[0].task_name / "run.json").read_text())
+    assert record["weights"] == [0.5, 0.5]
+    for index in range(tasks[0].num_windows):
+        filename = tasks[0].task_name + f"/window_{index}.npz"
+        with np.load(out / filename) as actual, np.load(simons / filename) as source:
+            np.testing.assert_allclose(actual["arrays"], source["arrays"] + 1, rtol=0, atol=1e-14)
+    before = {p: p.read_bytes() for p in out.rglob("*") if p.is_file()}
+    ensemble(tasks, [reference, simons], out)
+    assert {p: p.read_bytes() for p in out.rglob("*") if p.is_file()} == before
+
+
+@pytest.mark.parametrize("change", ["published", "covariates", "context", "fev", "datasets"])
+def test_mixed_members_keep_evaluation_guards(scenario, make_member, tmp_path, monkeypatch, change):
+    tasks, _, _ = scenario
+    simons = make_member(
+        0, model="simons", processing="published" if change == "published" else "raw"
+    )
+    changes = {}
+    if change == "covariates":
+        changes["covariates"] = "none"
+    elif change == "context":
+        changes["max_context"] = 5
+    elif change in ("fev", "datasets"):
+        original = runner.runtime_identity
+
+        def runtime(options):
+            identity = original(options)
+            identity["packages"][change] = "changed"
+            return identity
+
+        monkeypatch.setattr(runner, "runtime_identity", runtime)
+    reference = make_member(1, model="timestral", **changes)
+    with pytest.raises(ValueError, match="evaluation.*identity|raw"):
+        ensemble(tasks, [simons, reference], tmp_path / "rejected")
+
+
+@pytest.mark.parametrize("model", ["timestral", "chronos2"])
+@pytest.mark.parametrize("change", ["fingerprint", "window_ids"])
+def test_mixed_members_reject_different_task_windows(
+    scenario, make_member, tmp_path, monkeypatch, model, change
+):
+    tasks, _, _ = scenario
+    simons = make_member(0, model="simons", processing="raw")
+    with monkeypatch.context() as patch:
+        if change == "fingerprint":
+            patch.setattr(runner, "dataset_fingerprint", lambda _: "different-dataset")
+        reference = make_member(1, model=model)
+    if change == "window_ids":
+        with np.load(reference / tasks[0].task_name / "window_0.npz") as saved:
+            ids = saved["ids"][::-1].copy()
+        rewrite_window(reference, tasks[0], ids=ids)
+    match = "evaluation.*identity" if change == "fingerprint" else "window input identity"
+    out = tmp_path / "rejected"
+    with pytest.raises(ValueError, match=match):
+        ensemble(tasks, [simons, reference], out)
+    assert not (out / tasks[0].task_name / "run.json").exists()

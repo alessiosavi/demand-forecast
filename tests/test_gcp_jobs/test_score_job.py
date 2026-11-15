@@ -1,5 +1,7 @@
 """Offline execution of the generated scoring job; external installation is faked."""
 
+import ast
+import gzip
 import hashlib
 import importlib.util
 import json
@@ -17,6 +19,11 @@ PIN = "8e338e915d26c8960713889ef12ab1cf5c08d591"
 SHA = "a" * 40
 TASKS = b"tasks:\n  - name: alpha\n    dataset_path: fake/data\n  - name: beta/new\n    dataset_path: fake/data\n"
 NAMES = b"alpha\nbeta/new\n"
+TIMESTRAL_PIN = "a534bdbd244d64f3d9d743f46c7bf6fc330ed4ff"
+PACKAGES = {
+    "timestral": "timestral @ git+https://github.com/mistralai/timestral.git@" + TIMESTRAL_PIN,
+    "chronos2": "chronos-forecasting==2.2.2",
+}
 
 
 @pytest.fixture
@@ -39,6 +46,135 @@ def arguments(**overrides):
         "tasks_sha256": hashlib.sha256(TASKS).hexdigest(),
         **overrides,
     }
+
+
+def reference_arguments(model="timestral", **overrides):
+    return arguments(
+        model=model,
+        checkpoint_uri=None,
+        hub_weights="abel/model",
+        hub_revision="b" * 40,
+        **overrides,
+    )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {},
+        {
+            "checkpoint_uri": None,
+            "hub_weights": "abel/model",
+            "hub_revision": "b" * 40,
+            "processing": "published",
+            "covariates": "none",
+            "max_context": 1024,
+            "names_uri": "gs://offline/names.txt",
+            "names_sha256": hashlib.sha256(NAMES).hexdigest(),
+        },
+    ],
+)
+def test_simons_job_byte_identical_to_e4351d8(score_jobs, overrides):
+    path = ROOT / "scripts/gcp/jobs/make_score_job.py"
+    # Archive the unmodified base generator so shallow CI checkouts also run
+    # the original function, with this interpreter's gzip implementation.
+    source = gzip.decompress(
+        (Path(__file__).parent / "fixtures/make_score_job-e4351d8.py.gz").read_bytes()
+    )
+    assert hashlib.sha256(source).hexdigest() == (
+        "aff259642e04c9f92fae755db93d02c2bb50d63a1a83b963fef7564ee331a993"
+    )
+    base = {"__file__": str(path), "__name__": "base_score_job"}
+    exec(compile(source, str(path), "exec"), base)
+    expected = base["generate"](**arguments(**overrides)).encode()
+    assert score_jobs.generate(**arguments(**overrides)).encode() == expected
+    assert score_jobs.generate(**arguments(**overrides), model="simons").encode() == expected
+
+
+@pytest.mark.parametrize("model", ["timestral", "chronos2"])
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"checkpoint_uri": "gs://offline/export", "hub_weights": None, "hub_revision": None},
+        {"hub_weights": None},
+        {"hub_revision": None},
+        {"hub_revision": "main"},
+        {"hub_revision": "b" * 39},
+        {"processing": "raw"},
+        {"processing": "published"},
+        {"covariates": "other"},
+        {"max_context": 0},
+    ],
+)
+def test_reference_validation(score_jobs, model, change):
+    options = {**reference_arguments(model), **change}
+    with pytest.raises(ValueError):
+        score_jobs.generate(**options)
+
+
+@pytest.mark.parametrize("model", ["timestral", "chronos2"])
+@pytest.mark.parametrize("count", [0, 2], ids=["missing", "duplicated"])
+@pytest.mark.parametrize(
+    "target,snippet",
+    [
+        (
+            "Simons package check",
+            """    upstream = json.loads(metadata.distribution("simons").read_text("direct_url.json"))
+    if upstream["vcs_info"]["commit_id"] != config["upstream_pin"]:
+        raise ValueError("installed Simons commit does not match upstream pin")""",
+        ),
+        (
+            "Simons child command",
+            """"--model", "simons",
+                   "--checkpoint", str(checkpoint), "--processing", mode,""",
+        ),
+    ],
+    ids=["package-check", "child-command"],
+)
+def test_reference_generation_refuses_template_drift(
+    score_jobs, monkeypatch, model, count, target, snippet
+):
+    assert score_jobs.GUEST.count(snippet) == 1
+    monkeypatch.setattr(score_jobs, "GUEST", score_jobs.GUEST.replace(snippet, snippet * count))
+    with pytest.raises(RuntimeError, match=target):
+        score_jobs.generate(**reference_arguments(model))
+
+
+@pytest.mark.parametrize("model", ["timestral", "chronos2"])
+def test_reference_generation_refuses_leftover_simons_child(score_jobs, monkeypatch, model):
+    monkeypatch.setattr(score_jobs, "GUEST", score_jobs.GUEST + '\nextra = ["--model", "simons"]\n')
+    with pytest.raises(RuntimeError, match="Simons child"):
+        score_jobs.generate(**reference_arguments(model))
+
+
+@pytest.mark.parametrize("model", ["simons", "timestral", "chronos2", "unknown"])
+def test_model_cli(tmp_path, model):
+    options = arguments() if model == "simons" else reference_arguments(model)
+    options["model"] = model
+    command = [sys.executable, str(ROOT / "scripts/gcp/jobs/make_score_job.py")]
+    for key, value in options.items():
+        if value is not None:
+            command += ["--" + key.replace("_", "-"), value]
+    output = tmp_path / "job.sh"
+    result = subprocess.run(command + ["--output", str(output)], capture_output=True, text=True)
+    if model == "unknown":
+        assert result.returncode == 2 and "invalid choice" in result.stderr
+        assert not output.exists()
+        return
+    assert result.returncode == 0, result.stderr
+    assert subprocess.run(["bash", "-n", str(output)]).returncode == 0
+    snippet = output.read_text().split("<<'SCORE_BUNDLE'\n", 1)[1].split("\nSCORE_BUNDLE\n", 1)[0]
+    result = subprocess.run(
+        [sys.executable, "-", str(tmp_path)], input=snippet, capture_output=True, text=True
+    )
+    assert result.returncode == 0, result.stderr
+    config = json.loads((tmp_path / "inputs.json").read_text())
+    ast.parse((tmp_path / "score.py").read_text(), feature_version=(3, 10))
+    if model != "simons":
+        assert config["model"] == model
+        assert config["modes"] == ["raw"]
+        assert config["model_package"] == PACKAGES[model]
+        assert PACKAGES[model] in output.read_text()
 
 
 @pytest.mark.parametrize(
@@ -140,11 +276,15 @@ def machine(score_jobs, tmp_path):
         ("datasets", "3.6.0"),
         ("huggingface_hub", "0.36.0"),
         ("simons", "0.1.1"),
+        ("timestral", "0.1.0"),
+        ("chronos_forecasting", "2.2.2"),
     ]:
         info = packages / f"{name}-{version}.dist-info"
         info.mkdir()
         (info / "METADATA").write_text(f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n")
-        (info / "direct_url.json").write_text(json.dumps({"vcs_info": {"commit_id": PIN}}))
+        (info / "direct_url.json").write_text(
+            json.dumps({"vcs_info": {"commit_id": TIMESTRAL_PIN if name == "timestral" else PIN}})
+        )
     (packages / "huggingface_hub.py").write_text(
         "import os, pathlib, shutil\n"
         "def hf_hub_download(repo_id, filename, *, revision, token, local_dir):\n"
@@ -159,14 +299,20 @@ def machine(score_jobs, tmp_path):
         import csv, hashlib, json, os, pathlib, sys
         args = sys.argv[1:]
         def value(flag): return args[args.index(flag) + 1]
-        assert value('--model') == 'simons'
+        model = value('--model')
+        assert model in ('simons', 'timestral', 'chronos2')
         assert '--resume' in args and '--keep-going' in args
-        assert pathlib.Path(value('--checkpoint'), 'model.safetensors').is_file()
+        if model == 'simons':
+            assert pathlib.Path(value('--checkpoint'), 'model.safetensors').is_file()
+        else:
+            assert value('--weights') == 'abel/model'
+            assert value('--revision') == 'b' * 40
+            assert '--processing' not in args and '--checkpoint' not in args
         assert pathlib.Path(value('--tasks')).read_bytes() == bytes.fromhex(os.environ['TASK_HEX'])
         if '--names' in args:
             assert pathlib.Path(value('--names')[1:]).read_text() == 'alpha\\nbeta/new\\n'
         assert not pathlib.Path(os.environ['HF_DATASETS_CACHE']).is_relative_to(pathlib.Path(os.environ['RUN_DIR']) / 'state')
-        mode = value('--processing')
+        mode = value('--processing') if model == 'simons' else 'raw'
         out = pathlib.Path(value('--out-dir'))
         out.mkdir(parents=True, exist_ok=True)
         with open(os.environ['EVENTS'], 'a') as log:
@@ -289,15 +435,95 @@ def machine(score_jobs, tmp_path):
         )
 
     def events():
-        return [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()]
+        path = tmp_path / "events.jsonl"
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
 
     yield run, Path(env["RUN_DIR"]) / "state/score" / score_name, events, cloud
     # The checkpoint path must remain stable across guest labels for the adapter's identity.
     for event in events():
-        if event[0] == "score":
+        if event[0] == "score" and "--checkpoint" in event[2]:
             checkpoint = Path(event[2][event[2].index("--checkpoint") + 1])
             if checkpoint.parent.name.startswith("demand-forecast-score-"):
                 shutil.rmtree(checkpoint.parent, ignore_errors=True)
+
+
+@pytest.mark.parametrize("model", ["timestral", "chronos2"])
+@pytest.mark.parametrize("covariates", ["all", "none"])
+def test_reference_guest_windows_resume_and_identity(machine, model, covariates):
+    run, state, events, _ = machine
+    options = reference_arguments(
+        model,
+        covariates=covariates,
+        max_context=2048,
+        names_uri="gs://offline/names.txt",
+        names_sha256=hashlib.sha256(NAMES).hexdigest(),
+    )
+    options.pop("name")
+    result = run(options, FAIL_TASK="1")
+    assert result.returncode == 1, result.stderr
+    assert json.loads((state / "completed.json").read_text())["modes"]["raw"]["failed"] == {
+        "alpha": "inference broke"
+    }
+    result = run(options)
+    assert result.returncode == 0, result.stderr
+    marker = json.loads((state / "completed.json").read_text())
+    assert marker["inputs"]["model"] == model
+    assert marker["inputs"]["model_package"] == PACKAGES[model]
+    assert marker["inputs"]["covariates"] == covariates
+    assert list(marker["modes"]) == ["raw"]
+    assert not (state / "published").exists()
+    assert marker["modes"]["raw"]["completed"] == ["alpha", "beta/new"]
+    for name in ["alpha", "beta/new"]:
+        record = json.loads((state / "raw" / name / "run.json").read_text())
+        window = "raw/" + name + "/window_0.npz"
+        assert marker["artifacts"][window] == record["window_sha256"]["window_0.npz"]
+    calls = [e for e in events() if e[0] == "score"]
+    assert [e[1] for e in calls] == ["raw", "raw"]
+    for _, _, command, _ in calls:
+        assert command[command.index("--model") + 1] == model
+        assert command[command.index("--weights") + 1] == "abel/model"
+        assert command[command.index("--revision") + 1] == "b" * 40
+        assert "--checkpoint" not in command
+        assert "--processing" not in command
+        assert command[command.index("--max-context") + 1] == "2048"
+        assert "--names" in command
+        assert ("--covariates" in command) == (covariates == "none")
+    installs = [e for e in events() if e[:4] == ["python", "-m", "pip", "install"]]
+    assert any(PACKAGES[model] in e for e in installs)
+    assert not any("simons @" in arg for e in installs for arg in e)
+    before = len(events())
+    assert run(options).returncode == 0
+    assert not any(e[0] in ["score", "git", "gcloud", "uv"] for e in events()[before:])
+    saved = {p: p.read_bytes() for p in state.rglob("*") if p.is_file()}
+    for change in [
+        {"model": "chronos2" if model == "timestral" else "timestral"},
+        {"hub_revision": "c" * 40},
+        {"covariates": "none" if covariates == "all" else "all"},
+        {"max_context": 1024},
+    ]:
+        result = run({**options, **change})
+        assert result.returncode != 0 and "different inputs" in result.stderr
+        assert {p: p.read_bytes() for p in state.rglob("*") if p.is_file()} == saved
+    (state / "raw/alpha/window_0.npz").unlink()
+    result = run(options)
+    assert result.returncode == 0, result.stderr
+    assert len([e for e in events() if e[0] == "score"]) == 3
+
+
+@pytest.mark.parametrize("model", ["timestral", "chronos2"])
+def test_reference_package_pin_mismatch_stops_before_scoring(machine, model):
+    run, _, events, cloud = machine
+    packages = cloud.parent / "packages"
+    if model == "timestral":
+        (packages / "timestral-0.1.0.dist-info/direct_url.json").write_text(
+            json.dumps({"vcs_info": {"commit_id": "f" * 40}})
+        )
+    else:
+        metadata = packages / "chronos_forecasting-2.2.2.dist-info/METADATA"
+        metadata.write_text(metadata.read_text().replace("Version: 2.2.2", "Version: 2.2.3"))
+    result = run(reference_arguments(model))
+    assert result.returncode != 0 and "does not match pin" in result.stderr
+    assert not any(e[0] == "score" for e in events())
 
 
 def test_both_modes_completion_early_exit_and_changed_inputs(machine):

@@ -177,6 +177,41 @@ rebuilt from intact recorded windows. A model is never loaded for complete tasks
 Local weight directories are content-hashed; Hub aliases resolve to commit SHAs.
 The default IDs above use the pinned SHAs even when `--revision` is omitted.
 
+## Cloud scoring jobs
+
+`make_score_job.py` uses the same harness, saved forecast windows and completion
+checks for Simons, Timestral and Chronos-2. Set `REPO_SHA` to the scoring code's
+40-hex commit and `TASKS_SHA256` to the task YAML's SHA-256. For a development
+subset, add `--names-uri` and `--names-sha256` to each command. The required
+`--upstream-pin` retains the repository's Simons integration pin for all jobs;
+reference jobs additionally record and verify their inference package pin in
+`inputs.json` (Timestral commit `a534bdb`, Chronos `2.2.2`). Generation is offline:
+
+```bash
+python scripts/gcp/jobs/make_score_job.py --model simons --name simons-seed11 \
+  --repo-sha "$REPO_SHA" --upstream-pin "$(cat third_party/simons/PINNED)" \
+  --tasks-uri gs://bucket/tasks.yaml --tasks-sha256 "$TASKS_SHA256" \
+  --checkpoint-uri gs://bucket/checkpoints/seed11/export --output /tmp/score-simons.sh
+python scripts/gcp/jobs/make_score_job.py --model timestral --name timestral5m \
+  --repo-sha "$REPO_SHA" --upstream-pin "$(cat third_party/simons/PINNED)" \
+  --tasks-uri gs://bucket/tasks.yaml --tasks-sha256 "$TASKS_SHA256" \
+  --hub-weights mistralai/Timestral-5M --hub-revision bdd20cfc15a3fea0e4cb5ccef37f8d3ca7aa335f \
+  --output /tmp/score-timestral.sh
+python scripts/gcp/jobs/make_score_job.py --model chronos2 --name chronos2 \
+  --repo-sha "$REPO_SHA" --upstream-pin "$(cat third_party/simons/PINNED)" \
+  --tasks-uri gs://bucket/tasks.yaml --tasks-sha256 "$TASKS_SHA256" \
+  --hub-weights amazon/chronos-2 --hub-revision 29ec3766d36d6f73f0696f85560a422f50e8498c \
+  --output /tmp/score-chronos2.sh
+```
+
+Reference jobs require Hub weights at a full commit SHA, refuse checkpoint URIs
+and nondefault `--processing`, and save their native output in `raw` only.
+`--covariates all|none` and `--max-context` apply to every model. To average these
+runs with Simons, generate the ensemble job with `--processing raw`; member
+tasks, covariates, context limits and scoring runtime must match. Model-specific
+packages, native batching and Simons's dropped-covariate reporting may differ.
+The mean uses fixed, equal weights.
+
 ## Averaging completed yardstick runs
 
 `scripts/fev_ensemble.py` averages saved forecasts with equal member weights,
