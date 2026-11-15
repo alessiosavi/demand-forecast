@@ -33,6 +33,55 @@ wall seconds. For local synthetic checks, the module
 written.
 Regenerate the supported source-file hash record after patch-series changes with `python -m scripts.corpus_v4.covariate_exposure --upstream <prepared-checkout> --print-source-hashes`.
 
+## Row inventory and exclusion manifests
+
+Inventory one released folder locally (or on a guest) with
+`python -m scripts.corpus_v4.row_inventory --folder /data/corpus/quarantine/covariates/eia930_subregion_load_weather --folder-name quarantine/covariates/eia930_subregion_load_weather --output /tmp/eia-inventory --rules /tmp/reviewed-rules.yaml`.
+Omit `--rules` for inventory alone. `inventory.csv` has one record per row in
+sorted shard order and zero-based shard row indices; `inventory.json` records
+totals, all schema columns, discovered scalar identifying columns and the CSV
+SHA256. The module and CLI require the canonical corpus-relative `--folder-name`;
+the directory's base name cannot identify a folder. Targets retain their stored
+numeric dtype in `target_dtype`. The `arrow-target-v1` fingerprint encoding,
+named in `inventory.json`, hashes a sorted compact JSON header containing the
+encoding version, stored dtype and shape, followed by a newline, one validity
+byte per value and C-order little-endian numeric bytes. Null slots are zeroed
+without converting other values; null-typed leaves have no numeric bytes.
+Finite counts exclude nulls, NaNs and infinities. Optional covariate names are preserved.
+Scalar columns keep their names; collisions with evidence fields gain a
+`scalar.` prefix, recorded in `scalar_fields`.
+
+Rules are YAML or JSON with a required
+`folder: quarantine/covariates/eia930_subregion_load_weather`, `default: keep` (or `exclude`) and an
+ordered `rules` list of `{match: {item_id: '^IDENTIFIED_SERIES$'}, action: exclude, reason: 'reviewed benchmark evidence'}`.
+Every match field must pass its regex search; the first matching entry decides.
+Anchor patterns with `^` and `$` when the whole field must match; unanchored
+patterns match substrings.
+Invalid regexes, unknown inventory fields and missing defaults are errors.
+The default may instead be `{action: keep, reason: 'reviewed default'}`.
+Manifest generation requires the companion `inventory.json` and validates the
+CSV header and every record against it. Rules must name the inventory's folder,
+and every row must belong to that folder. Short records, absent columns and
+null values are refused; empty strings in fields referenced by any rule also
+count as missing. The document may explicitly set `missing: exclude` to exclude
+incomplete records before matching, with rule `missing` and the missing fields
+in the reason. The default is `missing: refuse`; missing data can never imply keep.
+Invalid headers, surplus columns and folder mismatches are always refused.
+`row-manifest.csv` retains every inventory row and appends action, zero-based
+rule index (or `default` or `missing`) and reason. Its JSON summary hashes the exact rules
+file, inventory CSV and manifest CSV, records the folder, and counts actions and deciding rules.
+These artifacts supply evidence for F-row review; they do not change corpus rows.
+
+Generate a pinned guest job with
+`python -m scripts.corpus_v4.make_inventory_job --name eia-rows --repo-sha <40-hex-sha> --corpus-uri gs://BUCKET/corpus-v4 --folder quarantine/covariates/eia930_subregion_load_weather --output /tmp/eia-rows.sh`.
+Repeat `--folder` to select more folders. The guest requires `RUN_DIR` and a
+separate `STATE_URI`, installs only PyArrow, and downloads only the named
+folders. It publishes inventory artifacts to
+`$STATE_URI/inventory/<name>/<folder with / replaced by __>/`, followed by
+`completed.json` with input identity, successful child runs and artifact hashes.
+Resume accepts only complete, rehashed evidence; corpus publication is refused.
+The job does not apply rules; the orchestrator supplies reviewed rule data later.
+
 ## Two contamination rules
 
 **Rule F:** any part of a benchmark dataset at the same frequency used in
