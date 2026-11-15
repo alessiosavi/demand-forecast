@@ -397,7 +397,7 @@ def test_dictionary_encoded_strings(tmp_path):
 
 
 @pytest.mark.parametrize("field", ["item_id", "source", "freq"])
-@pytest.mark.parametrize("value", ["absent", None, ""])
+@pytest.mark.parametrize("value", ["absent", None, "", " ", "\t"])
 @pytest.mark.parametrize("policy", [None, "refuse", "exclude"])
 def test_missing_values_never_fall_through_to_keep(field, value, policy):
     good, bad = record(item_id="other", source="independent"), record(row_index="1")
@@ -425,6 +425,56 @@ def test_missing_values_never_fall_through_to_keep(field, value, policy):
         assert all(part in str(error.value) for part in (FOLDER, "train-0.parquet", "1"))
 
 
+@pytest.mark.parametrize("field", ["folder", "shard", "row_index", "source", "item_id", "freq"])
+@pytest.mark.parametrize("value", ["absent", None, "", " ", "\t"])
+@pytest.mark.parametrize("policy", ["refuse", "exclude"])
+def test_missing_identity_values_are_validated_without_rule_references(field, value, policy):
+    good = record(item_id="other", source="independent")
+    bad = {**good, field: value}
+    if value == "absent":
+        bad.pop(field)
+    document = {
+        "folder": FOLDER,
+        "default": "keep",
+        "missing": policy,
+        "rules": [{"match": {"source": "^load$"}, "action": "exclude", "reason": "load source"}],
+    }
+    assert decide([good], document)[0]["action"] == "keep"
+    reason = "missing inventory values: " + field
+    if policy == "exclude":
+        result = decide([bad], document)[0]
+        assert (result["action"], result["rule"], result["reason"]) == (
+            "exclude",
+            "missing",
+            reason,
+        )
+    else:
+        with pytest.raises(ValueError, match=reason):
+            decide([bad], document)
+
+
+@pytest.mark.parametrize("value", ["", " ", "\t"])
+@pytest.mark.parametrize("policy", ["refuse", "exclude"])
+def test_empty_optional_metadata_is_allowed_only_when_unreferenced(value, policy):
+    row = record(item_id="other", source="independent", target_dtype=value)
+    document = {**rules(), "missing": policy}
+    assert decide([row], document)[0]["action"] == "keep"
+    document["rules"].append(
+        {"match": {"target_dtype": ".*"}, "action": "keep", "reason": "dtype rule"}
+    )
+    reason = "missing inventory values: target_dtype"
+    if policy == "exclude":
+        result = decide([row], document)[0]
+        assert (result["action"], result["rule"], result["reason"]) == (
+            "exclude",
+            "missing",
+            reason,
+        )
+    else:
+        with pytest.raises(ValueError, match=reason):
+            decide([row], document)
+
+
 @pytest.mark.parametrize("policy", ["keep", "default", None, {}, True])
 def test_invalid_missing_policy_refused(policy):
     document = {**rules(), "missing": policy}
@@ -434,12 +484,15 @@ def test_invalid_missing_policy_refused(policy):
 
 @pytest.mark.parametrize("policy", [None, "exclude"])
 def test_missing_unreferenced_column_validates_entire_record(policy):
-    row = record()
+    row = record(item_id="other", source="independent")
     row.pop("target_dtype")
     document = rules()
     if policy:
         document["missing"] = policy
-        assert decide([row], document)[0]["action"] == "exclude"
+        result = decide([row], document)[0]
+        assert result["action"] == "exclude"
+        assert result["rule"] == "missing"
+        assert result["reason"] == "missing inventory values: target_dtype"
     else:
         with pytest.raises(ValueError, match="target_dtype"):
             decide([row], document)
@@ -461,7 +514,6 @@ def test_manifest_refuses_malformed_or_missing_values(tmp_path, mutation, policy
     fields.append("item_id")
     header = json.loads((output / "inventory.json").read_text())
     header["csv_fields"] = fields.copy()
-    (output / "inventory.json").write_text(json.dumps(header))
     if mutation == "absent-column":
         fields.remove("item_id")
     with path.open("w", newline="") as stream:
@@ -477,6 +529,9 @@ def test_manifest_refuses_malformed_or_missing_values(tmp_path, mutation, policy
                 elif mutation == "extra":
                     values.append("surplus")
             writer.writerow(values)
+    # Keep provenance valid so this test reaches row/header validation.
+    header["csv_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+    (output / "inventory.json").write_text(json.dumps(header))
     rule_path = tmp_path / "rules.json"
     document = rules()
     if policy:
@@ -499,6 +554,7 @@ def test_manifest_refuses_malformed_or_missing_values(tmp_path, mutation, policy
     "name", [None, "source", "/covariates/source", "covariates/../source", "covariates/source/"]
 )
 def test_canonical_folder_identity_is_required(tmp_path, name):
+    shard(tmp_path / "train-0.parquet")
     with pytest.raises(ValueError, match="folder"):
         inventory.build_inventory(tmp_path, tmp_path / "out", folder_name=name)
 
@@ -537,21 +593,22 @@ def test_rules_require_matching_folder_binding(folder):
         decide([record()], document)
 
 
-def test_manifest_refuses_wrong_folder_even_when_inventory_is_empty(tmp_path):
+@pytest.mark.parametrize("empty", [False, True])
+def test_manifest_refuses_wrong_folder_even_when_inventory_is_empty(tmp_path, empty):
     folder = tmp_path / "source"
     folder.mkdir()
     shard(folder / "train-0.parquet")
+    if empty:
+        path = folder / "train-0.parquet"
+        pq.write_table(pa.Table.from_batches([], schema=pq.read_schema(path)), path)
     output = tmp_path / "out"
     inventory.build_inventory(folder, output, folder_name=FOLDER)
     rule_path = tmp_path / "rules.json"
     rule_path.write_text(json.dumps({**rules(), "folder": "covariates/other"}))
     path = output / "inventory.csv"
-    for empty in (False, True):
-        if empty:
-            path.write_text(path.read_text().splitlines()[0] + "\n")
-        with pytest.raises(ValueError, match="folder"):
-            inventory.write_manifest(path, rule_path, output)
-        assert not (output / "row-manifest.json").exists()
+    with pytest.raises(ValueError, match="folder"):
+        inventory.write_manifest(path, rule_path, output)
+    assert not (output / "row-manifest.json").exists()
 
 
 def test_mixed_folder_rows_are_refused():
@@ -567,8 +624,8 @@ def test_rule_patterns_use_regex_substring_search():
     assert decide([row], document)[0]["action"] == "exclude"
 
 
-@pytest.mark.parametrize("mutation", ["truncated", "reordered"])
-def test_manifest_hash_binds_exact_inventory_order_and_length(tmp_path, mutation):
+@pytest.mark.parametrize("mutation", ["truncated", "reordered", "emptied", "edited"])
+def test_manifest_rejects_inventory_bytes_that_differ_from_companion(tmp_path, mutation):
     folder = tmp_path / "source"
     folder.mkdir()
     shard(folder / "train-0.parquet")
@@ -577,14 +634,55 @@ def test_manifest_hash_binds_exact_inventory_order_and_length(tmp_path, mutation
     path = output / "inventory.csv"
     rule_path = tmp_path / "rules.json"
     rule_path.write_text(json.dumps(rules()))
-    original = inventory.write_manifest(path, rule_path, output)
     rows = read_csv(path)
     fields = list(rows[0])
-    rows = rows[:-1] if mutation == "truncated" else list(reversed(rows))
+    if mutation == "truncated":
+        rows = rows[:-1]
+    elif mutation == "reordered":
+        rows.reverse()
+    elif mutation == "emptied":
+        rows = []
+    else:
+        rows[0]["item_id"] = "edited"
     with path.open("w", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=fields, lineterminator="\n")
         writer.writeheader()
         writer.writerows(rows)
-    modified = inventory.write_manifest(path, rule_path, output)
-    assert modified["inventory_sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
-    assert modified["inventory_sha256"] != original["inventory_sha256"]
+    destination = tmp_path / "manifest"
+    with pytest.raises(ValueError, match="sha256"):
+        inventory.write_manifest(path, rule_path, destination)
+    assert not destination.exists()
+
+
+@pytest.mark.parametrize("rows", [0, 2, 4])
+def test_manifest_rejects_companion_row_count_mismatch(tmp_path, rows):
+    folder = tmp_path / "source"
+    folder.mkdir()
+    shard(folder / "train-0.parquet")
+    output = tmp_path / "out"
+    inventory.build_inventory(folder, output, folder_name=FOLDER)
+    companion = output / "inventory.json"
+    header = json.loads(companion.read_text())
+    header["rows"] = rows
+    companion.write_text(json.dumps(header))
+    rule_path = tmp_path / "rules.json"
+    rule_path.write_text(json.dumps(rules()))
+    destination = tmp_path / "manifest"
+    with pytest.raises(ValueError, match="row count"):
+        inventory.write_manifest(output / "inventory.csv", rule_path, destination)
+    assert not destination.exists()
+
+
+def test_manifest_requires_companion_before_writing_decisions(tmp_path):
+    folder = tmp_path / "source"
+    folder.mkdir()
+    shard(folder / "train-0.parquet")
+    output = tmp_path / "out"
+    inventory.build_inventory(folder, output, folder_name=FOLDER)
+    (output / "inventory.json").unlink()
+    rule_path = tmp_path / "rules.json"
+    rule_path.write_text(json.dumps(rules()))
+    destination = tmp_path / "manifest"
+    with pytest.raises((ValueError, FileNotFoundError), match="inventory.*json"):
+        inventory.write_manifest(output / "inventory.csv", rule_path, destination)
+    assert not destination.exists()

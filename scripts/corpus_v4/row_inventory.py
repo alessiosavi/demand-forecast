@@ -309,6 +309,7 @@ def apply_rules(inventory_rows, rules, *, fields, folder_name):
     folder_name = _folder_identity(folder_name)
     default, compiled, missing_policy = _compile_rules(rules, fields, folder_name)
     referenced = {field for match, _, _ in compiled for field, _ in match}
+    required = referenced | {"folder", "shard", "row_index", "source", "item_id", "freq"}
     for row in inventory_rows:
         identity = ", ".join(
             f"{key}={row.get(key, '<missing>')!r}" for key in ("folder", "shard", "row_index")
@@ -318,15 +319,17 @@ def apply_rules(inventory_rows, rules, *, fields, folder_name):
             raise ValueError(
                 f"inventory row ({identity}): unexpected columns {sorted(unexpected, key=str)!r}"
             )
-        if row.get("folder") != folder_name:
-            raise ValueError(
-                f"inventory row ({identity}): folder differs from inventory folder {folder_name!r}"
-            )
         missing = [
             field
             for field in fields
-            if field not in row or row[field] is None or (field in referenced and row[field] == "")
+            if field not in row
+            or row[field] is None
+            or (field in required and not scalar_text(row[field]).strip())
         ]
+        if "folder" not in missing and row["folder"] != folder_name:
+            raise ValueError(
+                f"inventory row ({identity}): folder differs from inventory folder {folder_name!r}"
+            )
         if missing:
             reason = "missing inventory values: " + ", ".join(missing)
             if missing_policy == "refuse":
@@ -342,9 +345,12 @@ def apply_rules(inventory_rows, rules, *, fields, folder_name):
 
 
 def write_manifest(inventory_csv, rules_path, output):
-    """Hash exact input document/CSV bytes, preserving inventory order and columns."""
+    """Verify inventory provenance before decisions; preserve row order and columns."""
     inventory_csv, rules_path, output = Path(inventory_csv), Path(rules_path), Path(output)
     header = json.loads(inventory_csv.with_suffix(".json").read_text())
+    inventory_sha256 = digest(inventory_csv)
+    if inventory_sha256 != header.get("csv_sha256"):
+        raise ValueError("inventory CSV sha256 differs from inventory JSON sha256")
     folder_name = _folder_identity(header["folder"])
     expected_fields = _inventory_fields(header["csv_fields"])
     raw = rules_path.read_bytes()
@@ -354,7 +360,6 @@ def write_manifest(inventory_csv, rules_path, output):
         import yaml
 
         rules = yaml.safe_load(raw)
-    output.mkdir(parents=True, exist_ok=True)
     actions, decided = Counter(), Counter()
     temporary = output / "row-manifest.csv.tmp"
     with inventory_csv.open(newline="", encoding="utf-8") as source:
@@ -362,7 +367,12 @@ def write_manifest(inventory_csv, rules_path, output):
         fields = _inventory_fields(reader.fieldnames)
         if fields != expected_fields:
             raise ValueError("inventory CSV header differs from inventory JSON header")
+        if sum(1 for _ in reader) != header.get("rows"):
+            raise ValueError("inventory CSV row count differs from inventory JSON row count")
+        source.seek(0)
+        reader = csv.DictReader(source)
         _compile_rules(rules, fields, folder_name)
+        output.mkdir(parents=True, exist_ok=True)
         with temporary.open("w", newline="", encoding="utf-8") as stream:
             writer = csv.DictWriter(
                 stream, fieldnames=fields + DECISION_FIELDS, lineterminator="\n"
@@ -379,7 +389,7 @@ def write_manifest(inventory_csv, rules_path, output):
         rows=sum(actions.values()),
         counts_by_action=dict(actions),
         counts_by_rule=dict(decided),
-        inventory_sha256=digest(inventory_csv),
+        inventory_sha256=inventory_sha256,
         rules_sha256=hashlib.sha256(raw).hexdigest(),
         csv_sha256=digest(output / "row-manifest.csv"),
     )
