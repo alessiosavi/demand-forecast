@@ -2,8 +2,9 @@
 
 Member identities do not hash this repository's evaluation code: callers must
 ensure members were scored by the same evaluation code, including adapters and scorer. Cloud scoring
-jobs record repo_sha in inputs.json beside the mode folders; the cloud route
-will compare those SHAs.
+jobs record repo_sha in inputs.json beside the mode folders. The cloud ensemble
+job compares members' repository SHAs and evaluation inputs, verifies saved-file
+hashes, and gates averaging on self-ensemble metric parity with the newer scorer.
 """
 
 from __future__ import annotations
