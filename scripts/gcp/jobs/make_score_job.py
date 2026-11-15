@@ -15,6 +15,7 @@ MODEL_PACKAGES = {
     "timestral": "timestral @ git+https://github.com/mistralai/timestral.git@"
     "a534bdbd244d64f3d9d743f46c7bf6fc330ed4ff",
     "chronos2": "chronos-forecasting==2.2.2",
+    "ciproto": "continuousintelligence==0.1.0",
 }
 
 # This payload runs on the guest. Preflight uses only the system Python stdlib;
@@ -394,6 +395,52 @@ def _guest(model):
                    "--weights", config["hub_weights"], "--revision", config["hub_revision"],""",
         ),
     ]
+    if model == "ciproto":
+        # CI-Proto needs a newer Hub client and its own four-file bundle. Keep
+        # these changes out of all previously registered reference payloads.
+        replacements[0] = (
+            replacements[0][0],
+            replacements[0][1],
+            """    if metadata.version("continuousintelligence") != config["model_package"].split("==")[1]:
+        raise ValueError("installed ci-proto package does not match pin")""",
+        )
+        replacements.extend(
+            [
+                (
+                    "Hub environment pin",
+                    '("huggingface-hub", "0.36.0")',
+                    '("huggingface-hub", "1.0.1")',
+                ),
+                (
+                    "checkpoint evidence file set",
+                    '{"config.json", "model.safetensors"}',
+                    '{"config.json", "model.ckpt", "model-long.ckpt", "tta.json"}',
+                ),
+                (
+                    "checkpoint download files",
+                    'for filename in ("config.json", "model.safetensors"):',
+                    'for filename in ("config.json", "model.ckpt", "model-long.ckpt", "tta.json"):',
+                ),
+                (
+                    "checkpoint hash files",
+                    'for name in ("config.json", "model.safetensors")}',
+                    'for name in ("config.json", "model.ckpt", "model-long.ckpt", "tta.json")}',
+                ),
+                (
+                    "checkpoint Hub cache",
+                    """            hf_hub_download(config["hub_weights"], filename, revision=config["hub_revision"],
+                            token=False, local_dir=str(download))""",
+                    """            cached = hf_hub_download(config["hub_weights"], filename,
+                                     revision=config["hub_revision"], token=False)
+            shutil.copyfile(cached, download / filename)""",
+                ),
+                (
+                    "runtime decision",
+                    "Python 3.12 provisioned for stage-1 pins; scipy 1.16.3 requires >=3.11; image cp310 torch cannot be reused",
+                    "Python 3.10 retained; isolated ci-proto pins use scipy 1.15.3 and Hub 1.0.1; torch remains 2.8.0+cu128",
+                ),
+            ]
+        )
     for target, old, _ in replacements:
         count = GUEST.count(old)
         if count != 1:
@@ -420,6 +467,53 @@ def _uri(value):
         raise ValueError("URI cannot contain dot path components")
 
 
+def _ciproto_shell(script):
+    """Specialize only recognized shell blocks, refusing template drift."""
+    replacements = [
+        (
+            "Python upgrade block",
+            r"""# scipy==1.16.3 cannot run on the image's 3.10. Use stage 1's Python 3.12;
+# cp310 torch is not ABI compatible, so install the stage-1 CUDA wheel explicitly.
+if [[ $("$python" -c 'import sys; print("%d.%d" % sys.version_info[:2])') != 3.12 ]]; then
+    bootstrap_uv
+    "$scratch/uv-bootstrap/bin/uv" venv --clear --seed --system-site-packages \
+        --python 3.12 "$scratch/venv"
+fi
+""",
+            "",
+        ),
+        (
+            "stdlib venv isolation",
+            'if ! python3 -m venv --system-site-packages "$scratch/venv"; then',
+            'if ! python3 -m venv "$scratch/venv"; then',
+        ),
+        (
+            "uv venv isolation",
+            r'''"$scratch/uv-bootstrap/bin/uv" venv --clear --seed --system-site-packages \
+        --python "$(command -v python3)" --no-python-downloads "$scratch/venv"''',
+            r'''"$scratch/uv-bootstrap/bin/uv" venv --clear --seed \
+        --python "$(command -v python3)" --no-python-downloads "$scratch/venv"''',
+        ),
+        (
+            "requirements file",
+            '"$repo/requirements-yardsticks.txt"',
+            '"$repo/requirements-yardsticks-ciproto.txt"',
+        ),
+    ]
+    for target, old, new in replacements:
+        count = script.count(old)
+        if count != 1:
+            raise RuntimeError(f"expected exactly one {target} target, found {count}")
+        script = script.replace(old, new)
+    if (
+        script.count('"$repo/requirements-yardsticks-ciproto.txt"') != 1
+        or "requirements-yardsticks.txt" in script
+        or "--system-site-packages" in script
+    ):
+        raise RuntimeError("ci-proto shell must use its own requirements and isolated venv")
+    return script
+
+
 def generate(
     *,
     name,
@@ -438,8 +532,8 @@ def generate(
     model="simons",
 ):
     """Validate inputs and return a shell job, without fetching code, data or cloud state."""
-    if model not in ("simons", "timestral", "chronos2"):
-        raise ValueError("model must be simons, timestral or chronos2")
+    if model not in ("simons", "timestral", "chronos2", "ciproto"):
+        raise ValueError("model must be simons, timestral, chronos2 or ciproto")
     if model != "simons":
         if checkpoint_uri or not hub_weights or not hub_revision:
             raise ValueError(
@@ -509,7 +603,7 @@ def generate(
         label = model
     encoded_config = base64.b64encode(json.dumps(config, sort_keys=True).encode()).decode()
     encoded_guest = base64.b64encode(payload).decode()
-    return f'''#!/usr/bin/env bash
+    script = f'''#!/usr/bin/env bash
 # {label} scoring {name}; repository {repo_sha}; upstream {upstream_pin}
 set -euo pipefail
 umask 077
@@ -578,12 +672,19 @@ git -C "$repo" checkout --detach FETCH_HEAD
 guest "$python" environment
 guest "$python" score
 '''
+    if model == "ciproto":
+        # The image runs CPython 3.10. Avoid inherited inference packages whose
+        # Hub <1 requirement conflicts with continuousintelligence's Hub >=1.
+        script = _ciproto_shell(script)
+    return script
 
 
 def main():
     """Write one executable job; generation never contacts an external service."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", choices=["simons", "timestral", "chronos2"], default="simons")
+    parser.add_argument(
+        "--model", choices=["simons", "timestral", "chronos2", "ciproto"], default="simons"
+    )
     for key in ("name", "repo-sha", "upstream-pin", "tasks-uri", "tasks-sha256"):
         parser.add_argument("--" + key, required=True)
     source = parser.add_mutually_exclusive_group(required=True)

@@ -21,6 +21,7 @@ def test_help_uses_only_standard_library(tmp_path):
     assert "--cross-series" in result.stdout and "--revision" in result.stdout
     assert "simons" in result.stdout and "--checkpoint" in result.stdout
     assert "--processing" in result.stdout
+    assert "ciproto" in result.stdout
 
 
 def test_simons_checkpoint_alias_and_required_processing(tmp_path, monkeypatch, capsys):

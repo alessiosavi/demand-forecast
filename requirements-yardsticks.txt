@@ -1,4 +1,5 @@
 # Separate Python 3.12 environment. Install the CUDA torch wheel first (see docs).
+# CI-Proto uses requirements-yardsticks-ciproto.txt (isolated Python 3.10 / Hub >=1).
 # Adapter sources: autogluon/fev@9cf943c388e5cfaf352175ea3c69e408b197d997.
 # Simons adapter source: Abel-ai-lab/Simons@8e338e915d26c8960713889ef12ab1cf5c08d591 (optional install, see docs).
 fev==0.10.0

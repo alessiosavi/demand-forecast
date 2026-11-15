@@ -66,6 +66,49 @@ Timestral retains its forecaster defaults: symmetric averaging, nonnegative
 clipping, block autoregression and forecast caps. Chronos retains its pipeline's
 normalization, category encoding and long-horizon decoding defaults.
 
+## CI-Proto
+
+`--model ciproto` follows the public fev wrapper at the same pinned source,
+using `continuousintelligence==0.1.0` and
+`ContinuousIntelligence/ci-proto@ee3031351a151e3f6febf8c62b53e6ea1008bef6`.
+Use a separate Python 3.10 environment with `requirements-yardsticks-ciproto.txt`,
+after installing the same torch 2.8.0 CUDA 12.8 wheel shown above. The package
+requires Hub >=1, which conflicts with the other references' Hub/Transformers
+pins; this file uses Hub 1.0.1, omits those inference packages, and uses SciPy
+1.15.3 for Python 3.10. Linux x86_64 also installs CUDA 13 compiler/toolkit
+dependencies. Guest installation and real inference require a separate probe;
+offline adapter tests do not establish CUDA/toolchain compatibility.
+[Package metadata](https://pypi.org/pypi/continuousintelligence/0.1.0/json)
+records these dependencies.
+
+The wrapper retains the last 16,384 history values (or the smaller
+`--max-context`), full known futures, nanosecond timestamps and frequency.
+`--covariates all` includes numeric and boolean dynamics, dataset-wide sorted
+text codes, and static features for univariate tasks; `none` drops dynamics and
+static features while retaining timestamps. Univariate series are left-padded
+and forecast together once per window, with IDs and static features. Multitarget
+tasks make one joint-target call per series, without static features or IDs.
+Batching follows the wrapper (`--batch-size` accepts only 1), including its
+512-step sine warmup. Each requested quantile must match a native head within
+1e-6, and the task must include 0.5 for its point forecast. The package retains
+its preprocessing/calibration defaults. The guest prefetches and hashes
+`config.json`, `model.ckpt`, `model-long.ckpt` and `tta.json`, including the
+long-context checkpoint and calibration used by its loader.
+
+```bash
+python scripts/fev_yardstick.py --model ciproto --weights ContinuousIntelligence/ci-proto \
+  --revision ee3031351a151e3f6febf8c62b53e6ea1008bef6 \
+  --tasks shifted.yaml --model-name ciproto --out-dir results/ciproto --resume --keep-going
+```
+
+The cloud generator also accepts `--model ciproto` with those `--hub-weights`
+and `--hub-revision` values. Its isolated environment retains guest Python 3.10
+and the shared recorded scoring runtime pins. In the harness, native CI-Proto
+members can join mixed averages under the existing task/window/runtime and
+same-model grouping checks. The existing cloud ensemble job still requires
+two-file checkpoint hash manifests, so it cannot consume CI-Proto's four-file
+bundle; its registered payload is preserved here.
+
 ## Simons checkpoints: raw and published
 
 Simons is an optional inference dependency, pinned to
@@ -180,12 +223,12 @@ The default IDs above use the pinned SHAs even when `--revision` is omitted.
 ## Cloud scoring jobs
 
 `make_score_job.py` uses the same harness, saved forecast windows and completion
-checks for Simons, Timestral and Chronos-2. Set `REPO_SHA` to the scoring code's
+checks for Simons, Timestral, Chronos-2 and CI-Proto. Set `REPO_SHA` to the scoring code's
 40-hex commit and `TASKS_SHA256` to the task YAML's SHA-256. For a development
 subset, add `--names-uri` and `--names-sha256` to each command. The required
 `--upstream-pin` retains the repository's Simons integration pin for all jobs;
 reference jobs additionally record and verify their inference package pin in
-`inputs.json` (Timestral commit `a534bdb`, Chronos `2.2.2`). Generation is offline:
+`inputs.json` (Timestral commit `a534bdb`, Chronos `2.2.2`, CI-Proto `0.1.0`). Generation is offline:
 
 ```bash
 python scripts/gcp/jobs/make_score_job.py --model simons --name simons-seed11 \
@@ -207,7 +250,9 @@ python scripts/gcp/jobs/make_score_job.py --model chronos2 --name chronos2 \
 Reference jobs require Hub weights at a full commit SHA, refuse checkpoint URIs
 and nondefault `--processing`, and save their native output in `raw` only.
 `--covariates all|none` and `--max-context` apply to every model. To average these
-runs with Simons, generate the ensemble job with `--processing raw`; member
+runs with Simons, use `scripts/fev_ensemble.py` for CI-Proto (see its cloud
+manifest limitation above), or generate the ensemble job with `--processing raw`
+for the other references; member
 tasks, covariates, context limits and scoring runtime must match. Model-specific
 packages, native batching and Simons's dropped-covariate report may differ across
 models, never between two runs of the same model. Runs of the same model must

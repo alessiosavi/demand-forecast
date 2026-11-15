@@ -19,6 +19,357 @@ from demand_forecast.bench.yardsticks import (  # noqa: E402
 from tests.helpers.fev_fixture import write_fev_fixture  # noqa: E402
 
 
+class RecordingCIProto:
+    def __init__(self):
+        torch = pytest.importorskip("torch")
+        self.quantiles = torch.tensor([0.9, 0.5, 0.1, 0.2, 0.3, 0.4, 0.6, 0.7, 0.8])
+        self.calls = []
+
+    def forecast(self, history, horizon, **kwargs):
+        torch = pytest.importorskip("torch")
+        self.calls.append((history, horizon, kwargs))
+        return history[:, -1, None, None] + torch.arange(9)[None, :, None].expand(
+            history.shape[0], 9, horizon
+        )
+
+
+@pytest.mark.parametrize("multitarget", [False, True], ids=["univariate", "multitarget"])
+@pytest.mark.parametrize("covariates", ["all", "none"])
+def test_ciproto_float64_inputs_match_public_wrapper(
+    tmp_path, monkeypatch, multitarget, covariates
+):
+    import importlib.util
+    import sys
+    from copy import copy
+    from types import SimpleNamespace
+
+    import pandas as pd
+    from datasets import Dataset, Features, Sequence, Value
+
+    torch = pytest.importorskip("torch")
+    from demand_forecast.bench.yardsticks.adapters import CIProtoAdapter
+    from demand_forecast.bench.yardsticks.runner import prepare_windows
+
+    path = Path("/Users/asavi/df-wins-2026-11-11/published/fev/models/ci-proto/model.py")
+    if not path.is_file():
+        pytest.skip("local public ci-proto wrapper is unavailable")
+    # Preparation does not use ci.load_model. Stub that optional dependency and
+    # bypass __init__ so this exercises the public helpers without any weights.
+    monkeypatch.setitem(sys.modules, "continuousintelligence", SimpleNamespace())
+    monkeypatch.setattr(fev.ForecastingModel, "_registry", {})
+    spec = importlib.util.spec_from_file_location("public_ciproto_inputs", path)
+    public = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(public)
+    except ImportError as exc:
+        pytest.skip(f"public ci-proto wrapper dependency unavailable: {exc}")
+
+    known = ["known_number", "known_bool", "known_text"]
+    past_only = ["past_number", "past_bool", "past_text"]
+    features = Features(
+        {
+            "id": Value("string"),
+            "timestamp": Sequence(Value("timestamp[ns]")),
+            **{name: Sequence(Value("float64")) for name in ("target", "second")},
+            **{name: Sequence(Value("float64")) for name in (known[0], past_only[0])},
+            **{name: Sequence(Value("bool")) for name in (known[1], past_only[1])},
+            **{name: Sequence(Value("string")) for name in (known[2], past_only[2])},
+            "label": Value("string"),
+            "size": Value("int64"),
+        }
+    )
+    rows = []
+    for i, length in enumerate((30, 24)):
+        rows.append(
+            {
+                "id": f"series-{1 - i}",
+                "timestamp": pd.date_range("2022-01-01", periods=length, freq="h").to_numpy()
+                + np.timedelta64(123, "ns"),
+                "target": [16777217.0 + 2 * j for j in range(length)],
+                "second": [1.0000000001 + j for j in range(length)],
+                "known_number": [1.0000000001 + j for j in range(length)],
+                "past_number": [16777217.0 + 2 * j for j in range(length)],
+                **{
+                    name: [None if j % 3 == 0 else bool(j % 2) for j in range(length)]
+                    for name in (known[1], past_only[1])
+                },
+                **{
+                    name: [("z", None, "a")[j % 3] for j in range(length - 4)] + ["0-heldout"] * 4
+                    for name in (known[2], past_only[2])
+                },
+                "label": f"static-{i}",
+                "size": i + 7,
+            }
+        )
+    data_path = tmp_path / "float64.parquet"
+    Dataset.from_list(rows, features=features).to_parquet(data_path)
+    task = fev.Task(
+        dataset_path=str(data_path),
+        dataset_config=None,
+        target=["second", "target"] if multitarget else "target",
+        known_dynamic_columns=known,
+        past_dynamic_columns=past_only,
+        static_columns=["size", "label"],
+        horizon=4,
+        num_windows=2,
+        quantile_levels=[j / 10 for j in range(1, 10)],
+    )
+    options = Options("ciproto", "unused", "ci", covariates=covariates).resolved()
+    model = RecordingCIProto()
+    adapter = CIProtoAdapter(options, task, model=model)
+    windows = prepare_windows(task, options)
+    adapter.predict(windows, task.horizon, task.quantile_levels)
+
+    # The none ablation removes roles; all other public preparation is identical.
+    public_task = copy(task)
+    if covariates == "none":
+        public_task.known_dynamic_columns = []
+        public_task.past_dynamic_columns = []
+        public_task.static_columns = []
+    full = task.load_full_dataset().with_format("arrow")[:]
+    text_values = {
+        name: public._text_values(full, name)
+        for name in public_task.known_dynamic_columns + public_task.past_dynamic_columns
+        if public._is_text(full, name)
+    }
+    wrapper = object.__new__(public.CIProtoModel)
+    wrapper._model = RecordingCIProto()
+    for window in task.iter_windows():
+        inputs = wrapper._prepare_window(public_task, *window.get_input_data(), text_values)
+        wrapper._forecast_window(public_task, inputs)
+    expected = wrapper._model.calls
+    assert len(model.calls) == len(expected) == (4 if multitarget else 2)
+    for (history, horizon, kwargs), (want_history, want_horizon, want_kwargs) in zip(
+        model.calls, expected, strict=True
+    ):
+        assert horizon == want_horizon
+        actual_inputs = {"history": history, **kwargs}
+        expected_inputs = {"history": want_history, **want_kwargs}
+        assert actual_inputs.keys() == expected_inputs.keys()
+        for name, want in expected_inputs.items():
+            actual = actual_inputs[name]
+            if isinstance(want, torch.Tensor):
+                assert actual.dtype == want.dtype
+                np.testing.assert_array_equal(actual.numpy(), want.numpy(), err_msg=name)
+            else:
+                assert actual == want, name
+    if not multitarget:
+        assert np.isnan(expected[0][0].numpy()).any()
+        assert (expected[0][2]["timestamps"] == np.iinfo(np.int64).min).any()
+
+
+@pytest.mark.parametrize("covariates", ["all", "none"])
+@pytest.mark.parametrize("cap", [None, 5, 20000])
+def test_ciproto_univariate_padding_categories_times_and_static(tmp_path, covariates, cap):
+    torch = pytest.importorskip("torch")
+    from demand_forecast.bench.yardsticks.adapters import CIProtoAdapter
+    from demand_forecast.bench.yardsticks.runner import prepare_windows
+    from tests.helpers.fev_fixture import fixture_task
+
+    task = fixture_task(
+        write_fev_fixture(
+            tmp_path,
+            lengths=(40, 38, 40, 28, 38, 40),
+            known=("promo", "event"),
+            past=("oil", "label"),
+            text_dynamic=("event", "label"),
+        ),
+        known=("promo", "event"),
+        past=("oil", "label"),
+    )
+    options = Options("ciproto", "unused", "ci", max_context=cap, covariates=covariates).resolved()
+    model = RecordingCIProto()
+    adapter = CIProtoAdapter(options, task, model=model)
+    windows = prepare_windows(task, options)
+    outputs = adapter.predict(windows, task.horizon, task.quantile_levels)
+    assert len(model.calls) == len(windows) == 2
+    for window, output, (history, horizon, kwargs) in zip(
+        windows, outputs, model.calls, strict=True
+    ):
+        length = max(it.target.shape[-1] for it in window.items)
+        assert history.shape == (6, length) and history.dtype == torch.float64
+        assert np.isnan(history[3, 0]) if cap != 5 else history.shape[-1] == 5
+        assert horizon == task.horizon and kwargs["freq"] == task.freq
+        assert kwargs["series_ids"] == window.ids
+        assert kwargs["timestamps"].shape == (6, length + horizon)
+        if cap != 5:
+            assert kwargs["timestamps"][3, 0] == np.iinfo(np.int64).min
+        for i, item in enumerate(window.items):
+            n = item.target.shape[-1]
+            np.testing.assert_equal(history[i, -n:], item.target[0])
+            np.testing.assert_equal(kwargs["timestamps"][i, -(n + horizon) :], item.timestamps)
+            expected = item.target[0, -1] + np.array([2, 3, 4, 5, 1, 6, 7, 8, 0])
+            np.testing.assert_allclose(output[i][0], np.tile(expected, (horizon, 1)))
+        if covariates == "all":
+            assert kwargs["static_features"] == {"cat": ["A", "B", "A", "B", "A", "B"]}
+            assert kwargs["categorical_past"] == (task.past_dynamic_columns.index("label"),)
+            assert kwargs["categorical_future"] == (task.known_dynamic_columns.index("event"),)
+            assert kwargs["past_covariates"].shape == (6, 2, length)
+            assert kwargs["future_covariates"].shape == (6, 2, length + horizon)
+            event = window.items[0].past["event"]
+            codes = {"0": 0.0, "a": 1.0, "b": 2.0}
+            np.testing.assert_equal(
+                kwargs["future_covariates"][
+                    0, task.known_dynamic_columns.index("event"), -len(event) - horizon : -horizon
+                ].numpy(),
+                [codes.get(v, np.nan) for v in event],
+            )
+        else:
+            assert kwargs["static_features"] is None
+            assert kwargs["categorical_past"] == kwargs["categorical_future"] == ()
+            assert "past_covariates" not in kwargs and "future_covariates" not in kwargs
+
+
+def test_ciproto_multitarget_batches_context_limit_and_quantile_rejection(scenario):
+    pytest.importorskip("torch")
+    from demand_forecast.bench.yardsticks.adapters import CIProtoAdapter
+    from demand_forecast.bench.yardsticks.runner import prepare_windows
+
+    tasks, options, _ = scenario
+    task = tasks[0]
+    options = replace(options, model="ciproto", max_context=5).resolved()
+    model = RecordingCIProto()
+    adapter = CIProtoAdapter(options, task, model=model)
+    windows = prepare_windows(task, options)
+    outputs = adapter.predict(windows, task.horizon, task.quantile_levels)
+    assert len(model.calls) == 6  # one joint-target call per series, per window
+    assert outputs[0][0].shape == (2, 4, 9)
+    for history, horizon, kwargs in model.calls:
+        assert history.shape == (2, 5)
+        assert kwargs["timestamps"].shape == (5 + horizon,)
+        assert kwargs["past_covariates"].shape == (1, 5)
+        assert kwargs["future_covariates"].shape == (1, 5 + horizon)
+        assert "series_ids" not in kwargs and "static_features" not in kwargs
+    with pytest.raises(ValueError, match="quantile.*0.15.*lacks"):
+        adapter.predict(windows, task.horizon, [0.15, 0.5])
+    assert len(model.calls) == 6
+    item = windows[0].items[0]
+    item.target = np.ones((2, 17000))
+    item.past = {k: np.ones(17000) for k in item.past}
+    item.timestamps = np.arange(17000 + task.horizon, dtype=np.int64)
+    adapter = CIProtoAdapter(replace(options, max_context=20000), task, model=model)
+    adapter.predict([replace(windows[0], items=[item])], task.horizon, [0.5])
+    assert model.calls[-1][0].shape == (2, 16384)
+    assert model.calls[-1][2]["timestamps"].shape == (16384 + task.horizon,)
+
+
+@pytest.mark.parametrize(
+    "level,accepted",
+    [(np.nextafter(1e-6, 0), True), (1e-6, False), (np.nextafter(1e-6, np.inf), False)],
+    ids=["just-inside", "exact-boundary", "just-outside"],
+)
+def test_ciproto_quantile_tolerance_is_strict(scenario, level, accepted):
+    torch = pytest.importorskip("torch")
+    from demand_forecast.bench.yardsticks.adapters import CIProtoAdapter
+    from demand_forecast.bench.yardsticks.runner import prepare_windows
+
+    task = scenario[0][0]
+    options = Options("ciproto", "unused", "ci").resolved()
+    model = RecordingCIProto()
+    model.quantiles = torch.tensor(
+        [0.0, 0.5, 0.1, 0.2, 0.3, 0.4, 0.6, 0.7, 0.8], dtype=torch.float64
+    )
+    adapter = CIProtoAdapter(options, task, model=model)
+    windows = prepare_windows(task, options)
+    if not accepted:
+        with pytest.raises(ValueError, match="quantile.*lacks"):
+            adapter.predict(windows, task.horizon, [level])
+        assert model.calls == []
+    else:
+        outputs = adapter.predict(windows, task.horizon, [level])
+        for window, output in zip(windows, outputs, strict=True):
+            for item, actual in zip(window.items, output, strict=True):
+                np.testing.assert_array_equal(
+                    actual[..., 0], np.repeat(item.target[:, -1:], task.horizon, axis=1)
+                )
+
+
+def test_ciproto_loader_pin_warmup_and_runtime_identity(scenario, monkeypatch):
+    import sys
+    from types import SimpleNamespace
+
+    torch = pytest.importorskip("torch")
+    from demand_forecast.bench.yardsticks import runner
+    from demand_forecast.bench.yardsticks.adapters import CIProtoAdapter
+
+    task = scenario[0][0]
+    options = Options("ciproto", "ContinuousIntelligence/ci-proto", "ci").resolved()
+    options = runner.resolve_weights(options)
+    assert options.weights_revision == "ee3031351a151e3f6febf8c62b53e6ea1008bef6"
+    model, loaded = RecordingCIProto(), []
+
+    def load(*args, **kwargs):
+        loaded.append((args, kwargs))
+        return model
+
+    monkeypatch.setitem(sys.modules, "continuousintelligence", SimpleNamespace(load_model=load))
+    CIProtoAdapter(options, task)
+    assert loaded == [
+        ((options.weights,), {"device": "cuda", "revision": options.weights_revision})
+    ]
+    assert model.calls[0][0].shape == (1, 512) and model.calls[0][1:] == (32, {})
+    assert model.calls[0][0].dtype == torch.float32
+    torch.testing.assert_close(
+        model.calls[0][0],
+        torch.sin(torch.arange(512, dtype=torch.float32) / 8)[None],
+        rtol=0,
+        atol=0,
+    )
+    assert "continuousintelligence" in runner.runtime_identity(options)["packages"]
+    with pytest.raises(ValueError, match="batch"):
+        replace(options, batch_size=2).resolved()
+    with pytest.raises(ValueError, match="Chronos"):
+        replace(options, cross_series="off").resolved()
+
+
+def test_ciproto_boolean_missing_values_median_and_series_order(tmp_path, monkeypatch):
+    pytest.importorskip("torch")
+    from datasets import Dataset, Sequence, Value
+
+    from demand_forecast.bench.yardsticks.adapters import CIProtoAdapter
+    from demand_forecast.bench.yardsticks.runner import prepare_windows
+    from tests.helpers.fev_fixture import fixture_task
+
+    path = write_fev_fixture(tmp_path)
+    data = Dataset.from_parquet(str(path))
+    features = data.features.copy()
+    features["promo"] = Sequence(Value("bool"))
+    data.map(
+        lambda row: {
+            "promo": [None if i % 3 == 0 else bool(v) for i, v in enumerate(row["promo"])]
+        },
+        features=features,
+    ).to_parquet(path)
+    task = fixture_task(path)
+    options = Options("ciproto", "unused", "ci").resolved()
+    model = RecordingCIProto()
+    adapter = CIProtoAdapter(options, task, model=model)
+    windows = prepare_windows(task, options)
+    adapter.predict(windows, task.horizon, task.quantile_levels)
+    assert model.calls[0][2]["categorical_future"] == ()
+    assert np.isnan(model.calls[0][2]["future_covariates"][0, 0, 0])
+    original = list(task.iter_windows())
+    past, future = original[0].get_input_data()
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        task,
+        "iter_windows",
+        lambda: iter(
+            [
+                SimpleNamespace(
+                    get_input_data=lambda: (past, future.select(list(reversed(range(len(future))))))
+                )
+            ]
+        ),
+    )
+    with pytest.raises(ValueError, match="series orders"):
+        prepare_windows(task, options)
+    task.quantile_levels = [0.1, 0.9]
+    with pytest.raises(ValueError, match="no 0.5"):
+        adapter.prepare(task)
+
+
 @pytest.fixture(autouse=True)
 def offline_only(monkeypatch):
     import datasets.config
@@ -243,7 +594,7 @@ def test_resume_mixed_timestamp_and_integer_cutoffs_preserves_evidence(
     assert before == {p: p.read_bytes() for p in out.rglob("*") if p.is_file()}
 
 
-@pytest.mark.parametrize("model", ["chronos2", "timestral"])
+@pytest.mark.parametrize("model", ["chronos2", "timestral", "ciproto"])
 def test_context_and_covariates_applied_before_adapter(scenario, model):
     tasks, options, out = scenario
     options = replace(options, model=model, max_context=5, covariates="none")
@@ -253,7 +604,9 @@ def test_context_and_covariates_applied_before_adapter(scenario, model):
         for it in w.items:
             assert it.target.shape == (2, 5)
             assert it.past == it.future == {}
-    assert options.resolved().batch_size == (100 if model == "chronos2" else 1024)
+    assert (
+        options.resolved().batch_size == {"chronos2": 100, "timestral": 1024, "ciproto": 1}[model]
+    )
 
 
 def test_cross_series_off_splits_targets_but_retains_covariates(scenario):
