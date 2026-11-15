@@ -10,7 +10,9 @@ from pathlib import Path
 def main(argv: list[str] | None = None) -> int:
     """Parse switches before importing optional benchmark or inference packages."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", choices=["chronos2", "timestral", "simons", "ciproto"], required=True)
+    parser.add_argument(
+        "--model", choices=["chronos2", "timestral", "simons", "ciproto"], required=True
+    )
     parser.add_argument(
         "--weights",
         "--checkpoint",
