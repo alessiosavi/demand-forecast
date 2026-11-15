@@ -231,6 +231,7 @@ def test_preflight_accepts_complete_successful_runs_and_zero_metrics(completion_
     [
         ("schema", None),
         ("schema", 999),
+        *[("schema", value) for value in (True, False, 1.0, 0.0)],
         ("runs", None),
         ("runs", {}),
         ("runs", []),
@@ -239,6 +240,7 @@ def test_preflight_accepts_complete_successful_runs_and_zero_metrics(completion_
         ("runs.unexpected-run", dict(exit_code=0, wall_seconds=1, peak_rss_bytes=1024)),
         ("runs.stage3-main-seed11.exit_code", None),
         ("runs.stage3-main-seed11.exit_code", 19),
+        *[("runs.stage3-main-seed11.exit_code", value) for value in (True, False, 1.0, 0.0)],
         ("runs.stage3-main-seed11.wall_seconds", None),
         ("runs.stage3-main-seed11.peak_rss_bytes", None),
         *[

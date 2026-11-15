@@ -17,7 +17,7 @@ import textwrap
 from collections import Counter
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
-from types import SimpleNamespace
+from types import CodeType, SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -27,29 +27,67 @@ from scripts.gcp.jobs.make_simons_job import canonical_condition
 REPLAY = "real-only statistical"
 STAGES = ("stage3", "stage4", "stage4-long")
 
-# sha256(inspect.getsource(function).encode()), including indentation and line layout.
+# sha256(file bytes), covering the loaded-module union for every supported stage/pass.
 # Recorded after third_party/simons/prepare.py applied its full series to this pin.
 SAMPLER_PIN = "8e338e915d26c8960713889ef12ab1cf5c08d591"
-SUPPORTED_SAMPLER_SOURCE_SHA256 = {
-    "trainer.covariate_passes": "5ef3d60498ddaafca21dd21330343255db84bc599e7a1a165bfdd8d4f685de71",
-    "trainer.config_module.weights": "185f937829151aea752f729204a9511342c10f44d764e0abb46a2052c3350ff2",
-    "trainer.network.future_steps": "3280e135ca10394f873c4a5aea36d1e52e69943e3e60bed6e8dfa2f04ff75f8a",
-    "covariates.stream.long_spec": "ac5f35150749c5b4c607182811905b6fa27ccbb25bfdcce8321516d0d038d260",
-    "covariates.stream.Batches.__iter__": "c499fbf58496adfb6f64aa37b21192d7884b7cc925243ab7ceb104dc5beb4f3b",
-    "covariates.stream.CovariateStream.__init__": "d894299c9f2fb9304e5bc30d8da8c8abc1e65c071353257c190050cce74e96da",
-    "covariates.stream.make_batch": "f95e533e4a544b05412507c722b50a82351805499f96213fad16bf3ff4f4c868",
-    "covariates.stream.tokens_per_window": "69b5ab68d4496c0fefb5d9cf9dd0ea2a97c146abee8c12382fcb2d4e6fc6d50a",
-    "covariates.stream.real_corpus": "dcb844f86fc5a8762612aa216b459d96a9794496af8cd450f1a0119be1886a58",
-    "covariates.windows.CovariateCorpus.__init__": "bde63d3bc050fbfb7a9ff30282ef16671efaf16df7c6a608871b46961d108cfe",
-    "covariates.windows.CovariateCorpus.train_sample": "f82dbd9d184946a3830400e4faa2a01ba4219e6316756cf73477c5cf81902a52",
-    "covariates.windows.horizon_for": "12f45381b12693478e955a4a2aab3703baa3f799d55cf80b6a817a478fe40472",
-    "covariates.windows.source_weights": "5fef15bcf4b8987562f2a7a5f561c4fc0f230c438e033f453b7a268df3b5b75d",
-    "covariates.windows.load_items": "86497d738282bf96a609ca9fd67d3fa6b41aaa5ec80d391331e2269e55d930e3",
-    "covariates.windows._list_arrays": "317478a48635eb167a1a6c90c98943086bc6f1dc9fee858da675e3e215910e03",
-    "covariates.windows._matrix_arrays": "9081fd43590bbeb969c48e0174763ab3da9619806d15ae61d59e687b12e8bf2e",
-    "covariates.windows.corpus_files": "c56f9a68e5d107625dee9001dcf5d9f955eaa2ad8a452e261ccc29f9a06a5e03",
-    "covariates.windows.resolve": "014bac3918d2601270cf6ba83e2225c9d74fd1ba3d550db7f4f972e628a85142",
+SUPPORTED_SOURCE_SHA256 = {
+    "simons/__init__.py": "4b46dc41e3cad66cfa349be82d0b90df1bfa25cbc4aa36ccd7e1c172db93ca9d",
+    "simons/config.py": "e37c0f0888d7ef5017f3b48198d6ae9ccfe478b1dbad2b04de90874a9f6f202b",
+    "simons/covariates.py": "4f172b5a26cb9eb46129ddf81777e127945bba1c484d19596267e9812cf412ef",
+    "simons/forecast.py": "ae84c4408915f6b6126632efcfdbbf5b7b4f816ca2aaa848479d081d6dc90aca",
+    "simons/model.py": "6b87b46f6f56267b9893fe224c959b24591a8a2588d4eec4194494e5435e95df",
+    "simons/periodicity.py": "8b44693f6561c0e99acb6d5bec0b977ac5fe1e2028c8ab8fa995d842ce93da9b",
+    "simons/synth/__init__.py": "8d18ab3612d4ee30be91f4c29df8d1d0d369d55b85636b6e81b2bbd37a39f802",
+    "simons/synth/augment.py": "7aff41774cb8db54146a41d4b2ead85578d1216a2e3457b699811cf372c0d59e",
+    "simons/synth/base.py": "22ae20d59db6f45cbee1ca0eaa34308c897b149c4cc078eec79df98c21367c97",
+    "simons/synth/covariates/__init__.py": "d3d9b719381643417cab5e705ba821667cf26c228f2edfd5a2132eb2ef797eae",
+    "simons/synth/covariates/effects.py": "860964551372a4d3f0ca371ce00b0271f87e875756dafa87a04b8765264500b3",
+    "simons/synth/mech.py": "228928cc9d0d23c70201ff238d9e48fa19b53c3d2f210fa99d0f9e5370406550",
+    "simons/synth/multi.py": "91bf4f23deafb161214bf8899fc6fe936cc27b7b3474a72d79e54a9070fdbcc6",
+    "simons/synth/observe.py": "1b435accb6baa41bab3a53993b4f1fe3d90278868f5f21dba3cc723449ce0556",
+    "simons/training/__init__.py": "cca66ebd098c78b859974b42899dfb686007b17e0dadcfbc4c1e6ca814d88c49",
+    "simons/training/augment.py": "0ab923b9a79478a25e10d1eba9506f026526c26da36c4cdc4f903a7528b1f6a9",
+    "simons/training/config.py": "d768e48c5dd2bd6ae36d1fa3f33531bff173a71fce3202fdd8b96b5bf8123a14",
+    "simons/training/covariates/__init__.py": "f45b58674bdbb9b54845c4d5b558f3b36ea387211a7d2d6dbb57fdff3fe53481",
+    "simons/training/covariates/roles.py": "5350125021ead60c3953427d9db3a80d30cb9577d92e4b724efc2f8a7ae2ea7a",
+    "simons/training/covariates/stream.py": "075444db876a93089c4c0d658cd212ff74135a7a4e2f171a039cc83b43bc138b",
+    "simons/training/covariates/windows.py": "8d1113a846a6b3e23ca6abe474a45df99b846fabaacc3a577f8aa741bf078cb1",
+    "simons/training/data.py": "3e61f0bce8e928699d0759ecc05c1880df5239f8c747e43636e7250a55fdcbbe",
+    "simons/training/distributed.py": "394682806caeff50774e090c387b27b8002b3004d9d9363841c7e4b9356aff3e",
+    "simons/training/exposure.py": "01615fed6acfc71f23f9e1dd27f32dd0a943b73b95b930c6eb8b12da4e0c7077",
+    "simons/training/fork_conditions.py": "bbbaaeec6c884f538bf3e508315f864c8b2f138ed959fbbe360caca495674b36",
+    "simons/training/network.py": "f76f41991509b5f8b5a42eda5681551ae3a570157ba9555d2fc4ceec842457bc",
+    "simons/training/objective.py": "fe934e67203e59c197511fe0b2dbd500bd4d582d2150ea4f80bb613a13e75173",
+    "simons/training/optim.py": "7fdc5a369755d089a8d41f1f013dca2f1120175ec3b559aece0f9e70807b74c0",
+    "simons/training/packing.py": "b8e80e1d8ffd623cf6b9dd3920c4117a987f23bd5137cecd7d5d45a5b979ca06",
+    "simons/training/reliability.py": "d3bac409c444de7fc770a5787001c7f215df76c7344672a2ca93d4cbb0eb5ba8",
+    "simons/training/schedule.py": "31b6db177d4f161f43c849de37acda23d133fc32b8e5982313bb617cfb63c5e2",
+    "simons/training/screen.py": "b4df5718f5b05fef1b67bc63b1541253c6e9a571752fe89b66ab62d9ea11768b",
+    "simons/training/spot_job.py": "fdec6013bff644cde2251d91ed5537354f5f17c77e3fbc4c72a807637cbcc80b",
+    "simons/training/trainer.py": "8fd976343799fa5ffc38a74b69def9ab22002903d0f7ee0200965cc9a785ce0d",
+    "simons/training/warp.py": "bd80855d44c62273061ab1337708b6cffa51a7911c491db804207b2de40adffc",
 }
+SAMPLER_FUNCTIONS = (
+    "trainer.covariate_passes",
+    "trainer.config_module.weights",
+    "trainer.network.future_steps",
+    "covariates.stream.long_spec",
+    "covariates.stream.Batches.__init__",
+    "covariates.stream.Batches.__iter__",
+    "covariates.stream.CovariateStream.__init__",
+    "covariates.stream.make_batch",
+    "covariates.stream.tokens_per_window",
+    "covariates.stream.real_corpus",
+    "covariates.windows.CovariateCorpus.__init__",
+    "covariates.windows.CovariateCorpus.train_sample",
+    "covariates.windows.horizon_for",
+    "covariates.windows.source_weights",
+    "covariates.windows.load_items",
+    "covariates.windows._list_arrays",
+    "covariates.windows._matrix_arrays",
+    "covariates.windows.corpus_files",
+    "covariates.windows.resolve",
+)
 
 
 def condition(overrides):
@@ -78,26 +116,101 @@ def _no_base(*args, **kwargs):
     raise RuntimeError("real-only audit attempted to load base/univariate series")
 
 
-def verify_sampler_source(modules):
-    """Fail before instrumentation or counting if any supported sampler body changed."""
+def loaded_sources(upstream):
+    """Snapshot every loaded file under this checkout, including lazy dependencies."""
+    root = Path(upstream).resolve() / "src"
+    sources = {}
+    for module in tuple(sys.modules.values()):
+        if not getattr(module, "__file__", None):
+            continue
+        path = Path(module.__file__).resolve()
+        if path.is_relative_to(root):
+            name = path.relative_to(root).as_posix()
+            try:
+                sources[name] = path.read_bytes()
+            except OSError as error:
+                raise RuntimeError(
+                    f"unsupported upstream source: {name}; cannot read file"
+                ) from error
+    return sources
+
+
+def verify_sampler_source(modules, upstream):
+    """Verify dependency files, then bind the traced functions to their compiled source."""
+    root = Path(upstream).resolve() / "src"
+    for name in SUPPORTED_SOURCE_SHA256:
+        module_name = name.removesuffix(".py").replace("/", ".").removesuffix(".__init__")
+        module = sys.modules.get(module_name)
+        if module is not None and (
+            not getattr(module, "__file__", None) or Path(module.__file__).resolve() != root / name
+        ):
+            raise RuntimeError(f"unsupported upstream source: {name}; loaded from elsewhere")
+    sources = loaded_sources(upstream)
+    verified = {}
+    for name, source in sorted(sources.items()):
+        actual = hashlib.sha256(source).hexdigest()
+        expected = SUPPORTED_SOURCE_SHA256.get(name)
+        if actual != expected:
+            raise RuntimeError(
+                f"unsupported upstream source: {name}; prepared pin {SAMPLER_PIN} "
+                f"requires sha256 {expected}, found {actual}"
+            )
+        verified[name] = actual
+
     _, _, trainer, stream, windows = modules
     roots = {"trainer": trainer, "covariates": SimpleNamespace(stream=stream, windows=windows)}
-    verified = {}
-    for name, expected in SUPPORTED_SAMPLER_SOURCE_SHA256.items():
+    compiled = {}
+    for name in SAMPLER_FUNCTIONS:
         parts = name.split(".")
         function = roots[parts[0]]
         try:
             for part in parts[1:]:
-                function = getattr(function, part)
-            actual = hashlib.sha256(inspect.getsource(function).encode()).hexdigest()
-        except (AttributeError, OSError, TypeError) as error:
-            raise RuntimeError(f"unsupported sampler source: {name}; cannot read source") from error
-        if actual != expected:
-            raise RuntimeError(
-                f"unsupported sampler source: {name}; prepared pin {SAMPLER_PIN} "
-                f"requires sha256 {expected}, found {actual}"
+                owner, function = function, getattr(function, part)
+            if hasattr(function, "__wrapped__"):
+                raise ValueError("wrapped function")
+            if inspect.ismethod(function):
+                function = function.__func__
+            if not inspect.isfunction(function) or hasattr(function, "__wrapped__"):
+                raise ValueError("not a plain function or method")
+            qualified_name = (
+                owner.__qualname__ + "." + parts[-1] if inspect.isclass(owner) else parts[-1]
             )
-        verified[name] = actual
+            if function.__qualname__ != qualified_name:
+                raise ValueError("function has a different qualified name")
+            module = sys.modules[function.__module__]
+            if function.__globals__ is not vars(module):
+                raise ValueError("function is not defined in its module")
+            path = Path(module.__file__).resolve()
+            relative = path.relative_to(root).as_posix()
+            if Path(function.__code__.co_filename).resolve() != path:
+                raise ValueError("function code is not from its module file")
+            if relative not in compiled:
+                pending = [compile(sources[relative], str(path), "exec", dont_inherit=True)]
+                codes = {}
+                while pending:
+                    code = pending.pop()
+                    # co_name, not co_qualname: the cloud guests run Python 3.10.
+                    codes[code.co_name, code.co_firstlineno] = code
+                    pending.extend(c for c in code.co_consts if isinstance(c, CodeType))
+                compiled[relative] = codes
+            expected = compiled[relative].get(
+                (function.__code__.co_name, function.__code__.co_firstlineno)
+            )
+            pending = [(function.__code__, expected)]
+            while pending:
+                actual_code, expected_code = pending.pop()
+                # Python 3.10 code equality omits the line tables used by the tracer.
+                if actual_code != expected_code or tuple(actual_code.co_lines()) != tuple(
+                    expected_code.co_lines()
+                ):
+                    raise ValueError("executed code differs from verified source")
+                pending.extend(
+                    (actual, expected)
+                    for actual, expected in zip(actual_code.co_consts, expected_code.co_consts)
+                    if isinstance(actual, CodeType)
+                )
+        except (AttributeError, KeyError, OSError, TypeError, ValueError) as error:
+            raise RuntimeError(f"unsupported sampler code: {name}; {error}") from error
     return verified
 
 
@@ -385,7 +498,6 @@ def audit(*, corpus, upstream, stage, pass_name, size="25m", batches, seed, over
     condition(overrides)
     with upstream_modules(upstream) as modules, ExitStack() as stack:
         _, _, _, stream, windows = modules
-        sampler_source_sha256 = verify_sampler_source(modules)
         stack.enter_context(patch.object(windows, "BaseSeries", _no_base))
         stack.enter_context(patch.object(windows, "base_files", _no_base))
         configured = sampling_spec(
@@ -393,21 +505,25 @@ def audit(*, corpus, upstream, stage, pass_name, size="25m", batches, seed, over
         )
         spec = copy.deepcopy(configured)
         spec.update(base=None, mix={"real": 1.0})
-        stats = {}
+        loaded_source_names = []
         read_table = windows.pq.read_table
 
         def read(path, *args, **kwargs):
             if not Path(path).resolve().is_relative_to((corpus / "covariates").resolve()):
                 _no_base()
             table = read_table(path, *args, **kwargs)
-            for source, count in Counter(table.column("source").to_pylist()).items():
-                stats.setdefault(source, _counter())["rows_loaded"] += count
+            loaded_source_names.extend(table.column("source").to_pylist())
             return table
 
         with patch.object(windows.pq, "read_table", read):
             real = stream.real_corpus(spec)
         if real is None:
             raise RuntimeError("upstream real_corpus returned no corpus")
+        sampler_source_sha256 = verify_sampler_source(modules, upstream)
+        stats = {}
+        for source, count in Counter(loaded_source_names).items():
+            stats[source] = _counter()
+            stats[source]["rows_loaded"] = count
         for source, indices in real.by_source.items():
             stats[source]["rows_retained"] = len(indices)
         usable, usable_rows = usable_histories(real, windows, spec)
@@ -491,16 +607,41 @@ def audit(*, corpus, upstream, stage, pass_name, size="25m", batches, seed, over
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--corpus", type=Path, required=True)
+    parser.add_argument("--corpus", type=Path)
     parser.add_argument("--upstream", type=Path, required=True)
-    parser.add_argument("--stage", choices=STAGES, required=True)
+    parser.add_argument("--stage", choices=STAGES)
     parser.add_argument("--size", choices=["25m"], default="25m")
-    parser.add_argument("--pass", dest="pass_name", choices=["main", "long"], required=True)
-    parser.add_argument("--batches", type=int, required=True)
-    parser.add_argument("--seed", type=int, required=True)
+    parser.add_argument("--pass", dest="pass_name", choices=["main", "long"])
+    parser.add_argument("--batches", type=int)
+    parser.add_argument("--seed", type=int)
     parser.add_argument("--override", dest="overrides", action="append", default=[])
-    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--print-source-hashes", action="store_true")
     args = vars(parser.parse_args(argv))
+    args["upstream"] = args["upstream"].resolve()
+    if args.pop("print_source_hashes"):
+        with upstream_modules(args["upstream"]) as modules:
+            with tempfile.TemporaryDirectory(prefix="exposure-source-hashes-") as temporary:
+                corpus = Path(temporary)
+                (corpus / "covariates").mkdir()
+                for stage in STAGES:
+                    for pass_name in ("main", "long") if stage != "stage3" else ("main",):
+                        sampling_spec(
+                            modules, args["upstream"], corpus, stage, pass_name, "25m", 11, ()
+                        )
+            hashes = {
+                name: hashlib.sha256(source).hexdigest()
+                for name, source in loaded_sources(args["upstream"]).items()
+            }
+        print(json.dumps(hashes, indent=2, sort_keys=True))
+        return 0
+    missing = [
+        "--" + name.replace("_", "-").replace("pass-name", "pass")
+        for name in ("corpus", "stage", "pass_name", "batches", "seed", "output")
+        if args[name] is None
+    ]
+    if missing:
+        parser.error("the following arguments are required: " + ", ".join(missing))
     output = args.pop("output").resolve()
     if output.is_relative_to(args["corpus"].resolve()):
         raise ValueError("output must be outside the read-only corpus")

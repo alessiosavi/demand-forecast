@@ -2,6 +2,7 @@
 
 import ast
 import csv
+import functools
 import hashlib
 import inspect
 import json
@@ -10,14 +11,17 @@ import os
 import subprocess
 import sys
 import textwrap
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
-import pyarrow as pa
-import pyarrow.parquet as pq
 import pytest
 
-from tests.test_gcp_jobs.conftest import upstream as upstream_fixture
+# Collected in the environment without the bench extra too: skip there instead of failing collection.
+pa = pytest.importorskip("pyarrow")
+pq = pytest.importorskip("pyarrow.parquet")
+
+from tests.test_gcp_jobs.conftest import upstream as upstream_fixture  # noqa: E402
 
 upstream = upstream_fixture
 
@@ -70,17 +74,15 @@ def test_real_only_counts_rejections_uniform_sources_and_determinism(corpus, ups
     assert report["effective_spec"]["base"] is None
     assert report["effective_spec"]["mix"] == {"real": 1.0}
     assert report["loss_weight"] == 0.025
-    from simons.training.covariates import stream, windows
-
-    for name, function in {
-        "covariates.windows.CovariateCorpus.train_sample": windows.CovariateCorpus.train_sample,
-        "covariates.stream.make_batch": stream.make_batch,
-        "covariates.windows.horizon_for": windows.horizon_for,
-    }.items():
-        assert (
-            report["sampler_source_sha256"][name]
-            == hashlib.sha256(inspect.getsource(function).encode()).hexdigest()
-        )
+    expected_hashes = {}
+    for module in tuple(sys.modules.values()):
+        if getattr(module, "__file__", None):
+            path = Path(module.__file__).resolve()
+            if path.is_relative_to(upstream / "src"):
+                expected_hashes[path.relative_to(upstream / "src").as_posix()] = hashlib.sha256(
+                    path.read_bytes()
+                ).hexdigest()
+    assert report["sampler_source_sha256"] == expected_hashes
     sources = report["per_source"]
     assert {k: v["rows_loaded"] for k, v in sources.items()} == dict(
         a=1, b=4, c=11, short=1, sparse=1
@@ -302,6 +304,141 @@ def test_cli_in_a_fresh_process(corpus, upstream, tmp_path):
     assert report["configured_mix"]["real"] == 0.12
 
 
+def test_print_source_hashes_needs_only_upstream(upstream):
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "scripts.corpus_v4.covariate_exposure",
+            "--upstream",
+            str(upstream),
+            "--print-source-hashes",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    hashes = json.loads(result.stdout)
+    assert "simons/training/spot_job.py" in hashes
+    assert "simons/training/config.py" in hashes
+    assert "simons/training/covariates/stream.py" in hashes
+    for name, digest in hashes.items():
+        assert hashlib.sha256((upstream / "src" / name).read_bytes()).hexdigest() == digest
+
+
+@pytest.mark.parametrize("module_name", ["spot_job", "config"])
+def test_dependency_file_drift_refused_before_counting(corpus, upstream, monkeypatch, module_name):
+    from scripts.corpus_v4 import covariate_exposure as exposure
+
+    with exposure.upstream_modules(upstream) as modules:
+        module = modules[0 if module_name == "spot_job" else 1]
+        path = Path(module.__file__)
+        original = path.read_bytes()
+
+        def no_counting():
+            pytest.fail("counting started before source verification")
+
+        monkeypatch.setattr(exposure, "_counter", no_counting)
+        try:
+            path.write_bytes(original + b"\n# unrecorded recipe/config change\n")
+            with pytest.raises(RuntimeError, match="unsupported.*" + module_name + r"\.py"):
+                run(corpus, upstream)
+        finally:
+            path.write_bytes(original)
+
+
+def test_unrecorded_module_loaded_during_corpus_build_refused(corpus, upstream, monkeypatch):
+    from scripts.corpus_v4 import covariate_exposure as exposure
+
+    with exposure.upstream_modules(upstream) as modules:
+        windows = modules[-1]
+        original_read = windows.pq.read_table
+        path = upstream / "src/exposure_unrecorded.py"
+
+        def read(*args, **kwargs):
+            monkeypatch.setitem(sys.modules, "exposure_unrecorded", SimpleNamespace(__file__=path))
+            return original_read(*args, **kwargs)
+
+        monkeypatch.setattr(windows.pq, "read_table", read)
+        path.write_text("# a newly loaded dependency\n")
+        try:
+            with pytest.raises(RuntimeError, match="unsupported.*exposure_unrecorded.py"):
+                run(corpus, upstream)
+        finally:
+            path.unlink()
+
+
+def test_recorded_dependency_loaded_elsewhere_refused(corpus, upstream, monkeypatch, tmp_path):
+    from scripts.corpus_v4 import covariate_exposure as exposure
+
+    with exposure.upstream_modules(upstream):
+        module = sys.modules["simons.training.schedule"]
+        monkeypatch.setattr(module, "__file__", str(tmp_path / "schedule.py"))
+        with pytest.raises(RuntimeError, match="unsupported.*schedule.py"):
+            run(corpus, upstream)
+
+
+@pytest.mark.parametrize("target", ["folded_guard", "batches_constructor"])
+def test_executed_code_with_pinned_source_lookup_refused(corpus, upstream, monkeypatch, target):
+    from scripts.corpus_v4 import covariate_exposure as exposure
+
+    with exposure.upstream_modules(upstream) as modules:
+        stream, windows = modules[-2:]
+        if target == "folded_guard":
+            module, owner, attribute = windows, windows.CovariateCorpus, "train_sample"
+            old = "if n < horizon + 64:\n                continue"
+            new = "if n < horizon + 64: continue\n"
+        else:
+            module, owner, attribute = stream, stream.Batches, "__init__"
+            old = "self.spec, self.seed, self.first_step = spec, seed, first_step"
+            new = old + '; self.spec = {**spec, "hist_weights": [1, 0, 0, 0, 0, 0]}'
+        original = getattr(owner, attribute)
+        source = Path(module.__file__).read_text()
+        changed = source.replace(old, new)
+        assert changed != source
+        namespace = {}
+        exec(compile(changed, module.__file__, "exec", dont_inherit=True), vars(module), namespace)
+        edited_owner = namespace[owner.__name__]
+        pinned_source = inspect.getsource(original)
+        monkeypatch.setattr(original, "__code__", getattr(edited_owner, attribute).__code__)
+        assert inspect.getsource(original) == pinned_source
+        with pytest.raises(RuntimeError, match="unsupported.*" + owner.__name__ + "." + attribute):
+            run(corpus, upstream)
+
+
+def test_wrapped_horizon_with_pinned_source_lookup_refused(corpus, upstream, monkeypatch):
+    from scripts.corpus_v4 import covariate_exposure as exposure
+
+    with exposure.upstream_modules(upstream) as modules:
+        windows = modules[-1]
+        original = windows.horizon_for
+
+        @functools.wraps(original)
+        def wrapped(*args, **kwargs):
+            return 2 * original(*args, **kwargs)
+
+        assert inspect.getsource(wrapped) == inspect.getsource(original)
+        monkeypatch.setattr(windows, "horizon_for", wrapped)
+        with pytest.raises(RuntimeError, match="unsupported.*horizon_for"):
+            run(corpus, upstream)
+
+
+@pytest.mark.parametrize("replacement", ["alias", "partial"])
+def test_horizon_function_binding_refused(corpus, upstream, monkeypatch, replacement):
+    from scripts.corpus_v4 import covariate_exposure as exposure
+
+    with exposure.upstream_modules(upstream) as modules:
+        windows = modules[-1]
+        substitute = (
+            windows.source_weights
+            if replacement == "alias"
+            else functools.partial(windows.horizon_for)
+        )
+        monkeypatch.setattr(windows, "horizon_for", substitute)
+        with pytest.raises(RuntimeError, match="unsupported.*horizon_for"):
+            run(corpus, upstream)
+
+
 def replace_source(monkeypatch, owner, attribute, source):
     """Give an in-memory upstream edit inspectable source, without changing its checkout."""
     original = getattr(owner, attribute)
@@ -352,6 +489,7 @@ def test_sampler_guard_drift_refused_before_counting(corpus, upstream, monkeypat
         (2, "config_module.weights"),
         (2, "network.future_steps"),
         (3, "long_spec"),
+        (3, "Batches.__init__"),
         (3, "Batches.__iter__"),
         (3, "CovariateStream.__init__"),
         (3, "make_batch"),

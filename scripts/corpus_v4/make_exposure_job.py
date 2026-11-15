@@ -73,7 +73,8 @@ def preflight(config, root):
     marker = root / "completed.json"
     if marker.exists():
         record = json.loads(marker.read_text())
-        if not isinstance(record, dict) or record.get("schema") != 1:
+        if (not isinstance(record, dict) or type(record.get("schema")) is not int
+                or record["schema"] != 1):
             raise ValueError("invalid exposure completion schema")
         expected_runs = {stage + "-" + leg + "-seed" + str(seed)
                          for seed in config["seeds"] for stage, leg in config["passes"]}
@@ -81,7 +82,8 @@ def preflight(config, root):
         if not isinstance(runs, dict) or set(runs) != expected_runs:
             raise ValueError("invalid exposure completion runs")
         for name, report in runs.items():
-            if not isinstance(report, dict) or report.get("exit_code") != 0:
+            if (not isinstance(report, dict) or type(report.get("exit_code")) is not int
+                    or report["exit_code"] != 0):
                 raise ValueError("unsuccessful exposure completion run: " + name)
             for metric in ("wall_seconds", "peak_rss_bytes"):
                 value = report.get(metric)

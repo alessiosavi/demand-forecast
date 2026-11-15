@@ -31,6 +31,7 @@ wall seconds. For local synthetic checks, the module
 `--upstream` checkout, `--stage`, `--size 25m`, `--pass`, `--batches`, `--seed` and
 `--output`; the corpus needs only `covariates/`. No training or release gate is
 written.
+Regenerate the supported source-file hash record after patch-series changes with `python -m scripts.corpus_v4.covariate_exposure --upstream <prepared-checkout> --print-source-hashes`.
 
 ## Two contamination rules
 
