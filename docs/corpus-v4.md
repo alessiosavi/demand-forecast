@@ -12,6 +12,26 @@ lineages. `configs/corpus-v4.yaml` retains each source's licence, frequency,
 structure, lineage, reason and uncertainty. Exact frequencies come from native
 rows, not the draft's coarse labels.
 
+## Real covariate exposure
+
+For real covariate exposure, generate a separate guest job with
+`python -m scripts.corpus_v4.make_exposure_job --name exposure --repo-sha <40-hex-sha> --upstream-pin <40-hex-pin> --corpus-uri gs://BUCKET/corpus-v4 --batches 100 --seed 11 --output exposure.sh`.
+The job downloads only `covariates/`, applies the training patches and measures
+stage3 main, stage4 main, and stage4-long main/long for each repeatable `--seed`;
+repeatable `--override key=value` accepts the training fork's three override keys.
+Results under `state/exposure/<name>/` include JSON/CSV counters for source draws,
+rejections, distinct rows/endpoints, feasible rows by history, horizons, channels
+and finite future covariates after upstream dropout. Every output is labelled
+`real-only statistical`: synthetic/sibling windows and the trainer's exact random
+stream are outside this audit. Compare the configured mixture and loss weight
+with the upstream-derived windows per batch and expected real windows per update.
+`completed.json` hashes the artifacts and records each run's peak RSS in bytes and
+wall seconds. For local synthetic checks, the module
+`scripts.corpus_v4.covariate_exposure` takes `--corpus`, an already patched
+`--upstream` checkout, `--stage`, `--size 25m`, `--pass`, `--batches`, `--seed` and
+`--output`; the corpus needs only `covariates/`. No training or release gate is
+written.
+
 ## Two contamination rules
 
 **Rule F:** any part of a benchmark dataset at the same frequency used in
