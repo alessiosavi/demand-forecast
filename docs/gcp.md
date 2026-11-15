@@ -6,6 +6,28 @@ call until `launch`; `init`, `price set`, `hold set` and `report` are local. The
 ledger does not discover prices or read your credits. A billing budget is an alert,
 not a spending limit. Review the training protocol separately before provisioning.
 
+For classical reference rows on shifted windows, generate an offline job with
+`python scripts/gcp/jobs/make_baseline_job.py --name shifted-sn --repo-sha <40-hex-SHA> --tasks-uri gs://<bucket>/tasks.yaml --tasks-sha256 <64-hex-SHA256> --output /tmp/baseline.sh`;
+optionally add `--names-uri` and `--names-sha256` for one selected task name per
+line, or `--model auto_ets|auto_theta|median3` (default `seasonal_naive`). The
+guest uses its Python 3.10 in an isolated CPU environment, pinning `fev==0.10.0`
+and `datasets==3.6.0` to the scoring job's yardstick versions, plus
+`statsforecast==2.0.1` and `torch==2.8.0+cpu`; other bench/base dependencies are
+resolved for that interpreter and recorded by `pip freeze`. It installs the
+`bench` extra without the full GPU yardstick requirements. Native fev task YAML
+needs no training role profiles. Each task runs independently through
+`run_baseline`; insufficient-history failures retain their reason while other
+tasks continue. State lives under `state/baseline/<name>/` and is published to
+`$STATE_URI/baseline/<name>/`: `summaries.csv`, `status.json`, `inputs.json`,
+`environment.txt`, the checked input files, selection, log, and a final
+`completed.json` containing artifact hashes. Matching completed state skips
+installation and scoring; partial state resumes saved rows, and changed inputs
+require a new name. Exit 0 permits only successful tasks and fev's specific
+insufficient-history error; other child/setup/publication failures exit nonzero
+without creating a completion marker. Damaged completed CSVs are refused until
+restored or rerun under a new name. Generation and local tests use no cloud
+resources; uploading or launching the generated job is a separate operator step.
+
 ## Prerequisites and scope
 
 Use Python 3.10+, Bash, and Google Cloud SDK (help checked against the installed
