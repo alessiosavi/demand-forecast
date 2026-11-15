@@ -67,9 +67,9 @@ def _summary_matches(row, expected):
     return _runner_summary_matches(row, defined)
 
 
-def _evaluation_configuration(configuration: dict) -> dict:
+def _evaluation_configuration(configuration: dict, *, mixed_models: bool = False) -> dict:
     """Remove member labels/checkpoints and derived hashes, keeping evaluation keys."""
-    return {
+    evaluation = {
         "configuration": {
             key: value
             for key, value in configuration.items()
@@ -81,15 +81,33 @@ def _evaluation_configuration(configuration: dict) -> dict:
             if key not in MEMBER_OPTION_KEYS
         },
     }
+    if mixed_models:
+        # Native reference outputs can join Simons raw. Inference implementation
+        # and batching differ by model; the scoring runtime must still match.
+        for key in ("model", "processing", "batch_size"):
+            evaluation["options"].pop(key, None)
+        for key in ("simons_source", "simons_implementation"):
+            evaluation["configuration"].pop(key, None)
+        evaluation["configuration"]["packages"] = {
+            key: value
+            for key, value in configuration["packages"].items()
+            if key not in {"simons", "timestral", "chronos-forecasting"}
+        }
+    return evaluation
 
 
-def evaluation_identity(record: dict) -> dict:
+def evaluation_identity(record: dict, *, mixed_models: bool = False) -> dict:
     """Task-specific evaluation keys; configurations are checked once per run."""
+    metadata = dict(record.get("input_metadata", {}))
+    if mixed_models:
+        # This is Simons-only reporting of unsupported covariates, not a change
+        # to task windows. Preserve any other metadata in the comparison.
+        metadata.pop("dropped_past_only_covariates", None)
     return {
         "task": record["task"],
         "dataset_fingerprint": record["dataset_fingerprint"],
         "levels": record["levels"],
-        "input_metadata": record.get("input_metadata", {}),
+        "input_metadata": metadata,
     }
 
 
@@ -140,6 +158,13 @@ def _read_configuration(directory: Path) -> dict:
 def _bind_members(members: list[Path]) -> list[dict]:
     """Reject mixed directories before creating output or scoring any task."""
     configurations = [_read_configuration(member) for member in members]
+    models = {configuration["options"]["model"] for configuration in configurations}
+    mixed_models = len(models) > 1
+    if mixed_models and (
+        not models <= {"simons", "timestral", "chronos2"}
+        or any(c["options"].get("processing", "raw") != "raw" for c in configurations)
+    ):
+        raise ValueError("mixed models require native reference outputs and Simons raw")
     for directory, configuration in zip(members, configurations, strict=True):
         for path in directory.rglob("run.json"):
             record = json.loads(path.read_text())
@@ -149,9 +174,16 @@ def _bind_members(members: list[Path]) -> list[dict]:
                 or record.get("configuration_identity") != configuration["configuration_identity"]
             ):
                 raise ValueError(f"{path}: task configuration differs from root manifest")
-    evaluation = _evaluation_configuration(configurations[0])
-    for directory, configuration in zip(members[1:], configurations[1:], strict=True):
-        if _evaluation_configuration(configuration) != evaluation:
+    evaluation = _evaluation_configuration(configurations[0], mixed_models=mixed_models)
+    model_evaluations = {}
+    for directory, configuration in zip(members, configurations, strict=True):
+        model = configuration["options"]["model"]
+        full_evaluation = _evaluation_configuration(configuration)
+        # Relaxation across models must never weaken checks within one model.
+        if (
+            full_evaluation != model_evaluations.setdefault(model, full_evaluation)
+            or _evaluation_configuration(configuration, mixed_models=mixed_models) != evaluation
+        ):
             raise ValueError(f"{directory}: evaluation identity differs")
     return configurations
 
@@ -311,7 +343,10 @@ def run_ensemble(
     revisions = [configuration["options"]["weights_revision"] for configuration in configurations]
     if not allow_identical_members and len(set(revisions)) != len(revisions):
         raise ValueError("identical weights digests; use --allow-identical-members to reproduce")
-    evaluation_configuration = _evaluation_configuration(configurations[0])
+    mixed_models = len({c["options"]["model"] for c in configurations}) > 1
+    evaluation_configuration = _evaluation_configuration(
+        configurations[0], mixed_models=mixed_models
+    )
     weights = [1 / len(members)] * len(members)
     options = {
         **configurations[0]["options"],
@@ -364,9 +399,15 @@ def run_ensemble(
                 _read_member(member, task, configuration)
                 for member, configuration in zip(members, configurations, strict=True)
             ]
-            task_evaluation = evaluation_identity(records[0])
-            for member, record in zip(members[1:], records[1:], strict=True):
-                if evaluation_identity(record) != task_evaluation:
+            task_evaluation = evaluation_identity(records[0], mixed_models=mixed_models)
+            model_task_evaluations = {}
+            for member, record in zip(members, records, strict=True):
+                model = record["configuration"]["options"]["model"]
+                full_evaluation = evaluation_identity(record)
+                if (
+                    full_evaluation != model_task_evaluations.setdefault(model, full_evaluation)
+                    or evaluation_identity(record, mixed_models=mixed_models) != task_evaluation
+                ):
                     raise ValueError(f"{name}: {member}: evaluation identity differs")
             evaluation = {**evaluation_configuration, **task_evaluation}
             sources = [

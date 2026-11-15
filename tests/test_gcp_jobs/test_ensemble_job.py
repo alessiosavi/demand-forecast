@@ -247,6 +247,30 @@ def test_legacy_covariates_all_accepted_and_only_identity_saved(members):
     assert (directories[0] / "raw/alpha/window_0.npz").exists()
 
 
+def test_simons_and_single_raw_reference_member(members):
+    guest, config, root, scratch, cloud = members
+    directory = cloud / "score/seed22"
+    inputs = load(directory / "inputs.json")
+    inputs.update(
+        model="timestral",
+        model_package="timestral @ git+https://example.invalid/repo@" + "b" * 40,
+        modes=["raw"],
+    )
+    write(directory / "inputs.json", inputs)
+    marker = load(directory / "completed.json")
+    marker["inputs"] = inputs
+    marker["modes"].pop("published")
+    write(directory / "completed.json", marker)
+    shutil.rmtree(directory / "published")
+    rehash(directory)
+    config["modes"] = ["raw"]
+    records, directories = guest["members"](config, root, scratch)
+    assert len(records) == 2
+    assert records[1]["inputs"]["model"] == "timestral"
+    assert all((p / "raw/alpha/window_0.npz").is_file() for p in directories)
+    assert not any((p / "published").exists() for p in directories)
+
+
 @pytest.mark.parametrize(
     "field",
     ["repo_sha", "upstream_pin", "tasks_sha256", "names_sha256", "max_context", "covariates"],

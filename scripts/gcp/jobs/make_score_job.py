@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate an offline, self-contained Simons fev scoring job for the GCP guest."""
+"""Generate an offline, self-contained fev scoring job for the GCP guest."""
 
 import argparse
 import base64
@@ -11,6 +11,11 @@ import shlex
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
+MODEL_PACKAGES = {
+    "timestral": "timestral @ git+https://github.com/mistralai/timestral.git@"
+    "a534bdbd244d64f3d9d743f46c7bf6fc330ed4ff",
+    "chronos2": "chronos-forecasting==2.2.2",
+}
 
 # This payload runs on the guest. Preflight uses only the system Python stdlib;
 # optional imports occur only after the pinned scoring environment is ready.
@@ -361,6 +366,46 @@ if __name__ == "__main__":
 """
 
 
+def _guest(model):
+    # Preserve the registered Simons payload byte-for-byte. References specialize
+    # only the inference package check and CLI; all state/evidence logic is shared.
+    if model == "simons":
+        return GUEST
+    replacements = [
+        (
+            "Simons package check",
+            """    upstream = json.loads(metadata.distribution("simons").read_text("direct_url.json"))
+    if upstream["vcs_info"]["commit_id"] != config["upstream_pin"]:
+        raise ValueError("installed Simons commit does not match upstream pin")""",
+            """    package = config["model_package"]
+    if config["model"] == "chronos2":
+        if metadata.version("chronos-forecasting") != package.split("==")[1]:
+            raise ValueError("installed Chronos package does not match pin")
+    else:
+        upstream = json.loads(metadata.distribution("timestral").read_text("direct_url.json"))
+        if upstream["vcs_info"]["commit_id"] != package.rsplit("@", 1)[1]:
+            raise ValueError("installed Timestral commit does not match pin")""",
+        ),
+        (
+            "Simons child command",
+            """"--model", "simons",
+                   "--checkpoint", str(checkpoint), "--processing", mode,""",
+            """"--model", config["model"],
+                   "--weights", config["hub_weights"], "--revision", config["hub_revision"],""",
+        ),
+    ]
+    for target, old, _ in replacements:
+        count = GUEST.count(old)
+        if count != 1:
+            raise RuntimeError(f"expected exactly one {target} target, found {count}")
+    guest = GUEST
+    for _, old, new in replacements:
+        guest = guest.replace(old, new)
+    if '"--model", "simons"' in guest:
+        raise RuntimeError("reference guest still contains Simons child arguments")
+    return guest
+
+
 def _sha(value, length, label):
     if not isinstance(value, str) or not re.fullmatch(rf"[0-9a-f]{{{length}}}", value):
         raise ValueError(f"{label} must be full {length}-character lowercase hex")
@@ -390,8 +435,20 @@ def generate(
     processing="both",
     max_context=None,
     covariates="all",
+    model="simons",
 ):
     """Validate inputs and return a shell job, without fetching code, data or cloud state."""
+    if model not in ("simons", "timestral", "chronos2"):
+        raise ValueError("model must be simons, timestral or chronos2")
+    if model != "simons":
+        if checkpoint_uri or not hub_weights or not hub_revision:
+            raise ValueError(
+                "reference models require Hub weights and revision; checkpoint URI is unsupported"
+            )
+        if processing != "both":
+            raise ValueError(
+                "reference models require the default processing; native output is stored as raw"
+            )
     _sha(repo_sha, 40, "repo SHA")
     _sha(upstream_pin, 40, "upstream pin")
     if upstream_pin != (ROOT / "third_party/simons/PINNED").read_text().strip():
@@ -425,7 +482,7 @@ def generate(
         raise ValueError("covariates must be all or none")
     if max_context is not None and (type(max_context) is not int or max_context < 1):
         raise ValueError("max-context must be a positive integer")
-    content = GUEST.encode()
+    content = _guest(model).encode()
     guest_sha = hashlib.sha256(content).hexdigest()
     payload = gzip.compress(content, mtime=0)
     config = dict(
@@ -444,10 +501,16 @@ def generate(
         covariates=covariates,
         guest_sha256=guest_sha,
     )
+    package = "simons @ git+https://github.com/Abel-ai-lab/Simons.git@" + upstream_pin
+    label = "Simons"
+    if model != "simons":
+        package = MODEL_PACKAGES[model]
+        config.update(model=model, model_package=package, modes=["raw"])
+        label = model
     encoded_config = base64.b64encode(json.dumps(config, sort_keys=True).encode()).decode()
     encoded_guest = base64.b64encode(payload).decode()
     return f'''#!/usr/bin/env bash
-# Simons scoring {name}; repository {repo_sha}; upstream {upstream_pin}
+# {label} scoring {name}; repository {repo_sha}; upstream {upstream_pin}
 set -euo pipefail
 umask 077
 : "${{RUN_DIR:?guest must export RUN_DIR}}"
@@ -510,7 +573,7 @@ git -C "$repo" checkout --detach FETCH_HEAD
 "$python" -m pip install --upgrade pip
 "$python" -m pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu128
 "$python" -m pip install -r "$repo/requirements-yardsticks.txt" --editable "$repo[bench]" \\
-    {shlex.quote("simons @ git+https://github.com/Abel-ai-lab/Simons.git@" + upstream_pin)}
+    {shlex.quote(package)}
 "$python" -m pip check
 guest "$python" environment
 guest "$python" score
@@ -520,6 +583,7 @@ guest "$python" score
 def main():
     """Write one executable job; generation never contacts an external service."""
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model", choices=["simons", "timestral", "chronos2"], default="simons")
     for key in ("name", "repo-sha", "upstream-pin", "tasks-uri", "tasks-sha256"):
         parser.add_argument("--" + key, required=True)
     source = parser.add_mutually_exclusive_group(required=True)
