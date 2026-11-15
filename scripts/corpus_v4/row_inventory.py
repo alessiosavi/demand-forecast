@@ -101,7 +101,11 @@ def target_evidence(scalar):
     if pa.types.is_null(values.type):
         observed = 0
     else:
-        observed = int(pc.sum(pc.is_finite(values)).as_py() or 0)
+        if pa.types.is_integer(values.type):
+            # Every stored integer is finite; do not depend on an is_finite kernel for integers.
+            observed = len(values) - values.null_count
+        else:
+            observed = int(pc.sum(pc.is_finite(values)).as_py() or 0)
         if values.null_count:
             # Canonicalize unspecified null-slot bytes without converting stored values.
             values = pc.fill_null(values, pa.scalar(0, type=values.type))

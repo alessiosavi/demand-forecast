@@ -60,10 +60,15 @@ patterns match substrings.
 Invalid regexes, unknown inventory fields and missing defaults are errors.
 The default may instead be `{action: keep, reason: 'reviewed default'}`.
 Manifest generation requires the companion `inventory.json` and validates the
-CSV header and every record against it. Rules must name the inventory's folder,
-and every row must belong to that folder. Short records, absent columns and
-null values are refused; empty strings in fields referenced by any rule also
-count as missing. The document may explicitly set `missing: exclude` to exclude
+CSV against it before anything is written: its SHA-256, its header and its row
+count must match, so a truncated, reordered or edited inventory is refused.
+Rules must name the inventory's folder, and every row must belong to that
+folder. Short records, absent columns and null values are refused. Empty or
+whitespace-only values count as missing in the identity fields (`folder`,
+`shard`, `row_index`, `source`, `item_id`, `freq`) of every row and in any
+field a rule refers to; other metadata may stay empty. The inventory itself
+records identity values as stored, so a whitespace-only identity is caught
+here, not when the inventory is built. The document may explicitly set `missing: exclude` to exclude
 incomplete records before matching, with rule `missing` and the missing fields
 in the reason. The default is `missing: refuse`; missing data can never imply keep.
 Invalid headers, surplus columns and folder mismatches are always refused.
