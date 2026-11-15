@@ -449,10 +449,13 @@ can be used without a condition.
 Only a receipt-free, condition-free stage2 parent can start a new provisional
 fork. An audited or legacy corpus-trained checkpoint cannot adopt provisional
 mode. Later legs, same-stage resumes, completed-job shortcuts and both export
-members must match the condition and provisional receipt exactly; dropping a
-flag or changing either recorded status value fails. Manifests, checkpoint
-identities, completion records and export member records are checked before
-recovery writes. An incompatible export is
+members must match the condition and provisional receipt exactly, with the same
+keys and the same types and values (so `false` differs from `0`, `true` from `1`,
+and `-1` from `-1.0`); dropping a flag or changing either recorded status value
+fails. Manifests, checkpoint identities, completion records and export member
+records are checked before
+recovery writes, including comparison with the freshly read receipt when only
+a completion marker remains. An incompatible export is
 refused, preserving its files. The existing legacy-to-audited resume migration
 and legacy-plus-audited export exception remain available without a condition
 or provisional receipt.
