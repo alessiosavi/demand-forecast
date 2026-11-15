@@ -20,6 +20,7 @@ GUEST = r"""
 import csv
 import hashlib
 import json
+import math
 import os
 import pathlib
 import re
@@ -89,25 +90,91 @@ def state_root(config):
 
 def artifact_names(config):
     names = {"inputs.json", "environment.txt", "tasks.yaml", "selected.json",
-             "summaries.csv", "status.json", "baseline.log"}
+             "summaries.csv", "progress.json", "status.json", "baseline.log"}
     if config["names_uri"]:
         names.add("names.txt")
     return names
 
 
-def evidence(config, root, names):
+def summary_rows(config, root, names):
     with (root / "summaries.csv").open(newline="") as stream:
         reader = csv.DictReader(stream)
         if not {"task", "model_name"} <= set(reader.fieldnames or []):
             raise ValueError("invalid baseline summary columns")
-        completed = set()
+        rows = {}
         for row in reader:
             name = row.get("task")
-            if (name not in names or name in completed or row.get("model_name") != config["model"]
-                    or None in row or any(value is None for value in row.values())):
+            if (name not in names or name in rows or row.get("model_name") != config["model"]
+                    or None in row or any(v is None for k, v in row.items() if k != "test_error")):
                 raise ValueError("invalid or duplicate baseline summary: " + str(name))
-            completed.add(name)
-    return [name for name in names if name in completed]
+            rows[name] = row
+        return reader.fieldnames, rows
+
+
+def validate_score(row):
+    try:
+        if math.isfinite(float(row.get("test_error"))):
+            return
+    except (ValueError, TypeError):
+        pass
+    raise ValueError("non-finite baseline score")
+
+
+def row_digest(row):
+    return hashlib.sha256(json.dumps(row, sort_keys=True).encode()).hexdigest()
+
+
+def progress(root):
+    try:
+        value = read(root / "progress.json")
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_rows(root, columns, rows):
+    with tempfile.NamedTemporaryFile(mode="w", newline="", dir=root, suffix=".tmp", delete=False) as stream:
+        writer = csv.DictWriter(stream, fieldnames=columns)
+        writer.writeheader()
+        writer.writerows(rows.values())
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(stream.name, root / "summaries.csv")
+
+
+def checkpoint(config, root, names):
+    _, rows = summary_rows(config, root, names)
+    for row in rows.values():
+        validate_score(row)
+    atomic(root / "progress.json", {name: row_digest(row) for name, row in rows.items()})
+
+
+def resume(config, root, names):
+    if not (root / "summaries.csv").exists():
+        return
+    columns, rows = summary_rows(config, root, names)
+    recorded, verified = progress(root), {}
+    for name, row in rows.items():
+        try:
+            validate_score(row)
+        except ValueError:
+            continue
+        if recorded.get(name) == row_digest(row):
+            verified[name] = row
+    if verified != rows:
+        save_rows(root, columns, verified)
+    atomic(root / "progress.json", {name: row_digest(row) for name, row in verified.items()})
+
+
+def evidence(config, root, names):
+    _, rows = summary_rows(config, root, names)
+    recorded = progress(root)
+    for row in rows.values():
+        validate_score(row)
+    if (set(recorded) != set(rows)
+            or any(recorded.get(name) != row_digest(row) for name, row in rows.items())):
+        raise ValueError("baseline summary progress sha256 mismatch")
+    return [name for name in names if name in rows]
 
 
 def complete(config, root, marker):
@@ -254,12 +321,17 @@ def selected(config, root):
 
 
 def task(config, root, scratch, index):
-    spec = selected(config, root)[index]
+    specs = selected(config, root)
+    spec = specs[index]
     result = {"name": spec.name}
     code = 0
     try:
         from demand_forecast.bench.run import run_baseline
         run_baseline([spec], root, model=config["model"])
+        _, rows = summary_rows(config, root, [s.name for s in specs])
+        if spec.name not in rows:
+            raise ValueError("baseline child produced no summary")
+        validate_score(rows[spec.name])
         result["completed"] = True
     except Exception as error:
         expected = isinstance(error, ValueError) and str(error) == HISTORY_ERROR
@@ -276,8 +348,10 @@ def run(config, root, scratch, repo, python, destination):
     specs = selected(config, root)
     names = [spec.name for spec in specs]
     atomic(root / "selected.json", names)
+    resume(config, root, names)
     # Even an all-short batch gets the runner's own empty summaries.csv schema.
     run_baseline([], root, model=config["model"])
+    checkpoint(config, root, names)
     failed, kinds, unsuccessful = {}, {}, set()
     started = time.monotonic()
 
@@ -310,9 +384,17 @@ def run(config, root, scratch, repo, python, destination):
             kinds[name] = "insufficient_history" if expected else "error"
             if not expected:
                 unsuccessful.add(name)
-        elif name not in evidence(config, root, names):
+        elif name not in summary_rows(config, root, names)[1]:
             failed[name], kinds[name] = "baseline child produced no summary", "error"
             unsuccessful.add(name)
+        if name in failed:
+            columns, rows = summary_rows(config, root, names)
+            if name in rows:
+                del rows[name]
+                save_rows(root, columns, rows)
+        # The runner may rewrite existing CSV rows (or add metric columns), so
+        # checkpoint its output only after validating the child and removing failures.
+        checkpoint(config, root, names)
         report()
     status = report()
     artifacts = {name: digest(root / name) for name in sorted(artifact_names(config))}

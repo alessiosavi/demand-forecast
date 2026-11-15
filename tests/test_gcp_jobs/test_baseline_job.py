@@ -130,7 +130,7 @@ def machine(jobs, tmp_path):
             rows = list(csv.DictReader(path.open())) if path.exists() else []
             def save():
                 with path.open('w') as stream:
-                    writer = csv.DictWriter(stream, fieldnames=['task', 'model_name', 'MASE', 'quantile_levels'])
+                    writer = csv.DictWriter(stream, fieldnames=['task', 'model_name', 'test_error', 'MASE', 'quantile_levels'])
                     writer.writeheader()
                     writer.writerows(rows)
             for spec in specs:
@@ -141,7 +141,8 @@ def machine(jobs, tmp_path):
                     raise ValueError({HISTORY_ERROR!r})
                 if task.task_name == os.environ.get('FAIL_TASK'):
                     raise RuntimeError('inference broke\\nsecond line')
-                rows.append({{'task': spec.name, 'model_name': model, 'MASE': 0.75, 'quantile_levels': '[0.1, 0.5, 0.9]'}})
+                score = os.environ.get('BASELINE_SCORE', '0.75') if spec.name == os.environ.get('SCORE_TASK') else '0.75'
+                rows.append({{'task': spec.name, 'model_name': model, 'test_error': score, 'MASE': 0.75, 'quantile_levels': '[0.1, 0.5, 0.9]'}})
                 save()
                 if spec.name == os.environ.get('CRASH_AFTER_ROW'):
                     os._exit(19)
@@ -428,7 +429,9 @@ def test_all_short_tasks_still_publish_runner_csv(machine):
     status = json.loads((state / "status.json").read_text())
     assert status["completed"] == []
     assert status["failed"] == {"alpha": HISTORY_ERROR, "beta/new": HISTORY_ERROR}
-    assert (state / "summaries.csv").read_text() == "task,model_name,MASE,quantile_levels\n"
+    assert (
+        state / "summaries.csv"
+    ).read_text() == "task,model_name,test_error,MASE,quantile_levels\n"
     assert run().returncode == 0  # Matching completion includes accepted history failures.
 
 
@@ -469,6 +472,113 @@ def test_corrupt_completed_summaries_are_never_accepted_as_resume_rows(machine):
         result = run()
         assert result.returncode != 0 and "summaries sha256 mismatch" in result.stderr
     assert not any(e[0] in ("git", "gcloud", "task") for e in events()[before:])
+
+
+@pytest.mark.parametrize("score", ["nan", "inf", "-inf", ""])
+def test_unusable_task_score_fails_and_publishes_other_results(machine, score):
+    run, state, events, cloud = machine
+    result = run(SCORE_TASK="alpha", BASELINE_SCORE=score)
+    assert result.returncode != 0
+    status = json.loads((state / "status.json").read_text())
+    assert status["completed"] == ["beta/new"]
+    assert status["failed"] == {"alpha": "non-finite baseline score"}
+    assert status["failure_kinds"] == {"alpha": "error"}
+    rows = list(csv.DictReader((state / "summaries.csv").open()))
+    assert [row["task"] for row in rows] == ["beta/new"]
+    assert not (state / "completed.json").exists()
+    destination = cloud / "state/baseline/probe_1"
+    assert not (destination / "completed.json").exists()
+    for name in ("summaries.csv", "status.json", "inputs.json", "environment.txt", "progress.json"):
+        assert (destination / name).read_bytes() == (state / name).read_bytes()
+    assert set(json.loads((state / "progress.json").read_text())) == {"beta/new"}
+    before = len(events())
+    assert run().returncode == 0
+    assert not any(e[:2] == ["task", "beta/new"] for e in events()[before:])
+
+
+def rewrite_score(state, name, score, *, attest=False):
+    """Alter persisted evidence, optionally forging matching integrity hashes."""
+    path = state / "summaries.csv"
+    with path.open(newline="") as stream:
+        reader = csv.DictReader(stream)
+        columns, rows = reader.fieldnames, list(reader)
+    row = next(row for row in rows if row["task"] == name)
+    if score is None:
+        columns.remove("test_error")
+        for item in rows:
+            item.pop("test_error")
+    else:
+        row["test_error"] = score
+    with path.open("w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=columns)
+        writer.writeheader()
+        writer.writerows(rows)
+    if attest:
+        (state / "progress.json").write_text(
+            json.dumps(
+                {
+                    item["task"]: hashlib.sha256(
+                        json.dumps(item, sort_keys=True).encode()
+                    ).hexdigest()
+                    for item in rows
+                }
+            )
+        )
+
+
+@pytest.mark.parametrize("score", ["nan", "inf", "", None])
+def test_unusable_resumed_score_is_recomputed_before_it_can_complete(machine, score):
+    run, state, events, _ = machine
+    assert run(FAIL_TASK="alpha").returncode != 0
+    rewrite_score(state, "beta/new", score, attest=True)
+    before = len(events())
+    result = run(SCORE_TASK="beta/new", BASELINE_SCORE="nan")
+    assert result.returncode != 0
+    assert any(e[:2] == ["task", "beta/new"] for e in events()[before:])
+    status = json.loads((state / "status.json").read_text())
+    assert status["completed"] == ["alpha"]
+    assert status["failed"] == {"beta/new": "non-finite baseline score"}
+    assert not (state / "completed.json").exists()
+    assert [row["task"] for row in csv.DictReader((state / "summaries.csv").open())] == ["alpha"]
+
+
+@pytest.mark.parametrize("corruption", ["score", "extra", "missing_progress", "invalid_progress"])
+def test_partial_resume_only_skips_rows_with_matching_progress(machine, corruption):
+    run, state, events, _ = machine
+    assert run(FAIL_TASK="alpha").returncode != 0
+    assert not (state / "completed.json").exists()
+    if corruption == "score":
+        rewrite_score(state, "beta/new", "999")
+    elif corruption == "extra":
+        path = state / "summaries.csv"
+        with path.open() as stream:
+            row = next(csv.DictReader(stream))
+        row["task"] = "alpha"
+        with path.open("a", newline="") as stream:
+            csv.DictWriter(stream, fieldnames=list(row)).writerow(row)
+    elif corruption == "missing_progress":
+        (state / "progress.json").unlink(missing_ok=True)
+    else:
+        (state / "progress.json").write_text("[]")
+    before = len(events())
+    result = run()
+    assert result.returncode == 0, result.stderr
+    recomputed = {e[1] for e in events()[before:] if e[0] == "task"}
+    assert recomputed == ({"alpha"} if corruption == "extra" else {"alpha", "beta/new"})
+    rows = list(csv.DictReader((state / "summaries.csv").open()))
+    assert {row["task"] for row in rows} == {"alpha", "beta/new"}
+    assert all(float(row["test_error"]) == 0.75 for row in rows)
+
+
+@pytest.mark.parametrize("score", ["nan", "inf", "", None])
+def test_completion_rejects_unusable_scores_even_with_matching_hashes(machine, guest, score):
+    run, state, _, _ = machine
+    assert run().returncode == 0
+    rewrite_score(state, "alpha", score, attest=True)
+    marker = json.loads((state / "completed.json").read_text())
+    for name in marker["artifacts"]:
+        marker["artifacts"][name] = hashlib.sha256((state / name).read_bytes()).hexdigest()
+    assert not guest["complete"](marker["inputs"], state, marker)
 
 
 @pytest.fixture
@@ -521,6 +631,7 @@ def test_real_runner_uses_native_tasks_without_profiles_and_keeps_csv(guest, tmp
     pytest.importorskip("fev")
     pytest.importorskip("statsforecast")
     from demand_forecast.bench.run import run_baseline
+    from demand_forecast.bench.yardsticks.runner import load_tasks
     from tests.helpers.fev_fixture import write_fev_fixture
 
     parquet = write_fev_fixture(tmp_path / "fixture")
@@ -530,6 +641,24 @@ def test_real_runner_uses_native_tasks_without_profiles_and_keeps_csv(guest, tmp
         "  seasonality: 2\n  eval_metric: SQL\n  quantile_levels: [0.1, 0.5, 0.9]\n"
     )
     specs = guest["selected"]({"names_uri": None}, tmp_path)
+    baseline_task = specs[0].to_task()
+    scoring_task = load_tasks(tmp_path / "tasks.yaml")[0]
+    baseline_windows = list(baseline_task.iter_windows())
+    scoring_windows = list(scoring_task.iter_windows())
+    assert [w.cutoff for w in baseline_windows] == [w.cutoff for w in scoring_windows] == [-12, -8]
+    assert baseline_task.quantile_levels == scoring_task.quantile_levels == [0.1, 0.5, 0.9]
+    assert baseline_task.eval_metric == scoring_task.eval_metric == "SQL"
+    assert baseline_task.seasonality == scoring_task.seasonality == 2
+    for baseline_window, scoring_window in zip(baseline_windows, scoring_windows):
+        assert baseline_window.horizon == scoring_window.horizon == 4
+        for baseline_data, scoring_data in zip(
+            baseline_window.get_input_data(), scoring_window.get_input_data()
+        ):
+            assert baseline_data.to_dict() == scoring_data.to_dict()
+        assert (
+            baseline_window.get_ground_truth().to_dict()
+            == scoring_window.get_ground_truth().to_dict()
+        )
     run_baseline(specs, tmp_path / "out")
     saved = (tmp_path / "out/summaries.csv").read_bytes()
     run_baseline(specs, tmp_path / "out")
