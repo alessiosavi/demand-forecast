@@ -1,0 +1,48 @@
+version: '4.1'
+standard: F-row
+parent:
+  manifest: configs/corpus-v4.yaml
+  manifest_sha256: 33e0b994bd878221639314fdf0013a11a12347a32b1582f18acbfa3c284040bd
+  repo_id: abel-lab/Simons-Pretrain
+  revision: 5f17ab8cfa3fa00a8e821599b631127ba250c342
+releases:
+- folder: covariates/eia930_ba_load_weather
+  source_folder: quarantine/covariates/eia930_ba_load_weather
+  rules: configs/corpus-v4.1/rules-eia930_ba_load_weather.yaml
+  rules_sha256: 037184bf268ce895a0b5082121a8c0538acf2fe0eeea839294efa0c0aecd4619
+  row_manifest: configs/corpus-v4.1/row-manifest-eia930_ba_load_weather.csv
+  row_manifest_sha256: d89f58357a5fcddd3383a02ce15cd98cc495d50faf05db3a04adef485fd57cf8
+  inventory_sha256: 22aa902bb9ac664608ed74f5b4b53cc6cba8390c75911a84aabebf13180c9dfd
+  rows: 160
+  kept: 156
+  excluded: 4
+  parent_shards:
+  - path: train-00000.parquet
+    size: 51056139
+    sha256: 30a991885ae9131569574a08afe16617550f10b9687c98760ac687973e5fe298
+  entry:
+    reason: released after row filtering under standard F-row (Amendment 5); docs/corpus-v4.md, Derived
+      corpus v4.1
+    uncertain: true
+    uncertainty: rule L not claimed; rows carry no absolute timestamps; GEFCom2012 utility unnamed; content
+      check is a triage
+- folder: covariates/eia930_subregion_load_weather
+  source_folder: quarantine/covariates/eia930_subregion_load_weather
+  rules: configs/corpus-v4.1/rules-eia930_subregion_load_weather.yaml
+  rules_sha256: 7cf607dae82da7159a298abe03ddb8e7fe0448162a221bb483655f5f71901cfa
+  row_manifest: configs/corpus-v4.1/row-manifest-eia930_subregion_load_weather.csv
+  row_manifest_sha256: 4981c27bd11f720f3dcaee6094dfa4707ea57eaf2ec3363f7de9be73ad3f976a
+  inventory_sha256: 4478b5b7cc19b25afa0463c7c393eaa0e98653165e64aa47d52b502f7a35722d
+  rows: 197
+  kept: 129
+  excluded: 68
+  parent_shards:
+  - path: train-00000.parquet
+    size: 62104956
+    sha256: a7850fad84aba8e3af2470c09b7960aabd4ac18996e350bc01c55e87028d23bf
+  entry:
+    reason: released after row filtering under standard F-row (Amendment 5); docs/corpus-v4.md, Derived
+      corpus v4.1
+    uncertain: true
+    uncertainty: rule L not claimed; rows carry no absolute timestamps; GEFCom2012 utility unnamed; content
+      check is a triage

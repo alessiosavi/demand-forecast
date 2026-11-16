@@ -1,0 +1,20 @@
+# Row rules for quarantine/covariates/eia930_subregion_load_weather (Amendment 5, standard F-row; plan 2026-11-15 16:09Z).
+# First matching rule decides. Evidence and reasons: corpus/gate-eia930/RELATIONSHIP-MAP.md.
+folder: quarantine/covariates/eia930_subregion_load_weather
+missing: refuse
+default:
+  action: keep
+  reason: "US balancing-authority demand outside every benchmark load entity, piece starting 2019 or later (no benchmark load series of an unidentified US utility reaches past 2008-06-30)"
+rules:
+  - match: {item_id: '^PJM[|-]'}
+    action: exclude
+    reason: "PJM is the entity of benchmark task epf_pjm (price target, system and COMED zonal load forecasts as covariates, 2013-01-01 to 2018-12-24); no period overlap, excluded as the same entity as a benchmark covariate"
+  - match: {item_id: '^(ERCO|ISNE)[|-]'}
+    action: exclude
+    reason: "guard: ERCOT is the entity of benchmark ercot_* (2004-01-01 to 2021-09-01) and ISO New England of proenfo_gfc17 (zones, 2016-2017); no such row exists in the inventory of 2026-11-15"
+  - match: {item_id: '[|](19[0-9][0-9]|200[0-9]|201[0-8])-'}
+    action: exclude
+    reason: "guard: a piece starting before 2019 could overlap the period of a benchmark load series; no such row exists in the inventory of 2026-11-15"
+  - match: {freq: '^(?!h$)'}
+    action: exclude
+    reason: "guard: only hourly rows were examined against the benchmark relationships"
