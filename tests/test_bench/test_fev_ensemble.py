@@ -875,3 +875,246 @@ def test_nan_member_metrics_are_scored_and_ensemble_resume_is_noop(
     resumed = ensemble(tasks, members, out)
     assert not resumed.attrs["failed_tasks"]
     assert snapshot(out) == before
+
+
+def test_weighted_ensemble_arrays_scores_sorting_and_resume(scenario, make_member, tmp_path):
+    tasks, _, _ = scenario
+    members = [make_member(0), make_member(1, 2), make_member(2, 6)]
+    expected = make_member(3, 3.5)
+    out = tmp_path / "weighted"
+    frame = ensemble(tasks, members[::-1], out, member_weights=[".5", ".25", ".25"])
+    reference = pd.read_csv(expected / "summaries.csv", float_precision="round_trip")
+    np.testing.assert_allclose(frame.test_error, reference.test_error, rtol=0, atol=1e-14)
+    assert json.loads(frame.weights.iloc[0]) == list(map(str, members))
+    manifest = json.loads((out / "yardstick.json").read_text())
+    record = json.loads((out / tasks[0].task_name / "run.json").read_text())
+    for evidence in [manifest, record, record["configuration"]]:
+        assert evidence["weight_spec"] == {"explicit": True, "values": ["1/4", "1/4", "1/2"]}
+        assert evidence["weights"] == [0.25, 0.25, 0.5]
+    for index in range(tasks[0].num_windows):
+        filename = tasks[0].task_name + f"/window_{index}.npz"
+        with (
+            np.load(out / filename) as actual,
+            np.load(members[0] / filename) as first,
+            np.load(members[1] / filename) as second,
+            np.load(members[2] / filename) as third,
+        ):
+            np.testing.assert_array_equal(
+                actual["arrays"],
+                0.25 * first["arrays"] + 0.25 * second["arrays"] + 0.5 * third["arrays"],
+            )
+    before = snapshot(out)
+    ensemble(tasks, members, out, member_weights=["25e-2", "0.250", "5e-1"])
+    assert snapshot(out) == before
+    with pytest.raises(ValueError, match="identity|members"):
+        ensemble(tasks, members, out, member_weights=[".5", ".25", ".25"])
+    assert snapshot(out) == before
+
+
+@pytest.mark.parametrize(
+    "weights,match",
+    [
+        ([], "count"),
+        (["1"], "count"),
+        ([".5", ".5", ".5"], "count"),
+        (["0", "1"], "positive"),
+        (["-.5", "1.5"], "positive"),
+        (["nan", "1"], "decimal|finite"),
+        (["inf", "1"], "decimal|finite"),
+        (["-inf", "1"], "decimal|finite"),
+        (["1/2", ".5"], "decimal"),
+        ([0.5, 0.5], "text|decimal"),
+        (["", "1"], "decimal"),
+        ([".4", ".5"], "sum"),
+        ([".5", "0.50000000000000000000000000001"], "sum"),
+        (["1_0e-2", ".9"], "decimal"),
+    ],
+)
+def test_invalid_explicit_weights_refused_before_output(scenario, tmp_path, weights, match):
+    tasks, _, _ = scenario
+    out = tmp_path / "invalid"
+    with pytest.raises(ValueError, match=match):
+        ensemble(
+            tasks, [tmp_path / "missing-a", tmp_path / "missing-b"], out, member_weights=weights
+        )
+    assert not out.exists()
+
+
+def test_explicit_weights_refuse_self_parity(scenario, tmp_path):
+    tasks, _, _ = scenario
+    out = tmp_path / "invalid"
+    with pytest.raises(ValueError, match="allow-identical-members"):
+        ensemble(
+            tasks,
+            [tmp_path / "a", tmp_path / "a"],
+            out,
+            member_weights=[".5", ".5"],
+            allow_identical_members=True,
+        )
+    assert not out.exists()
+
+
+def test_equal_explicit_weights_have_new_identity_and_equivalent_spelling(
+    scenario, make_member, tmp_path
+):
+    tasks, _, _ = scenario
+    members = [make_member(0), make_member(1)]
+    identities = []
+    for index, weights in enumerate(
+        [
+            None,
+            [".5", "0.50"],
+            ["5e-1", ".5"],
+            [".25", ".75"],
+            [".50000000000000000000000000001", ".49999999999999999999999999999"],
+        ]
+    ):
+        out = tmp_path / f"out-{index}"
+        ensemble(tasks, members, out, member_weights=weights)
+        identities.append(
+            json.loads((out / "yardstick.json").read_text())["configuration_identity"]
+        )
+    assert identities[0] != identities[1] == identities[2] != identities[3]
+    assert identities[4] not in identities[:4]
+
+
+def test_cli_member_weights(scenario, make_member, tmp_path):
+    from scripts.fev_ensemble import main
+
+    tasks, _, _ = scenario
+    members = [make_member(0), make_member(1, 4)]
+    task_file = tmp_path / "weighted.yaml"
+    task_file.write_text(yaml.safe_dump({"tasks": [task.to_dict() for task in tasks]}))
+    out = tmp_path / "cli-weighted"
+    assert (
+        main(
+            [
+                "--members",
+                *map(str, members),
+                "--tasks",
+                str(task_file),
+                "--model-name",
+                "weighted",
+                "--out-dir",
+                str(out),
+                "--member-weight",
+                ".25",
+                "--member-weight",
+                ".75",
+            ]
+        )
+        == 0
+    )
+    assert json.loads((out / "yardstick.json").read_text())["weight_spec"]["values"] == [
+        "1/4",
+        "3/4",
+    ]
+
+
+def test_unweighted_three_member_legacy_golden(scenario, make_member, tmp_path, monkeypatch):
+    from demand_forecast.bench.yardsticks import ensemble as implementation
+
+    tasks, _, _ = scenario
+    members = [make_member(index, 3 * index) for index in range(3)]
+    # Fix only output identities and elapsed time so the complete npz hash is
+    # independent of machine paths/timing. Member identity validation stays real.
+    original_digest, original_read = implementation.digest, implementation.read_window
+
+    def fixed_digest(value):
+        if "ensemble_version" in value:
+            return "a" * 64
+        if value.get("configuration_identity") == "a" * 64:
+            return "b" * 64
+        return original_digest(value)
+
+    def fixed_read(*args):
+        array, _ = original_read(*args)
+        return array, 0.125
+
+    monkeypatch.setattr(implementation, "digest", fixed_digest)
+    monkeypatch.setattr(implementation, "read_window", fixed_read)
+    out = tmp_path / "legacy"
+    frame = ensemble(tasks, members, out)
+    manifest = json.loads((out / "yardstick.json").read_text())
+    record = json.loads((out / tasks[0].task_name / "run.json").read_text())
+    assert set(manifest) == {
+        "ensemble_version",
+        "members",
+        "member_configurations",
+        "weights",
+        "model_name",
+        "configuration_identity",
+    }
+    assert set(record) == {
+        "configuration_identity",
+        "task",
+        "dataset_fingerprint",
+        "configuration",
+        "run_identity",
+        "summary",
+        "levels",
+        "members",
+        "weights",
+        "window_sha256",
+    }
+    assert record["window_sha256"] == {
+        "window_0.npz": "d76c6d3cc563eaa1940d3d2ef7685b6fdbac49f39f6ac0d5497cf70d9329967a",
+        "window_1.npz": "95196846f15cfb0ab7678a5854475ecd867c9015cc1f24271769cfcf45669e7a",
+    }
+    np.testing.assert_allclose(
+        frame[["SQL", "test_error", "MASE", "WQL", "WAPE"]].iloc[0],
+        [
+            1.2479836254889949,
+            1.2479836254889949,
+            1.2601443770112901,
+            0.7438568605462242,
+            0.7509265063531362,
+        ],
+        rtol=0,
+        atol=1e-14,
+    )
+    before = snapshot(out)
+    ensemble(tasks, members[::-1], out)
+    assert snapshot(out) == before
+
+
+def test_weighted_float32_members_accumulate_in_float64(scenario, make_member, tmp_path):
+    tasks, _, _ = scenario
+    members = [make_member(0), make_member(1)]
+    for member, value in zip(members, [16777216.0, 1.0], strict=True):
+        for index in range(tasks[0].num_windows):
+            with np.load(member / tasks[0].task_name / f"window_{index}.npz") as source:
+                array = np.full(source["arrays"].shape, value, dtype=np.float32)
+            rewrite_window(member, tasks[0], index=index, arrays=array)
+    out = tmp_path / "float64-mean"
+    ensemble(tasks, members, out, member_weights=[".5", ".5"])
+    with np.load(out / tasks[0].task_name / "window_0.npz") as saved:
+        assert saved["arrays"].dtype == np.float64
+        np.testing.assert_array_equal(saved["arrays"], 8388608.5)
+
+
+def test_weighted_inference_time_overflow_is_refused(scenario, make_member, tmp_path):
+    tasks, _, _ = scenario
+    members = [make_member(0), make_member(1)]
+    for member in members:
+        for index in range(tasks[0].num_windows):
+            rewrite_window(member, tasks[0], index=index, inference_time_s=np.finfo(np.float64).max)
+    out = tmp_path / "timing-overflow"
+    with pytest.raises(ValueError, match="non-finite ensemble or timing"):
+        ensemble(tasks, members, out, member_weights=[".25", ".75"])
+    assert not (out / tasks[0].task_name / "run.json").exists()
+
+
+def test_weighted_forecast_overflow_is_refused(scenario, make_member, tmp_path):
+    tasks, _, _ = scenario
+    members = [make_member(index) for index in range(3)]
+    for member in members:
+        for index in range(tasks[0].num_windows):
+            with np.load(member / tasks[0].task_name / f"window_{index}.npz") as source:
+                array = np.full(source["arrays"].shape, np.finfo(np.float64).max)
+            rewrite_window(member, tasks[0], index=index, arrays=array, inference_time_s=0.125)
+    out = tmp_path / "forecast-overflow"
+    with np.errstate(over="ignore"):
+        with pytest.raises(ValueError, match="non-finite ensemble or timing"):
+            ensemble(tasks, members, out, member_weights=[".02", ".81", ".17"])
+    assert not (out / tasks[0].task_name / "run.json").exists()

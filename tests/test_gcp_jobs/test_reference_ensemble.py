@@ -1,4 +1,4 @@
-"""Mix native reference forecasts and Simons raw forecasts on local fev windows."""
+"""Mix native references with consistently processed Simons saved forecasts."""
 
 import json
 
@@ -37,6 +37,17 @@ def test_mixed_raw_reference_mean(scenario, make_member, tmp_path, model, batch_
     assert frame.test_error.iloc[0] == scores.test_error.iloc[0]
     record = json.loads((out / tasks[0].task_name / "run.json").read_text())
     assert record["weights"] == [0.5, 0.5]
+    manifest = json.loads((out / "yardstick.json").read_text())
+    assert set(manifest) == {
+        "ensemble_version",
+        "members",
+        "member_configurations",
+        "weights",
+        "model_name",
+        "configuration_identity",
+    }
+    assert "member_processing" not in record and "member_input_metadata" not in record
+    assert "weight_spec" not in record
     for index in range(tasks[0].num_windows):
         filename = tasks[0].task_name + f"/window_{index}.npz"
         with np.load(out / filename) as actual, np.load(simons / filename) as source:
@@ -46,7 +57,7 @@ def test_mixed_raw_reference_mean(scenario, make_member, tmp_path, model, batch_
     assert {p: p.read_bytes() for p in out.rglob("*") if p.is_file()} == before
 
 
-@pytest.mark.parametrize("change", ["published", "covariates", "context", "fev", "datasets"])
+@pytest.mark.parametrize("change", ["covariates", "context", "fev", "datasets"])
 def test_mixed_members_keep_evaluation_guards(scenario, make_member, tmp_path, monkeypatch, change):
     tasks, _, _ = scenario
     simons = make_member(
@@ -72,15 +83,16 @@ def test_mixed_members_keep_evaluation_guards(scenario, make_member, tmp_path, m
 
 
 @pytest.mark.parametrize("model", ["timestral", "chronos2"])
+@pytest.mark.parametrize("processing", ["raw", "published"])
 @pytest.mark.parametrize(
     "change", ["simons_source", "simons_implementation", "simons", "batch_size"]
 )
 def test_mixed_members_reject_different_simons_configurations(
-    scenario, make_member, tmp_path, monkeypatch, model, change
+    scenario, make_member, tmp_path, monkeypatch, model, change, processing
 ):
     tasks, _, _ = scenario
     reference = make_member(0, model=model)
-    first = make_member(1, model="simons", processing="raw")
+    first = make_member(1, model="simons", processing=processing)
     original = runner.runtime_identity
 
     def runtime(options):
@@ -95,7 +107,7 @@ def test_mixed_members_reject_different_simons_configurations(
 
     monkeypatch.setattr(runner, "runtime_identity", runtime)
     changes = {"batch_size": 7} if change == "batch_size" else {}
-    second = make_member(2, model="simons", processing="raw", **changes)
+    second = make_member(2, model="simons", processing=processing, **changes)
     out = tmp_path / "rejected"
     with pytest.raises(ValueError, match="evaluation.*identity"):
         ensemble(tasks, [reference, first, second], out)
@@ -186,3 +198,78 @@ def test_mixed_members_reject_different_task_windows(
     with pytest.raises(ValueError, match=match):
         ensemble(tasks, [simons, reference], out)
     assert not (out / tasks[0].task_name / "run.json").exists()
+
+
+@pytest.mark.parametrize("model", ["timestral", "chronos2"])
+@pytest.mark.parametrize("reference_first", [False, True])
+@pytest.mark.parametrize("weighted", [False, True])
+def test_published_mixed_ensemble_provenance(
+    scenario, make_member, tmp_path, model, reference_first, weighted
+):
+    tasks, _, _ = scenario
+    reference = make_member(0 if reference_first else 2, 6, model=model)
+    simons = [
+        make_member(i, offset, model="simons", processing="published")
+        for i, offset in zip(([1, 2] if reference_first else [0, 1]), [0, 2], strict=True)
+    ]
+    out = tmp_path / "published-mixed"
+    frame = ensemble(
+        tasks, [*simons, reference], out, member_weights=[".25", ".25", ".5"] if weighted else None
+    )
+    assert frame.processing.iloc[0] == "published"
+    manifest = json.loads((out / "yardstick.json").read_text())
+    record = json.loads((out / tasks[0].task_name / "run.json").read_text())
+    expected = {str(member): {"model": "simons", "processing": "published"} for member in simons}
+    expected[str(reference)] = {"model": model, "processing": "native"}
+    assert manifest["member_processing"] == record["member_processing"] == expected
+    for member in [*simons, reference]:
+        metadata = json.loads((member / tasks[0].task_name / "run.json").read_text()).get(
+            "input_metadata", {}
+        )
+        assert record["member_input_metadata"][str(member)] == metadata
+        assert manifest["member_input_metadata"][str(member)][tasks[0].task_name] == metadata
+    assert record["member_input_metadata"][str(simons[0])]["dropped_past_only_covariates"] == 6
+    assert "dropped_past_only_covariates" not in record["member_input_metadata"][str(reference)]
+    before = {p: p.read_bytes() for p in out.rglob("*") if p.is_file()}
+    ensemble(
+        tasks, [reference, *simons], out, member_weights=[".5", ".25", ".25"] if weighted else None
+    )
+    assert before == {p: p.read_bytes() for p in out.rglob("*") if p.is_file()}
+
+
+def test_mixed_ensemble_rejects_raw_and_published_simons(scenario, make_member, tmp_path):
+    tasks, _, _ = scenario
+    members = [
+        make_member(0, model="timestral"),
+        make_member(1, model="simons", processing="raw"),
+        make_member(2, model="simons", processing="published"),
+    ]
+    out = tmp_path / "invalid"
+    with pytest.raises(ValueError, match="raw and published Simons"):
+        ensemble(tasks, members, out)
+    assert not out.exists()
+
+
+@pytest.mark.parametrize(
+    "change,match", [("unknown-model", "models"), ("reference-processing", "native")]
+)
+def test_mixed_ensemble_rejects_unsupported_processing(
+    scenario, make_member, tmp_path, monkeypatch, change, match
+):
+    tasks, _, _ = scenario
+    simons = make_member(0, model="simons", processing="published")
+    original = runner.runtime_identity
+
+    def runtime(options):
+        configuration = original(options)
+        configuration["options"]["model" if change == "unknown-model" else "processing"] = (
+            "unknown" if change == "unknown-model" else "published"
+        )
+        return configuration
+
+    monkeypatch.setattr(runner, "runtime_identity", runtime)
+    reference = make_member(1, model="timestral")
+    out = tmp_path / "invalid"
+    with pytest.raises(ValueError, match=match):
+        ensemble(tasks, [simons, reference], out)
+    assert not out.exists()
