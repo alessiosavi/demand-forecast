@@ -1,4 +1,4 @@
-"""Score the fixed, equal-weight mean of aligned saved yardstick quantile forecasts.
+"""Score a fixed weighted or equal-weight mean of aligned saved yardstick quantile forecasts.
 
 The mean keeps quantiles ordered when each member's quantiles are ordered. It
 is not the quantile function of the mixture distribution. Scores are computed
@@ -21,6 +21,7 @@ from __future__ import annotations
 import hashlib
 import json
 import traceback
+from collections.abc import Sequence
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
@@ -28,6 +29,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from demand_forecast.bench.ensemble_weights import parse_member_weights
 from demand_forecast.bench.run import _save_failures, _save_summaries, score_predictions
 from demand_forecast.bench.specs import dataset_fingerprint
 
@@ -82,7 +84,7 @@ def _evaluation_configuration(configuration: dict, *, mixed_models: bool = False
         },
     }
     if mixed_models:
-        # Native reference outputs can join Simons raw. Inference implementation
+        # Native reference outputs can join consistently processed Simons. Inference implementation
         # and batching differ by model; the scoring runtime must still match.
         for key in ("model", "processing", "batch_size"):
             evaluation["options"].pop(key, None)
@@ -160,11 +162,24 @@ def _bind_members(members: list[Path]) -> list[dict]:
     configurations = [_read_configuration(member) for member in members]
     models = {configuration["options"]["model"] for configuration in configurations}
     mixed_models = len(models) > 1
-    if mixed_models and (
-        not models <= {"simons", "timestral", "chronos2"}
-        or any(c["options"].get("processing", "raw") != "raw" for c in configurations)
-    ):
-        raise ValueError("mixed models require native reference outputs and Simons raw")
+    simons_processing = {
+        c["options"].get("processing") for c in configurations if c["options"]["model"] == "simons"
+    }
+    if len(simons_processing) > 1:
+        raise ValueError(
+            "raw and published Simons members cannot be mixed; evaluation identity differs"
+        )
+    if mixed_models:
+        if not models <= {"simons", "timestral", "chronos2"}:
+            raise ValueError("mixed models must be simons, timestral or chronos2")
+        if not simons_processing <= {"raw", "published"}:
+            raise ValueError("Simons members require raw or published processing")
+        if any(
+            c["options"].get("processing") not in (None, "raw")
+            for c in configurations
+            if c["options"]["model"] != "simons"
+        ):
+            raise ValueError("mixed models require native reference outputs")
     for directory, configuration in zip(members, configurations, strict=True):
         for path in directory.rglob("run.json"):
             record = json.loads(path.read_text())
@@ -274,12 +289,12 @@ def _completed(directory: Path, identity: str | None, rows: pd.DataFrame, count:
         return False
 
 
-def _average_windows(task, members, records, windows, levels):
+def _average_windows(task, members, records, windows, levels, weights=None):
     """Read through the runner's validator, and retain only one member at a time."""
     averaged, durations = [], []
     for index, window in enumerate(windows):
         mean, elapsed = None, 0.0
-        for directory, record in zip(members, records, strict=True):
+        for member_index, (directory, record) in enumerate(zip(members, records, strict=True)):
             path = directory / task.task_name / f"window_{index}.npz"
             try:
                 raw = path.read_bytes()
@@ -295,7 +310,11 @@ def _average_windows(task, members, records, windows, levels):
             # Divide before summing to avoid overflowing for large finite members.
             # For two identical float64 members, halving and adding is exact
             # except at subnormal magnitudes; fev's scorer is otherwise identical.
-            contribution = array.astype(np.float64) / len(members)
+            contribution = (
+                array.astype(np.float64) / len(members)
+                if weights is None
+                else float(weights[member_index]) * array.astype(np.float64)
+            )
             if mean is None:
                 mean = contribution
             else:
@@ -314,6 +333,7 @@ def run_ensemble(
     model_name: str,
     out_dir: Path,
     *,
+    member_weights: Sequence[str] | None = None,
     keep_going: bool = False,
     allow_identical_members: bool = False,
 ) -> pd.DataFrame:
@@ -325,7 +345,14 @@ def run_ensemble(
     floating-point accumulation order; directory spellings are retained.
     """
     tasks = list(tasks)
-    members = sorted((Path(member) for member in members), key=str)
+    members = [Path(member) for member in members]
+    fractions = parse_member_weights(member_weights, len(members))
+    if fractions is not None and allow_identical_members:
+        raise ValueError("explicit weights cannot be used with --allow-identical-members")
+    order = sorted(range(len(members)), key=lambda index: str(members[index]))
+    members = [members[index] for index in order]
+    if fractions is not None:
+        fractions = [fractions[index] for index in order]
     if len(members) < 2 or not model_name.strip() or not tasks:
         raise ValueError("at least two members, tasks and a nonempty model-name are required")
     names = [task.task_name for task in tasks]
@@ -347,7 +374,15 @@ def run_ensemble(
     evaluation_configuration = _evaluation_configuration(
         configurations[0], mixed_models=mixed_models
     )
-    weights = [1 / len(members)] * len(members)
+    weights = (
+        [1 / len(members)] * len(members)
+        if fractions is None
+        else [float(weight) for weight in fractions]
+    )
+    published_mixed = mixed_models and any(
+        c["options"]["model"] == "simons" and c["options"].get("processing") == "published"
+        for c in configurations
+    )
     options = {
         **configurations[0]["options"],
         "model": "ensemble",
@@ -366,6 +401,28 @@ def run_ensemble(
         "weights": weights,
         "model_name": model_name,
     }
+    if fractions is not None:
+        run["weight_spec"] = {"explicit": True, "values": [str(weight) for weight in fractions]}
+    if published_mixed:
+        options["processing"] = "published"
+        run["member_processing"] = {
+            str(member): {
+                "model": c["options"]["model"],
+                "processing": c["options"]["processing"]
+                if c["options"]["model"] == "simons"
+                else "native",
+            }
+            for member, c in zip(members, configurations, strict=True)
+        }
+        run["member_input_metadata"] = {
+            str(member): {
+                str(path.parent.relative_to(member)): json.loads(path.read_text()).get(
+                    "input_metadata", {}
+                )
+                for path in sorted(member.rglob("run.json"))
+            }
+            for member in members
+        }
     run["configuration_identity"] = digest(run)
     manifest_path = out_dir / "yardstick.json"
     if manifest_path.exists():
@@ -418,6 +475,9 @@ def run_ensemble(
                 }
                 for member, record in zip(members, records, strict=True)
             ]
+            if published_mixed:
+                for source, record in zip(sources, records, strict=True):
+                    source["input_metadata"] = record.get("input_metadata", {})
             configuration = {
                 **run,
                 "evaluation": evaluation,
@@ -459,7 +519,7 @@ def run_ensemble(
             if len(windows) != task.num_windows:
                 raise ValueError(f"{name}: task window count differs")
             levels = evaluation["levels"]
-            arrays, durations = _average_windows(task, members, records, windows, levels)
+            arrays, durations = _average_windows(task, members, records, windows, levels, fractions)
             summary = score_predictions(
                 task,
                 [
@@ -495,6 +555,14 @@ def run_ensemble(
                 "weights": weights,
                 "window_sha256": {path.name: file_digest(path) for path in paths},
             }
+            if fractions is not None:
+                record["weight_spec"] = run["weight_spec"]
+            if published_mixed:
+                record["member_processing"] = run["member_processing"]
+                record["member_input_metadata"] = {
+                    str(member): source.get("input_metadata", {})
+                    for member, source in zip(members, records, strict=True)
+                }
             if evaluation["input_metadata"]:
                 record["input_metadata"] = evaluation["input_metadata"]
             _save_failures(directory / "run.json", record)

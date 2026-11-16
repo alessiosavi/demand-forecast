@@ -207,16 +207,16 @@ python scripts/gcp/jobs/make_score_job.py --model chronos2 --name chronos2 \
 Reference jobs require Hub weights at a full commit SHA, refuse checkpoint URIs
 and nondefault `--processing`, and save their native output in `raw` only.
 `--covariates all|none` and `--max-context` apply to every model. To average these
-runs with Simons, generate the ensemble job with `--processing raw`; member
-tasks, covariates, context limits and scoring runtime must match. Model-specific
+runs with Simons, select `--processing raw|published|both`; references contribute
+`raw` native forecasts in every mode, while Simons contributes that mode. Member tasks, covariates, context limits and scoring runtime must match. Model-specific
 packages, native batching and Simons's dropped-covariate report may differ across
 models, never between two runs of the same model. Runs of the same model must
 share the full evaluation configuration and per-task evaluation identity,
-including the inference implementation. The mean uses fixed, equal weights.
+including the inference implementation. The mean uses fixed, equal weights by default.
 
 ## Averaging completed yardstick runs
 
-`scripts/fev_ensemble.py` averages saved forecasts with equal member weights,
+`scripts/fev_ensemble.py` averages saved forecasts with fixed member weights (equal by default),
 then recomputes fev scores from the averaged windows without loading models:
 
 ```bash
@@ -224,6 +224,17 @@ python scripts/fev_ensemble.py --members results/seed-1 results/seed-2 \
   --tasks shifted.yaml --names @names.txt --model-name average \
   --out-dir results/average
 ```
+
+For a weighted mixed average, repeat `--member-weight W` once per `--members`
+entry (or per `--member-uri` in the cloud generator), in the same order. Decimal
+weights must be positive and sum exactly to one; for example `0.25`, `0.25`,
+`0.5` combine two published-style Simons seeds with one native Timestral member.
+All Simons members must share raw or published processing. Saved forecasts are
+averaged directly, with no further clipping, snapping or processing: this is a
+quantile average, not the quantiles of a probabilistic mixture. Members may have
+seen different covariates (Simons drops past-only covariates); published mixed
+outputs record each member's processing and input metadata. Explicit weights
+cannot be combined with `--allow-identical-members`.
 
 Supply at least two complete yardstick runs with matching tasks, dataset
 fingerprints, quantiles, input ordering and evaluation settings. Each member
@@ -243,11 +254,12 @@ average.sh` (optionally `--names-uri` plus `--names-sha256`, and
 `--processing raw|published|both`). It requires completed members with matching
 evaluation code, task selection and evaluation settings, distinct names and
 weight hashes, and verified manifests with no missing or unlisted mode files.
-Before averaging, it scores the first member against itself with the job's
-scorer and checks every shared metric (NaN equals NaN; rtol `1e-9`, atol `1e-12`).
+Before averaging, it scores every distinct member/source-folder pair against
+itself with the job's scorer and checks every shared metric (NaN equals NaN; rtol `1e-9`, atol `1e-12`).
 The job needs task data access but no GPU, model weights or Simons install.
 Under `RUN_DIR/state/ensemble/<name>/`, it saves configuration, environment,
-task inputs, member identity files, `parity/<mode>.json`, mode outputs/statuses
+task inputs, member identity files, the hashed `resolved-inputs.json` folder mapping,
+`parity/<member-index>-<source-folder>.json`, mode outputs/statuses
 and a hashed `completed.json`. Downloaded member forecasts and parity outputs
 stay in scratch. Restored jobs use the averaging script's own completion checks
 to reuse partial results; a fully verified state exits before installation.

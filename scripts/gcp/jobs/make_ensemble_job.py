@@ -8,6 +8,7 @@ import gzip
 import hashlib
 import json
 import re
+import runpy
 import shlex
 from pathlib import Path
 
@@ -129,7 +130,15 @@ def checked_member(config, uri, directory):
     for field in ("tasks_sha256", "names_sha256"):
         if inputs[field] != config[field]:
             refuse(uri, field, "differs from job inputs")
-    for mode in config["modes"]:
+    model = inputs.get("model", "simons")
+    if model not in ("simons", "timestral", "chronos2"):
+        refuse(uri, "model", "unknown model: " + str(model))
+    folders = {
+        mode: {"source_folder": mode if model == "simons" else "raw",
+               "score_label": inputs["name"] + "-" + (mode if model == "simons" else "raw")}
+        for mode in config["modes"]
+    }
+    for mode in dict.fromkeys(value["source_folder"] for value in folders.values()):
         reports = marker.get("modes")
         report = reports.get(mode) if isinstance(reports, dict) else None
         if not isinstance(report, dict) or mode not in inputs.get("modes", []):
@@ -141,8 +150,30 @@ def checked_member(config, uri, directory):
             refuse(uri, mode + ".failed", "member has failures or missing failure report")
         if report.get("exit_code") != 0:
             refuse(uri, mode + ".exit_code", "member did not exit successfully")
-    return {"uri": uri, "name": inputs["name"], "inputs": inputs,
+    return {"uri": uri, "name": inputs["name"], "inputs": inputs, "model": model, "folders": folders,
             "checkpoint_sha256": checkpoints, "completed_sha256": digest(directory / "completed.json")}
+
+
+def resolved_inputs(entries):
+    return {"schema": 1, "members": [
+        {key: entry[key] for key in ("uri", "model", "folders", "completed_sha256")}
+        for entry in entries
+    ]}
+
+
+def check_resolved(root, entries):
+    path = root / "resolved-inputs.json"
+    if path.exists() and read(path) != resolved_inputs(entries):
+        raise ValueError("resolved member mapping differs under the same ensemble name")
+
+
+def parity_targets(entries):
+    targets = {}
+    for index, entry in enumerate(entries):
+        for mapping in entry["folders"].values():
+            folder = mapping["source_folder"]
+            targets[str(index) + "-" + folder] = (index, mapping)
+    return targets
 
 
 def objects(prefix):
@@ -196,11 +227,13 @@ def members(config, root, scratch):
                 refuse(uri, filename, "different member identity under the same ensemble name")
         entries.append(entry)
         directories.append(directory)
+    check_resolved(root, entries)
     # Validate all identities before fetching the large forecast folders.
     for entry, directory in zip(entries, directories):
         uri = entry["uri"]
         hashes = read(directory / "completed.json")["artifacts"]
-        for mode in config["modes"]:
+        mappings = {value["source_folder"]: value for value in entry["folders"].values()}
+        for mode, mapping in mappings.items():
             expected = {uri + "/" + p for p in hashes if p.startswith(mode + "/")}
             try:
                 actual = objects(uri + "/" + mode)
@@ -225,12 +258,18 @@ def members(config, root, scratch):
                         raise ValueError("sha256 mismatch")
                 except Exception as error:
                     refuse(uri, path, str(error))
+            manifest = member_json(uri, directory, mode + "/yardstick.json")
+            options = manifest.get("options", {}) if isinstance(manifest, dict) else {}
+            if not isinstance(options, dict) or options.get("model") != entry["model"]:
+                refuse(uri, mode + ".model", "yardstick.json model differs from member inputs")
+            if entry["model"] == "simons" and options.get("processing") != mode:
+                refuse(uri, mode + ".processing", "yardstick.json processing differs from source folder")
             names = read(directory / "selected.json")
             failure_file = mode + "/failures.json"
             if (directory / failure_file).exists() and member_json(uri, directory, failure_file) != {}:
                 refuse(uri, mode + ".failed", "saved failures.json is nonempty or invalid")
             try:
-                completed = evidence(directory, mode, names, entry["name"] + "-" + mode)
+                completed = evidence(directory, mode, names, mapping["score_label"])
             except (OSError, ValueError, KeyError, TypeError, csv.Error) as error:
                 refuse(uri, mode + ".evidence", str(error))
             if completed != names:
@@ -244,6 +283,8 @@ def members(config, root, scratch):
             target = saved / (filename + ".tmp")
             shutil.copyfile(directory / filename, target)
             os.replace(target, saved / filename)
+    if not (root / "resolved-inputs.json").exists():
+        atomic(root / "resolved-inputs.json", resolved_inputs(entries))
     return entries, directories
 
 
@@ -264,10 +305,22 @@ def preflight(config, root):
         if marker_inputs != config and any(not p.name.endswith(".tmp") for p in root.iterdir()):
             raise ValueError("ensemble state has no valid input identity; refusing to overwrite")
         atomic(identity, config)
+    resolved_path = root / "resolved-inputs.json"
+    expected_hash = marker.get("artifacts", {}).get("resolved-inputs.json") if isinstance(marker.get("artifacts"), dict) else None
+    if expected_hash is not None and (not resolved_path.is_file() or digest(resolved_path) != expected_hash):
+        raise ValueError("resolved-inputs.json sha256 mismatch; refusing changed mapping")
+    if resolved_path.exists():
+        try:
+            retained = [checked_member(config, uri, root / "members" / str(index))
+                        for index, uri in enumerate(config["member_uris"])]
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            # Recover through members(), verifying downloads and the saved mapping.
+            return 10
+        check_resolved(root, retained)
     try:
         if marker["schema"] != 1 or marker["inputs"] != config or marker["artifacts"] != artifacts(root):
             return 10
-        required = {"inputs.json", "environment.txt", "tasks.yaml"}
+        required = {"inputs.json", "environment.txt", "tasks.yaml", "resolved-inputs.json"}
         if config["names_uri"]:
             required.add("names.txt")
         if digest(root / "tasks.yaml") != config["tasks_sha256"]:
@@ -282,19 +335,27 @@ def preflight(config, root):
         if entries != marker["members"]:
             return 10
         names = read(root / "members/0/selected.json")
-        if set(marker["modes"]) != set(config["modes"]) or set(marker["parity"]) != set(config["modes"]):
+        targets = parity_targets(entries)
+        if (read(root / "resolved-inputs.json") != resolved_inputs(entries)
+                or set(marker["modes"]) != set(config["modes"])
+                or set(marker["parity"]) != set(targets)):
             return 10
+        for key, (index, mapping) in targets.items():
+            parity = read(root / "parity" / (key + ".json"))
+            if (not parity["success"] or parity != marker["parity"][key]
+                    or parity["member"] != entries[index]["uri"]
+                    or parity["source_folder"] != mapping["source_folder"]
+                    or parity["score_label"] != mapping["score_label"]
+                    or parity["tasks_compared"] != len(names) or parity["columns_compared"] < 1):
+                return 10
+            required.add("parity/" + key + ".json")
         for mode in config["modes"]:
             report = marker["modes"][mode]
-            parity = read(root / "parity" / (mode + ".json"))
-            if (not valid_report(report, names) or report != read(root / (mode + "-status.json"))
-                    or not parity["success"] or parity != marker["parity"][mode]
-                    or parity["member"] != entries[0]["uri"] or parity["tasks_compared"] != len(names)
-                    or parity["columns_compared"] < 1):
+            if not valid_report(report, names) or report != read(root / (mode + "-status.json")):
                 return 10
             if evidence(root, mode, names, config["name"] + "-" + mode) != names:
                 return 10
-            required.update({mode + "/yardstick.json", mode + "/summaries.csv", mode + "-status.json", "parity/" + mode + ".json"})
+            required.update({mode + "/yardstick.json", mode + "/summaries.csv", mode + "-status.json"})
             for name in names:
                 record = read(root / mode / name / "run.json")
                 required.add(mode + "/" + name + "/run.json")
@@ -356,36 +417,39 @@ def compare_metrics(source, output, names, metrics):
             "differences": failures, "rtol": 1e-9, "atol": 1e-12}
 
 
-def command(python, repo, root, config, directories, label, output):
+def command(python, repo, root, config, directories, label, output, member_weights=None):
     args = [python, str(repo / "scripts/fev_ensemble.py"), "--members", *map(str, directories),
             "--tasks", str(root / "tasks.yaml"), "--model-name", label,
             "--out-dir", str(output), "--keep-going"]
     if config["names_uri"]:
         args += ["--names", "@" + str(root / "names.txt")]
+    if member_weights is not None:
+        for weight in member_weights:
+            args += ["--member-weight", weight]
     return args
 
 
-def parity(config, root, scratch, repo, python, mode, entry, directory, names):
+def parity(config, root, scratch, repo, python, key, entry, mapping, directory, names):
     from fev.metrics import AVAILABLE_METRICS
-    label = config["name"] + "-parity-" + mode
-    output = scratch / ("parity-" + mode)
+    label = config["name"] + "-parity-" + key
+    output = scratch / ("parity-" + key)
     args = command(python, repo, root, config, [directory, directory], label, output)
     args += ["--allow-identical-members"]
-    path = root / "parity" / (mode + ".json")
+    path = root / "parity" / (key + ".json")
     path.parent.mkdir(exist_ok=True)
-    report = {"success": False, "member": entry["uri"], "member_name": entry["name"]}
+    report = {"success": False, "member": entry["uri"], "member_name": entry["name"], **mapping}
     try:
         status = subprocess.run(args, check=False).returncode
         if status or evidence(scratch, output.name, names, label) != names:
             raise ValueError("self-ensemble did not complete; exit " + str(status))
-        original = summaries(directory / "summaries.csv", entry["name"] + "-" + mode, names)
+        original = summaries(directory / "summaries.csv", mapping["score_label"], names)
         recomputed = summaries(output / "summaries.csv", label, names)
         report.update(compare_metrics(original, recomputed, names, AVAILABLE_METRICS))
     except Exception as error:
         report.update(success=False, error=str(error))
     atomic(path, report)
     if not report["success"]:
-        raise ValueError("scorer parity failed for " + mode + "; see " + str(path))
+        raise ValueError("scorer parity failed for " + key + "; see " + str(path))
     return report
 
 
@@ -435,18 +499,19 @@ def average(config, root, scratch, repo, python):
         entries, directories = members(config, root, base)
         if read(directories[0] / "selected.json") != names:
             refuse(entries[0]["uri"], "selected.json", "differs from job task selection")
-        # Sort exactly as run_ensemble does (lexicographic directory spelling).
-        first = min(range(len(directories)), key=lambda i: str(directories[i]))
         parity_reports = {}
-        # Every parity gate passes before *any* real averaging is started.
-        for mode in config["modes"]:
-            parity_reports[mode] = parity(config, root, scratch, repo, python, mode,
-                                          entries[first], directories[first] / mode, names)
+        # Every distinct member/source gate passes before *any* real averaging.
+        for key, (index, mapping) in parity_targets(entries).items():
+            parity_reports[key] = parity(config, root, scratch, repo, python, key,
+                                          entries[index], mapping,
+                                          directories[index] / mapping["source_folder"], names)
         reports = {}
         for mode in config["modes"]:
             recover_mode(root, mode)
             label = config["name"] + "-" + mode
-            args = command(python, repo, root, config, [d / mode for d in directories], label, root / mode)
+            args = command(python, repo, root, config,
+                           [d / entry["folders"][mode]["source_folder"] for entry, d in zip(entries, directories)],
+                           label, root / mode, config.get("member_weights"))
             start = time.monotonic()
             log = root / (mode + ".log")
             with log.open("w") as stream:
@@ -506,6 +571,7 @@ def generate(
     tasks_uri,
     tasks_sha256,
     member_uris,
+    member_weights=None,
     names_uri=None,
     names_sha256=None,
     processing="both",
@@ -525,6 +591,13 @@ def generate(
         _sha(names_sha256, 64, "names sha256")
     if not isinstance(member_uris, (list, tuple)) or len(member_uris) < 2:
         raise ValueError("at least two member URIs are required")
+    if member_weights is not None:
+        # Load the stdlib-only validator without importing optional bench packages;
+        # direct generator execution also works without an installed repository.
+        parse_weights = runpy.run_path(
+            str(Path(__file__).resolve().parents[3] / "demand_forecast/bench/ensemble_weights.py")
+        )["parse_member_weights"]
+        parse_weights(member_weights, len(member_uris))
     normalized = []
     for uri in member_uris:
         _uri(uri)
@@ -548,6 +621,8 @@ def generate(
         modes=["raw", "published"] if processing == "both" else [processing],
         guest_sha256=guest_sha,
     )
+    if member_weights is not None:
+        config["member_weights"] = list(member_weights)
     encoded_config = base64.b64encode(json.dumps(config, sort_keys=True).encode()).decode()
     encoded_guest = base64.b64encode(gzip.compress(GUEST.encode(), mtime=0)).decode()
     return f'''#!/usr/bin/env bash
@@ -627,6 +702,7 @@ def main():
     for key in ("name", "repo-sha", "tasks-uri", "tasks-sha256"):
         parser.add_argument("--" + key, required=True)
     parser.add_argument("--member-uri", dest="member_uris", action="append", required=True)
+    parser.add_argument("--member-weight", dest="member_weights", action="append")
     parser.add_argument("--names-uri")
     parser.add_argument("--names-sha256")
     parser.add_argument("--processing", choices=["raw", "published", "both"], default="both")

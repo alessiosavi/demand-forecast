@@ -22,6 +22,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--names", help="comma-separated task names or @file")
     parser.add_argument("--model-name", required=True)
     parser.add_argument("--out-dir", type=Path, required=True)
+    parser.add_argument("--member-weight", dest="member_weights", action="append")
     parser.add_argument("--keep-going", action="store_true")
     parser.add_argument("--allow-identical-members", action="store_true")
     args = parser.parse_args(argv)
@@ -35,6 +36,7 @@ def main(argv: list[str] | None = None) -> int:
             args.members,
             args.model_name,
             args.out_dir,
+            member_weights=args.member_weights,
             keep_going=args.keep_going,
             allow_identical_members=args.allow_identical_members,
         )

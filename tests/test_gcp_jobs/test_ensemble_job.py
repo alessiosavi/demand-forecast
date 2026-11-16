@@ -92,7 +92,8 @@ def test_generator_validation(jobs, change):
 
 
 @pytest.mark.parametrize("processing", ["raw", "published", "both"])
-def test_bundle_and_cli(jobs, tmp_path, processing):
+@pytest.mark.parametrize("weighted", [False, True])
+def test_bundle_and_cli(jobs, tmp_path, processing, weighted):
     output = tmp_path / "job.sh"
     command = [sys.executable, str(ROOT / "scripts/gcp/jobs/make_ensemble_job.py")]
     for key, value in arguments().items():
@@ -101,6 +102,8 @@ def test_bundle_and_cli(jobs, tmp_path, processing):
                 command += ["--member-uri", uri]
         else:
             command += ["--" + key.replace("_", "-"), value]
+    if weighted:
+        command += ["--member-weight", ".25", "--member-weight", ".75"]
     command += ["--processing", processing, "--output", str(output)]
     result = subprocess.run(command, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
@@ -114,6 +117,7 @@ def test_bundle_and_cli(jobs, tmp_path, processing):
     config = load(tmp_path / "inputs.json")
     assert config["modes"] == (["raw", "published"] if processing == "both" else [processing])
     assert config["guest_sha256"] == sha(tmp_path / "ensemble.py")
+    assert config.get("member_weights") == ([".25", ".75"] if weighted else None)
 
 
 def synthetic_member(directory, index, names=None):
@@ -139,7 +143,7 @@ def synthetic_member(directory, index, names=None):
             "task,model_name,run_identity,test_error,SQL,SQL[0.5]\n"
             + "".join(f"{n},seed{index}-{mode},identity,1,1,1\n" for n in names)
         )
-        write(out / "yardstick.json", {"synthetic": True})
+        write(out / "yardstick.json", {"options": {"model": "simons", "processing": mode}})
         for name in names:
             task = out / name
             task.mkdir(parents=True)
@@ -260,6 +264,7 @@ def test_simons_and_single_raw_reference_member(members):
     marker = load(directory / "completed.json")
     marker["inputs"] = inputs
     marker["modes"].pop("published")
+    write(directory / "raw/yardstick.json", {"options": {"model": "timestral"}})
     write(directory / "completed.json", marker)
     shutil.rmtree(directory / "published")
     rehash(directory)
@@ -704,14 +709,21 @@ def test_shell_completion_preflight_and_different_inputs(machine):
     result = run(FAIL_VENV="1", NEED_PYTHON="1")
     assert result.returncode == 0, result.stderr + result.stdout
     calls = [e[1:3] for e in events() if e[0] == "ensemble"]
-    assert calls == [["raw", True], ["published", True], ["raw", False], ["published", False]]
+    assert calls == [
+        ["raw", True],
+        ["published", True],
+        ["raw", True],
+        ["published", True],
+        ["raw", False],
+        ["published", False],
+    ]
     marker = load(state / "completed.json")
     assert marker["schema"] == 1
     assert marker["members"][0]["inputs"]["repo_sha"] != marker["inputs"]["repo_sha"]
     assert len(marker["members"]) == 2
     assert "members/0/completed.json" in marker["artifacts"]
     assert all(
-        load(state / "parity" / (mode + ".json"))["values_compared"] == 6
+        load(state / "parity" / ("0-" + mode + ".json"))["values_compared"] == 6
         for mode in ["raw", "published"]
     )
     assert '"simons_required": false' in (state / "environment.txt").read_text()
@@ -736,7 +748,7 @@ def test_parity_failure_prevents_all_averaging(machine):
     rehash(cloud / "score/seed11")
     result = run()
     assert result.returncode != 0 and "parity failed" in result.stderr
-    report = load(state / "parity/raw.json")
+    report = load(state / "parity/0-raw.json")
     assert report["success"] is False
     assert report["differences"] == [
         {"task": name, "column": "test_error", "recorded": "2", "recomputed": "1"}
@@ -993,7 +1005,13 @@ def test_real_fev_parity_mean_and_resume(members, tmp_path, monkeypatch, case):
             shutil.rmtree(directory / mode)
             run_yardstick(
                 tasks,
-                replace(options, weights=str(weights), model_name=f"seed{index}-{mode}"),
+                replace(
+                    options,
+                    model="simons",
+                    processing=mode,
+                    weights=str(weights),
+                    model_name=f"seed{index}-{mode}",
+                ),
                 directory / mode,
                 adapter_factory=lambda _, i=index: OffsetAdapter(i * 2),
             )
@@ -1068,7 +1086,7 @@ def test_real_fev_parity_mean_and_resume(members, tmp_path, monkeypatch, case):
     if case == "parity-drift":
         with pytest.raises(ValueError, match="parity failed"):
             guest["average"](config, root, scratch, ROOT, sys.executable)
-        report = load(root / "parity/raw.json")
+        report = load(root / "parity/0-raw.json")
         assert report["differences"][0]["column"] == "test_error"
         assert all(parity for _, parity in calls)
         return
@@ -1093,7 +1111,7 @@ def test_real_fev_parity_mean_and_resume(members, tmp_path, monkeypatch, case):
         saved = root / "raw" / tasks[0].task_name / "window_0.npz"
         assert (saved.read_bytes(), saved.stat().st_mtime_ns) == before
     for mode in config["modes"]:
-        report = load(root / "parity" / (mode + ".json"))
+        report = load(root / "parity" / ("0-" + mode + ".json"))
         assert report["success"] and report["tasks_compared"] == 1
         source = pd.read_csv(cloud / "score/seed11" / mode / "summaries.csv")
         if case == "nan":
@@ -1108,3 +1126,294 @@ def test_real_fev_parity_mean_and_resume(members, tmp_path, monkeypatch, case):
                         np.testing.assert_array_equal(
                             actual["arrays"], first["arrays"] / 2 + second["arrays"] / 2
                         )
+
+
+def unpack_config(script, tmp_path):
+    snippet = script.split("<<'ENSEMBLE_BUNDLE'\n")[1].split("\nENSEMBLE_BUNDLE")[0]
+    result = subprocess.run(
+        [sys.executable, "-", str(tmp_path)], input=snippet, capture_output=True, text=True
+    )
+    assert result.returncode == 0, result.stderr
+    return load(tmp_path / "inputs.json")
+
+
+def test_unweighted_generator_input_contract(jobs, tmp_path):
+    config = unpack_config(jobs.generate(**arguments()), tmp_path)
+    config.pop("guest_sha256")
+    assert config == {
+        "name": "average",
+        "repo_sha": SHA,
+        "tasks_uri": "gs://offline/tasks.yaml",
+        "tasks_sha256": hashlib.sha256(TASKS).hexdigest(),
+        "member_uris": URIS,
+        "names_uri": None,
+        "names_sha256": None,
+        "modes": ["raw", "published"],
+    }
+
+
+@pytest.mark.parametrize(
+    "weights,match",
+    [
+        ([], "count"),
+        (["1"], "count"),
+        (["0", "1"], "positive"),
+        ([".5", ".51"], "sum"),
+        (["nan", "1"], "decimal"),
+        (["1/2", ".5"], "decimal"),
+        ([0.5, 0.5], "decimal"),
+        ([".5", "0.50000000000000000000000000001"], "sum"),
+    ],
+)
+def test_generator_member_weight_validation(jobs, weights, match):
+    with pytest.raises(ValueError, match=match):
+        jobs.generate(**arguments(member_weights=weights))
+
+
+def reference_member(directory, model="timestral"):
+    inputs = load(directory / "inputs.json")
+    inputs.update(model=model, model_package="synthetic reference package", modes=["raw"])
+    write(directory / "inputs.json", inputs)
+    marker = load(directory / "completed.json")
+    marker["inputs"] = inputs
+    marker["modes"].pop("published", None)
+    write(directory / "completed.json", marker)
+    write(directory / "raw/yardstick.json", {"options": {"model": model}})
+    shutil.rmtree(directory / "published")
+    rehash(directory)
+
+
+@pytest.mark.parametrize("processing", ["published", "both"])
+@pytest.mark.parametrize("reference_first", [False, True])
+def test_weighted_mixed_job_mapping_and_parity(machine, processing, reference_first):
+    run, state, events, cloud = machine
+    reference_index = 0 if reference_first else 1
+    reference_member(cloud / ("score/seed11" if reference_first else "score/seed22"))
+    result = run({"processing": processing, "member_weights": [".25", ".75"]})
+    assert result.returncode == 0, result.stderr + result.stdout
+    config = load(state / "inputs.json")
+    assert config["member_weights"] == [".25", ".75"]
+    resolved = load(state / "resolved-inputs.json")
+    members = resolved["members"]
+    modes = ["published"] if processing == "published" else ["raw", "published"]
+    for index, member in enumerate(members):
+        assert member["model"] == ("timestral" if index == reference_index else "simons")
+        for mode in modes:
+            folder = "raw" if index == reference_index else mode
+            assert member["folders"][mode] == {
+                "source_folder": folder,
+                "score_label": f"seed{index}-{folder}",
+            }
+    marker = load(state / "completed.json")
+    assert marker["artifacts"]["resolved-inputs.json"] == sha(state / "resolved-inputs.json")
+    calls = [e for e in events() if e[0] == "ensemble"]
+    parity_count = 2 if processing == "published" else 3
+    assert [e[2] for e in calls] == [True] * parity_count + [False] * len(modes)
+    assert len(marker["parity"]) == parity_count
+    for event in calls:
+        args = event[3]
+        directories = args[args.index("--members") + 1 : args.index("--tasks")]
+        if event[2]:
+            assert "--member-weight" not in args
+            assert directories[0] == directories[1]
+        else:
+            assert [args[i + 1] for i, v in enumerate(args) if v == "--member-weight"] == [
+                ".25",
+                ".75",
+            ]
+            assert Path(directories[reference_index]).name == "raw"
+        assert all(Path(d).name in ("raw", "published") for d in directories)
+    before = len(events())
+    assert run({"processing": processing, "member_weights": [".25", ".75"]}).returncode == 0
+    assert not any(e[0] in ("git", "gcloud", "ensemble") for e in events()[before:])
+
+
+@pytest.mark.parametrize("damage", ["model", "processing", "unknown-model"])
+def test_member_folder_identity_crosschecked(members, damage):
+    guest, config, root, scratch, cloud = members
+    config["modes"] = ["published"]
+    directory = cloud / "score/seed22"
+    if damage == "unknown-model":
+        inputs = load(directory / "inputs.json")
+        inputs["model"] = "unknown"
+        write(directory / "inputs.json", inputs)
+        marker = load(directory / "completed.json")
+        marker["inputs"] = inputs
+        write(directory / "completed.json", marker)
+    else:
+        manifest = load(directory / "published/yardstick.json")
+        manifest["options"][damage] = "timestral" if damage == "model" else "raw"
+        write(directory / "published/yardstick.json", manifest)
+    rehash(directory)
+    with pytest.raises(
+        ValueError, match="seed22.*" + ("model" if damage == "unknown-model" else damage)
+    ):
+        guest["members"](config, root, scratch)
+    assert not list(root.iterdir())
+
+
+@pytest.mark.parametrize("reference", [False, True])
+def test_later_member_parity_failure_stops_before_average(machine, reference):
+    run, state, events, cloud = machine
+    directory = cloud / "score/seed22"
+    if reference:
+        reference_member(directory)
+    path = directory / ("raw" if reference else "published") / "summaries.csv"
+    path.write_text(path.read_text().replace(",1,1,1", ",2,1,1"))
+    rehash(directory)
+    result = run({"processing": "published", "member_weights": [".25", ".75"]})
+    assert result.returncode != 0 and "parity failed" in result.stderr
+    assert not any(e[0] == "ensemble" and not e[2] for e in events())
+    reports = list((state / "parity").glob("*.json"))
+    assert any(
+        load(path).get("member") == URIS[1] and not load(path)["success"] for path in reports
+    )
+    assert not (state / "completed.json").exists()
+
+
+@pytest.mark.parametrize("damage", ["mapping", "mapping-hash", "changed-member"])
+@pytest.mark.parametrize("interrupted", [False, True])
+def test_resolved_mapping_refuses_tampering_and_changed_members(machine, damage, interrupted):
+    run, state, _, cloud = machine
+    reference_member(cloud / "score/seed22")
+    options = {"member_weights": [".25", ".75"]}
+    first = run(options, **({"INTERRUPT": "published"} if interrupted else {}))
+    assert (first.returncode != 0) is interrupted
+    if damage.startswith("mapping"):
+        mapping = load(state / "resolved-inputs.json")
+        mapping["members"][1]["folders"]["published"]["source_folder"] = "published"
+        write(state / "resolved-inputs.json", mapping)
+        if damage == "mapping-hash" and not interrupted:
+            marker = load(state / "completed.json")
+            marker["artifacts"]["resolved-inputs.json"] = sha(state / "resolved-inputs.json")
+            write(state / "completed.json", marker)
+    else:
+        directory = cloud / "score/seed22"
+        inputs = load(directory / "inputs.json")
+        inputs["model"] = "chronos2"
+        write(directory / "inputs.json", inputs)
+        marker = load(directory / "completed.json")
+        marker["inputs"] = inputs
+        write(directory / "completed.json", marker)
+        rehash(directory)
+        # Completed preflight is offline: require re-entry before inspecting a changed remote.
+        if not interrupted:
+            (state / "raw/alpha/window_0.npz").unlink()
+    before = {str(p.relative_to(state)): p.read_bytes() for p in state.rglob("*") if p.is_file()}
+    result = run(options)
+    assert result.returncode != 0
+    assert "resolved" in result.stderr or "different member" in result.stderr
+    after = {str(p.relative_to(state)): p.read_bytes() for p in state.rglob("*") if p.is_file()}
+    # environment.txt is refreshed by the install phase on a partial restart.
+    assert {k: v for k, v in before.items() if k != "environment.txt"} == {
+        k: v for k, v in after.items() if k != "environment.txt"
+    }
+
+
+@pytest.mark.parametrize(
+    "filename", ["inputs.json", "selected.json", "checkpoint-sha256.json", "completed.json"]
+)
+def test_partial_member_restore_refetches_missing_identity(machine, jobs, filename):
+    run, state, events, _ = machine
+    first = run()
+    assert first.returncode == 0, first.stderr
+    guest = {"__name__": "ensemble_test"}
+    exec(jobs.GUEST, guest)
+    config = load(state / "inputs.json")
+    assert guest["preflight"](config, state) == 0
+    mapping = (state / "resolved-inputs.json").read_bytes()
+    path = state / "members/1" / filename
+    identity = path.read_bytes()
+    path.unlink()
+    assert guest["preflight"](config, state) == 10
+    before = len(events())
+    result = run()
+    assert result.returncode == 0, result.stderr
+    assert path.read_bytes() == identity
+    assert (state / "resolved-inputs.json").read_bytes() == mapping
+    assert any(
+        event[:4] == ["gcloud", "storage", "cp", URIS[1] + "/" + filename]
+        for event in events()[before:]
+    )
+    assert guest["preflight"](config, state) == 0
+
+
+@pytest.mark.parametrize("damage", ["mapping", "identity"])
+def test_partial_member_restore_refuses_changed_resolved_mapping(machine, jobs, damage):
+    run, state, _, cloud = machine
+    reference_member(cloud / "score/seed22")
+    first = run()
+    assert first.returncode == 0, first.stderr
+    guest = {"__name__": "ensemble_test"}
+    exec(jobs.GUEST, guest)
+    config = load(state / "inputs.json")
+    for filename in guest["IDENTITY_FILES"]:
+        (state / "members/1" / filename).unlink()
+    if damage == "mapping":
+        mapping = load(state / "resolved-inputs.json")
+        mapping["members"][1]["folders"]["published"]["source_folder"] = "published"
+        write(state / "resolved-inputs.json", mapping)
+        marker = load(state / "completed.json")
+        marker["artifacts"]["resolved-inputs.json"] = sha(state / "resolved-inputs.json")
+        write(state / "completed.json", marker)
+    else:
+        directory = cloud / "score/seed22"
+        inputs = load(directory / "inputs.json")
+        inputs["model"] = "chronos2"
+        write(directory / "inputs.json", inputs)
+        marker = load(directory / "completed.json")
+        marker["inputs"] = inputs
+        write(directory / "completed.json", marker)
+        rehash(directory)
+    assert guest["preflight"](config, state) == 10
+    before = {str(p.relative_to(state)): p.read_bytes() for p in state.rglob("*") if p.is_file()}
+    result = run()
+    assert result.returncode != 0
+    assert "resolved member mapping differs" in result.stderr
+    after = {str(p.relative_to(state)): p.read_bytes() for p in state.rglob("*") if p.is_file()}
+    assert {k: v for k, v in before.items() if k != "environment.txt"} == {
+        k: v for k, v in after.items() if k != "environment.txt"
+    }
+
+
+def test_weighted_mixed_interrupted_resume_preserves_inputs_and_completed_mode(machine, tmp_path):
+    run, state, _, cloud = machine
+    reference_member(cloud / "score/seed11")
+    options = {"member_weights": [".5", ".5"]}
+    assert run(options, INTERRUPT="published").returncode != 0
+    inputs = (state / "inputs.json").read_bytes()
+    mapping = (state / "resolved-inputs.json").read_bytes()
+    saved = state / "raw/alpha/window_0.npz"
+    before = saved.read_bytes(), saved.stat().st_mtime_ns
+    restored = tmp_path / "restored-weighted"
+    shutil.copytree(state.parents[1], restored / "state")
+    result = run(options, RUN_DIR=str(restored))
+    assert result.returncode == 0, result.stderr
+    target = restored / "state/ensemble" / state.name
+    assert (target / "inputs.json").read_bytes() == inputs
+    assert (target / "resolved-inputs.json").read_bytes() == mapping
+    saved = target / "raw/alpha/window_0.npz"
+    assert (saved.read_bytes(), saved.stat().st_mtime_ns) == before
+
+
+@pytest.mark.parametrize("damage", ["missing-report", "wrong-source"])
+def test_preflight_checks_later_member_parity(machine, damage):
+    run, state, events, _ = machine
+    assert run().returncode == 0
+    marker = load(state / "completed.json")
+    if damage == "missing-report":
+        marker["parity"].pop("1-published")
+    else:
+        path = state / "parity/1-published.json"
+        report = load(path)
+        report["member"] = URIS[0]
+        write(path, report)
+        marker["parity"]["1-published"] = report
+        marker["artifacts"]["parity/1-published.json"] = sha(path)
+    write(state / "completed.json", marker)
+    before = len(events())
+    result = run()
+    assert result.returncode == 0, result.stderr
+    assert any(e[0] == "ensemble" and e[2] for e in events()[before:])
+    marker = load(state / "completed.json")
+    assert marker["parity"]["1-published"]["member"] == URIS[1]
