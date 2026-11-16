@@ -641,6 +641,10 @@ Release a quarantined folder only through a reviewed manifest-change PR citing
 the exact audit output, corpus/benchmark revisions, complete pair coverage and
 lineage evidence. Resolve skipped searches or inconclusive alignment explicitly.
 A content-clean result alone cannot settle an unresolved metadata lineage.
+For corpora built under Amendment 5, the alternative F-row standard replaces
+rule L and requires a retained-row inventory, benchmark relationship map,
+deterministic exclusions, bounded content check and a separate materialised
+object with identity and ledger; see [Derived corpus v4.1](#derived-corpus-v41).
 The generator must be updated through the reviewed source draft so regeneration
 preserves that decision. Never move quarantine bytes into the allowed tree by
 hand. The cloud run still must measure native schema validity, actual sizes and
@@ -1031,3 +1035,136 @@ the existing gates, as described in the method section.
 Cold storage, real owner/mask distributions, long numerical fits and 48-worker
 memory-bandwidth contention require a fresh cloud measurement before forecasting
 the full run.
+
+## Derived corpus v4.1
+
+Amendment 5's standard **F-row** permits a separate materialised release after a
+retained-row inventory, benchmark relationship map, deterministic exclusions and
+a bounded content check. It replaces rule L for newly built corpora; it does not
+claim that unresolved lineage has been resolved. v4.0 and its strict validator
+retain their existing meaning.
+
+The reviewed contract is [configs/corpus-v4.1.yaml](../configs/corpus-v4.1.yaml).
+It binds the exact v4.0 manifest and the native Hub inventory at
+`abel-lab/Simons-Pretrain`, revision
+`5f17ab8cfa3fa00a8e821599b631127ba250c342`. The derived identity keeps the 97
+allowed folders and their bytes unchanged, removes every quarantine directory,
+and releases only these two filtered folders, at their original manifest positions:
+
+| Covariate folder | Original rows | Kept | Excluded | Kept ≥ 16,384 steps | Observed target values kept |
+|---|---:|---:|---:|---:|---:|
+| `eia930_ba_load_weather` | 160 | 156 | 4 | 119 | 2,426,155 |
+| `eia930_subregion_load_weather` | 197 | 129 | 68 | 96 | 1,990,528 |
+| Total | 357 | 285 | 72 | 215 | 4,416,683 |
+
+These are hourly US EIA Form 930 balancing-authority and subregion demand.
+The source inventory identifies 51 authorities and 62 subregions of six
+authorities (PJM, SWPP, NYIS, MISO, CISO, PNM). After exclusion, 50 authorities
+and 42 subregions of five authorities remain. Item labels identify pieces in
+2019–2020, 2021–2022, 2023–2024 and 2025–2026; row lengths agree with those
+labels. No ERCO or ISNE row occurs in either source inventory. All rows have
+eight weather channels: `temp_c`, `dewpoint_c`, `rh_pct`, `wind10_ms`, `ghi_wm2`,
+`dni_wm2`, `dhi_wm2`, `precip_mm_h`. The release card and lineage review describe
+these as NASA POWER observed/reanalysis weather. The allowed corpus previously
+held 18 load-with-weather rows from three sources.
+
+The checked-in [BA rules](../configs/corpus-v4.1/rules-eia930_ba_load_weather.yaml)
+and [subregion rules](../configs/corpus-v4.1/rules-eia930_subregion_load_weather.yaml)
+exclude `^PJM[|-]`, including all PJM subregions and COMED (`PJM-CE`). Guards also
+exclude ERCO/ISNE identities, pieces starting before 2019 and non-hourly rows;
+none of those guards match the reviewed inventories. First matching rule wins,
+otherwise keep; missing identity is refused. The corresponding row manifests in
+`configs/corpus-v4.1/` list every identity, target shape/hash and decision.
+
+The benchmark relationship map used Parquet footers and ID columns of
+`autogluon/fev_datasets` at Hub revision
+`d3e7e720f4158eab03ebcb021f1cce779cd92acc`; target values were not read for these
+period measurements. Relevant families among the 100 tasks / 59 families are:
+
+| Benchmark families | Period in the data | Relationship and decision |
+|---|---|---|
+| `proenfo_gfc12` | 2004-01-01 → 2008-06-30 | 11 zones of an unnamed US utility; no period in common |
+| `proenfo_gfc14` | 2013-01-01 → 2015-01-01 | GEFCom2014 load; no period in common |
+| `proenfo_gfc17` | 2016-01-01 → 2017-12-31 | ISO New England zones; entity absent and no period in common |
+| `ercot_1H/1D/1W/1M` | 2004-01-01 → 2021-09-01 | Eight ERCOT weather zones; ERCO absent |
+| `epf_pjm` | 2013-01-01 → 2018-12-24 | PJM price, system load forecast and COMED forecast covariates; all PJM rows excluded despite no common period |
+| `epf_np/be/fr/de` | 2011/2013 → 2016/2018 | European electricity markets; other entities |
+| `entsoe_15T/30T/1H` | 2015-01-01 → 2019-12-31 | Six European load/weather regions; other entities |
+| `solar_with_weather_15T/1H` | 2017-01-01 → 2022-08-31 | Conditional daylight inference near 53.3° N; see uncertainty below |
+| `solar_1D/1W` | 2006 | NREL synthetic plants; no period in common |
+| `walmart` | 2010-02-05 → 2012-10-26 | Store temperature; no period in common |
+| `jena_weather` | 2020 | German station; other continent |
+| `uci_air_quality` | 2004-03 → 2005-04 | Italian site; no period in common |
+
+Declaration under the board's rule: **No part of a benchmark dataset at the
+same frequency is identified in the retained rows, so no task would be declared
+overlap because of them under this scope.** PJM exclusion additionally removes a
+shared benchmark covariate entity with a different period. This is an audit
+under the stated scope, with the following blind spots, rather than a claim of
+exhaustive clearance:
+
+- Rows have no absolute timestamps. Calendar placement rests on item labels,
+  consistent lengths and EIA-930's start (authority demand July 2015, subregions
+  July 2018).
+- GEFCom2012's utility is unnamed. It could share a retained authority, but its
+  observations end over ten years before these pieces begin.
+- Other authorities in 2019–2021 are concurrent with ERCOT benchmark windows,
+  including regional weather events. F-row does not exclude distinct entities
+  for calendar concurrency alone.
+- The `solar_with_weather` location near 53.3° N is a conditional daylight
+  inference, dependent on plant/weather co-location and provider assumptions.
+  These are unverified; the pinned footer/ID measurements do not establish
+  geography or prove that no weather location is shared.
+- The `sketch4` fidelity pass found no verified content match in these folders
+  and detected 587 of 588 planted positives across all 121 folders. It is a
+  triage: interior crops are undetected by design, and two control classes had
+  no eligible benchmark series (Amendment 3 condition 2 remains open).
+- The original row inventory binds target content, weather names and channel
+  counts; it does not bind weather content independently. The derivation adds
+  NaN-safe canonical hashes of every retained covariate matrix and checks them
+  on read-back.
+
+Observed weather is supplied over the forecast horizon, matching the oracle
+weather input that benchmark tasks supply (for example actual `airtemperature`
+in `proenfo_*`). It is not weather forecast availability at issue time.
+
+Generate the CPU guest with `python -m scripts.corpus_v4.make_derive_job --name
+<name> --repo-sha <full-commit> --parent-uri <parent-prefix> --output-uri
+<new-prefix> --output <guest-script>`. The host supplies `RUN_DIR` and a
+pairwise-disjoint `STATE_URI`, a 100 GB boot disk and about 1.5 hours. The guest
+pins CPython 3.10-compatible `pyarrow==25.0.1`, `numpy==2.2.6`, `PyYAML==6.0.3`.
+It downloads the full parent identity/status and only the two quarantined source
+folders, replays inventory and manifest hashes, filters in source order and
+measures the resulting folders. The remaining 97 allowed folders are copied
+object for object on the server. No other quarantine folder is downloaded.
+
+For these two derived folders, `stats.json` contains stable measurements only;
+the run's volatile `wall_seconds` and `peak_rss_bytes` are kept in the job's
+completion state (`state/derive/<name>/completed.json`, under `measurements`).
+The 97 copied folders retain their v4.0 statistics unchanged.
+
+The first output write is the create-only `derivation/publishing.json`, binding
+inputs and a deterministic attempt ID. Every subsequent output object is also
+created conditionally. The whole output is downloaded once; its complete byte
+map finalises `derivation/derivation.json` (the copied receipts/stats cannot be
+hashed from source inventories alone). The guest confirms those uploaded record
+bytes and calls `verify_derived` before creating `attempt-status.json` last.
+Failures before that status leave training closed. A retry reconciles remote
+bytes even if local completion state is present or lost. Once status exists,
+retries only re-verify the output and update state outside that prefix.
+
+For offline verification call `scripts.corpus_v4.derive_corpus.verify_derived(root,
+repo_root, pinned_files)` on a local copy; `pinned_files` may be omitted to use
+the checked-in inventory. It checks the 99-entry identity, unchanged folder
+receipts and hashes, filtered shard and evidence hashes, the complete permitted
+object set, rebuilt retained-row inventories through source/output row maps and
+both target and covariate hashes. `derivation.json`, `publishing.json` and the
+status are excluded from the payload hash map to avoid circular hashes; the
+status and state completion bind the final derivation SHA256.
+
+The status remains `complete: false`, `exit_code: -1`, `mode: derived`. Training
+uses the existing generator with the derived corpus URI and
+`--provisional-unaudited-corpus-attempt <derived-attempt-id>`, limited to 25m,
+full recipe, stage3/stage4/stage4-long/export, from a receipt-free stage2 fork.
+The audited gate remains closed. Registering and training the two-seed
+covariate-data arm, including its spend decision, is a separate next task.

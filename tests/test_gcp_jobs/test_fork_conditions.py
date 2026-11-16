@@ -1587,3 +1587,25 @@ def test_81f46d9_provisional_state_remains_usable(upstream, tmp_path, monkeypatc
     if use == "member":
         assert marker["member_corpus_releases"] == [saved["corpus_release"]] * 2
         assert (directory / "model.safetensors").stat().st_size > 0
+
+
+@pytest.mark.parametrize("provisional", [False, True])
+def test_derived_status_training_handshake(upstream, tmp_path, provisional):
+    from simons.training import spot_job
+
+    release(tmp_path / "corpus")
+    raw = (FIXTURES / "derived-corpus-attempt-status.json").read_bytes()
+    status = json.loads(raw)
+    (tmp_path / "corpus/attempt-status.json").write_bytes(raw)
+    if provisional:
+        expected = dict(
+            provisional=True,
+            warning="UNAUDITED_CORPUS_PROVISIONAL",
+            attempt_id=status["attempt_id"],
+            corpus_uri=URI,
+        )
+        receipt = spot_job.corpus_release(tmp_path / "corpus", provisional=expected)
+        assert receipt == dict(**expected, attempt_complete=False, attempt_exit_code=-1)
+    else:
+        with pytest.raises(ValueError, match="attempt is incomplete or failed"):
+            spot_job.corpus_release(tmp_path / "corpus")

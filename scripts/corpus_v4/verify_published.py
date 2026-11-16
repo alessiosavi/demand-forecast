@@ -43,6 +43,12 @@ def verify_published(root, manifest, *, pinned_files=None):
         else PinnedInventory(manifest["repo_id"], manifest["revision"], pinned_files)
     )
     expected = inventory(manifest, hub)
+    return verify_integrity(root, manifest, expected)
+
+
+def verify_integrity(root, manifest, expected, *, derived_receipts=False):
+    """Shared byte/receipt checks; callers must first enforce their own policy."""
+    root = Path(root)
     identity = dict(
         repo_id=manifest["repo_id"], revision=manifest["revision"], folders=manifest["folders"]
     )
@@ -65,6 +71,8 @@ def verify_published(root, manifest, *, pinned_files=None):
             status=entry["status"],
             files=[asdict(f) for f in expected[entry["folder"]]],
         )
+        if derived_receipts and "derived" in entry:
+            recorded["derived"] = entry["derived"]
         if {k: receipt.get(k) for k in recorded} != recorded:
             raise ValueError(f"receipt differs from pinned inventory/manifest: {entry['folder']}")
         names = {Path(f.path).name for f in expected[entry["folder"]]}

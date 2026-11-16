@@ -1,0 +1,9 @@
+{
+  "attempt_id": "derived-fixture-123456789abc",
+  "repo_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "exit_code": -1,
+  "complete": false,
+  "mode": "derived",
+  "parent_attempt_id": "20261113T114417Z-1990",
+  "derivation_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+}
