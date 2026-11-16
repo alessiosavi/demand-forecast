@@ -249,8 +249,9 @@ output with `fev_report.py` and the same task YAML and selection as above.
 **Cloud route.** Generate an offline guest job with
 `scripts/gcp/jobs/make_ensemble_job.py --name average --repo-sha <40-hex> --tasks-uri
 gs://bucket/tasks.yaml --tasks-sha256 <64-hex> --member-uri
-gs://bucket/state/score/seed-1 --member-uri gs://bucket/state/score/seed-2 --output
-average.sh` (optionally `--names-uri` plus `--names-sha256`, and
+gs://bucket/state/score/seed-1 --member-uri gs://bucket/state/score/seed-2
+--member-weight .25 --member-weight .75 --output average.sh`
+(optionally `--names-uri` plus `--names-sha256`, and
 `--processing raw|published|both`). It requires completed members with matching
 evaluation code, task selection and evaluation settings, distinct names and
 weight hashes, and verified manifests with no missing or unlisted mode files.

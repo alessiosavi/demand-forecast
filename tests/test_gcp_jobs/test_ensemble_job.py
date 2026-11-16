@@ -1271,7 +1271,9 @@ def test_later_member_parity_failure_stops_before_average(machine, reference):
     assert not (state / "completed.json").exists()
 
 
-@pytest.mark.parametrize("damage", ["mapping", "mapping-hash", "changed-member"])
+@pytest.mark.parametrize(
+    "damage", ["mapping", "mapping-hash", "changed-member", "missing-mapping-changed-member"]
+)
 @pytest.mark.parametrize("interrupted", [False, True])
 def test_resolved_mapping_refuses_tampering_and_changed_members(machine, damage, interrupted):
     run, state, _, cloud = machine
@@ -1297,17 +1299,56 @@ def test_resolved_mapping_refuses_tampering_and_changed_members(machine, damage,
         write(directory / "completed.json", marker)
         rehash(directory)
         # Completed preflight is offline: require re-entry before inspecting a changed remote.
-        if not interrupted:
+        if damage == "missing-mapping-changed-member":
+            (state / "resolved-inputs.json").unlink()
+        elif not interrupted:
             (state / "raw/alpha/window_0.npz").unlink()
     before = {str(p.relative_to(state)): p.read_bytes() for p in state.rglob("*") if p.is_file()}
     result = run(options)
     assert result.returncode != 0
-    assert "resolved" in result.stderr or "different member" in result.stderr
+    if damage == "missing-mapping-changed-member":
+        assert "different member" in result.stderr
+    else:
+        assert "resolved" in result.stderr or "different member" in result.stderr
     after = {str(p.relative_to(state)): p.read_bytes() for p in state.rglob("*") if p.is_file()}
     # environment.txt is refreshed by the install phase on a partial restart.
     assert {k: v for k, v in before.items() if k != "environment.txt"} == {
         k: v for k, v in after.items() if k != "environment.txt"
     }
+
+
+def test_missing_resolved_mapping_recovers_identical_outputs(machine, jobs):
+    run, state, _, cloud = machine
+    reference_member(cloud / "score/seed22")
+    options = {"member_weights": [".25", ".75"]}
+    first = run(options)
+    assert first.returncode == 0, first.stderr
+    guest = {"__name__": "ensemble_test"}
+    exec(jobs.GUEST, guest)
+    config = load(state / "inputs.json")
+    path = state / "resolved-inputs.json"
+    mapping = path.read_bytes()
+    assert load(state / "completed.json")["artifacts"][path.name] == sha(path)
+    outputs = {
+        str(p.relative_to(state)): p.read_bytes()
+        for mode in config["modes"]
+        for p in (state / mode).rglob("*")
+        if p.is_file()
+    }
+    windows = {name: (state / name).stat().st_mtime_ns for name in outputs if name.endswith(".npz")}
+    path.unlink()
+    assert guest["preflight"](config, state) == 10
+    result = run(options)
+    assert result.returncode == 0, result.stderr
+    assert path.read_bytes() == mapping
+    assert outputs == {
+        str(p.relative_to(state)): p.read_bytes()
+        for mode in config["modes"]
+        for p in (state / mode).rglob("*")
+        if p.is_file()
+    }
+    assert windows == {name: (state / name).stat().st_mtime_ns for name in windows}
+    assert guest["preflight"](config, state) == 0
 
 
 @pytest.mark.parametrize(

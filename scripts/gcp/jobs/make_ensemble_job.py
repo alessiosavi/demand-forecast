@@ -307,7 +307,7 @@ def preflight(config, root):
         atomic(identity, config)
     resolved_path = root / "resolved-inputs.json"
     expected_hash = marker.get("artifacts", {}).get("resolved-inputs.json") if isinstance(marker.get("artifacts"), dict) else None
-    if expected_hash is not None and (not resolved_path.is_file() or digest(resolved_path) != expected_hash):
+    if expected_hash is not None and resolved_path.is_file() and digest(resolved_path) != expected_hash:
         raise ValueError("resolved-inputs.json sha256 mismatch; refusing changed mapping")
     if resolved_path.exists():
         try:
