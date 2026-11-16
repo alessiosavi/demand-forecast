@@ -149,14 +149,30 @@ class Store:
 
 def complete(config, state, downloaded, verified):
     status = downloaded / "attempt-status.json"
-    measurements = state / "measurements.json"
+    measurements_path = state / "measurements.json"
     destination = os.environ["STATE_URI"].rstrip("/") + "/derive/" + config["name"]
+    measurements, measurements_source = {}, "unavailable"
+    if measurements_path.exists():
+        measurements = json.loads(measurements_path.read_text())
+        measurements_source = "local"
+    else:
+        try:
+            previous = json.loads(Store(destination).read("completed.json"))
+        except (OSError, ValueError, subprocess.CalledProcessError):
+            previous = None
+        # Previous state supplies measurements only; all other evidence is fresh.
+        if (isinstance(previous, dict) and type(previous.get("schema")) is int
+                and previous["schema"] == 1 and previous.get("inputs") == config
+                and previous.get("derivation_sha256") == verified["derivation_sha256"]
+                and isinstance(previous.get("measurements"), dict)):
+            measurements = previous["measurements"]
+            measurements_source = "previous-completion"
     for name in ("inputs.json", "environment.txt"):
         subprocess.run(["gcloud", "storage", "cp", str(state / name),
                         destination + "/" + name], check=True)
     record = dict(schema=1, inputs=config, derivation_sha256=verified["derivation_sha256"],
                   status_sha256=sha(status), verification=verified,
-                  measurements=json.loads(measurements.read_text()) if measurements.exists() else {},
+                  measurements=measurements, measurements_source=measurements_source,
                   artifacts={name: sha(state / name) for name in ("inputs.json", "environment.txt")})
     candidate = state / "completion-candidate.json"
     atomic(candidate, record)

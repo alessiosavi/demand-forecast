@@ -269,6 +269,7 @@ def test_volatile_measurements_are_saved_in_state_only(machine):
     result = m["invoke"]()
     assert result.returncode == 0, result.stderr
     completion = json.loads((m["state"] / "completed.json").read_text())
+    assert completion["measurements_source"] == "local"
     metrics = completion["measurements"]
     assert set(metrics) == {r["folder"] for r in m["case"]["contract"]["releases"]}
     for folder, measurement in metrics.items():
@@ -283,10 +284,90 @@ def test_volatile_measurements_are_saved_in_state_only(machine):
         json.loads((m["cloud"] / "offline/state/derive/probe/completed.json").read_text())
         == completion
     )
+    remote = m["cloud"] / "offline/state/derive/probe/completed.json"
+    remote.write_text(json.dumps(dict(completion, measurements={})))
     before = snapshot(m["output"])
     result = m["invoke"]()
     assert result.returncode == 0, result.stderr
-    assert json.loads((m["state"] / "completed.json").read_text())["measurements"] == metrics
+    assert json.loads((m["state"] / "completed.json").read_text()) == completion
+    assert json.loads(remote.read_text()) == completion
+    assert snapshot(m["output"]) == before
+
+
+def test_state_loss_retry_preserves_previous_completion_measurements_only(machine):
+    m = machine
+    result = m["invoke"]()
+    assert result.returncode == 0, result.stderr
+    remote = m["cloud"] / "offline/state/derive/probe/completed.json"
+    original = json.loads(remote.read_text())
+    assert original["measurements"]
+    previous = dict(
+        original, status_sha256="0" * 64, verification={"untrusted": True}, artifacts={}
+    )
+    remote.write_text(json.dumps(previous))
+    before, offset = snapshot(m["output"]), len(m["calls"]())
+    shutil.rmtree(m["case"]["tmp"] / "run")
+
+    result = m["invoke"]()
+
+    assert result.returncode == 0, result.stderr
+    completion = json.loads(remote.read_text())
+    assert completion["measurements"] == original["measurements"]
+    assert completion["measurements_source"] == "previous-completion"
+    assert completion == dict(original, measurements_source="previous-completion")
+    assert json.loads((m["state"] / "completed.json").read_text()) == completion
+    assert snapshot(m["output"]) == before
+    assert not any(
+        c[:3] == ["gcloud", "storage", "cp"] and c[-1].startswith("gs://offline/output/")
+        for c in m["calls"]()[offset:]
+    )
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "different-derivation",
+        "different-inputs",
+        "unparsable",
+        "non-object",
+        "invalid-schema",
+        "invalid-measurements",
+        "missing",
+    ],
+)
+def test_state_loss_retry_discards_untrusted_previous_measurements(machine, mode):
+    m = machine
+    result = m["invoke"]()
+    assert result.returncode == 0, result.stderr
+    remote = m["cloud"] / "offline/state/derive/probe/completed.json"
+    previous = json.loads(remote.read_text())
+    assert previous["measurements"]
+    if mode == "different-derivation":
+        previous["derivation_sha256"] = "b" * 64
+    elif mode == "different-inputs":
+        previous["inputs"] = dict(previous["inputs"], name="other")
+    elif mode == "invalid-schema":
+        previous["schema"] = True
+    elif mode == "invalid-measurements":
+        previous["measurements"] = ["untrusted"]
+    if mode == "unparsable":
+        remote.write_text("{")
+    elif mode == "non-object":
+        remote.write_text("[]")
+    elif mode == "missing":
+        remote.unlink()
+    else:
+        remote.write_text(json.dumps(previous))
+    before = snapshot(m["output"])
+    shutil.rmtree(m["case"]["tmp"] / "run")
+
+    result = m["invoke"]()
+
+    assert result.returncode == 0, result.stderr
+    completion = json.loads(remote.read_text())
+    assert completion["measurements"] == {}
+    assert completion["measurements_source"] == "unavailable"
+    assert json.loads((m["state"] / "completed.json").read_text()) == completion
     assert snapshot(m["output"]) == before
 
 

@@ -1044,7 +1044,7 @@ a bounded content check. It replaces rule L for newly built corpora; it does not
 claim that unresolved lineage has been resolved. v4.0 and its strict validator
 retain their existing meaning.
 
-The reviewed contract is [configs/corpus-v4.1.yaml](../configs/corpus-v4.1.yaml).
+The reviewed contract is [configs/corpus-v4.1.yaml](https://github.com/alessiosavi/demand-forecast/blob/main/configs/corpus-v4.1.yaml).
 It binds the exact v4.0 manifest and the native Hub inventory at
 `abel-lab/Simons-Pretrain`, revision
 `5f17ab8cfa3fa00a8e821599b631127ba250c342`. The derived identity keeps the 97
@@ -1068,8 +1068,8 @@ eight weather channels: `temp_c`, `dewpoint_c`, `rh_pct`, `wind10_ms`, `ghi_wm2`
 these as NASA POWER observed/reanalysis weather. The allowed corpus previously
 held 18 load-with-weather rows from three sources.
 
-The checked-in [BA rules](../configs/corpus-v4.1/rules-eia930_ba_load_weather.yaml)
-and [subregion rules](../configs/corpus-v4.1/rules-eia930_subregion_load_weather.yaml)
+The checked-in [BA rules](https://github.com/alessiosavi/demand-forecast/blob/main/configs/corpus-v4.1/rules-eia930_ba_load_weather.yaml)
+and [subregion rules](https://github.com/alessiosavi/demand-forecast/blob/main/configs/corpus-v4.1/rules-eia930_subregion_load_weather.yaml)
 exclude `^PJM[|-]`, including all PJM subregions and COMED (`PJM-CE`). Guards also
 exclude ERCO/ISNE identities, pieces starting before 2019 and non-hourly rows;
 none of those guards match the reviewed inventories. First matching rule wins,
