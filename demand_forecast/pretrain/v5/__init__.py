@@ -18,20 +18,41 @@ from .config import (
     V5TrainConfig,
     identity,
 )
+from .corpus import (
+    CorpusIndex,
+    CorpusValueError,
+    RowCache,
+    SamplerSkip,
+    ShortRow,
+    listing_digest,
+    read_values,
+)
+from .sources import CorpusSource, PanelSource, SourceMix, TypedSource
 
 __all__ = [
     "T1_BASE",
     "T1_MODEL",
     "CheckpointError",
     "CheckpointRequest",
+    "CorpusIndex",
+    "CorpusSource",
+    "CorpusValueError",
     "OptimConfig",
+    "PanelSource",
+    "RowCache",
     "SamplerConfig",
+    "SamplerSkip",
+    "ShortRow",
     "SourceConfig",
+    "SourceMix",
+    "TypedSource",
     "V5TrainConfig",
     "file_digest",
     "identity",
     "latest_checkpoint",
+    "listing_digest",
     "read_manifest",
+    "read_values",
     "save_checkpoint",
     "write_manifest",
 ]
