@@ -401,3 +401,20 @@ def test_numeric_normalization_keeps_canonical_and_identity_in_agreement(section
     parts = dict(code="rev", corpus=None, init=None, env=None)
     assert a.canonical() == b.canonical()
     assert api.identity(a, **parts) == api.identity(b, **parts)
+
+
+@pytest.mark.parametrize(
+    ("section", "field"),
+    [("source", "heldout"), ("sampler", "designate_target"), ("optim", "amp")],
+)
+@pytest.mark.parametrize("value", ["false", "yes", 0, 1, None])
+def test_flags_must_be_real_booleans(section, field, value):
+    # A quoted "false" in a yaml is truthy: it must fail instead of silently switching a control on.
+    cfg = config_module()
+    base = {
+        "source": cfg.SourceConfig(kind="typed", weight=1.0),
+        "sampler": cfg.SamplerConfig(),
+        "optim": cfg.OptimConfig(max_steps=10),
+    }[section]
+    with pytest.raises(ValueError, match=field):
+        replace(base, **{field: value})

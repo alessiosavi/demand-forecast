@@ -17,6 +17,12 @@ from demand_forecast.data.episode.schema import SUMMARY_FEATURES
 from demand_forecast.models.v5.config import V5Config
 
 
+def _flag(self, name: str) -> None:
+    """A switch must be a real boolean: a quoted "false" from yaml is truthy."""
+    if not isinstance(getattr(self, name), bool):
+        raise ValueError(f"{name} must be a boolean")
+
+
 def _numeric(value, name: str, *, integer: bool = False, minimum=None, maximum=None):
     """Normalize finite numbers without admitting booleans or truncating counts."""
     try:
@@ -67,6 +73,7 @@ class SourceConfig:
     control_inputs: str = "all"
 
     def __post_init__(self) -> None:
+        _flag(self, "heldout")
         for name in ("weight", "singleton_share"):
             _normalize(self, name, minimum=0, maximum=1 if name == "singleton_share" else None)
         if self.weight == 0:
@@ -110,6 +117,7 @@ class SamplerConfig:
     max_cells: int | None = 4_000_000
 
     def __post_init__(self) -> None:
+        _flag(self, "designate_target")
         for name in ("episodes_per_batch", "episodes_per_panel", "origins", "origin_stride"):
             _normalize(self, name, integer=True, minimum=1)
         if not self.contexts:
@@ -148,6 +156,7 @@ class OptimConfig:
     log_every: int = 50
 
     def __post_init__(self) -> None:
+        _flag(self, "amp")
         for name in ("max_steps", "log_every", "warmup_steps"):
             _normalize(self, name, integer=True, minimum=0 if name == "warmup_steps" else 1)
         for name in ("learning_rate", "weight_decay", "grad_clip", "checkpoint_minutes"):

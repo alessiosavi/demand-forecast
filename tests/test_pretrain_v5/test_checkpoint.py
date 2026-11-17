@@ -526,3 +526,15 @@ def test_directory_fsync_failure_raises_after_publishing(tmp_path, monkeypatch, 
     else:
         assert api.read_manifest(tmp_path / "unit.json")["files"]["artifact"]["bytes"] == 3
     assert not list(tmp_path.glob(".*-*"))
+
+
+@pytest.mark.parametrize("files", ["a", True, 3, {"a"}])
+def test_manifest_files_must_be_a_list_of_names(tmp_path, files):
+    (tmp_path / "a").write_bytes(b"x")
+    with pytest.raises(ValueError, match="files"):
+        checkpoint_module().write_manifest(tmp_path / "unit.json", {"files": files})
+
+
+def test_manifest_record_must_be_a_mapping(tmp_path):
+    with pytest.raises(ValueError, match="record"):
+        checkpoint_module().write_manifest(tmp_path / "unit.json", ["a"])

@@ -207,8 +207,10 @@ def write_manifest(path: Path | str, record: dict) -> None:
     A directory fsync failure raises even after the rename has published the manifest.
     """
     path = Path(path)
-    if not record.get("files"):
-        raise ValueError("files must name at least one artifact")
+    if not isinstance(record, dict):
+        raise ValueError("record must be a mapping")
+    if not isinstance(record.get("files"), (list, tuple, dict)) or not record["files"]:
+        raise ValueError("files must name at least one artifact as a list of names")
     files = {}
     for name in record["files"]:
         artifact = _manifest_file(path.parent, name)
