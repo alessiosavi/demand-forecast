@@ -13,6 +13,8 @@ from demand_forecast.data.episode.schema import (
     CH_STEP_FLAG,
     KIND_NUMBER,
     N_SUMMARY,
+    ROLE_FORECAST,
+    ROLE_KNOWN,
     ROLE_PANEL,
     ROLE_PAST,
     ROLE_PEER,
@@ -463,6 +465,152 @@ def test_overflow_item_decodes_siblings():
 def test_eval_is_deterministic():
     batch, model = toy_batch(), V5Model(TINY).eval()
     torch.testing.assert_close(model(batch).quantiles, model(batch).quantiles, rtol=0, atol=0)
+
+
+def routing_batch(episodes=3):
+    builder = EpisodeBuilder(toy_panel(n_items=9))
+    examples = [builder.build(EpisodeRequest(i, (320,), 5, 32)) for i in range(episodes)]
+    if episodes > 1:
+        examples[-1] = EpisodeBuilder(bare_panel()).build(EpisodeRequest(0, (320,), 5, 32))
+    return collate(examples)
+
+
+def test_uniform_router_uses_all_experts_in_encoder_and_decoder():
+    batch = routing_batch()
+    model = V5Model(replace(TINY, n_experts=3)).eval()
+    learned = model(batch)
+    encoder_weights, decoder_weights = [], []
+    hooks = [
+        block.register_forward_pre_hook(lambda module, args: encoder_weights.append(args[-1]))
+        for block in model.encoder
+    ] + [
+        block.register_forward_pre_hook(lambda module, args: decoder_weights.append(args[-1]))
+        for block in model.decoder
+    ]
+    rng = torch.random.get_rng_state()
+    try:
+        uniform = model(batch, router="uniform")
+    finally:
+        for hook in hooks:
+            hook.remove()
+    assert torch.equal(torch.random.get_rng_state(), rng)
+    assert (~batch.row_mask).any()  # Padding also receives uniform routing.
+    for weights in [uniform.router, *encoder_weights, *decoder_weights]:
+        torch.testing.assert_close(weights, torch.full_like(weights, 1 / 3), rtol=0, atol=0)
+    assert not torch.allclose(uniform.quantiles, learned.quantiles, atol=1e-6)
+    torch.testing.assert_close(uniform.aux["balance"], learned.aux["balance"], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("episodes,shift", [(1, 1), (3, 1), (4, 2)])
+def test_rolled_router_is_a_deterministic_batch_roll(episodes, shift):
+    batch, model = routing_batch(episodes), V5Model(TINY).eval()
+    learned = model(batch)
+    rng = torch.random.get_rng_state()
+    first = model(batch, router="rolled")
+    second = model(batch, router="rolled")
+    assert torch.equal(torch.random.get_rng_state(), rng)
+    torch.testing.assert_close(first.router, learned.router.roll(shift, 0), rtol=0, atol=0)
+    torch.testing.assert_close(first.router, second.router, rtol=0, atol=0)
+    torch.testing.assert_close(first.quantiles, second.quantiles, rtol=0, atol=0)
+    torch.testing.assert_close(first.aux["balance"], learned.aux["balance"], rtol=0, atol=0)
+    if episodes == 1:
+        torch.testing.assert_close(first.quantiles, learned.quantiles, rtol=0, atol=0)
+    else:
+        assert not torch.equal(first.router, learned.router)
+        assert not torch.allclose(first.quantiles, learned.quantiles, atol=1e-6)
+
+
+def test_unknown_router_raises():
+    with pytest.raises(ValueError, match="router"):
+        V5Model(TINY).eval()(routing_batch(1), router="typo")
+
+
+def test_explicit_learned_router_matches_original_call_bitwise():
+    batch, model = routing_batch(), V5Model(TINY).eval()
+    reference = model(batch)
+    explicit = model(batch, router="learned")
+    torch.testing.assert_close(explicit.quantiles, reference.quantiles, rtol=0, atol=0)
+    torch.testing.assert_close(explicit.router, reference.router, rtol=0, atol=0)
+    for field in dataclasses.fields(Gates):
+        assert torch.equal(
+            getattr(explicit.gates, field.name), getattr(reference.gates, field.name)
+        )
+    for name in reference.aux:
+        assert torch.equal(explicit.aux[name], reference.aux[name])
+
+
+@pytest.mark.parametrize("mode", ["learned", "ones"])
+def test_forced_candidates_zero_all_uses_and_match_pruning(mode):
+    batch, model = routing_batch(1), V5Model(replace(TINY, gate_init=0.0)).eval()
+    baseline = model.gates(batch, mode=mode)
+    zero = torch.zeros_like(batch.cand_mask)
+    indices = [batch.cand_names[0].index(name) for name in ("tags", "size")]
+    zero[0, indices] = True
+    gates = model.gates(batch, mode=mode, zero_candidates=zero)
+    peers = batch.row_mask & (batch.row_role == ROLE_PEER)
+    forced_peers = peers & zero.gather(1, batch.row_cand.clamp_min(0))
+    forced_attrs = batch.attr_mask & zero.gather(1, batch.attr_cand.clamp_min(0))
+    forced_numbers = batch.static_num_mask & zero.gather(1, batch.static_num_cand.clamp_min(0))
+    assert forced_peers.any() and forced_attrs.any() and forced_numbers.any()
+    assert (gates.cand[zero] == 0).all()
+    assert (gates.row[forced_peers] == 0).all()
+    assert torch.equal(gates.cand[~zero], baseline.cand[~zero])
+    assert torch.equal(gates.row[~forced_peers], baseline.row[~forced_peers])
+    assert torch.equal(gates.expected_l0, baseline.expected_l0)
+    assert torch.equal(gates.family, baseline.family)
+    assert torch.equal(gates.summary_mask, baseline.summary_mask)
+    context_inputs = []
+    hook = model.static_context.register_forward_pre_hook(
+        lambda module, args: context_inputs.append(args)
+    )
+    try:
+        before = model(batch, gates)
+    finally:
+        hook.remove()
+    assert (context_inputs[0][1][forced_attrs] == 0).all()
+    assert (context_inputs[0][4][forced_numbers] == 0).all()
+    reduced, reduced_gates = prune(batch, gates)
+    assert all(name not in reduced.cand_names[0] for name in ("tags", "size"))
+    assert not any(name.startswith("tags=") for name in reduced.row_names[0])
+    assert not any(name.startswith(("tags=", "size=")) for name in reduced.attr_names[0])
+    assert reduced.static_num_mask.sum() == 0
+    after = model(reduced, reduced_gates)
+    kept = (batch.keep & batch.forecast_mask)[:, None, :, None, None].expand_as(before.quantiles)
+    torch.testing.assert_close(before.quantiles[kept], after.quantiles[kept], rtol=0, atol=1e-5)
+
+
+@pytest.mark.parametrize("mode", ["learned", "ones"])
+@pytest.mark.parametrize("role", [ROLE_PAST, ROLE_PEER, ROLE_KNOWN])
+def test_forced_rows_stay_zero_without_changing_candidate_gates(mode, role):
+    batch, model = routing_batch(1), V5Model(replace(TINY, gate_init=0.0)).eval()
+    baseline = model.gates(batch, mode=mode)
+    zero = batch.row_mask & (batch.row_role == role)
+    assert zero.any() and (baseline.row[zero] > 0).all()
+    gates = model.gates(batch, mode=mode, zero_rows=zero)
+    assert (gates.row[zero] == 0).all()
+    assert torch.equal(gates.row[~zero], baseline.row[~zero])
+    assert torch.equal(gates.cand, baseline.cand)
+    assert torch.equal(gates.expected_l0, baseline.expected_l0)
+
+
+@pytest.mark.parametrize("mode", ["learned", "ones"])
+def test_forcing_forecast_rows_raises(mode):
+    batch = routing_batch(1)
+    zero = batch.row_mask & (batch.row_role == ROLE_FORECAST)
+    assert zero.any()
+    with pytest.raises(ValueError, match="forecast"):
+        V5Model(TINY).gates(batch, mode=mode, zero_rows=zero)
+
+
+@pytest.mark.parametrize("argument", ["zero_candidates", "zero_rows"])
+@pytest.mark.parametrize("invalid", ["shape", "dtype"])
+def test_forcing_masks_require_boolean_batch_shapes(argument, invalid):
+    batch = routing_batch(1)
+    mask = batch.cand_mask if argument == "zero_candidates" else batch.row_mask
+    mask = torch.zeros_like(mask)
+    mask = mask[:, :-1] if invalid == "shape" else mask.float()
+    with pytest.raises(ValueError, match=argument):
+        V5Model(TINY).gates(batch, **{argument: mask})
 
 
 def test_padded_horizon_inputs_are_inert():
