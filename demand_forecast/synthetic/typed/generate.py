@@ -96,6 +96,9 @@ def generate_typed_panel(recipe: PanelRecipe, *, without: tuple[str, ...] = ()) 
             ),
             _range_fn(mechanism, recipe.heldout),
         )
+        for key in ("process", "inputs"):
+            if key in result.params:
+                raise ValueError(f"Mechanism {mechanism!r} uses reserved parameter key {key!r}")
         params[mechanism] = {**result.params, "process": result.process, "inputs": result.inputs}
         if result.contribution is not None:
             contribution = (
@@ -145,4 +148,7 @@ def generate_typed_panel(recipe: PanelRecipe, *, without: tuple[str, ...] = ()) 
         tuple(f"i{i:04d}" for i in np.flatnonzero(draft.short)),
         {f"i{i:04d}": f"i{draft.host[i]:04d}" for i in np.flatnonzero(draft.host >= 0)},
         availability,
+        draft.grid_length,
+        draft.period,
+        draft.long_lag,
     )
