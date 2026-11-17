@@ -182,14 +182,222 @@ def test_source_controls_require_identical_unbudgeted_designated_episodes(contro
 @pytest.mark.parametrize("violation", ["budget", "target"])
 def test_fixed_removals_require_unbudgeted_designated_episodes(removal, violation):
     base = config_module().T1_BASE
-    changes = {removal: ("calendar",)}
+    name = "skewness" if removal == "summary_off" else "calendar"
+    changes = {removal: (name,)}
     changes.update({"max_cells": 100} if violation == "budget" else {"designate_target": False})
     with pytest.raises(ValueError, match="max_cells|designate_target"):
         replace(base, sampler=replace(base.sampler, **changes))
-    assert replace(base, sampler=replace(base.sampler, **{removal: ("calendar",)}))
+    assert replace(base, sampler=replace(base.sampler, **{removal: (name,)}))
 
 
 @pytest.mark.parametrize("field", ["router", "gates"])
 def test_router_and_gates_reject_unknown_modes(field):
     with pytest.raises(ValueError, match=field):
         replace(config_module().T1_BASE, **{field: "unrecognised"})
+
+
+# Each row catches a missing range/type guard, before invalid values reach the sampler/loop.
+_NUMERIC_FIELDS = (
+    ("source", "weight"),
+    ("source", "max_items"),
+    ("source", "n_nuisance"),
+    ("source", "singleton_share"),
+    ("source", "length"),
+    ("sampler", "episodes_per_batch"),
+    ("sampler", "episodes_per_panel"),
+    ("sampler", "origins"),
+    ("sampler", "origin_stride"),
+    ("sampler", "contexts"),
+    ("sampler", "horizon"),
+    ("sampler", "cutoff_at_origin"),
+    ("sampler", "path_share"),
+    ("sampler", "drop"),
+    ("sampler", "max_cells"),
+    ("optim", "max_steps"),
+    ("optim", "learning_rate"),
+    ("optim", "weight_decay"),
+    ("optim", "warmup_steps"),
+    ("optim", "grad_clip"),
+    ("optim", "ema_decay"),
+    ("optim", "checkpoint_minutes"),
+    ("optim", "log_every"),
+    ("train", "seed"),
+    ("train", "workers"),
+)
+
+
+def config_section(section):
+    cfg = training_config()
+    return {"source": cfg.sources[0], "sampler": cfg.sampler, "optim": cfg.optim, "train": cfg}[
+        section
+    ]
+
+
+@pytest.mark.parametrize("section,field", _NUMERIC_FIELDS)
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf"), True, "1"])
+def test_numeric_fields_reject_nonfinite_and_nonnumeric_values(section, field, value):
+    if field in ("length", "horizon"):
+        value = (value, 128)
+    elif field == "contexts":
+        value = (value,)
+    elif field == "drop":
+        value = (("features", value),)
+    with pytest.raises(ValueError, match=field):
+        replace(config_section(section), **{field: value})
+
+
+@pytest.mark.parametrize(
+    "section,field,value",
+    [
+        ("source", "weight", 0),
+        ("source", "weight", -1),
+        ("source", "max_items", 0),
+        ("source", "n_nuisance", -1),
+        ("source", "singleton_share", -0.1),
+        ("source", "singleton_share", 1.1),
+        ("source", "length", (0, 64)),
+        ("source", "length", (128, 64)),
+        ("source", "length", (64,)),
+        ("sampler", "episodes_per_batch", 0),
+        ("sampler", "episodes_per_panel", 0),
+        ("sampler", "origins", 0),
+        ("sampler", "origin_stride", 0),
+        ("sampler", "contexts", ()),
+        ("sampler", "contexts", (0,)),
+        ("sampler", "contexts", (17,)),
+        ("sampler", "horizon", (0, 16)),
+        ("sampler", "horizon", (16, 289)),
+        ("sampler", "horizon", (32, 16)),
+        ("sampler", "horizon", (16,)),
+        ("sampler", "cutoff_at_origin", -0.1),
+        ("sampler", "cutoff_at_origin", 1.1),
+        ("sampler", "path_share", -0.1),
+        ("sampler", "path_share", 1.1),
+        ("sampler", "drop", (("features", -0.1),)),
+        ("sampler", "drop", (("features", 1.1),)),
+        ("sampler", "max_cells", 0),
+        ("optim", "max_steps", 0),
+        ("optim", "learning_rate", 0),
+        ("optim", "weight_decay", -1),
+        ("optim", "warmup_steps", -1),
+        ("optim", "grad_clip", 0),
+        ("optim", "ema_decay", 0),
+        ("optim", "ema_decay", 1),
+        ("optim", "checkpoint_minutes", 0),
+        ("optim", "log_every", 0),
+        ("train", "workers", -1),
+    ],
+)
+def test_numeric_fields_reject_values_outside_contract(section, field, value):
+    with pytest.raises(ValueError, match=field):
+        replace(config_section(section), **{field: value})
+
+
+@pytest.mark.parametrize(
+    "section,field",
+    [
+        ("source", "max_items"),
+        ("source", "n_nuisance"),
+        ("source", "length"),
+        ("sampler", "episodes_per_batch"),
+        ("sampler", "episodes_per_panel"),
+        ("sampler", "origins"),
+        ("sampler", "origin_stride"),
+        ("sampler", "contexts"),
+        ("sampler", "horizon"),
+        ("sampler", "max_cells"),
+        ("optim", "max_steps"),
+        ("optim", "warmup_steps"),
+        ("optim", "log_every"),
+        ("train", "seed"),
+        ("train", "workers"),
+    ],
+)
+def test_integer_fields_do_not_silently_truncate(section, field):
+    value = (
+        (16.5, 32) if field in ("length", "horizon") else (16.5,) if field == "contexts" else 1.5
+    )
+    with pytest.raises(ValueError, match=field):
+        replace(config_section(section), **{field: value})
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("drop", (("typo", 0.1),)),
+        ("drop", (("features", 0.1), ("features", 0.2))),
+        ("drop_always", ("typo",)),
+        ("summary_off", ("mean",)),
+    ],
+)
+def test_sampler_rejects_unknown_or_duplicate_family_names(field, value):
+    with pytest.raises(ValueError, match=field):
+        replace(config_module().T1_BASE.sampler, **{field: value})
+
+
+@pytest.mark.parametrize(
+    "device", ["banana", "cuda:-1", "cuda:", "cuda:1.5", "cuda:1x", "CPU", None]
+)
+def test_train_rejects_invalid_device(device):
+    with pytest.raises(ValueError, match="device"):
+        replace(training_config(), device=device)
+
+
+@pytest.mark.parametrize(
+    "section,field", [pair for pair in _NUMERIC_FIELDS if pair[1] != "ema_decay"]
+)
+def test_numeric_normalization_keeps_canonical_and_identity_in_agreement(section, field):
+    api = config_module()
+    cfg = training_config()
+    record = config_section(section)
+    if field == "drop":
+        integral, floating = (("features", 1),), (("features", 1.0),)
+        expected_type = float
+    elif field in ("length", "horizon", "contexts"):
+        integral, floating = (16, 32), (16.0, 32.0)
+        expected_type = int
+    else:
+        integral, floating = 1, 1.0
+        expected_type = (
+            int
+            if field
+            in {
+                "max_items",
+                "n_nuisance",
+                "episodes_per_batch",
+                "episodes_per_panel",
+                "origins",
+                "origin_stride",
+                "max_cells",
+                "max_steps",
+                "warmup_steps",
+                "log_every",
+                "seed",
+                "workers",
+            }
+            else float
+        )
+    left = replace(record, **{field: integral})
+    right = replace(record, **{field: floating})
+    value = getattr(left, field)
+    if field == "drop":
+        value = value[0][1]
+    elif isinstance(value, tuple):
+        value = value[0]
+    if value is not None:
+        assert type(value) is expected_type
+        other = getattr(right, field)
+        if field == "drop":
+            other = other[0][1]
+        elif isinstance(other, tuple):
+            other = other[0]
+        assert type(other) is expected_type
+    if section == "train":
+        a, b = left, right
+    elif section == "source":
+        a, b = replace(cfg, sources=(left,)), replace(cfg, sources=(right,))
+    else:
+        a, b = replace(cfg, **{section: left}), replace(cfg, **{section: right})
+    parts = dict(code="rev", corpus=None, init=None, env=None)
+    assert a.canonical() == b.canonical()
+    assert api.identity(a, **parts) == api.identity(b, **parts)

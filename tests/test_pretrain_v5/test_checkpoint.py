@@ -1,6 +1,8 @@
 """Durable slot selection, integrity, and the guest nonce protocol."""
 
+import hashlib
 import importlib
+import io
 import json
 import os
 import stat
@@ -155,12 +157,12 @@ def test_manifest_round_trip_preserves_metadata_and_input(tmp_path):
     assert record["files"] == ["artifacts/weights.pt", "empty"]
 
 
-@pytest.mark.parametrize("record", [{"status": "done"}, {"files": [], "status": "done"}])
-def test_manifest_without_named_files_publishes_empty_mapping(tmp_path, record):
-    api = checkpoint_module()
+@pytest.mark.parametrize("record", [{"status": "done"}, {"files": []}, {"files": {}}])
+def test_manifest_without_named_files_is_rejected(tmp_path, record):
     path = tmp_path / "new/unit.json"
-    api.write_manifest(path, record)
-    assert api.read_manifest(path) == {**record, "files": {}}
+    with pytest.raises(ValueError, match="files"):
+        checkpoint_module().write_manifest(path, record)
+    assert not path.exists()
 
 
 def test_manifest_paths_remain_valid_when_unit_directory_moves(tmp_path):
@@ -203,6 +205,7 @@ def test_missing_or_invalid_manifest_returns_none(tmp_path, contents):
     "files",
     [
         [],
+        {},
         None,
         {"weights.pt": None},
         {"weights.pt": {}},
@@ -264,7 +267,9 @@ def test_manifest_reader_rejects_unsafe_names(tmp_path, kind):
 def test_manifest_is_synced_before_replace_and_directory_synced_after(tmp_path, monkeypatch):
     api = checkpoint_module()
     path = tmp_path / "unit.json"
-    path.write_text('{"files": {}, "version": 1}')
+    (tmp_path / "artifact").write_bytes(b"abc")
+    api.write_manifest(path, {"files": ["artifact"], "version": 1})
+    files = api.read_manifest(path)["files"]
     events = []
     original_sync, original_replace = os.fsync, os.replace
 
@@ -277,22 +282,23 @@ def test_manifest_is_synced_before_replace_and_directory_synced_after(tmp_path, 
         assert Path(source).parent == path.parent
         assert Path(source) != path and destination == path
         assert json.loads(path.read_text())["version"] == 1
-        assert json.loads(Path(source).read_text()) == {"files": {}, "version": 2}
+        assert json.loads(Path(source).read_text()) == {"files": files, "version": 2}
         events.append("replace")
         original_replace(source, destination)
 
     monkeypatch.setattr(api.os, "fsync", sync)
     monkeypatch.setattr(api.os, "replace", replace)
-    api.write_manifest(path, {"version": 2})
+    api.write_manifest(path, {"files": ["artifact"], "version": 2})
     assert events == ["file", "replace", "directory"]
-    assert api.read_manifest(path) == {"files": {}, "version": 2}
-    assert list(tmp_path.iterdir()) == [path]
+    assert api.read_manifest(path) == {"files": files, "version": 2}
+    assert {p.name for p in tmp_path.iterdir()} == {"unit.json", "artifact"}
 
 
 def test_manifest_failed_replace_preserves_previous_record(tmp_path, monkeypatch):
     api = checkpoint_module()
     path = tmp_path / "unit.json"
-    api.write_manifest(path, {"version": 1})
+    (tmp_path / "artifact").write_bytes(b"abc")
+    api.write_manifest(path, {"files": ["artifact"], "version": 1})
     before = path.read_bytes()
 
     def fail_replace(source, destination):
@@ -300,20 +306,21 @@ def test_manifest_failed_replace_preserves_previous_record(tmp_path, monkeypatch
 
     monkeypatch.setattr(api.os, "replace", fail_replace)
     with pytest.raises(OSError, match="failed publish"):
-        api.write_manifest(path, {"version": 2})
+        api.write_manifest(path, {"files": ["artifact"], "version": 2})
     assert path.read_bytes() == before
-    assert list(tmp_path.iterdir()) == [path]
+    assert {p.name for p in tmp_path.iterdir()} == {"unit.json", "artifact"}
 
 
 def test_manifest_requires_json_serialisable_metadata(tmp_path):
     api = checkpoint_module()
     path = tmp_path / "unit.json"
-    api.write_manifest(path, {"version": 1})
+    (tmp_path / "artifact").write_bytes(b"abc")
+    api.write_manifest(path, {"files": ["artifact"], "version": 1})
     before = path.read_bytes()
     with pytest.raises(TypeError):
-        api.write_manifest(path, {"invalid": {1, 2}})
+        api.write_manifest(path, {"files": ["artifact"], "invalid": {1, 2}})
     assert path.read_bytes() == before
-    assert list(tmp_path.iterdir()) == [path]
+    assert {p.name for p in tmp_path.iterdir()} == {"unit.json", "artifact"}
 
 
 def test_request_disabled_is_never_pending():
@@ -339,3 +346,183 @@ def test_nonce_remains_pending_until_exact_answer_and_survives_restart(tmp_path)
     assert request.pending() is None
     assert (tmp_path / "checkpoint-done").read_bytes() == b"second-nonce"
     assert {p.name for p in tmp_path.iterdir()} == {"checkpoint-request", "checkpoint-done"}
+
+
+@pytest.mark.parametrize("damage", ["tensor_storage", "footer", "foreign_footer"])
+@pytest.mark.parametrize("fallback", [False, True])
+def test_sha256_footer_rejects_loadable_corruption(tmp_path, damage, fallback):
+    api = checkpoint_module()
+    # Unique uint8 storage bytes let us flip tensor data, never ZIP metadata.
+    pattern = bytes(range(32, 224))
+    newer = {**payload(2, 2), "pattern": torch.tensor(list(pattern), dtype=torch.uint8)}
+    bad, _ = api.save_checkpoint(tmp_path, newer, counter=1)
+    data = bytearray(bad.read_bytes())
+    if damage == "tensor_storage":
+        assert data.count(pattern) == 1
+        data[data.index(pattern) + 17] ^= 1
+    elif damage == "footer":
+        data[-1] ^= 1
+    else:
+        other, _ = api.save_checkpoint(tmp_path / "other", payload(9, 9), counter=0)
+        foreign = other.read_bytes()[-32:]
+        assert foreign != data[-32:]
+        data[-32:] = foreign
+    bad.write_bytes(data)
+    # Prove deserialization alone accepts these bytes (including wrong tensor values).
+    loadable = torch.load(io.BytesIO(data[:-32]), map_location="cpu", weights_only=True)
+    assert loadable["counters"] == {"batch": 2, "saves": 2}
+    assert torch.equal(loadable["pattern"], newer["pattern"]) == (damage != "tensor_storage")
+    if fallback:
+        good, _ = api.save_checkpoint(tmp_path, payload(), counter=0)
+        selected, restored = api.latest_checkpoint(tmp_path)
+        assert selected == good
+        assert torch.equal(restored["model"]["weight"], torch.arange(3))
+    else:
+        with pytest.raises(api.CheckpointError, match="footer"):
+            api.latest_checkpoint(tmp_path)
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+def test_checkpoint_payload_without_counters_is_rejected(tmp_path, fallback):
+    api = checkpoint_module()
+    # Bypass the writer's counter check to model a malformed, correctly hashed slot.
+    body = io.BytesIO()
+    torch.save({"model": {"weight": torch.arange(3)}}, body)
+    data = body.getvalue()
+    (tmp_path / "checkpoint-slot-1.pt").write_bytes(data + hashlib.sha256(data).digest())
+    if fallback:
+        good, _ = api.save_checkpoint(tmp_path, payload(), counter=0)
+        assert api.latest_checkpoint(tmp_path)[0] == good
+    else:
+        with pytest.raises(api.CheckpointError, match="counters"):
+            api.latest_checkpoint(tmp_path)
+
+
+def test_checkpoint_load_streams_body_and_hides_footer(tmp_path, monkeypatch):
+    api = checkpoint_module()
+    saved = {**payload(), "large": torch.arange(600_000)}
+    path, _ = api.save_checkpoint(tmp_path, saved, counter=0)
+    body_size = path.stat().st_size - 32
+    original_open, original_load = Path.open, torch.load
+    reads, handles = [], []
+    loading = False
+
+    class TrackedFile:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def __getattr__(self, name):
+            return getattr(self.stream, name)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.stream.close()
+
+        def read(self, size=-1):
+            # Hashing must never materialize the entire checkpoint.
+            if not loading:
+                assert 0 <= size <= 1024 * 1024
+                reads.append(size)
+            return self.stream.read(size)
+
+    def tracked_open(self, *args, **kwargs):
+        stream = TrackedFile(original_open(self, *args, **kwargs))
+        handles.append(stream)
+        return stream
+
+    def checked_load(stream, *args, **kwargs):
+        nonlocal loading
+        loading = True
+        assert len(handles) == 1
+        assert not isinstance(stream, io.BytesIO)
+        assert kwargs["weights_only"] is True
+        assert stream.seek(0, os.SEEK_END) == body_size
+        assert stream.read(32) == b""
+        stream.seek(-16, os.SEEK_END)
+        assert len(stream.read(64)) == 16
+        buffer = bytearray(64)
+        stream.seek(-8, os.SEEK_END)
+        assert stream.readinto(buffer) == 8
+        stream.seek(0)
+        return original_load(stream, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", tracked_open)
+    monkeypatch.setattr(api.torch, "load", checked_load)
+    restored = api.latest_checkpoint(tmp_path)[1]
+    assert len(reads) >= 5
+    assert torch.equal(restored["large"], saved["large"])
+
+
+@pytest.mark.parametrize(
+    "operation", ["save_checkpoint", "latest_checkpoint", "write_manifest", "read_manifest"]
+)
+def test_persistence_accepts_string_paths(tmp_path, operation):
+    api = checkpoint_module()
+    path = tmp_path / "unit.json"
+    (tmp_path / "artifact").write_bytes(b"abc")
+    if operation == "save_checkpoint":
+        staging = tmp_path / "staging"
+        slot, _ = api.save_checkpoint(str(tmp_path), payload(), counter=0, staging=str(staging))
+        assert api.latest_checkpoint(tmp_path)[0] == slot
+    elif operation == "latest_checkpoint":
+        slot, _ = api.save_checkpoint(tmp_path, payload(), counter=0)
+        assert api.latest_checkpoint(str(tmp_path))[0] == slot
+    elif operation == "write_manifest":
+        api.write_manifest(str(path), {"files": ["artifact"]})
+        assert api.read_manifest(path)["files"]["artifact"]["bytes"] == 3
+    else:
+        api.write_manifest(path, {"files": ["artifact"]})
+        assert api.read_manifest(str(path))["files"]["artifact"]["bytes"] == 3
+
+
+@pytest.mark.parametrize("kind", ["symlink", "directory", "symlink_parent"])
+def test_manifest_rejects_nonregular_artifact_names(tmp_path, kind):
+    api = checkpoint_module()
+    directory = tmp_path / "unit"
+    directory.mkdir()
+    target = tmp_path / "outside"
+    target.write_bytes(b"abc")
+    name = "artifact"
+    artifact = directory / name
+    if kind == "symlink":
+        artifact.symlink_to(target)
+    elif kind == "directory":
+        artifact.mkdir()
+    else:
+        artifact.symlink_to(tmp_path, target_is_directory=True)
+        name += "/outside"
+    path = directory / "unit.json"
+    path.write_text(
+        json.dumps({"files": {name: {"sha256": hashlib.sha256(b"abc").hexdigest(), "bytes": 3}}})
+    )
+    assert api.read_manifest(path) is None
+    path.unlink()
+    with pytest.raises(ValueError):
+        api.write_manifest(path, {"files": [name]})
+    assert not path.exists()
+
+
+@pytest.mark.parametrize("operation", ["checkpoint", "manifest"])
+def test_directory_fsync_failure_raises_after_publishing(tmp_path, monkeypatch, operation):
+    api = checkpoint_module()
+    original_sync = os.fsync
+
+    def fail_directory_sync(descriptor):
+        if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise OSError("directory fsync failed")
+        original_sync(descriptor)
+
+    monkeypatch.setattr(api.os, "fsync", fail_directory_sync)
+    with pytest.raises(OSError, match="directory fsync failed"):
+        if operation == "checkpoint":
+            api.save_checkpoint(tmp_path, payload(), counter=0)
+        else:
+            (tmp_path / "artifact").write_bytes(b"abc")
+            api.write_manifest(tmp_path / "unit.json", {"files": ["artifact"]})
+    if operation == "checkpoint":
+        assert api.latest_checkpoint(tmp_path)[1]["counters"] == {"batch": 1, "saves": 1}
+    else:
+        assert api.read_manifest(tmp_path / "unit.json")["files"]["artifact"]["bytes"] == 3
+    assert not list(tmp_path.glob(".*-*"))
