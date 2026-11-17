@@ -8,6 +8,7 @@ import pytest
 
 from demand_forecast.data.episode import Item, Panel
 from demand_forecast.data.episode import schema as sc
+from demand_forecast.data.episode.calendar import calendar_arrays
 from demand_forecast.data.episode.kinds import (
     flag_codes,
     infer_kind,
@@ -143,7 +144,29 @@ def test_panel_validate():
         with pytest.raises(ValueError, match=rf"{item.item_id}.*temp"):
             replace(panel, roles=roles).validate()
     with pytest.raises(ValueError, match="epoch"):
-        replace(panel, epoch=None).validate()
+        replace(panel, freq=None).validate()
+
+
+@pytest.mark.parametrize("aligned", [False, True])
+def test_frequency_without_dates_keeps_periods_without_calendar(aligned):
+    panel = replace(toy_panel(), freq="h", epoch=None, aligned=aligned)
+    panel.validate()
+    assert panel.timestamps(-2, 10) is None
+    assert panel.season == 24 and panel.long_lag == 168
+    assert panel.freq_class == sc.FREQ_CLASSES.index("hourly")
+    assert calendar_arrays(panel, 0, 10) is None
+
+
+@pytest.mark.parametrize("freq", ["not-a-frequency", "-1h", "0h"])
+def test_frequency_without_dates_still_rejects_invalid_frequencies(freq):
+    with pytest.raises(ValueError, match="freq"):
+        replace(toy_panel(), freq=freq, epoch=None).validate()
+
+
+@pytest.mark.parametrize("epoch", [pd.NaT, pd.Timestamp("2024-01-02")])
+def test_dated_panel_rejects_missing_or_off_grid_epoch(epoch):
+    with pytest.raises(ValueError, match="epoch"):
+        replace(toy_panel(), freq="MS", epoch=epoch).validate()
 
 
 @pytest.mark.parametrize("change", ["missing", "extra"])

@@ -114,18 +114,19 @@ class Panel:
         """Reject inconsistent grids, array shapes, raw dtypes and dynamic roles."""
         if self.freq is None:
             if self.epoch is not None:
-                raise ValueError(f"Panel {self.name!r}: an undated panel must have epoch=None")
+                raise ValueError(f"Panel {self.name!r}: an epoch requires a freq")
         else:
-            if self.epoch is None or pd.isna(self.epoch):
-                raise ValueError(f"Panel {self.name!r}: freq requires an epoch")
-            if not self.aligned:
-                raise ValueError(f"Panel {self.name!r}: a dated panel must be aligned")
             try:
                 offset = to_offset(self.freq)
             except (TypeError, ValueError) as error:
                 raise ValueError(f"Panel {self.name!r}: invalid freq {self.freq!r}") from error
-            if offset.n <= 0 or not offset.is_on_offset(self.epoch):
-                raise ValueError(f"Panel {self.name!r}: epoch must lie on a positive freq grid")
+            if offset.n <= 0:
+                raise ValueError(f"Panel {self.name!r}: freq must be positive")
+            if self.epoch is not None:
+                if pd.isna(self.epoch) or not offset.is_on_offset(self.epoch):
+                    raise ValueError(f"Panel {self.name!r}: epoch must lie on the freq grid")
+                if not self.aligned:
+                    raise ValueError(f"Panel {self.name!r}: a dated panel must be aligned")
 
         for item in self.items:
             for family, columns in (("target", item.targets), ("dynamic", item.dynamic)):
@@ -158,7 +159,7 @@ class Panel:
 
     def timestamps(self, start: int, length: int) -> pd.DatetimeIndex | None:
         """Return absolute grid timestamps, preserving calendar offsets and DST."""
-        if self.freq is None:
+        if self.epoch is None:
             return None
         offset = to_offset(self.freq)
         first = self.epoch + start * offset
@@ -166,7 +167,7 @@ class Panel:
 
     @property
     def season(self) -> int:
-        """Use the existing pretraining convention, with one for undated rows."""
+        """Use the declared frequency's pretraining period, or one without a frequency."""
         return pretrain_period(self.freq)
 
     @property
