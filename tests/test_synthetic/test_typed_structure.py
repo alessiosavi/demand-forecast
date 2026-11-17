@@ -402,3 +402,25 @@ def test_seeded_processes_and_nonwrapping_lags():
             assert (p["add:multi_target"][j, :delay] == 0).all()
         assert p["add:missing_vs_zero"][0, 0] == 0
         assert p["missing"].any()
+
+
+def test_rebound_does_not_wrap_around_the_item():
+    # A stock-out on the item's last step must not create a rebound on its first step.
+    g = generate_typed_panel(
+        PanelRecipe(
+            ("missing_vs_zero",), n_items=6, length=(64, 400), seed=11, complete_inputs=True
+        )
+    )
+    rebound = g.params["missing_vs_zero"]["rebound"]
+    wrapping = 0
+    for item in g.panel.items:
+        parts = g.parts[item.item_id]
+        stockout = parts["stockout"]
+        previous = np.concatenate([np.zeros_like(stockout[:, :1]), stockout[:, :-1]], axis=1)
+        np.testing.assert_allclose(
+            parts["add:missing_vs_zero"], rebound * (previous & ~stockout), rtol=0, atol=1e-12
+        )
+        if stockout[0, -1] and not stockout[0, 0]:
+            wrapping += 1
+            assert parts["add:missing_vs_zero"][0, 0] == 0.0
+    assert wrapping >= 1  # the fixture must contain the case a wrap-around would get wrong
