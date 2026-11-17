@@ -41,7 +41,11 @@ class Gates:
 
 @dataclass
 class V5Output:
-    """Scaled quantiles, applied gates, per-row expert weights and penalties."""
+    """Scaled quantiles, applied gates, per-row expert weights and penalties.
+
+    ``router`` holds the expert weights applied in the forward pass, including
+    the null weights under ``"uniform"`` and ``"rolled"`` routing.
+    """
 
     quantiles: Tensor
     gates: Gates
@@ -107,7 +111,15 @@ class V5Model(nn.Module):
         zero_candidates: Tensor | None = None,
         zero_rows: Tensor | None = None,
     ) -> Gates:
-        """Choose cutoff-only gates, then force removals without changing expected L0."""
+        """Choose cutoff-only gates, then force zeros without changing expected L0.
+
+        ``zero_candidates`` zeros candidate gates and their inherited peer gates.
+        ``zero_rows`` may force any real row except ``ROLE_FORECAST``, including
+        siblings and known-future rows (overriding their gate floor).
+        A forced sibling behaves like a sibling with a learned zero gate: its
+        forecast slot remains in the output until ``prune`` removes it. Callers
+        scoring forecasts must select kept rows (``keep & forecast_mask``).
+        """
         if mode not in ("learned", "ones"):
             raise ValueError("gate mode must be 'learned' or 'ones'")
         for name, mask, shape in (

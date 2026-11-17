@@ -525,18 +525,17 @@ def test_unknown_router_raises():
         V5Model(TINY).eval()(routing_batch(1), router="typo")
 
 
-def test_explicit_learned_router_matches_original_call_bitwise():
+def test_default_router_matches_explicit_learned_router_bitwise():
     batch, model = routing_batch(), V5Model(TINY).eval()
-    reference = model(batch)
+    # The default router is the learned router.
+    default = model(batch)
     explicit = model(batch, router="learned")
-    torch.testing.assert_close(explicit.quantiles, reference.quantiles, rtol=0, atol=0)
-    torch.testing.assert_close(explicit.router, reference.router, rtol=0, atol=0)
+    torch.testing.assert_close(explicit.quantiles, default.quantiles, rtol=0, atol=0)
+    torch.testing.assert_close(explicit.router, default.router, rtol=0, atol=0)
     for field in dataclasses.fields(Gates):
-        assert torch.equal(
-            getattr(explicit.gates, field.name), getattr(reference.gates, field.name)
-        )
-    for name in reference.aux:
-        assert torch.equal(explicit.aux[name], reference.aux[name])
+        assert torch.equal(getattr(explicit.gates, field.name), getattr(default.gates, field.name))
+    for name in default.aux:
+        assert torch.equal(explicit.aux[name], default.aux[name])
 
 
 @pytest.mark.parametrize("mode", ["learned", "ones"])
@@ -581,7 +580,7 @@ def test_forced_candidates_zero_all_uses_and_match_pruning(mode):
 
 @pytest.mark.parametrize("mode", ["learned", "ones"])
 @pytest.mark.parametrize("role", [ROLE_PAST, ROLE_PEER, ROLE_KNOWN])
-def test_forced_rows_stay_zero_without_changing_candidate_gates(mode, role):
+def test_forced_rows_match_pruning_without_changing_candidate_gates(mode, role):
     batch, model = routing_batch(1), V5Model(replace(TINY, gate_init=0.0)).eval()
     baseline = model.gates(batch, mode=mode)
     zero = batch.row_mask & (batch.row_role == role)
@@ -591,6 +590,51 @@ def test_forced_rows_stay_zero_without_changing_candidate_gates(mode, role):
     assert torch.equal(gates.row[~zero], baseline.row[~zero])
     assert torch.equal(gates.cand, baseline.cand)
     assert torch.equal(gates.expected_l0, baseline.expected_l0)
+    before = model(batch, gates)
+    reduced, reduced_gates = prune(batch, gates)
+    after = model(reduced, reduced_gates)
+    kept = batch.keep[0] & batch.forecast_mask[0]
+    reduced_kept = reduced.keep[0] & reduced.forecast_mask[0]
+    torch.testing.assert_close(
+        before.quantiles[:, :, kept], after.quantiles[:, :, reduced_kept], rtol=0, atol=1e-5
+    )
+
+
+@pytest.mark.parametrize("mode", ["learned", "ones"])
+def test_forced_siblings_keep_forecast_slots_until_pruning(mode):
+    panel = bare_panel(n_targets=20)
+    request = EpisodeRequest(0, (320,), 5, 32, target="y")
+    batch = collate([EpisodeBuilder(panel).build(request)])
+    model = V5Model(replace(TINY, gate_init=0.0)).eval()
+    baseline = model.gates(batch, mode=mode)
+    zero = batch.row_mask & (batch.row_role == ROLE_SIBLING)
+    sibling_slots = batch.forecast_mask & (
+        batch.row_role.gather(1, batch.forecast_rows) == ROLE_SIBLING
+    )
+    kept = batch.keep[0] & batch.forecast_mask[0]
+    assert sibling_slots.sum() == zero.sum() > 0
+    assert kept.sum() == 1 and not batch.keep[sibling_slots].any()
+    assert (baseline.row[zero] > 0).all()
+    gates = model.gates(batch, mode=mode, zero_rows=zero)
+    assert (gates.row[zero] == 0).all()
+    before = model(batch, gates)
+    natural_zero = replace(baseline, row=baseline.row.masked_fill(zero, 0))
+    torch.testing.assert_close(
+        before.quantiles, model(batch, natural_zero).quantiles, rtol=0, atol=0
+    )
+    assert before.quantiles.shape[2] == batch.forecast_rows.shape[1]
+    reduced, reduced_gates = prune(batch, gates)
+    assert reduced.forecast_mask.sum() == 1
+    assert not (reduced.row_mask & (reduced.row_role == ROLE_SIBLING)).any()
+    after = model(reduced, reduced_gates)
+    reduced_kept = reduced.keep[0] & reduced.forecast_mask[0]
+    torch.testing.assert_close(
+        before.quantiles[:, :, kept], after.quantiles[:, :, reduced_kept], rtol=0, atol=1e-5
+    )
+    zero_kept = batch.row_mask & (batch.row_role == ROLE_FORECAST)
+    assert zero_kept.sum() == kept.sum()
+    with pytest.raises(ValueError, match="forecast"):
+        model.gates(batch, mode=mode, zero_rows=zero_kept)
 
 
 @pytest.mark.parametrize("mode", ["learned", "ones"])
