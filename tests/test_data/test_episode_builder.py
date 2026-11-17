@@ -1,0 +1,743 @@
+"""Task 6 contracts: availability, typed rows, budgets and batch padding."""
+
+from dataclasses import fields, replace
+
+import numpy as np
+import pytest
+import torch
+
+from demand_forecast.data.episode import EpisodeBuilder, EpisodeRequest, collate
+from demand_forecast.data.episode.bank import summary_vectors
+from demand_forecast.data.episode.builder import DROPPABLE
+from demand_forecast.data.episode.kinds import flag_codes
+from demand_forecast.data.episode.panel_stats import PanelStats
+from demand_forecast.data.episode.scale import fit_scale, to_scaled
+from demand_forecast.data.episode.schema import (
+    CH_OBSERVED,
+    CH_STEP,
+    CH_STEP_FLAG,
+    CH_SUPPORT,
+    CH_VALUE,
+    CH_VALUE_STATS,
+    KIND_CATEGORY,
+    KIND_FLAG,
+    ROLE_KNOWN,
+    ROLE_PANEL,
+    ROLE_PAST,
+    ROLE_PEER,
+    ROLE_SIBLING,
+    STEP_FAMILIES,
+    SUMMARY_FEATURES,
+)
+from demand_forecast.data.episode.screening import ScreeningConfig, relevance_number
+from demand_forecast.data.episode.value_stats import category_step_stats
+from tests.helpers.episodes import perturb_after, toy_panel
+
+
+def _plain(panel):
+    return replace(
+        panel, items=tuple(replace(i, static={}, dynamic={}) for i in panel.items), roles={}
+    )
+
+
+def _equal_inputs(a, b, exclude=()):
+    for field in fields(a):
+        if field.name in exclude:
+            continue
+        x, y = getattr(a, field.name), getattr(b, field.name)
+        if isinstance(x, np.ndarray):
+            np.testing.assert_allclose(x, y, rtol=0, atol=1e-6, equal_nan=True, err_msg=field.name)
+        else:
+            assert x == y, field.name
+
+
+def test_inputs_ignore_what_is_not_available():
+    p = toy_panel()
+    req = EpisodeRequest(0, (320, 336), 28, context=256)
+    e = EpisodeBuilder(p).build(req)
+    e2 = EpisodeBuilder(perturb_after(p, 336, value=1e6, keep_known=True)).build(req)
+    for f in (
+        "x",
+        "xh",
+        "attr_stats",
+        "cand_summary",
+        "row_summary",
+        "row_score",
+        "static_num",
+        "loc",
+        "scale",
+    ):
+        assert np.array_equal(getattr(e, f), getattr(e2, f)), f
+
+
+def test_statistics_stop_at_the_cutoff():
+    p = toy_panel()
+    req = EpisodeRequest(0, (320, 336), 28, context=256, cutoff=304)
+    changed = perturb_after(p, 304, keep_known=True)
+    items = []
+    for original, modified in zip(p.items, changed.items):
+        targets = {name: a.copy() for name, a in modified.targets.items()}
+        dynamic = {name: a.copy() for name, a in modified.dynamic.items()}
+        for name, values in targets.items():
+            values[max(0, 336 - original.start) :] = original.targets[name][
+                max(0, 336 - original.start) :
+            ]
+        dynamic["temp"][max(0, 336 - original.start) :] = original.dynamic["temp"][
+            max(0, 336 - original.start) :
+        ]
+        items.append(replace(modified, targets=targets, dynamic=dynamic))
+    e = EpisodeBuilder(p).build(req)
+    e2 = EpisodeBuilder(replace(p, items=tuple(items))).build(req)
+    for name in (
+        "row_summary",
+        "row_summary_flags",
+        "row_score",
+        "cand_summary",
+        "cand_flags",
+        "cand_score",
+        "attr_stats",
+        "static_num",
+        "loc",
+        "scale",
+    ):
+        np.testing.assert_array_equal(getattr(e, name), getattr(e2, name), err_msg=name)
+    assert e.row_names == e2.row_names
+    assert not np.array_equal(e.x, e2.x)
+
+
+def test_known_future_reaches_xh_only():
+    p = toy_panel()
+    req = EpisodeRequest(0, (320, 336), 28, context=256)
+    promo = p.items[0].dynamic["promo"].copy()
+    promo[336:] = 1 - promo[336:]
+    item = replace(p.items[0], dynamic={**p.items[0].dynamic, "promo": promo})
+    a = EpisodeBuilder(p).build(req)
+    b = EpisodeBuilder(replace(p, items=(item, *p.items[1:]))).build(req)
+    assert not np.array_equal(a.xh, b.xh)
+    _equal_inputs(a, b, exclude=("xh",))
+
+
+def test_known_category_horizon_follows_its_labels():
+    p = toy_panel()
+    req = EpisodeRequest(0, (336,), 16, context=64)
+    a = EpisodeBuilder(p).build(req)
+    event = p.items[0].dynamic["event"].copy()
+    event[336:352] = "holiday"
+    item = replace(p.items[0], dynamic={**p.items[0].dynamic, "event": event})
+    b = EpisodeBuilder(replace(p, items=(item, *p.items[1:]))).build(req)
+    row = list(a.known_rows).index(a.row_names.index("event"))
+    assert not np.array_equal(
+        a.xh[:, row, ..., CH_VALUE_STATS:], b.xh[:, row, ..., CH_VALUE_STATS:]
+    )
+    _equal_inputs(a, b, exclude=("xh",))
+
+
+def test_channel_table():
+    p = toy_panel()
+    items = []
+    for item in p.items:
+        target = item.targets["y"].copy()
+        temp = item.dynamic["temp"].copy()
+        known = 4 * temp + np.arange(len(temp)) * 0.25
+        target[280 - item.start] = np.nan
+        temp[281 - item.start] = np.nan
+        known[np.array([283, 322, 340]) - item.start] = np.nan
+        items.append(
+            replace(
+                item,
+                targets={"y": target},
+                dynamic={**item.dynamic, "temp": temp, "known_number": known},
+            )
+        )
+    p = replace(p, items=tuple(items), roles={**p.roles, "known_number": "known"})
+    req = EpisodeRequest(1, (320, 336), 28, context=64, cutoff=304)
+    e = EpisodeBuilder(p).build(req)
+    item = p.items[req.item_index]
+    end = req.cutoff - item.start
+    columns = {**item.targets, **item.dynamic}
+    stats = PanelStats(p, "y", req.cutoff)
+    assert {"y", "temp", "known_number"} <= set(e.row_names)
+    for row, (name, kind, role) in enumerate(zip(e.row_names, e.row_kind, e.row_role)):
+        x = e.x[row].reshape(64, 39)
+        if role in (ROLE_PEER, ROLE_PANEL):
+            if role == ROLE_PEER:
+                attribute, label = name.split("=", 1)
+                values, support = stats.peer_row(attribute, label, req.item_index, 272, 336)
+                assert e.row_score[row] == e.cand_score[e.row_cand[row]]
+            else:
+                values, support = stats.panel_row(req.item_index, 272, 336)
+            np.testing.assert_allclose(x[:, CH_VALUE], values)
+            np.testing.assert_allclose(x[:, CH_SUPPORT], np.log1p(support), rtol=1e-6)
+            assert not x[:, CH_STEP:].any()
+            assert not e.row_summary[row].any()
+        elif kind == KIND_FLAG:
+            np.testing.assert_array_equal(
+                x[:, CH_VALUE],
+                flag_codes(item.dynamic[name], end)[272 - item.start : 336 - item.start],
+            )
+            assert not x[:, CH_SUPPORT:].any()
+        elif kind == KIND_CATEGORY:
+            assert not x[:, CH_VALUE].any()
+            assert not x[:, CH_SUPPORT:CH_VALUE_STATS].any()
+            assert not e.row_summary_flags[row].any()
+        else:
+            scale = fit_scale(columns[name], end, p.season)
+            raw = columns[name][272 - item.start : 336 - item.start]
+            observed = np.isfinite(raw)
+            scaled = (raw - scale.loc) / scale.scale
+            assert np.max(np.abs(scaled[observed])) > 1
+            np.testing.assert_array_equal(x[:, CH_OBSERVED], observed)
+            np.testing.assert_allclose(
+                x[:, CH_VALUE], np.where(observed, np.arcsinh(scaled), 0.0), rtol=1e-6, atol=1e-6
+            )
+            assert not x[:, CH_SUPPORT].any()
+            assert not x[:, CH_VALUE_STATS:].any()
+            if role == ROLE_KNOWN:
+                known_row = list(e.known_rows).index(row)
+                for oi, origin in enumerate(req.origins):
+                    raw = columns[name][origin - item.start : origin - item.start + req.horizon]
+                    observed = np.isfinite(raw)
+                    scaled = (raw - scale.loc) / scale.scale
+                    assert np.max(np.abs(scaled[observed])) > 1
+                    expected = np.zeros(e.xh.shape[2] * 16)
+                    expected[: req.horizon] = np.where(observed, np.arcsinh(scaled), 0.0)
+                    horizon_observed = np.zeros(len(expected), dtype=bool)
+                    horizon_observed[: req.horizon] = observed
+                    xh = e.xh[oi, known_row].reshape(-1, 39)
+                    np.testing.assert_array_equal(xh[:, CH_OBSERVED], horizon_observed)
+                    np.testing.assert_allclose(xh[:, CH_VALUE], expected, rtol=1e-6, atol=1e-6)
+    assert not e.xh[..., CH_STEP:CH_VALUE_STATS].any()
+
+
+def test_forecast_row_summary_matches_panel_stats_on_grid():
+    p = toy_panel(n_targets=2)
+    req = EpisodeRequest(1, (320, 336), 16, context=64, target="y", cutoff=304)
+    assert p.items[req.item_index].start % p.season != 0
+    e = EpisodeBuilder(p).build(req)
+    for row in e.forecast_rows:
+        stats = PanelStats(p, e.row_names[row], req.cutoff)
+        np.testing.assert_allclose(
+            e.row_summary[row], stats.summaries[req.item_index], rtol=0, atol=1e-6
+        )
+        np.testing.assert_array_equal(e.row_summary_flags[row], stats.summary_flags[req.item_index])
+
+
+def test_seasonal_profiles_are_invariant_to_full_season_grid_shift():
+    p = toy_panel()
+    req = EpisodeRequest(1, (320, 336), 16, context=64, cutoff=304)
+    e = EpisodeBuilder(p).build(req)
+    items = list(p.items)
+    items[req.item_index] = replace(
+        items[req.item_index], start=items[req.item_index].start + p.season
+    )
+    shifted = EpisodeBuilder(replace(p, items=tuple(items))).build(
+        replace(req, origins=tuple(o + p.season for o in req.origins), cutoff=req.cutoff + p.season)
+    )
+    profiles = [j for j, name in enumerate(SUMMARY_FEATURES) if name.startswith("profile_")]
+    row, shifted_row = e.row_names.index("y"), shifted.row_names.index("y")
+    assert e.row_summary_flags[row, profiles].any()
+    np.testing.assert_allclose(
+        e.row_summary[row, profiles], shifted.row_summary[shifted_row, profiles], rtol=0, atol=1e-6
+    )
+    np.testing.assert_array_equal(
+        e.row_summary_flags[row, profiles], shifted.row_summary_flags[shifted_row, profiles]
+    )
+
+
+@pytest.mark.parametrize("role", ["known", "past"])
+def test_number_row_summary_uses_grid_cutoff(role):
+    p = toy_panel()
+    p = replace(p, roles={**p.roles, "temp": role})
+    req = EpisodeRequest(1, (320, 336), 16, context=64, cutoff=304)
+    item = p.items[req.item_index]
+    end = req.cutoff - item.start
+    raw = item.dynamic["temp"][:end]
+    scaled = to_scaled(raw, fit_scale(item.dynamic["temp"], end, p.season))
+    expected, flags = summary_vectors(
+        scaled[None], raw[None], season=p.season, long_lag=p.long_lag, end=req.cutoff
+    )
+    e = EpisodeBuilder(p).build(req)
+    row = e.row_names.index("temp")
+    np.testing.assert_allclose(e.row_summary[row], expected[0], rtol=0, atol=1e-6)
+    np.testing.assert_array_equal(e.row_summary_flags[row], flags[0])
+
+
+@pytest.mark.parametrize("mode", ["flag", "effect"])
+def test_expanded_category_summary_uses_grid_cutoff(mode):
+    p = toy_panel()
+    req = EpisodeRequest(1, (320, 336), 16, context=64, cutoff=304, drop=frozenset({"value_stats"}))
+    item = p.items[req.item_index]
+    end = req.cutoff - item.start
+    event = item.dynamic["event"]
+    observed = np.array([label is not None for label in event])
+    e = EpisodeBuilder(p).build(req)
+    names = (
+        [name for name in e.row_names if name.startswith("event=")]
+        if mode == "flag"
+        else ["event~effect"]
+    )
+    assert names
+    for name in names:
+        if mode == "flag":
+            raw = np.where(observed[:end], event[:end] == name.split("=", 1)[1], np.nan)
+        else:
+            target = to_scaled(item.targets["y"], fit_scale(item.targets["y"], end, p.season))
+            effects, _ = category_step_stats(event, target, left=0, right=end)
+            raw = np.where(observed[:end], effects[:, 0], np.nan)
+        expected, flags = summary_vectors(
+            raw[None], raw[None], season=p.season, long_lag=p.long_lag, end=req.cutoff
+        )
+        row = e.row_names.index(name)
+        np.testing.assert_allclose(e.row_summary[row], expected[0], rtol=0, atol=1e-6)
+        np.testing.assert_array_equal(e.row_summary_flags[row], flags[0])
+
+
+def test_overflow_item():
+    p = toy_panel(n_targets=20)
+    p = replace(
+        p,
+        items=tuple(
+            replace(i, targets={f"y{j:02}": a for j, a in enumerate(i.targets.values())})
+            for i in p.items
+        ),
+    )
+    e = EpisodeBuilder(p).build(EpisodeRequest(0, (336,), 5, context=64, target="y07"))
+    assert len(e.forecast_rows) == 16
+    assert e.keep.sum() == 1
+    assert e.row_names[e.forecast_rows[np.flatnonzero(e.keep)[0]]] == "y07"
+    assert (e.row_role == ROLE_SIBLING).sum() == 15
+    with pytest.raises(ValueError):
+        EpisodeBuilder(p).build(EpisodeRequest(0, (336,), 5, context=64))
+    joint = EpisodeBuilder(_plain(toy_panel(n_targets=3))).build(
+        EpisodeRequest(0, (336,), 5, context=64)
+    )
+    assert len(joint.forecast_rows) == 3 and joint.keep.all()
+    assert joint.context_target is None
+    assert not len(joint.cand_names)
+
+
+def test_plan_requests():
+    p = toy_panel(n_targets=3)
+    builder = EpisodeBuilder(p)
+    requests = builder.plan_requests(
+        0, (336,), 5, context=64, cutoff=320, drop=frozenset({"calendar"})
+    )
+    assert [r.target for r in requests] == ["y", "y1", "y2"]
+    episodes = [builder.build(r) for r in requests]
+    assert all(len(e.forecast_rows) == 3 and e.keep.sum() == 1 for e in episodes)
+    for r, e in zip(requests, episodes):
+        assert e.context_target == r.target
+        assert r.cutoff == 320 and r.drop == frozenset({"calendar"})
+        attribute, label = e.attr_names[0].split("=", 1)
+        expected, _, _ = PanelStats(p, r.target, 320).value_token(attribute, label, 0)
+        np.testing.assert_array_equal(e.attr_stats[0], expected)
+    assert not np.array_equal(episodes[0].attr_stats, episodes[1].attr_stats)
+    with pytest.raises(ValueError):
+        builder.build(EpisodeRequest(0, (336,), 5, context=64))
+    plain = EpisodeBuilder(_plain(p)).plan_requests(0, (336,), 5, context=64)
+    assert len(plain) == 1 and plain[0].target is None
+    assert len(EpisodeBuilder(toy_panel(n_targets=20)).plan_requests(0, (336,), 5)) == 20
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"origins": (320, 330)},
+        {"cutoff": 321},
+        {"origins": (16, 336)},
+        {"context": 250},
+        {"context": 0},
+        {"context": 2064},
+        {"horizon": 0},
+        {"horizon": 289},
+        {"origins": ()},
+        {"origins": (336, 320)},
+        {"origins": (320, 320)},
+        {"item_index": -1},
+        {"item_index": 6},
+        {"target": "absent"},
+        {"drop": frozenset({"typo"})},
+    ],
+)
+def test_request_validation(changes):
+    request = replace(EpisodeRequest(0, (320, 336), 28, context=256), **changes)
+    with pytest.raises(ValueError):
+        EpisodeBuilder(toy_panel()).build(request)
+
+
+def test_short_history_and_empty_target():
+    p = _plain(toy_panel(n_items=1, length=10))
+    e = EpisodeBuilder(p).build(EpisodeRequest(0, (10,), 5, context=64))
+    np.testing.assert_array_equal(e.patch_valid, [[False, False, False, True]])
+    assert not e.x[:, :3].any()
+    assert e.origin_patches.tolist() == [4]
+    p = replace(p, items=(replace(p.items[0], start=20),))
+    e = EpisodeBuilder(p).build(EpisodeRequest(0, (10,), 5, context=64))
+    assert e.fallback.all() and not e.x.any() and not e.patch_valid.any()
+    assert not e.label_mask.any()
+
+
+def test_constant_history_is_a_fallback_row():
+    p = _plain(toy_panel(n_items=1, length=20))
+    p = replace(p, items=(replace(p.items[0], targets={"y": np.full(20, 7.0)}),))
+    e = EpisodeBuilder(p).build(EpisodeRequest(0, (17,), 3, context=32))
+    assert e.fallback.tolist() == [True] and e.loc.tolist() == [7.0]
+    assert np.isfinite(e.x).all()
+
+
+def test_model_inputs_are_finite():
+    p = toy_panel()
+    item = p.items[1]
+    y, temp, event = (
+        item.targets["y"].copy(),
+        item.dynamic["temp"].copy(),
+        item.dynamic["event"].copy(),
+    )
+    y[::7], temp[::5], event[::3] = np.nan, np.nan, None
+    item = replace(
+        item,
+        targets={"y": y},
+        dynamic={**item.dynamic, "temp": temp, "event": event, "empty": np.full(len(y), np.nan)},
+    )
+    p = replace(
+        p,
+        items=tuple(
+            replace(i, dynamic={**i.dynamic, "empty": np.full(len(i.targets["y"]), np.nan)})
+            if n != 1
+            else item
+            for n, i in enumerate(p.items)
+        ),
+        roles={**p.roles, "empty": "known"},
+    )
+    e = EpisodeBuilder(p).build(EpisodeRequest(1, (33,), 19, context=64))
+    b = collate([e, EpisodeBuilder(toy_panel()).build(EpisodeRequest(0, (336,), 33, context=96))])
+    for record in (e, b):
+        for field in fields(record):
+            values = getattr(record, field.name)
+            if field.name == "labels":
+                assert not np.isinf(np.asarray(values)).any()
+                assert np.isfinite(np.asarray(values)[np.asarray(record.label_mask)]).all()
+            elif isinstance(values, (np.ndarray, torch.Tensor)):
+                assert np.isfinite(np.asarray(values)).all(), field.name
+        for name in ("x", "xh"):
+            values = np.asarray(getattr(record, name))
+            assert not values[values[..., CH_OBSERVED] == 0].any()
+    assert not e.x[e.row_names.index("empty")].any()
+
+
+def test_horizon_not_a_multiple_of_16():
+    p = toy_panel()
+    req = EpisodeRequest(0, (337,), 5, context=64)
+    a = EpisodeBuilder(p).build(req)
+    assert a.xh.shape[2] == 1
+    assert a.label_mask[..., :5].all() and not a.label_mask[..., 5:].any()
+    assert not a.xh[..., 5:, :].any()
+    assert not a.calh_phases[..., 5:, :].any()
+    assert (a.calh_ids[..., 5:, :] == -1).all()
+    b = EpisodeBuilder(perturb_after(p, 342, keep_known=False)).build(req)
+    _equal_inputs(a, b)
+
+
+def test_unsupported_peer_rows_are_not_built():
+    p = toy_panel()
+    items = tuple(
+        replace(i, static={"group": "alone" if n == 0 else "shared"}) for n, i in enumerate(p.items)
+    )
+    e = EpisodeBuilder(replace(p, items=items)).build(EpisodeRequest(0, (336,), 5, context=64))
+    assert "group=alone" not in e.row_names
+    assert not (e.row_role == ROLE_PEER).any()
+    assert (e.row_role == ROLE_PANEL).any()
+
+
+@pytest.mark.parametrize(
+    "dated,aligned,frequency",
+    [
+        (True, True, "D"),
+        (False, True, None),
+        (False, False, None),
+        (False, True, "D"),
+        (False, False, "h"),
+    ],
+)
+def test_dated_and_aligned_cases(dated, aligned, frequency):
+    p = replace(toy_panel(dated=dated), aligned=aligned, freq=frequency)
+    e = EpisodeBuilder(p).build(EpisodeRequest(0, (336,), 5, context=64))
+    assert bool((e.cal_ids >= 0).any()) == dated
+    assert bool((e.row_role == ROLE_PEER).any()) == aligned
+    assert bool((e.row_role == ROLE_PANEL).any()) == aligned
+    assert len(e.attr_stats) > 0
+    assert e.freq_class == p.freq_class
+    if not dated:
+        assert not e.cal_phases.any() and not e.calh_phases.any()
+        assert (e.calh_ids == -1).all()
+
+
+def test_no_feature_single_item_panel():
+    p = _plain(toy_panel(n_items=1))
+    e = EpisodeBuilder(p).build(EpisodeRequest(0, (336,), 5, context=64))
+    assert len(e.x) == 1
+    assert len(e.attr_stats) == len(e.cand_names) == len(e.static_num) == 0
+
+
+def test_budgets_after_expansion():
+    p = toy_panel(n_items=20, length=96)
+    items = []
+    for n, item in enumerate(p.items):
+        dynamic = {
+            f"c{j:02}": np.array(
+                [f"label{(t + j) % 3}" for t in range(len(item.targets["y"]))], dtype=object
+            )
+            for j in range(20)
+        }
+        static = {"huge": [f"shared{j}" for j in range(17)]}
+        static.update({f"s{j:02}": float((n + 0.25) ** (1 + j / 100)) for j in range(20)})
+        items.append(replace(item, dynamic=dynamic, static=static))
+    p = replace(p, items=tuple(items), roles={f"c{j:02}": "known" for j in range(20)})
+    e = EpisodeBuilder(p).build(
+        EpisodeRequest(0, (64,), 5, context=64, drop=frozenset({"value_stats"}))
+    )
+    feature = np.isin(e.row_role, [ROLE_KNOWN, ROLE_PAST])
+    assert feature.sum() == 16
+    assert any(name.endswith("~effect") for name in e.row_names)
+    assert not any(name.startswith("huge=") for name in e.attr_names)
+    assert "huge" not in e.cand_names
+    assert len(e.attr_stats) <= 16 and len(e.static_num) <= 16
+    assert np.isin(e.row_role, [ROLE_PEER, ROLE_PANEL]).sum() <= 8
+
+
+@pytest.mark.parametrize("drop", DROPPABLE)
+def test_drop_switches(drop):
+    p = toy_panel(n_targets=2)
+    req = EpisodeRequest(0, (336,), 5, context=64, target="y")
+    a = EpisodeBuilder(p).build(req)
+    b = EpisodeBuilder(p).build(replace(req, drop=frozenset({drop})))
+    roles = {
+        "features": (ROLE_KNOWN, ROLE_PAST),
+        "siblings": (ROLE_SIBLING,),
+        "peers": (ROLE_PEER,),
+        "panel_row": (ROLE_PANEL,),
+    }
+    if drop in roles:
+        assert not np.isin(b.row_role, roles[drop]).any()
+        assert b.row_names == [
+            name for name, role in zip(a.row_names, a.row_role) if role not in roles[drop]
+        ]
+    elif drop == "attributes":
+        assert not len(b.attr_stats)
+        assert b.cand_names == a.cand_names and b.row_names == a.row_names
+    elif drop == "static_numbers":
+        assert not len(b.static_num)
+        assert b.row_names == a.row_names
+    elif drop == "calendar":
+        assert not b.cal_phases.any() and (b.cal_ids == -1).all()
+        assert not b.calh_phases.any() and (b.calh_ids == -1).all()
+        np.testing.assert_array_equal(a.x, b.x)
+    elif drop in STEP_FAMILIES:
+        family = STEP_FAMILIES[drop]
+        assert not b.x[..., CH_STEP + family.start : CH_STEP + family.stop].any()
+        assert not b.x[..., CH_STEP_FLAG + family.start : CH_STEP_FLAG + family.stop].any()
+        np.testing.assert_array_equal(a.x[..., CH_VALUE], b.x[..., CH_VALUE])
+    else:
+        assert not (b.row_kind == KIND_CATEGORY).any()
+        assert "event~effect" in b.row_names
+        assert not b.x[..., CH_VALUE_STATS:].any()
+
+
+def test_order_independence():
+    p = toy_panel(n_targets=2)
+    req = EpisodeRequest(0, (320, 336), 19, context=64, target="y")
+    a = EpisodeBuilder(p).build(req)
+    items = tuple(
+        replace(
+            i,
+            targets=dict(reversed(list(i.targets.items()))),
+            dynamic=dict(reversed(list(i.dynamic.items()))),
+            static={
+                k: list(reversed(v)) if isinstance(v, list) else v
+                for k, v in reversed(list(i.static.items()))
+            },
+        )
+        for i in reversed(p.items)
+    )
+    b = EpisodeBuilder(replace(p, items=items, roles=dict(reversed(list(p.roles.items()))))).build(
+        replace(req, item_index=5)
+    )
+    _equal_inputs(a, b)
+
+
+def test_statistics_are_cached(monkeypatch):
+    import demand_forecast.data.episode.builder as module
+
+    calls = []
+    original = module.PanelStats
+
+    def counted(panel, target, cutoff):
+        calls.append((target, cutoff))
+        return original(panel, target, cutoff)
+
+    monkeypatch.setattr(module, "PanelStats", counted)
+    builder = EpisodeBuilder(toy_panel(n_targets=2))
+    for i in range(6):
+        for target in ("y", "y1"):
+            builder.build(EpisodeRequest(i, (336,), 5, context=64, target=target))
+    assert calls == [("y", 336), ("y1", 336)]
+    for cutoff in range(300, 308):
+        builder.build(EpisodeRequest(0, (336,), 5, context=64, cutoff=cutoff, target="y"))
+    builder.build(EpisodeRequest(0, (336,), 5, context=64, target="y"))
+    assert calls.count(("y", 336)) == 2
+
+
+def test_collate_pads():
+    a = EpisodeBuilder(_plain(toy_panel(n_items=1))).build(EpisodeRequest(0, (337,), 5, context=32))
+    b = EpisodeBuilder(toy_panel(n_targets=2)).build(
+        EpisodeRequest(0, (320, 336), 33, context=96, target="y")
+    )
+    batch = collate([a, b])
+    assert batch.x.shape == (2, len(b.x), 6, 16, 39)
+    assert batch.row_mask.sum(1).tolist() == [len(a.x), len(b.x)]
+    assert batch.forecast_mask.sum(1).tolist() == [1, 2]
+    assert batch.known_mask.sum(1).tolist() == [len(a.known_rows), len(b.known_rows)]
+    assert batch.cand_mask.sum(1).tolist() == [0, len(b.cand_names)]
+    assert batch.attr_mask.sum(1).tolist() == [0, len(b.attr_stats)]
+    assert batch.static_num_mask.sum(1).tolist() == [0, len(b.static_num)]
+    assert batch.origin_mask.tolist() == [[True, False], [True, True]]
+    assert batch.horizon_mask.tolist() == [[True, False, False], [True, True, True]]
+    assert batch.origin_patches[0, 0] == a.origin_patches[0] + 4
+    assert not batch.patch_valid[0, :, :4].any()
+    np.testing.assert_array_equal(batch.x[0, :1, 4:].numpy(), a.x)
+    np.testing.assert_array_equal(batch.x[1].numpy(), b.x)
+    for name in (
+        "row_kind",
+        "row_role",
+        "row_cand",
+        "forecast_rows",
+        "known_rows",
+        "cal_ids",
+        "calh_ids",
+        "cand_kind",
+        "attr_cand",
+        "static_num_cand",
+        "origin_patches",
+        "freq_class",
+        "horizon",
+    ):
+        assert getattr(batch, name).dtype == torch.long, name
+    assert batch.to("cpu").x.device.type == "cpu"
+    assert not batch.x[~batch.row_mask].any()
+    assert not batch.xh[0].any()
+    assert batch.row_names == [a.row_names, b.row_names]
+    with pytest.raises(ValueError):
+        collate([])
+
+
+def test_expanded_feature_budget_breaks_score_ties_by_row_name():
+    p = _plain(toy_panel(n_items=1, length=96))
+    steps = np.arange(96)
+    dynamic = {f"a{j:02}": np.sin(steps + j) for j in range(15)}
+    dynamic["z"] = np.array(["x", "a", "m"] * 32, dtype=object)
+    p = replace(
+        p, items=(replace(p.items[0], dynamic=dynamic),), roles={name: "known" for name in dynamic}
+    )
+    e = EpisodeBuilder(p, ScreeningConfig(min_steps=1000)).build(
+        EpisodeRequest(0, (80,), 5, context=64, drop=frozenset({"value_stats"}))
+    )
+    assert [e.row_names[i] for i in e.known_rows] == [*(f"a{j:02}" for j in range(15)), "z=a"]
+
+
+def test_keep_columns_filters_before_allocating_budgets():
+    p = toy_panel(n_targets=3)
+    req = EpisodeRequest(
+        0, (336,), 5, context=64, target="y", keep_columns=frozenset({"promo", "y2"})
+    )
+    e = EpisodeBuilder(p).build(req)
+    assert e.row_names[:3] == ["y", "y2", "promo"]
+    assert "temp" not in e.row_names and "event" not in e.row_names and "y1" not in e.row_names
+    assert len(e.cand_names) > 0
+
+
+def test_joint_episode_scores_features_against_every_kept_target():
+    p = toy_panel(n_items=1, n_targets=3)
+    item = p.items[0]
+    p = replace(
+        p,
+        items=(replace(item, static={}, dynamic={"temp": item.dynamic["temp"]}),),
+        roles={"temp": "past"},
+    )
+    req = EpisodeRequest(0, (336,), 5, context=64)
+    e = EpisodeBuilder(p).build(req)
+    expected = max(
+        relevance_number(item.dynamic["temp"][:336], y[:336], (0, 1, 7), 16)
+        for y in item.targets.values()
+    )
+    assert e.row_score[e.row_names.index("temp")] == pytest.approx(expected)
+    assert not np.isin(e.row_role, [ROLE_PEER, ROLE_PANEL]).any()
+    assert len(EpisodeBuilder(p).plan_requests(0, (336,), 5, context=64)) == 1
+
+
+def test_category_horizon_statistics_freeze_at_each_origin():
+    p = toy_panel()
+    req = EpisodeRequest(0, (320, 336), 16, context=64, cutoff=304)
+    e = EpisodeBuilder(p).build(req)
+    row = list(e.known_rows).index(e.row_names.index("event"))
+    target = (p.items[0].targets["y"] - e.loc[0]) / e.scale[0]
+    for oi, origin in enumerate(req.origins):
+        expected, _ = category_step_stats(
+            p.items[0].dynamic["event"], target, left=origin, right=origin + 16, frozen_at=origin
+        )
+        np.testing.assert_array_equal(e.xh[oi, row, ..., CH_VALUE_STATS:].reshape(16, 6), expected)
+    expanded = EpisodeBuilder(p).build(replace(req, drop=frozenset({"value_stats"})))
+    effect = list(expanded.known_rows).index(expanded.row_names.index("event~effect"))
+    np.testing.assert_array_equal(
+        expanded.xh[:, effect, ..., CH_VALUE], e.xh[:, row, ..., CH_VALUE_STATS]
+    )
+
+
+def test_category_effect_number_has_causal_bank_channels():
+    p = toy_panel()
+    req = EpisodeRequest(0, (336,), 16, context=64, drop=frozenset({"value_stats"}))
+    e = EpisodeBuilder(p).build(req)
+    row = e.row_names.index("event~effect")
+    assert e.x[row, ..., CH_STEP_FLAG:CH_VALUE_STATS].any()
+    assert not e.xh[..., CH_STEP:CH_VALUE_STATS].any()
+    changed = EpisodeBuilder(perturb_after(p, 336, keep_known=True)).build(req)
+    np.testing.assert_array_equal(e.x[row], changed.x[row])
+
+
+def test_plan_requests_splits_for_dynamic_categories_without_statics():
+    p = toy_panel(n_targets=3)
+    p = replace(p, items=tuple(replace(i, static={}) for i in p.items))
+    requests = EpisodeBuilder(p).plan_requests(0, (336,), 5, context=64)
+    assert [r.target for r in requests] == ["y", "y1", "y2"]
+
+
+def test_collate_preserves_all_unpadded_fields():
+    p = toy_panel(n_targets=2)
+    req = EpisodeRequest(
+        0,
+        (337,),
+        5,
+        context=32,
+        target="y",
+        drop=frozenset({"siblings", "static_numbers"}),
+        keep_columns=frozenset({"promo"}),
+    )
+    a = EpisodeBuilder(p).build(req)
+    b = EpisodeBuilder(p).build(EpisodeRequest(0, (320, 336), 33, context=96, target="y"))
+    batch = collate([a, b])
+    for index, episode in enumerate((a, b)):
+        for field in fields(episode):
+            name = field.name
+            value = getattr(episode, name)
+            if not isinstance(value, np.ndarray):
+                continue
+            restored = getattr(batch, name)[index]
+            if name in ("x", "patch_valid"):
+                restored = restored[: len(episode.x), -episode.x.shape[1] :]
+            elif name in ("cal_phases", "cal_ids"):
+                restored = restored[-episode.x.shape[1] :]
+            else:
+                restored = restored[tuple(slice(0, length) for length in value.shape)]
+            expected = value + 4 if name == "origin_patches" and index == 0 else value
+            np.testing.assert_array_equal(restored.numpy(), expected, err_msg=name)
+    assert batch.loc.dtype == batch.scale.dtype == torch.float64
+    assert batch.x.dtype == batch.xh.dtype == torch.float32
