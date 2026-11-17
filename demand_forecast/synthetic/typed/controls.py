@@ -15,13 +15,23 @@ def _length(item: Item) -> int:
 
 
 def _moving_inputs(generated: GeneratedPanel, record: InputRecord) -> tuple[InputRecord, ...]:
+    if record.twin == "hierarchy":
+        twins = tuple(
+            (i, r)
+            for i, r in enumerate(generated.inputs)
+            if r.twin == record.twin and r.process is record.process
+        )
+        if (
+            record.mechanism != "nuisance"
+            or record.process is None
+            or len(twins) != 2
+            or twins[1][0] != twins[0][0] + 1
+            or any(r.mechanism != "nuisance" for _, r in twins)
+        ):
+            raise ValueError(f"Invalid hierarchy twin pair for input: {record.name!r}")
+        return tuple(r for _, r in twins)
     if record.mechanism == "hierarchy":
         return generated.inputs_of("hierarchy")
-    if record.twin == "hierarchy":
-        # Nuisance runs append their parent and child records consecutively.
-        twins = tuple(r for r in generated.inputs if r.twin == "hierarchy")
-        first = twins.index(record) // 2 * 2
-        return twins[first : first + 2]
     return (record,)
 
 
@@ -107,7 +117,7 @@ def necessary_items(generated: GeneratedPanel, mechanism: str) -> tuple[str, ...
 def quiet_origins(
     generated: GeneratedPanel, item_id: str, *, context: int, horizon: int
 ) -> tuple[int, ...]:
-    """Find origins with an event in the fitting prefix and horizon, but none in context."""
+    """Find origins with no true context event and visible prefix and horizon events."""
     records = generated.inputs_of("event_response")
     if not records:
         raise ValueError("quiet_origins requires event_response")
@@ -116,12 +126,14 @@ def quiet_origins(
     item = next((item for item in generated.complete.items if item.item_id == item_id), None)
     if item is None:
         raise ValueError(f"Unknown item: {item_id!r}")
+    exposed = next(item for item in generated.panel.items if item.item_id == item_id)
     column = next(r.name for r in records if r.where == "dynamic")
-    events = item.dynamic[column] != 0
+    events = item.dynamic[column] == 1
     prefix = np.r_[0, np.cumsum(events)]
+    visible = np.r_[0, np.cumsum(exposed.dynamic[column] == 1)]
     origins = np.arange(context, len(events) - horizon + 1)
     left = origins - context
     quiet = prefix[origins] == prefix[left]
-    future = prefix[origins + horizon] > prefix[origins]
-    fitted = prefix[left] > 0
+    future = visible[origins + horizon] > visible[origins]
+    fitted = visible[left] > 0
     return tuple(int(o) + item.start for o in origins[quiet & future & fitted])

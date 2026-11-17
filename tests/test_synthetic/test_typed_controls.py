@@ -140,9 +140,9 @@ def test_shuffle_keeps_everything_else(mechanisms, complete_inputs):
         if record.mechanism == "hierarchy":
             moved = tuple(r.name for r in g.inputs_of("hierarchy"))
         elif record.twin == "hierarchy":
-            twins = [r.name for r in g.inputs if r.twin == "hierarchy"]
-            first = twins.index(record.name) // 2 * 2
-            moved = tuple(twins[first : first + 2])
+            moved = tuple(
+                r.name for r in g.inputs if r.twin == "hierarchy" and r.process is record.process
+            )
         else:
             moved = (record.name,)
         assert shuffled.shuffled == moved
@@ -209,6 +209,50 @@ def test_shuffle_refusals():
     one = typed.generate_typed_panel(replace(g.recipe, n_items=1))
     with pytest.raises(ValueError):
         typed.shuffle_assignment(one, one.inputs[0].name, seed=0)
+
+
+def test_shuffle_keeps_separate_nuisance_hierarchy_runs():
+    g = typed.generate_typed_panel(
+        typed.PanelRecipe(("hierarchy",), n_items=4, length=(32, 32), n_nuisance=2)
+    )
+    a, b, c, d = (r for r in g.inputs if r.twin == "hierarchy")
+    assert a.process == c.process and a.process is not c.process
+    for pair, other in (((a, b), (c, d)), ((c, d), (a, b))):
+        for record in pair:
+            shuffled = typed.shuffle_assignment(g, record.name, seed=0)
+            assert shuffled.shuffled == tuple(r.name for r in pair)
+            assert shuffled.donors[pair[0].name] == shuffled.donors[pair[1].name]
+            assert_inputs_equal(g.complete, shuffled.complete, (*g.inputs_of("hierarchy"), *other))
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    (
+        "different_process",
+        "nonadjacent",
+        "different_twin",
+        "different_mechanism",
+        "missing_twin",
+        "extra_twin",
+    ),
+)
+def test_shuffle_rejects_invalid_nuisance_hierarchy_pair(invalid):
+    g = typed.generate_typed_panel(
+        typed.PanelRecipe(("hierarchy",), n_items=4, length=(32, 32), n_nuisance=2)
+    )
+    original = g.inputs_of("hierarchy")
+    a, b, c, d = (r for r in g.inputs if r.twin == "hierarchy")
+    twins = {
+        "different_process": (a, replace(b, process=deepcopy(b.process)), c, d),
+        "nonadjacent": (a, c, b, d),
+        "different_twin": (a, replace(b, twin="static_category"), c, d),
+        "different_mechanism": (a, replace(b, mechanism="hierarchy"), c, d),
+        "missing_twin": (a, c, d),
+        "extra_twin": (a, b, replace(c, process=a.process), d),
+    }[invalid]
+    g = replace(g, inputs=(*original, *twins))
+    with pytest.raises(ValueError, match=a.name):
+        typed.shuffle_assignment(g, a.name, seed=0)
 
 
 def test_two_items_and_successive_shuffles():
@@ -330,10 +374,20 @@ def expected_necessary(g, mechanism):
             for i in g.complete.items
             if len(targets_of(i)) > g.params[mechanism]["lag"] + 16
         )
-    if records[0].where == "dynamic":
-        minimum = 20 if records[0].role == "past" else 0
+    attributes = tuple(r for r in records if r.where == "static")
+    if not attributes:
+        dynamic = next(r for r in records if r.where == "dynamic")
+        minimum = 20 if dynamic.role == "past" else 0
         return tuple(i.item_id for i in g.complete.items if len(targets_of(i)) >= minimum)
-    attribute = records[1].name if mechanism == "hierarchy" else records[0].name
+    if mechanism == "hierarchy":
+        children = set(g.params["hierarchy"]["parent_of"])
+        attribute = next(
+            r.name
+            for r in attributes
+            if {item.static[r.name] for item in g.complete.items} == children
+        )
+    else:
+        attribute = next(r.name for r in records if r.where == "static")
     result = []
     for item in g.complete.items:
         if item.item_id not in g.short_items:
@@ -355,10 +409,19 @@ def expected_necessary(g, mechanism):
 
 
 @pytest.mark.parametrize("seed", range(5))
-def test_necessary_items(seed):
+@pytest.mark.parametrize("heldout", (False, True))
+@pytest.mark.parametrize("singleton_share", (0.0, 0.25))
+def test_necessary_items(seed, heldout, singleton_share):
     for mechanism in (*INPUT_RECIPES[0], *INPUT_RECIPES[1], *INPUT_RECIPES[2]):
         g = typed.generate_typed_panel(
-            typed.PanelRecipe((mechanism,), n_items=40, length=(128, 400), seed=seed)
+            typed.PanelRecipe(
+                (mechanism,),
+                n_items=40,
+                length=(128, 400),
+                heldout=heldout,
+                singleton_share=singleton_share,
+                seed=seed,
+            )
         )
         actual = typed.necessary_items(g, mechanism)
         assert actual == expected_necessary(g, mechanism), (mechanism, seed)
@@ -474,7 +537,11 @@ def test_quiet_origins_exact_boundaries():
     name = g.inputs_of("event_response")[1].name
     flag = np.array([1, 0, 0, 0, 0, 1, 0, 0], dtype=np.float64)
     item = replace(g.complete.items[0], start=100, dynamic={name: flag})
-    g = replace(g, complete=replace(g.complete, items=(item,)))
+    g = replace(
+        g,
+        complete=replace(g.complete, items=(item,)),
+        panel=replace(g.panel, items=(deepcopy(item),)),
+    )
     assert typed.quiet_origins(g, item.item_id, context=3, horizon=3) == (104, 105)
     assert typed.quiet_origins(g, item.item_id, context=8, horizon=1) == ()
     with pytest.raises(ValueError):
@@ -482,6 +549,62 @@ def test_quiet_origins_exact_boundaries():
     for context, horizon in ((0, 3), (3, 0), (-1, 3), (3, -1)):
         with pytest.raises(ValueError):
             typed.quiet_origins(g, item.item_id, context=context, horizon=horizon)
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_quiet_origins_with_partial_availability(seed):
+    g = typed.generate_typed_panel(
+        typed.PanelRecipe(("event_response",), n_items=24, length=(600, 900), seed=seed)
+    )
+    column = next(r.name for r in g.inputs_of("event_response") if r.where == "dynamic")
+    exposed = {item.item_id: item for item in g.panel.items}
+    count = old_count = 0
+    for item in g.complete.items:
+        truth = item.dynamic[column] == 1
+        visible = np.array(
+            [
+                not is_missing(value) and value == 1
+                for value in exposed[item.item_id].dynamic[column]
+            ]
+        )
+        actual = typed.quiet_origins(g, item.item_id, context=64, horizon=16)
+        for origin in actual:
+            local = origin - item.start
+            assert item.start <= origin - 64 and origin + 16 <= item.start + len(truth)
+            assert not truth[local - 64 : local].any()
+            assert visible[local : local + 16].any()
+            assert visible[: local - 64].any()
+        expected = tuple(
+            item.start + o
+            for o in range(64, len(truth) - 16 + 1)
+            if not truth[o - 64 : o].any() and visible[o : o + 16].any() and visible[: o - 64].any()
+        )
+        assert actual == expected
+        count += len(actual)
+        old_count += sum(
+            not truth[o - 64 : o].any() and truth[o : o + 16].any() and truth[: o - 64].any()
+            for o in range(64, len(truth) - 16 + 1)
+        )
+    if seed == 0:
+        assert 0 < count < old_count
+
+
+@pytest.mark.parametrize("hidden", (0, 2, 5), ids=("prefix", "context", "horizon"))
+def test_quiet_origins_truth_in_context_and_visible_events_elsewhere(hidden):
+    g = typed.generate_typed_panel(typed.PanelRecipe(("event_response",), n_items=1, length=(8, 8)))
+    column = next(r.name for r in g.inputs_of("event_response") if r.where == "dynamic")
+    truth = np.array([1, 0, 0, 0, 0, 1, 0, 0], dtype=np.float64)
+    if hidden == 2:
+        truth[2] = 1
+    visible = truth.copy()
+    visible[hidden] = np.nan
+    item = replace(g.complete.items[0], start=100, dynamic={column: truth})
+    g = replace(
+        g,
+        complete=replace(g.complete, items=(item,)),
+        panel=replace(g.panel, items=(replace(item, dynamic={column: visible}),)),
+    )
+    assert typed.quiet_origins(g, item.item_id, context=3, horizon=3) == ()
 
 
 def last_aligned_origin(panel, k):
