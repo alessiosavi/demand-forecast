@@ -1,14 +1,16 @@
 """Uniform corpus variates and typed controls with identical random streams."""
 
+import hashlib
 import importlib
 from dataclasses import replace
 
 import numpy as np
 import pytest
 
+from demand_forecast.data.episode import is_missing
 from demand_forecast.pretrain.v5.config import SourceConfig
-from demand_forecast.synthetic.typed import sample_recipe, shuffle_assignment
-from tests.helpers.corpus_v4_fixture import write_corpus, write_rows
+from demand_forecast.synthetic.typed import PanelRecipe, sample_recipe, shuffle_assignment
+from tests.helpers.corpus_v4_fixture import write_corpus, write_malformed_row, write_rows
 
 
 def api():
@@ -81,6 +83,36 @@ def test_sampled_recipe_only_caps_items_and_passes_heldout():
     assert rng.bit_generator.state == duplicate.bit_generator.state
 
 
+@pytest.mark.parametrize("recipes", [(), (("event_response",),)])
+@pytest.mark.parametrize("max_items", [-1, 0, 1])
+def test_shuffle_rejects_too_few_items_at_construction(recipes, max_items):
+    config = SourceConfig("typed", 1.0, recipes=recipes, max_items=max_items, control="shuffle")
+    with pytest.raises(ValueError, match=r"shuffle.*max_items.*2"):
+        api().TypedSource(config)
+
+
+def test_shuffle_raises_sampled_single_item_to_two_without_extra_rng_draws(monkeypatch):
+    def one_item_recipe(seed, *, heldout):
+        return PanelRecipe(
+            mechanisms=("event_response",),
+            n_items=1,
+            length=(64, 64),
+            seed=seed,
+            heldout=heldout,
+        )
+
+    module = api()
+    monkeypatch.setattr(module, "sample_recipe", one_item_recipe)
+    config = SourceConfig("typed", 1.0, max_items=2, heldout=True, control="shuffle")
+    rng, duplicate = np.random.default_rng(9), np.random.default_rng(9)
+    seed = int(duplicate.integers(0, 2**63))
+    panel, record = module.TypedSource(config).panel(rng)
+    panel.validate()
+    assert len(panel.items) == record["recipe"].n_items == 2
+    assert record["recipe"] == replace(one_item_recipe(seed, heldout=True), n_items=2)
+    assert rng.bit_generator.state == duplicate.bit_generator.state
+
+
 @pytest.mark.parametrize("selection", ["all", "attribute", "column"])
 def test_shuffle_preserves_targets_uncontrolled_record_and_rng(selection):
     config = typed_config(n_nuisance=2, nuisance_from=("event_response",))
@@ -122,14 +154,55 @@ def test_shuffle_preserves_targets_uncontrolled_record_and_rng(selection):
     )
 
 
-def test_hierarchy_and_its_twins_are_each_shuffled_once():
-    config = replace(typed_config(n_nuisance=2), recipes=(("hierarchy",),), control="shuffle")
-    panel, record = api().TypedSource(config).panel(np.random.default_rng(3))
-    expected = record["generated"]
-    for input_record in expected.inputs:
-        if input_record.name not in expected.shuffled:
-            expected = shuffle_assignment(expected, input_record.name, expected.recipe.seed)
-    equal_panels(panel, expected.panel)
+@pytest.mark.parametrize("selection", ["all", "attribute"])
+def test_hierarchy_and_its_twins_are_each_shuffled_once(monkeypatch, selection):
+    config = replace(
+        typed_config(n_nuisance=2, nuisance_from=("hierarchy",)),
+        recipes=(("hierarchy",),),
+        max_items=64,
+    )
+    module = api()
+    calls = []
+
+    def capture_shuffle(generated, name, seed):
+        result = shuffle_assignment(generated, name, seed)
+        calls.append(result)
+        return result
+
+    monkeypatch.setattr(module, "shuffle_assignment", capture_shuffle)
+    true_rng, null_rng = np.random.default_rng(3), np.random.default_rng(3)
+    true, true_record = module.TypedSource(config).panel(true_rng)
+    panel, record = module.TypedSource(
+        replace(config, control="shuffle", control_inputs=selection)
+    ).panel(null_rng)
+    assert true_rng.bit_generator.state == null_rng.bit_generator.state
+    equal_panels(true, record["generated"].panel)
+    equal_panels(true_record["generated"].complete, record["generated"].complete)
+    assert record["generated"].shuffled == ()
+    generated = record["generated"]
+    assert len(generated.inputs) == 6  # hierarchy pair and two nuisance twin pairs
+    assert len(calls) == 3
+    assert [len(call.shuffled) for call in calls] == [2, 4, 6]
+    controlled = calls[-1]
+    originals = {item.item_id: item for item in generated.complete.items}
+    for i in (0, 2, 4):
+        first, second = generated.inputs[i : i + 2]
+        assert controlled.donors[first.name] == controlled.donors[second.name]
+    for input_record in generated.inputs:
+        name = input_record.name
+        assert any(a.static[name] != b.static[name] for a, b in zip(true.items, panel.items))
+        for original, moved in zip(true.items, panel.items, strict=True):
+            donor, _ = controlled.donors[name][original.item_id]
+            assert donor != original.item_id
+            expected = original.static[name]
+            if not is_missing(expected):
+                expected = originals[donor].static[name]
+            assert moved.static[name] == expected
+    for original, moved in zip(true.items, panel.items, strict=True):
+        for name, target in original.targets.items():
+            assert target.dtype == moved.targets[name].dtype
+            assert target.shape == moved.targets[name].shape
+            assert target.tobytes() == moved.targets[name].tobytes()
 
 
 @pytest.mark.parametrize("control", ["no_dates", "missing_as_zero"])
@@ -193,6 +266,31 @@ def test_corpus_roles_vary_covariates_are_sampled_and_grid_has_season(tmp_path):
     assert len(seen) == 40
 
 
+@pytest.mark.parametrize(
+    "problem", ["null_variate", "null_channel", "ragged_channels", "zero_variates", "bad_shape"]
+)
+def test_corpus_panel_propagates_malformed_row_skip_unchanged(tmp_path, monkeypatch, problem):
+    pytest.importorskip("pyarrow")
+    write_malformed_row(tmp_path, problem)
+    module = api()
+    corpus = importlib.import_module("demand_forecast.pretrain.v5.corpus")
+    source = module.CorpusSource(SourceConfig("corpus", 1.0, root=str(tmp_path)))
+    read = module.read_values
+    skips = []
+
+    def capture_skip(*args):
+        try:
+            return read(*args)
+        except corpus.SamplerSkip as skip:
+            skips.append(skip)
+            raise
+
+    monkeypatch.setattr(module, "read_values", capture_skip)
+    with pytest.raises(corpus.CorpusValueError, match=r"train-bad.parquet: row 1") as caught:
+        source.panel(np.random.default_rng(0))  # seed 0 selects the malformed second row
+    assert skips == [caught.value]
+
+
 def test_mix_weights_and_corpus_digest(tmp_path):
     configs = tuple(
         SourceConfig("typed", weight, recipes=((),), freq=freq, max_items=1, length=(8, 8))
@@ -209,3 +307,24 @@ def test_mix_weights_and_corpus_digest(tmp_path):
     index_api = importlib.import_module("demand_forecast.pretrain.v5.corpus")
     assert corpus.corpus_digest == index_api.CorpusIndex.build(tmp_path).digest
     assert corpus.panel(rng)[1]["source"] == "corpus"
+
+
+def test_corpus_roots_only_fill_missing_configuration(tmp_path):
+    pytest.importorskip("pyarrow")
+    roots = [tmp_path / name for name in ("first", "second", "fallback")]
+    for i, root in enumerate(roots):
+        write_rows(root / "univariate/a/train-000.parquet", [[np.arange(32) + i]])
+    configs = tuple(SourceConfig("corpus", 1.0, root=str(root)) for root in roots[:2])
+    mix = api().SourceMix(configs, corpus_root=roots[2])
+    assert [source.index.root for source in mix.sources] == roots[:2]
+    assert api().CorpusSource(configs[0], roots[2]).index.root == roots[0]
+    digests = [source.index.digest for source in mix.sources]
+    assert len(set(digests)) == 2
+    expected = hashlib.sha256(
+        "".join(f"{i}\t0\t{digest}\n" for i, digest in enumerate(digests)).encode()
+    ).hexdigest()
+    assert mix.corpus_digest == expected
+    fallback = api().SourceMix((SourceConfig("corpus", 1.0),), corpus_root=roots[2])
+    assert fallback.sources[0].index.root == roots[2]
+    with pytest.raises(ValueError, match="corpus source requires a root"):
+        api().SourceMix((SourceConfig("corpus", 1.0),))

@@ -25,7 +25,18 @@ class PanelSource(Protocol):
 
 
 class TypedSource:
+    """Generate typed panels with optional input controls.
+
+    ``shuffle`` requires ``max_items >= 2``; sampled recipes are clamped to
+    between two items and that cap without drawing from the caller's generator.
+    Both hierarchy attributes move together in one ``shuffle_assignment`` call;
+    each hierarchy nuisance twin pair likewise moves together exactly once.
+    This applies to both ``control_inputs='all'`` and ``'attribute'``.
+    """
+
     def __init__(self, config: SourceConfig):
+        if config.control == "shuffle" and config.max_items < 2:
+            raise ValueError("control='shuffle' requires max_items >= 2")
         self.config = config
 
     def panel(self, rng: np.random.Generator) -> tuple[Panel, dict]:
@@ -47,7 +58,10 @@ class TypedSource:
             )
         else:
             recipe = sample_recipe(seed, heldout=config.heldout)
-            recipe = replace(recipe, n_items=min(recipe.n_items, config.max_items))
+            n_items = min(recipe.n_items, config.max_items)
+            if config.control == "shuffle":
+                n_items = max(2, n_items)
+            recipe = replace(recipe, n_items=n_items)
         generated = generate_typed_panel(recipe)
         panel = generated.panel
         if config.control == "shuffle":
@@ -75,7 +89,7 @@ class TypedSource:
 
 class CorpusSource:
     def __init__(self, config: SourceConfig, root: Path | None = None):
-        location = root if root is not None else config.root
+        location = config.root if config.root is not None else root
         if location is None:
             raise ValueError("corpus source requires a root")
         self.config = config

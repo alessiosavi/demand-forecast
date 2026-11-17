@@ -8,7 +8,7 @@ import json
 import numpy as np
 import pytest
 
-from tests.helpers.corpus_v4_fixture import write_corpus, write_rows
+from tests.helpers.corpus_v4_fixture import write_corpus, write_malformed_row, write_rows
 
 pa = pytest.importorskip("pyarrow")
 pq = pytest.importorskip("pyarrow.parquet")
@@ -155,6 +155,56 @@ def test_bad_frequency_names_file_even_in_excluded_group(tmp_path):
     assert path.exists()
 
 
+@pytest.mark.parametrize("distinct", [("D",), ("h", "D", "ME")])
+def test_large_frequency_group_only_materialises_distinct_strings(tmp_path, monkeypatch, distinct):
+    count = 20_000
+    freqs = [distinct[i % len(distinct)] for i in range(count)]
+    write_rows(
+        tmp_path / "univariate/a/train-000.parquet",
+        [[np.zeros(1)]] * count,
+        freqs=freqs,
+        row_group_size=count,
+    )
+    original = pq.ParquetFile.read_row_group
+
+    class FrequencyColumn:
+        def __init__(self, column):
+            self.column = column
+
+        def to_pylist(self):
+            assert len(self.column) <= 3, "materialised per-row Python frequency strings"
+            return self.column.to_pylist()
+
+        def dictionary_encode(self):
+            return FrequencyColumn(self.column.dictionary_encode())
+
+        def combine_chunks(self):
+            return FrequencyColumn(self.column.combine_chunks())
+
+        @property
+        def dictionary(self):
+            return FrequencyColumn(self.column.dictionary)
+
+        def __getattr__(self, name):
+            return getattr(self.column, name)
+
+    def read(reader, i, columns=None, **kwargs):
+        table = original(reader, i, columns=columns, **kwargs)
+        assert columns == ["freq"]
+        return {"freq": FrequencyColumn(table["freq"])}
+
+    monkeypatch.setattr(pq.ParquetFile, "read_row_group", read)
+    index = api().CorpusIndex.build(tmp_path)
+    assert index.rows == count
+    frequency = index._frequencies[0]
+    assert frequency.values == tuple(sorted(distinct))
+    assert [frequency.at(i) for i in range(count)] == freqs
+    if len(distinct) == 1:
+        assert frequency.codes == b"" and frequency.width == 0
+    else:
+        assert len(frequency.codes) == count and frequency.width == 1
+
+
 @pytest.mark.parametrize("location", ["quarantine", "univariate/quarantine-source"])
 def test_quarantined_paths_refused(tmp_path_factory, location):
     tmp_path = tmp_path_factory.mktemp("placement")
@@ -240,6 +290,18 @@ def test_bad_values_in_covariates_are_checked(tmp_path):
     module = api()
     with pytest.raises(module.CorpusValueError, match="train-bad.parquet"):
         module.read_values(module.CorpusIndex.build(tmp_path), 0, module.RowCache())
+
+
+@pytest.mark.parametrize(
+    "problem", ["null_variate", "null_channel", "ragged_channels", "zero_variates", "bad_shape"]
+)
+def test_malformed_rows_are_counted_skips_with_file_row_context(tmp_path, problem):
+    write_malformed_row(tmp_path, problem)
+    module = api()
+    index, cache = module.CorpusIndex.build(tmp_path), module.RowCache()
+    for _ in range(2):  # cold and cached reads preserve the skip contract
+        with pytest.raises(module.CorpusValueError, match=r"train-bad.parquet: row 1"):
+            module.read_values(index, 1, cache)
 
 
 def test_row_bounds_are_programming_errors(tmp_path):

@@ -58,9 +58,12 @@ class _Frequencies:
 
 
 def _frequencies(parquet, group: int, relative: str) -> _Frequencies:
-    aliases = parquet.read_row_group(group, columns=["freq"], use_threads=False)["freq"].to_pylist()
-    invalid = []
-    for value in dict.fromkeys(aliases):
+    column = parquet.read_row_group(group, columns=["freq"], use_threads=False)["freq"]
+    encoded = column.dictionary_encode().combine_chunks()
+    # Only the dictionary crosses into Python; per-row aliases remain Arrow codes.
+    aliases = encoded.dictionary.to_pylist()
+    invalid = [None] if encoded.null_count else []
+    for value in aliases:
         try:
             if not isinstance(value, str) or not value or to_offset(value).n <= 0:
                 raise ValueError("frequency must be a positive offset")
@@ -68,12 +71,13 @@ def _frequencies(parquet, group: int, relative: str) -> _Frequencies:
             invalid.append(value)
     if invalid:
         raise ValueError(f"invalid frequency in {relative}: {invalid!r}")
-    values = tuple(sorted(set(aliases)))
+    values = tuple(sorted(aliases))
     if len(values) <= 1:
         return _Frequencies(values)
     lookup = {value: i for i, value in enumerate(values)}
     width = 1 if len(values) <= 256 else 2 if len(values) <= 65536 else 4
-    codes = np.fromiter((lookup[value] for value in aliases), dtype=f"<u{width}")
+    dictionary_codes = np.fromiter((lookup[value] for value in aliases), dtype=f"<u{width}")
+    codes = dictionary_codes[encoded.indices.to_numpy(zero_copy_only=False)]
     return _Frequencies(values, codes.tobytes(), width)
 
 
@@ -228,7 +232,7 @@ class ShortRow(SamplerSkip):
 
 
 class CorpusValueError(SamplerSkip):
-    """A corpus row contains infinity."""
+    """A corpus row contains malformed numeric data or infinity."""
 
 
 class RowCache:
@@ -308,17 +312,20 @@ def read_values(index: CorpusIndex, row: int, cache: RowCache) -> dict:
         ) as parquet:
             table = parquet.read_row_group(group, columns=columns, use_threads=False)
         cache._put(key, table)
-    targets = _matrix(table["target"][local_row], nested=kind != "covariates")
-    covariates = (
-        _matrix(table["covariates"][local_row], nested=True)
-        if kind == "covariates"
-        else np.empty((0, targets.shape[1]), dtype=np.float64)
-    )
+    context = f"{relative}: row {file_row}"
+    try:
+        targets = _matrix(table["target"][local_row], nested=kind != "covariates")
+        covariates = (
+            _matrix(table["covariates"][local_row], nested=True)
+            if kind == "covariates"
+            else np.empty((0, targets.shape[1]), dtype=np.float64)
+        )
+    except ValueError as error:
+        raise CorpusValueError(f"{context}: {error}") from error
     if covariates.shape == (0, 0):
         covariates = np.empty((0, targets.shape[1]), dtype=np.float64)
-    context = f"{relative}: row {file_row}"
     if not targets.shape[0] or covariates.shape[1] != targets.shape[1]:
-        raise ValueError(f"invalid numeric shapes in {context}")
+        raise CorpusValueError(f"invalid numeric shapes in {context}")
     if np.isinf(targets).any() or np.isinf(covariates).any():
         raise CorpusValueError(f"infinite value in {context}")
     if targets.shape[1] < 32:

@@ -82,3 +82,23 @@ def write_corpus(root: Path) -> tuple[Path, ...]:
             row_group_size=3,
         ),
     )
+
+
+def write_malformed_row(root: Path, problem: str) -> Path:
+    """A valid row followed by a malformed row, in separate row groups."""
+    first = np.arange(32, dtype=np.float64)
+    if problem == "bad_shape":
+        return write_rows(
+            root / "covariates/a/train-bad.parquet",
+            [first, first],
+            kind="covariates",
+            covariates=[[first], [first[:-1]]],
+            row_group_size=1,
+        )
+    target = {
+        "null_variate": None,
+        "null_channel": [first, None],
+        "ragged_channels": [first, first[:-1]],
+        "zero_variates": [],
+    }[problem]
+    return write_rows(root / "univariate/a/train-bad.parquet", [[first], target], row_group_size=1)
