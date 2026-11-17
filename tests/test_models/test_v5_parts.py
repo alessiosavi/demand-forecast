@@ -34,6 +34,74 @@ from demand_forecast.models.v5.tokens import CalendarEmbedding, PatchEncoder
 TINY = V5Config(d_model=64, nhead=4, dim_feedforward=128, dropout=0.0)
 
 
+@pytest.mark.parametrize(
+    "field",
+    (
+        "d_model",
+        "nhead",
+        "enc_layers",
+        "dec_layers",
+        "dim_feedforward",
+        "n_experts",
+        "d_calendar",
+        "d_step",
+        "d_out",
+    ),
+)
+@pytest.mark.parametrize("value", (0, -1))
+def test_config_rejects_nonpositive_dimensions(field, value):
+    with pytest.raises(ValueError):
+        replace(TINY, **{field: value})
+
+
+@pytest.mark.parametrize(
+    "changes",
+    (
+        {"d_model": 65},
+        {"d_model": 60},
+        {"top_k": 0},
+        {"top_k": 5},
+        {"expert_enc_layers": -1},
+        {"expert_enc_layers": 6},
+        {"expert_dec_layers": -1},
+        {"expert_dec_layers": 4},
+        {"dropout": -0.1},
+        {"dropout": 1.0},
+        {"known_gate_floor": -0.1},
+        {"known_gate_floor": 1.0},
+        {"sparsity_weight": -0.1},
+        {"balance_weight": -0.1},
+        {"width_factor": 0.0},
+        {"width_factor": -1.0},
+        {"quantiles": ()},
+        {"quantiles": (0.0, 0.5)},
+        {"quantiles": (0.5, 1.0)},
+        {"quantiles": (0.5, 0.5)},
+        {"quantiles": (0.8, 0.5)},
+        {"quantiles": (0.1, float("nan"), 0.9)},
+    ),
+)
+def test_config_rejects_invalid_settings(changes):
+    with pytest.raises(ValueError):
+        replace(TINY, **changes)
+
+
+def test_config_accepts_valid_boundaries():
+    assert V5Config().d_model == 384
+    config = replace(
+        TINY,
+        top_k=1,
+        expert_enc_layers=0,
+        expert_dec_layers=0,
+        dropout=0.0,
+        known_gate_floor=0.0,
+        sparsity_weight=0.0,
+        balance_weight=0.0,
+    )
+    assert config.top_k == 1
+    assert replace(TINY, top_k=4, expert_enc_layers=5, expert_dec_layers=3)
+
+
 def test_scale_shift_is_identity_at_init():
     t = torch.randn(2, 3, 5, 384)
     assert torch.equal(ScaleShift(V5Config())(t, torch.randn(2, 384)), t)
