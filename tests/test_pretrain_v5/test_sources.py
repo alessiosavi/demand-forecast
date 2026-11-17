@@ -84,11 +84,13 @@ def test_sampled_recipe_only_caps_items_and_passes_heldout():
 
 
 @pytest.mark.parametrize("recipes", [(), (("event_response",),)])
-@pytest.mark.parametrize("max_items", [-1, 0, 1])
-def test_shuffle_rejects_too_few_items_at_construction(recipes, max_items):
-    config = SourceConfig("typed", 1.0, recipes=recipes, max_items=max_items, control="shuffle")
+def test_shuffle_rejects_too_few_items_at_construction(recipes):
+    config = SourceConfig("typed", 1.0, recipes=recipes, max_items=1, control="shuffle")
     with pytest.raises(ValueError, match=r"shuffle.*max_items.*2"):
         api().TypedSource(config)
+    for invalid in (-1, 0):  # refused earlier, by the configuration itself
+        with pytest.raises(ValueError, match="max_items"):
+            SourceConfig("typed", 1.0, recipes=recipes, max_items=invalid, control="shuffle")
 
 
 def test_shuffle_raises_sampled_single_item_to_two_without_extra_rng_draws(monkeypatch):
