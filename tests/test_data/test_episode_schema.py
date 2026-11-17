@@ -50,6 +50,36 @@ def test_missing_and_labels():
     assert label_of(3) == label_of("3") and label_of(True) == "True"
 
 
+@pytest.mark.parametrize("missing", [pd.NA, pd.NaT])
+def test_pandas_missing_scalars_are_missing(missing):
+    assert is_missing(missing)
+    values = np.array(["a", "b", "a", missing], dtype=object)
+    assert infer_kind(values) == KIND_FLAG
+    np.testing.assert_array_equal(flag_codes(values, 4), [0.0, 1.0, 0.0, np.nan])
+
+
+@pytest.mark.parametrize("dtype", ["Int64", "boolean", "string"])
+def test_nullable_pandas_columns_do_not_create_a_missing_label(dtype):
+    cells = ["a", "b", "a", pd.NA] if dtype == "string" else [0, 1, 0, pd.NA]
+    values = pd.array(cells, dtype=dtype).to_numpy(dtype=object)
+    assert infer_kind(values) == KIND_FLAG
+    np.testing.assert_array_equal(flag_codes(values, 4), [0.0, 1.0, 0.0, np.nan])
+
+
+def test_list_and_tuple_cells_keep_scalar_missing_semantics():
+    values = np.empty(8, dtype=object)
+    values[:] = [[], (), ["a", "b"], ("a", "b"), 0, False, "0", [pd.NA]]
+    assert [is_missing(value) for value in values] == [True, True, *([False] * 6)]
+    assert infer_kind(values) == KIND_CATEGORY
+    assert np.isnan(flag_codes(values, 8)[:2]).all()
+    assert np.isfinite(flag_codes(values, 8)[2:]).all()
+
+
+@pytest.mark.parametrize("nonfinite", [np.inf, -np.inf])
+def test_nonfinite_static_values_are_numbers(nonfinite):
+    assert infer_static_kind([1.0, nonfinite, 1.0, nonfinite]) == "number"
+
+
 def test_flag_codes_do_not_depend_on_spelling():
     a = flag_codes(np.array(["a", "b", "a", "a", "c"], dtype=object), 4)
     z = flag_codes(np.array(["z", "b", "z", "z", "c"], dtype=object), 4)
@@ -77,6 +107,24 @@ def test_scale_floors():
     assert fit_scale(np.full(50, np.nan), 50, 7) == Scale(0.0, 1.0)
 
 
+def test_negative_scale_cutoff_has_an_empty_prefix():
+    values = np.arange(1.0, 11.0)
+    perturbed = values.copy()
+    perturbed[-5:] = 1e9
+    for array in (values, perturbed):
+        assert fit_scale(array, -3, 1) == fit_scale(array, 0, 1) == Scale(0.0, 1.0)
+
+
+def test_negative_flag_cutoff_has_an_empty_prefix():
+    values = np.array([0.0, 1.0, 0.0, np.nan, 1.0, 0.0, 1.0, 0.0])
+    perturbed = values.copy()
+    perturbed[-5:] = 42.0
+    for array in (values, perturbed):
+        codes = flag_codes(array, -3)
+        np.testing.assert_array_equal(codes, flag_codes(array, 0))
+        assert (codes[np.isfinite(array)] == 1.0).all()
+
+
 def test_panel_validate():
     panel = toy_panel()
     panel.validate()
@@ -96,6 +144,49 @@ def test_panel_validate():
             replace(panel, roles=roles).validate()
     with pytest.raises(ValueError, match="epoch"):
         replace(panel, epoch=None).validate()
+
+
+@pytest.mark.parametrize("change", ["missing", "extra"])
+def test_panel_target_names_must_match_the_first_item(change):
+    panel = toy_panel(n_targets=2)
+    item = panel.items[1]
+    targets = item.targets.copy()
+    if change == "missing":
+        del targets["y1"]
+    else:
+        targets["extra"] = targets["y"].copy()
+    changed = replace(item, targets=targets)
+    with pytest.raises(
+        ValueError, match=rf"{item.item_id}.*target.*{('y1' if change == 'missing' else 'extra')}"
+    ):
+        replace(panel, items=(panel.items[0], changed, *panel.items[2:])).validate()
+
+
+@pytest.mark.parametrize("change", ["missing", "extra"])
+def test_panel_dynamic_names_must_match_the_first_item(change):
+    panel = toy_panel()
+    item = panel.items[1]
+    dynamic = item.dynamic.copy()
+    if change == "missing":
+        del dynamic["temp"]
+    else:
+        dynamic["extra"] = dynamic["temp"].copy()
+    changed = replace(item, dynamic=dynamic)
+    with pytest.raises(
+        ValueError,
+        match=rf"{item.item_id}.*dynamic.*{('temp' if change == 'missing' else 'extra')}",
+    ):
+        replace(
+            panel,
+            roles={**panel.roles, "extra": "past"},
+            items=(panel.items[0], changed, *panel.items[2:]),
+        ).validate()
+
+
+def test_panel_static_keys_may_differ_between_items():
+    panel = toy_panel()
+    item = replace(panel.items[1], static={"brand": "other", "extra": 3.5})
+    replace(panel, items=(panel.items[0], item, *panel.items[2:])).validate()
 
 
 def test_mixed_labels_preserve_missing_and_renaming():
@@ -183,6 +274,27 @@ def test_panel_frequency_properties(freq, epoch, freq_class, season, long_lag):
     assert panel.freq_class == sc.FREQ_CLASSES.index(freq_class)
     assert panel.season == season
     assert panel.long_lag == long_lag
+
+
+@pytest.mark.parametrize(
+    ("freq", "epoch", "freq_class"),
+    [
+        ("BME", "2024-01-31", "monthly"),
+        ("BMS", "2024-01-01", "monthly"),
+        ("BQE", "2024-03-29", "quarterly"),
+        ("BQS", "2024-01-01", "quarterly"),
+        ("BYE", "2024-12-31", "yearly"),
+        ("BYS", "2024-01-01", "yearly"),
+        ("bh", "2024-01-01 09:00", "hourly"),
+        ("B", "2024-01-01", "daily"),
+    ],
+)
+def test_business_anchors_get_their_family_class(freq, epoch, freq_class):
+    # Only the class is pinned: the season of a business grid follows the repository's
+    # pretraining convention (pretrain/periods.py), which this package does not change.
+    panel = replace(toy_panel(), freq=freq, epoch=pd.Timestamp(epoch))
+    panel.validate()
+    assert panel.freq_class == sc.FREQ_CLASSES.index(freq_class)
 
 
 def test_timestamps_use_absolute_grid_and_calendar_offsets():

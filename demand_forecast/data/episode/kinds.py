@@ -10,7 +10,7 @@ from .schema import KIND_CATEGORY, KIND_FLAG, KIND_NUMBER
 
 def is_missing(value: object) -> bool:
     """Recognise missing scalar cells without confusing zero, False or labels."""
-    if value is None:
+    if value is None or value is pd.NA or value is pd.NaT:
         return True
     if isinstance(value, (list, tuple, str)):
         return len(value) == 0
@@ -62,6 +62,7 @@ def infer_static_kind(values: Sequence[object]) -> str:
     numbers = np.asarray(observed, dtype=np.float64)
     if (
         len(numbers)
+        and np.isfinite(numbers).all()
         and np.all(numbers == np.floor(numbers))
         and 2 * len(np.unique(numbers)) <= len(values)
     ):
@@ -76,6 +77,7 @@ def flag_codes(values: np.ndarray, cutoff: int) -> np.ndarray:
     remain NaN. Factorisation preserves occurrence order rather than spelling.
     """
     values = np.asarray(values)
+    cutoff = max(0, cutoff)
     observed = _observed(values)
     labels = _labels(values)
     prefix_codes, prefix_labels = pd.factorize(labels[:cutoff][observed[:cutoff]], sort=False)

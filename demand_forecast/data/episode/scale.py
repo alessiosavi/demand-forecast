@@ -17,7 +17,7 @@ class Scale:
 
 def fit_scale(values: np.ndarray, cutoff: int, season: int) -> Scale:
     """Fit the median and seasonal error using only values before the cutoff."""
-    prefix = np.asarray(values[:cutoff], dtype=np.float64)
+    prefix = np.asarray(values[: max(0, cutoff)], dtype=np.float64)
     finite = prefix[np.isfinite(prefix)]
     if not len(finite):
         return Scale(0.0, 1.0)

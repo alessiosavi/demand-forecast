@@ -128,6 +128,15 @@ class Panel:
                 raise ValueError(f"Panel {self.name!r}: epoch must lie on a positive freq grid")
 
         for item in self.items:
+            for family, columns in (("target", item.targets), ("dynamic", item.dynamic)):
+                first = self.items[0].targets if family == "target" else self.items[0].dynamic
+                missing = set(first) - set(columns)
+                extra = set(columns) - set(first)
+                if missing or extra:
+                    raise ValueError(
+                        f"Item {item.item_id!r}: {family} names differ from the first item; "
+                        f"missing={sorted(missing)!r}, extra={sorted(extra)!r}"
+                    )
             length = None
             for is_target, columns in ((True, item.targets), (False, item.dynamic)):
                 for name, values in columns.items():
@@ -173,10 +182,35 @@ class Panel:
             return FREQ_CLASSES.index("undated")
         offset = to_offset(self.freq)
         for classes, name in (
-            ((pd.offsets.YearBegin, pd.offsets.YearEnd), "yearly"),
-            ((pd.offsets.QuarterBegin, pd.offsets.QuarterEnd), "quarterly"),
-            ((pd.offsets.MonthBegin, pd.offsets.MonthEnd), "monthly"),
+            (
+                (
+                    pd.offsets.YearBegin,
+                    pd.offsets.YearEnd,
+                    pd.offsets.BYearBegin,
+                    pd.offsets.BYearEnd,
+                ),
+                "yearly",
+            ),
+            (
+                (
+                    pd.offsets.QuarterBegin,
+                    pd.offsets.QuarterEnd,
+                    pd.offsets.BQuarterBegin,
+                    pd.offsets.BQuarterEnd,
+                ),
+                "quarterly",
+            ),
+            (
+                (
+                    pd.offsets.MonthBegin,
+                    pd.offsets.MonthEnd,
+                    pd.offsets.BusinessMonthBegin,
+                    pd.offsets.BusinessMonthEnd,
+                ),
+                "monthly",
+            ),
             ((pd.offsets.Week,), "weekly"),
+            ((pd.offsets.BusinessHour,), "hourly"),
         ):
             if isinstance(offset, classes):
                 return FREQ_CLASSES.index(name)
