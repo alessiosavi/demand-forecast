@@ -207,6 +207,8 @@ class Panel:
                     pd.offsets.MonthEnd,
                     pd.offsets.BusinessMonthBegin,
                     pd.offsets.BusinessMonthEnd,
+                    pd.offsets.CustomBusinessMonthBegin,
+                    pd.offsets.CustomBusinessMonthEnd,
                 ),
                 "monthly",
             ),

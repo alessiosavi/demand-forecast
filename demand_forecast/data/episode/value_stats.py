@@ -55,18 +55,25 @@ def category_step_stats(
             finite = np.isfinite(responses)
             completed, responses = completed[finite], responses[finite]
             n = np.searchsorted(completed, ends, side="left")
-            total = np.r_[0.0, responses.cumsum()][n]
-            means[:, offset] = total / np.maximum(n, 1)
-            if offset == 0:
-                support = n
-                squares = np.r_[0.0, (responses**2).cumsum()][n]
-                spread = np.sqrt(np.maximum(0.0, squares / np.maximum(n, 1) - means[:, 0] ** 2))
+            # Shifting before accumulation preserves variation around large levels.
+            anchor = responses[0] if len(responses) else 0.0
+            with np.errstate(over="ignore", invalid="ignore"):
+                shifted = responses - anchor
+                total = np.r_[0.0, shifted.cumsum()][n]
+                mean = total / np.maximum(n, 1)
+                means[:, offset] = np.where(n > 0, anchor + mean, 0.0)
+                if offset == 0:
+                    support = n
+                    squares = np.r_[0.0, (shifted**2).cumsum()][n]
+                    spread = np.sqrt(np.maximum(0.0, squares / np.maximum(n, 1) - mean**2))
         valid = support > 0
         shrink = support / (support + 4)
-        values[rows, 0] = means[:, 0] * shrink
-        values[rows, 1] = spread
-        values[rows, 2:5] = means[:, 1:] * shrink[:, None]
+        with np.errstate(over="ignore", invalid="ignore"):
+            values[rows, 0] = means[:, 0] * shrink
+            values[rows, 1] = spread
+            values[rows, 2:5] = means[:, 1:] * shrink[:, None]
         values[rows, 5] = np.log1p(support)
         values[rows[~valid]] = 0
         flags[rows] = valid
+    np.nan_to_num(values, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
     return values, flags
