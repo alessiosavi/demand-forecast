@@ -16,7 +16,7 @@ from demand_forecast.pretrain.v5.corpus import CorpusValueError, ShortRow
 from demand_forecast.pretrain.v5.sources import SourceMix, TypedSource
 from demand_forecast.synthetic.typed import PanelRecipe, generate_typed_panel
 from tests.helpers.corpus_v4_fixture import write_rows
-from tests.helpers.v5_sampler import FixedSource, config, equal_batches, panel
+from tests.helpers.v5_sampler import FixedSource, config, equal_batches, fixed_mix, panel
 
 
 def api():
@@ -29,6 +29,127 @@ def test_batch_is_pure():
     b, rb = api().make_batch(c, 3)
     equal_batches(a, b)
     assert ra == rb and ra["episodes"] == 4 and ra["supervised"] > 0
+
+
+@pytest.mark.parametrize("mechanism", ["static_category", "known_driver"])
+def test_path_share_counts_kept_episodes_over_twenty_batches(mechanism):
+    c = config(path_share=0.5, designate_target=True, episodes_per_panel=8)
+    c = replace(
+        c,
+        sources=(replace(c.sources[0], recipes=((mechanism,),), max_items=24, length=(128, 160)),),
+    )
+    paths = kept = 0
+    for k in range(20):
+        _, report = api().make_batch(c, k)
+        assert sum(report["paths"].values()) <= 2
+        paths += sum(report["paths"].values())
+        kept += report["episodes"]
+    assert paths / kept >= 0.45
+    if mechanism == "known_driver":
+        assert paths / kept <= 0.55
+
+
+@pytest.mark.parametrize("share", [0.0, 0.2, 0.5, 0.9, 1.0])
+def test_path_quota_is_never_exceeded(share):
+    c = config(path_share=share, designate_target=True, episodes_per_batch=7, episodes_per_panel=8)
+    c = replace(c, sources=(replace(c.sources[0], recipes=(("known_driver",),)),))
+    for k in range(3):
+        _, report = api().make_batch(c, k)
+        assert report["episodes"] == 7
+        assert sum(report["paths"].values()) == round(share * 7)
+
+
+def test_typed_corpus_mix_fills_any_open_quota(tmp_path):
+    pytest.importorskip("pyarrow")
+    write_rows(tmp_path / "univariate/a/train-000.parquet", [[np.arange(64, dtype=np.float64)]])
+    c = config(path_share=1.0, designate_target=True)
+    c = replace(
+        c,
+        sources=(
+            replace(c.sources[0], recipes=(("known_driver",),)),
+            SourceConfig("corpus", 1, root=str(tmp_path)),
+        ),
+    )
+    seen_corpus = False
+    for k in range(10):
+        _, report = api().make_batch(c, k)
+        assert report["episodes"] == 4
+        assert sum(report["paths"].values()) <= 4
+        seen_corpus |= report["sources"].get("corpus", 0) > 0
+    assert seen_corpus
+
+
+@pytest.mark.parametrize("mechanisms", [(), ("known_driver",)])
+def test_plan_panel_respects_open_quotas(mechanisms):
+    c = config(path_share=1.0, designate_target=True, episodes_per_panel=8)
+    source = replace(c.sources[0], recipes=(mechanisms,))
+    p, record = TypedSource(source).panel(np.random.default_rng(2))
+    _, plans, _ = api().plan_panel(
+        p, record, c.sampler, source, np.random.default_rng(3), path_quota=2, ordinary_quota=0
+    )
+    assert len(plans) == 2
+    assert all(bool(q.mechanism) == bool(mechanisms) for q in plans)
+    _, ordinary, _ = api().plan_panel(
+        p, record, c.sampler, source, np.random.default_rng(3), path_quota=0, ordinary_quota=1
+    )
+    assert len(ordinary) == 1 and ordinary[0].mechanism is None
+
+
+def test_failed_path_search_cannot_fill_closed_ordinary_quota():
+    g = generate_typed_panel(PanelRecipe(("static_category",), n_items=24, seed=2))
+    for item in g.panel.items:
+        for name in item.static:
+            item.static[name] = None
+    c = config(path_share=1.0, designate_target=True)
+    _, plans, skips = api().plan_panel(
+        g.panel,
+        {"source": "typed", "generated": g},
+        c.sampler,
+        c.sources[0],
+        np.random.default_rng(3),
+        path_quota=4,
+        ordinary_quota=0,
+    )
+    assert not plans and skips["no_support"] == 1
+
+
+@pytest.mark.parametrize("reason", ["short_row", "unsupervised", "oversized"])
+def test_path_quota_replenishes_after_build_skip(monkeypatch, reason):
+    c = config(path_share=0.5, designate_target=True, max_cells=100_000)
+    c = replace(c, sources=(replace(c.sources[0], recipes=(("known_driver",),)),))
+    original = api().EpisodeBuilder.build
+    calls = 0
+
+    def skip_once(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            if reason == "short_row":
+                raise ShortRow()
+            if reason == "oversized":
+                return shaped_episode(40, 160)
+            episode = original(*args, **kwargs)
+            episode.label_mask[:] = False
+            return episode
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(api().EpisodeBuilder, "build", skip_once)
+    _, report = api().make_batch(c, 0)
+    assert report["episodes"] == 4 and report["paths"] == {"known_driver": 2}
+    assert report["skips"][reason] == 1
+
+
+@pytest.mark.parametrize("invalid", ["bare", "mapping", "object", "sequence"])
+def test_make_batch_rejects_sources_other_than_source_mix(invalid):
+    c = config()
+    sources = {
+        "bare": TypedSource(c.sources[0]),
+        "mapping": {},
+        "object": object(),
+        "sequence": c.sources,
+    }[invalid]
+    with pytest.raises(TypeError, match="SourceMix"):
+        api().make_batch(c, 0, sources=sources)
 
 
 @pytest.mark.parametrize("workers", [0, 1, 2])
@@ -144,8 +265,11 @@ def test_no_support_and_tiny_necessary_items_are_safe():
         c.sampler,
         c.sources[0],
         np.random.default_rng(0),
+        path_quota=2,
+        ordinary_quota=2,
     )
-    assert skips["no_support"] == 1 and plans
+    assert skips["no_support"] == 1 and len(plans) == 2
+    assert all(q.mechanism is None for q in plans)
 
 
 def test_no_labels_skipped_before_build():
@@ -213,18 +337,65 @@ def test_shuffle_admission_requests_labels_and_masks_equal():
     )
 
 
+@pytest.mark.parametrize(
+    "control,mechanism",
+    [
+        ("shuffle", "event_response"),
+        ("no_dates", "calendar"),
+        ("missing_as_zero", "missing_vs_zero"),
+        ("drop_always", "seasonal_lag"),
+    ],
+)
+def test_control_kept_fallback_and_supervised_cells_equal_over_ten_batches(control, mechanism):
+    c = config(path_share=0.5, designate_target=True, origins=1, drop=())
+    c = replace(
+        c,
+        sources=(replace(c.sources[0], recipes=((mechanism,),), max_items=24, length=(128, 160)),),
+    )
+    if control == "drop_always":
+        null = replace(
+            c,
+            sampler=replace(
+                c.sampler,
+                drop_always=("rolling", "lags", "zeros"),
+                summary_off=("zero_share", "missing_share", "log_length"),
+            ),
+        )
+    else:
+        null = replace(c, sources=(replace(c.sources[0], control=control),))
+    for k in range(10):
+        true, true_report = api().make_batch(c, k)
+        other, other_report = api().make_batch(null, k)
+        assert true.context_target == other.context_target
+        assert torch.equal(true.origin_patches, other.origin_patches)
+        assert torch.equal(true.keep, other.keep)
+        kept = true.keep & true.forecast_mask
+        assert kept.any()
+        assert torch.equal(true.fallback[kept], other.fallback[kept])
+        counts = []
+        for batch in (true, other):
+            steps = torch.arange(batch.labels.shape[-1])[None, :] < batch.horizon[:, None]
+            valid = batch.keep & batch.forecast_mask & ~batch.fallback
+            mask = batch.label_mask & valid[:, None, :, None] & steps[:, None, None, :]
+            counts.append(mask.sum(dim=(1, 2, 3)))
+        assert torch.equal(*counts)
+        assert int(counts[0].sum()) == true_report["supervised"] == other_report["supervised"]
+        assert true_report["paths"] == other_report["paths"]
+        assert true_report["skips"] == other_report["skips"]
+
+
 def test_missing_as_zero_equals_prefilled_panel_and_preserves_true_units():
     p = panel(length=17, count=2)
     for item in p.items:
         item.targets["y0"][3:5] = np.nan
     c = config(designate_target=True, origins=1, drop=(), cutoff_at_origin=1)
-    true, _ = api().make_batch(c, 0, sources=FixedSource(p))
+    true, _ = api().make_batch(c, 0, sources=fixed_mix(c, FixedSource(p)))
     null_config = replace(c, sources=(replace(c.sources[0], control="missing_as_zero"),))
-    null, _ = api().make_batch(null_config, 0, sources=FixedSource(p))
+    null, _ = api().make_batch(null_config, 0, sources=fixed_mix(null_config, FixedSource(p)))
     filled = deepcopy(p)
     for item in filled.items:
         item.targets["y0"][3:5] = 0
-    expected, _ = api().make_batch(c, 0, sources=FixedSource(filled))
+    expected, _ = api().make_batch(c, 0, sources=fixed_mix(c, FixedSource(filled)))
     equal_batches(null, expected)
     assert torch.equal(null.label_mask, true.label_mask)
     original = true.labels * true.scale[:, None, :, None] + true.loc[:, None, :, None]
@@ -293,7 +464,7 @@ def test_padded_budget_includes_cross_shape_and_known_decoder_rows(monkeypatch):
     assert api()._cells([shaped_episode(1, 1, known=16)]) == 16 + 17 * 16
     episodes = iter([shaped_episode(40, 16), shaped_episode(1, 128)])
     monkeypatch.setattr(api().EpisodeBuilder, "build", lambda self, r: next(episodes))
-    _, report = api().make_batch(c, 0, sources=FixedSource(panel()))
+    _, report = api().make_batch(c, 0, sources=fixed_mix(c, FixedSource(panel())))
     assert report["episodes"] == 1 and report["skips"]["budget"] == 1
     assert report["cells"] == 40 * 16 * 16 + 16
 
@@ -302,7 +473,7 @@ def test_oversized_skipped_then_stream_continues(monkeypatch):
     c = config(episodes_per_batch=1, max_cells=1000)
     episodes = iter([shaped_episode(40, 16), shaped_episode(1, 1)])
     monkeypatch.setattr(api().EpisodeBuilder, "build", lambda self, r: next(episodes))
-    _, report = api().make_batch(c, 0, sources=FixedSource(panel()))
+    _, report = api().make_batch(c, 0, sources=fixed_mix(c, FixedSource(panel())))
     assert report["skips"]["oversized"] == 1 and report["episodes"] == 1
 
 
@@ -321,12 +492,12 @@ def test_unexpected_exceptions_name_batch(monkeypatch, stage, error):
     else:
         monkeypatch.setattr(api().EpisodeBuilder, "build", fail)
     with pytest.raises(RuntimeError, match="batch 17.*injected"):
-        api().make_batch(config(), 17, sources=fixed)
+        api().make_batch(config(), 17, sources=fixed_mix(config(), fixed))
 
 
 def test_all_short_panels_fail_with_index_and_count():
     with pytest.raises(RuntimeError, match="batch 19.*no_room.*16"):
-        api().make_batch(config(), 19, sources=FixedSource(panel(16)))
+        api().make_batch(config(), 19, sources=fixed_mix(config(), FixedSource(panel(16))))
 
 
 @pytest.mark.parametrize(
@@ -345,7 +516,7 @@ def test_only_sampler_skip_is_counted(monkeypatch, error, reason):
         return original(rng)
 
     monkeypatch.setattr(fixed, "panel", draw)
-    _, report = api().make_batch(config(), 0, sources=fixed)
+    _, report = api().make_batch(config(), 0, sources=fixed_mix(config(), fixed))
     assert report["skips"][reason] == 1
 
 
@@ -358,7 +529,7 @@ def test_unlabelled_episode_is_never_built(monkeypatch):
 
     monkeypatch.setattr(api().EpisodeBuilder, "build", forbidden)
     with pytest.raises(RuntimeError, match="no_labels.*16"):
-        api().make_batch(config(), 0, sources=FixedSource(p))
+        api().make_batch(config(), 0, sources=fixed_mix(config(), FixedSource(p)))
 
 
 @pytest.mark.parametrize("stage", ["plan", "build"])
@@ -376,5 +547,5 @@ def test_sampler_skip_at_planning_and_building_is_counted(monkeypatch, stage):
         return original(*args, **kwargs)
 
     monkeypatch.setattr(owner, name, fail_once)
-    _, report = api().make_batch(config(), 0, sources=FixedSource(panel()))
+    _, report = api().make_batch(config(), 0, sources=fixed_mix(config(), FixedSource(panel())))
     assert report["skips"]["short_row"] == 1 and report["episodes"] == 4

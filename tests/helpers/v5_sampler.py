@@ -13,6 +13,7 @@ from demand_forecast.pretrain.v5.config import (
     SourceConfig,
     V5TrainConfig,
 )
+from demand_forecast.pretrain.v5.sources import SourceMix
 
 
 def config(**sampler):
@@ -62,6 +63,14 @@ class FixedSource:
 
     def panel(self, rng):
         return self.value, self.record
+
+
+def fixed_mix(c, source):
+    """Inject a deterministic panel source through the production mixture API."""
+    mixture = SourceMix(c.sources)
+    source.config = c.sources[0]
+    mixture.sources = (source,)
+    return mixture
 
 
 def equal_batches(left, right):

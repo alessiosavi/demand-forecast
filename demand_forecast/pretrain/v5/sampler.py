@@ -61,13 +61,28 @@ def plan_panel(
     config: SamplerConfig,
     source: SourceConfig,
     rng: np.random.Generator,
+    *,
+    path_quota: int | None = None,
+    ordinary_quota: int | None = None,
 ) -> tuple[Panel, list[EpisodePlan], dict]:
-    """Choose requests on the uncontrolled record; controls only change build inputs."""
+    """Choose requests on the uncontrolled record, within the two open quotas.
+
+    Omitted quotas default to those of an empty batch. Planning and building
+    must share one EpisodeBuilder per panel; make_batch retains that builder
+    through _plan_panel to preserve screening caches and cutoff consistency.
+    """
     # The private builder lets make_batch reuse planning's screening cache.
-    return _plan_panel(panel, record, config, source, rng)[:3]
+    return _plan_panel(
+        panel, record, config, source, rng, path_quota=path_quota, ordinary_quota=ordinary_quota
+    )[:3]
 
 
-def _plan_panel(panel, record, config, source, rng):
+def _plan_panel(panel, record, config, source, rng, *, path_quota=None, ordinary_quota=None):
+    target_paths = round(config.path_share * config.episodes_per_batch)
+    path_quota = target_paths if path_quota is None else path_quota
+    ordinary_quota = (
+        config.episodes_per_batch - target_paths if ordinary_quota is None else ordinary_quota
+    )
     generated = record.get("generated")
     original = generated.panel if generated is not None else panel
     context = int(rng.choice(config.contexts))
@@ -93,7 +108,8 @@ def _plan_panel(panel, record, config, source, rng):
         own = tuple(o for o in origins if _admissible(item, o))
         return own, _cutoff(item, own, panel_cutoff)
 
-    if generated is not None and generated.recipe.mechanisms and rng.random() < config.path_share:
+    path_capable = generated is not None and bool(generated.recipe.mechanisms)
+    if path_capable and path_quota > 0:
         candidate = str(rng.choice(generated.recipe.mechanisms))
         ids = set(necessary_items(generated, candidate)) if candidate in INPUT_MECHANISMS else None
         pool = [i for i in eligible if ids is None or original.items[i].item_id in ids]
@@ -120,18 +136,17 @@ def _plan_panel(panel, record, config, source, rng):
             return panel, [], dict(skips), None
         lead, anchor = choose(eligible)
     others = [i for i, item in enumerate(original.items) if i != lead and _admissible(item, anchor)]
+    ordered = [int(i) for i in rng.permutation(others)]
     count = 1 if record.get("source") == "corpus" else config.episodes_per_panel
-    selected = [lead, *rng.choice(others, size=min(len(others), count - 1), replace=False)]
-    plans = []
-    builder = None
-    for index in selected:
-        index = int(index)
-        item = original.items[index]
-        origins, cutoff = episode_frame(item, anchor)
-        path = (
-            mechanism
-            if mechanism is not None
-            and supported(
+    selected = []
+    if mechanism is not None:
+        selected.append((lead, mechanism))
+        for index in ordered:
+            if len(selected) >= min(count, path_quota):
+                break
+            item = original.items[index]
+            _, cutoff = episode_frame(item, anchor)
+            if supported(
                 generated,
                 mechanism,
                 item.item_id,
@@ -139,9 +154,20 @@ def _plan_panel(panel, record, config, source, rng):
                 context=context,
                 horizon=horizon,
                 cutoff=cutoff,
-            )
-            else None
-        )
+            ):
+                selected.append((index, mechanism))
+        path_items = {index for index, _ in selected}
+        remaining = [index for index in ordered if index not in path_items]
+        room = min(count - len(selected), ordinary_quota)
+    else:
+        remaining = [lead, *ordered]
+        room = min(count, ordinary_quota + (path_quota if not path_capable else 0))
+    selected.extend((index, None) for index in remaining[:room])
+    plans = []
+    builder = None
+    for index, path in selected:
+        item = original.items[index]
+        origins, cutoff = episode_frame(item, anchor)
         if config.designate_target or record.get("source") == "corpus":
             target = record.get("target")
             if target is None:
@@ -189,7 +215,7 @@ def _plan_panel(panel, record, config, source, rng):
 
 
 def _cells(episodes):
-    """Charge the maxima of all padded axes, including known-future rows."""
+    """Count padded token cells, including known-future rows, not tensor elements."""
     n = len(episodes)
     rows = max(e.x.shape[0] for e in episodes)
     patches = max(e.x.shape[1] for e in episodes)
@@ -225,23 +251,24 @@ def _skip_reason(error):
     return getattr(error, "reason", "sampler_skip")
 
 
-def _draw(sources, config, rng):
-    if isinstance(sources, SourceMix):
-        # SourceMix's record omits the selected configuration. Preserve its exact
-        # draw while retaining that configuration, also for multiple typed sources.
-        index = int(rng.choice(len(sources.sources), p=sources._weights))
-        source = sources.sources[index]
-        panel, record = source.panel(rng)
-        return panel, record, source.config
-    panel, record = sources.panel(rng)
-    source = next(c for c in config.sources if c.kind == record.get("source", c.kind))
-    return panel, record, source
+def _draw(sources, rng):
+    # SourceMix's record omits the selected configuration. Preserve its exact
+    # draw while retaining that configuration, also for multiple typed sources.
+    index = int(rng.choice(len(sources.sources), p=sources._weights))
+    source = sources.sources[index]
+    panel, record = source.panel(rng)
+    return panel, record, source.config
 
 
 def make_batch(
     config: V5TrainConfig, k: int, *, sources: SourceMix | None = None
 ) -> tuple[EpisodeBatch, dict]:
-    """Build a nonempty batch or explain the exhausted index with counted skips."""
+    """Build a nonempty batch, accepting only a SourceMix override.
+
+    The report's ``cells`` counts padded token cells, not tensor elements.
+    """
+    if sources is not None and not isinstance(sources, SourceMix):
+        raise TypeError("sources must be a SourceMix or None")
     try:
         return _make_batch(config, k, sources)
     except Exception as error:
@@ -253,12 +280,25 @@ def _make_batch(config, k, sources):
     sources = SourceMix(config.sources) if sources is None else sources
     episodes = []
     skips, source_counts, paths, absent = Counter(), Counter(), Counter(), Counter()
+    target_paths = round(config.sampler.path_share * config.sampler.episodes_per_batch)
     closed = False
     for _ in range(4 * config.sampler.episodes_per_batch):
         try:
-            panel, record, source = _draw(sources, config, rng)
+            panel, record, source = _draw(sources, rng)
+            kept_paths = sum(paths.values())
+            room = config.sampler.episodes_per_batch - len(episodes)
+            path_quota = min(target_paths - kept_paths, room)
+            ordinary_quota = max(
+                0, config.sampler.episodes_per_batch - target_paths - (len(episodes) - kept_paths)
+            )
             panel, plans, planned_skips, builder = _plan_panel(
-                panel, record, config.sampler, source, rng
+                panel,
+                record,
+                config.sampler,
+                source,
+                rng,
+                path_quota=path_quota,
+                ordinary_quota=ordinary_quota,
             )
             skips.update(planned_skips)
             if not plans:
