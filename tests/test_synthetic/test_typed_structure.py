@@ -4,6 +4,7 @@ import hashlib
 import math
 import os
 import subprocess
+import sys
 from dataclasses import replace
 
 import numpy as np
@@ -336,7 +337,7 @@ print(h.hexdigest())
 """
     results = [
         subprocess.run(
-            ["/private/tmp/v5-venv/bin/python", "-c", script],
+            [sys.executable, "-c", script],
             check=True,
             capture_output=True,
             text=True,
