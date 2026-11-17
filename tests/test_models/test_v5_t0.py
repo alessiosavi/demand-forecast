@@ -1,6 +1,7 @@
 """T0: panel-to-forecast correctness, availability and selection contracts."""
 
 from collections.abc import Callable, Iterator
+from copy import deepcopy
 from dataclasses import replace
 
 import numpy as np
@@ -22,6 +23,7 @@ from demand_forecast.data.episode import (
 )
 from demand_forecast.data.episode.bank import TSFRESH_PARITY
 from demand_forecast.data.episode.schema import (
+    CALENDAR_SIZES,
     CH_STEP,
     CH_STEP_FLAG,
     CH_VALUE_STATS,
@@ -52,16 +54,22 @@ def deterministic_eval() -> Iterator[None]:
 
 @pytest.fixture
 def model() -> V5Model:
-    result = V5Model(TINY).eval()
-    # Defaults initialise these outputs to constant, saturated gates. Randomise
-    # them too, so equality checks can detect leakage into the learned inputs.
-    result.gate_net.net[-1].reset_parameters()
-    result.family_logits.reset_parameters()
-    return result
+    return V5Model(TINY).eval()
+
+
+@pytest.fixture
+def input_sensitive_model(model: V5Model) -> V5Model:
+    # The shipped gate outputs are constant and saturated. Only tests checking
+    # input-dependent gates reset them, so leakage into gate inputs is visible.
+    model.gate_net.net[-1].reset_parameters()
+    model.family_logits.reset_parameters()
+    return model
 
 
 @pytest.fixture(name="mixed_gates")
-def mixed_gate_factory(model: V5Model) -> GateFactory:
+def mixed_gate_factory(input_sensitive_model: V5Model) -> GateFactory:
+    model = input_sensitive_model
+
     def mixed_gates(batch: EpisodeBatch, values: dict[str, float] | None = None) -> Gates:
         """Fix independent gates by name, retaining learned forecast/known gates."""
         gates = model.gates(batch, mode="learned")
@@ -93,6 +101,15 @@ def mixed_gate_factory(model: V5Model) -> GateFactory:
         )
 
     return mixed_gates
+
+
+def test_gates_start_open(model: V5Model) -> None:
+    batch = _batch(toy_panel())
+    gates = model.gates(batch, mode="learned")
+    assert torch.equal(gates.family, torch.ones_like(gates.family))
+    assert batch.cand_mask.any()
+    assert torch.equal(gates.cand[batch.cand_mask], torch.ones_like(gates.cand[batch.cand_mask]))
+    assert (gates.row[batch.row_mask] >= 0.95).all()
 
 
 def _batch(panel: Panel, request: EpisodeRequest = REQUEST) -> EpisodeBatch:
@@ -282,8 +299,30 @@ def test_reordering(model: V5Model, mixed_gates: GateFactory) -> None:
     request = replace(REQUEST, target="y")
     a = _batch(panel, request)
     b = _batch(shuffled, replace(request, item_index=int(np.flatnonzero(order == 0)[0])))
+    context_names = [
+        {
+            name
+            for i, name in enumerate(batch.row_names[0])
+            if batch.row_role[0, i] in (ROLE_PEER, ROLE_PANEL)
+        }
+        for batch in (a, b)
+    ]
+    assert context_names[0] == context_names[1]
+    assert (a.row_role == ROLE_PEER).any() and (a.row_role == ROLE_PANEL).sum() == 1
+    for name in sorted(context_names[0]):
+        i, j = a.row_names[0].index(name), b.row_names[0].index(name)
+        assert a.row_role[0, i] == b.row_role[0, j]
+        for field in ("x", "row_score", "row_summary"):
+            np.testing.assert_allclose(
+                getattr(a, field)[0, i], getattr(b, field)[0, j], rtol=0, atol=1e-6
+            )
     _equal_learned_gates(model, a, b)
     _equal(_kept(model(a, mixed_gates(a)), a), _kept(model(b, mixed_gates(b)), b))
+    # Keep every peer open as well: mixed_gates can mask an order-dependent row.
+    open_a, open_b = model.gates(a, mode="ones"), model.gates(b, mode="ones")
+    assert (open_a.row[a.row_role == ROLE_PEER] == 1).all()
+    assert (open_b.row[b.row_role == ROLE_PEER] == 1).all()
+    _equal(_kept(model(a, open_a), a), _kept(model(b, open_b), b))
 
 
 @pytest.mark.parametrize("horizon", [5, 28])
@@ -345,6 +384,7 @@ def test_peers_after_origin(
     _equal(first.router, second.router)
 
 
+@pytest.mark.usefixtures("input_sensitive_model")
 def test_after_cutoff_statistics(model: V5Model) -> None:
     panel = toy_panel(n_items=12, n_targets=3)
     changed = _change_cells(panel, 304, right=336, targets=True, columns=tuple(panel.roles))
@@ -420,6 +460,7 @@ def test_swapped_futures(model: V5Model, mixed_gates: GateFactory) -> None:
     )
 
 
+@pytest.mark.usefixtures("input_sensitive_model")
 def test_past_value_changes_forecast(model: V5Model) -> None:
     panel = toy_panel()
     changed = _change_cells(panel, 304, right=336, columns=("temp",), items=(0,))
@@ -528,13 +569,49 @@ def test_group_of_one(model: V5Model, mixed_gates: GateFactory) -> None:
     )
 
 
-def test_padded_horizon_is_inert(model: V5Model, mixed_gates: GateFactory) -> None:
+@pytest.mark.usefixtures("input_sensitive_model")
+def test_padded_horizon_is_inert(model: V5Model) -> None:
     panel = toy_panel()
-    changed = _change_cells(panel, 341, columns=("promo", "event"), items=(0,))
-    request = replace(REQUEST, horizon=5)
-    a, b = _batch(panel, request), _batch(changed, request)
+    builder = EpisodeBuilder(panel)
+    a = collate([builder.build(replace(REQUEST, horizon=horizon)) for horizon in (21, 5)])
+    b = deepcopy(a)
+    value = 1e4
+    assert not a.horizon_mask[1, 1]  # A whole extra patch is padding for horizon 5.
+    for i, horizon in enumerate(a.horizon.tolist()):
+        b.xh.flatten(3, 4)[i, :, :, horizon:] = value
+        b.calh_phases.flatten(2, 3)[i, :, horizon:] = value
+        # All fields have valid, nonzero IDs, including originally inactive cells.
+        b.calh_ids.flatten(2, 3)[i, :, horizon:] = torch.tensor(CALENDAR_SIZES) - 1
+    assert not torch.equal(a.xh, b.xh)
+    assert not torch.equal(a.calh_phases, b.calh_phases)
+    assert not torch.equal(a.calh_ids, b.calh_ids)
     _equal_learned_gates(model, a, b)
-    _equal(_kept(model(a, mixed_gates(a)), a), _kept(model(b, mixed_gates(b)), b))
+    gates = model.gates(a, mode="ones")
+    before, after = model(a, gates), model(b, gates)
+    for i in range(2):
+        np.testing.assert_allclose(_kept(before, a, i), _kept(after, b, i), rtol=0, atol=1e-6)
+
+    inside = deepcopy(a)
+    for i, horizon in enumerate(a.horizon.tolist()):
+        row = a.row_names[i].index("promo")
+        known = a.known_rows[i].tolist().index(row)
+        inside.xh.flatten(3, 4)[i, :, known, :horizon] = value
+    control = model(inside, gates)
+    for i in range(2):
+        assert np.max(np.abs(_kept(before, a, i) - _kept(control, inside, i))) > 1e-4
+
+
+@pytest.mark.parametrize("family", ["rolling", "lags", "zeros"])
+def test_zero_family_gate_equals_absence(model: V5Model, family: str) -> None:
+    panel = toy_panel()
+    a = _batch(panel)
+    b = _batch(panel, replace(REQUEST, drop=frozenset({family})))
+    gates = model.gates(a, mode="ones")
+    gates.family[:, ("rolling", "lags", "zeros").index(family)] = 0
+    _equal(
+        _kept(model(a, gates), a),
+        _kept(model(b, model.gates(b, mode="ones")), b),
+    )
 
 
 def test_no_dataset_parameters(model: V5Model) -> None:
@@ -542,12 +619,47 @@ def test_no_dataset_parameters(model: V5Model) -> None:
     shapes = {name: tuple(value.shape) for name, value in model.state_dict().items()}
     panel = toy_panel(n_items=19, n_targets=3)
     renamed, _ = _rename(panel, 336)
-    forecast(model, toy_panel(n_items=1), REQUEST)
-    forecast(other, renamed, replace(REQUEST, target="y"))
-    assert shapes == {name: tuple(value.shape) for name, value in model.state_dict().items()}
+    renamed = replace(
+        renamed,
+        name="unrelated_panel",
+        items=tuple(
+            replace(
+                item,
+                targets={f"other_{name}": values for name, values in item.targets.items()},
+                dynamic={f"other_{name}": values for name, values in item.dynamic.items()},
+                static={f"other_{name}": value for name, value in item.static.items()},
+            )
+            for item in renamed.items
+        ),
+        roles={f"other_{name}": role for name, role in renamed.roles.items()},
+    )
+    first = toy_panel(n_items=1)
+
+    def names(panel: Panel) -> tuple[set[str], set[str], set[str]]:
+        ids, labels, columns = set(), set(), set()
+        for item in panel.items:
+            ids.add(item.item_id)
+            columns.update(set(item.targets) | set(item.dynamic) | set(item.static))
+            for values in (*item.dynamic.values(), *item.static.values()):
+                cells = values if isinstance(values, (np.ndarray, list, tuple)) else [values]
+                labels.update(value for value in cells if isinstance(value, str))
+        return ids, labels, columns
+
+    assert all(left.isdisjoint(right) for left, right in zip(names(first), names(renamed)))
     assert shapes == {name: tuple(value.shape) for name, value in other.state_dict().items()}
+    for candidate in (model, other):
+        for seen, request in (
+            (first, REQUEST),
+            (renamed, replace(REQUEST, target="other_y")),
+        ):
+            result = forecast(candidate, seen, request)
+            assert np.isfinite(result.quantiles).all()
+            assert shapes == {
+                name: tuple(value.shape) for name, value in candidate.state_dict().items()
+            }
 
 
+@pytest.mark.usefixtures("input_sensitive_model")
 def test_feature_bank_is_causal(model: V5Model) -> None:
     panel = toy_panel()
     request = replace(REQUEST, cutoff=160)
@@ -563,10 +675,9 @@ def test_feature_bank_is_causal(model: V5Model) -> None:
             x[121:, CH_STEP:CH_VALUE_STATS], changed[121:, CH_STEP:CH_VALUE_STATS]
         )
     event = a.row_names[0].index("event")
-    _equal(
-        a.x[0, event].flatten(0, 1)[:120, CH_VALUE_STATS:],
-        b.x[0, event].flatten(0, 1)[:120, CH_VALUE_STATS:],
-    )
+    x, changed = a.x[0, event].flatten(0, 1), b.x[0, event].flatten(0, 1)
+    _equal(x[:121, CH_VALUE_STATS:], changed[:121, CH_VALUE_STATS:])
+    assert not torch.equal(x[121:, CH_VALUE_STATS:], changed[121:, CH_VALUE_STATS:])
 
 
 @pytest.mark.parametrize("length", [64, 200, 400])
