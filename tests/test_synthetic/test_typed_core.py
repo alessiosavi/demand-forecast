@@ -5,6 +5,7 @@ import json
 import math
 import os
 import subprocess
+import sys
 import zlib
 from collections import Counter
 from dataclasses import asdict, replace
@@ -681,7 +682,7 @@ print(h.hexdigest())
 """
     results = [
         subprocess.run(
-            ["/private/tmp/v5-venv/bin/python", "-c", script],
+            [sys.executable, "-c", script],
             check=True,
             capture_output=True,
             text=True,
