@@ -4,6 +4,7 @@ import hashlib
 import math
 import os
 import subprocess
+import sys
 from collections import Counter
 from dataclasses import replace
 
@@ -353,7 +354,7 @@ print(h.hexdigest())
 """
     digests = [
         subprocess.run(
-            ["/private/tmp/v5-venv/bin/python", "-c", script],
+            [sys.executable, "-c", script],
             check=True,
             capture_output=True,
             text=True,
