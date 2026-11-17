@@ -281,6 +281,17 @@ def test_without_refusals():
         generate_typed_panel(PanelRecipe(("multi_target",)), without=("multi_target",))
 
 
+@pytest.mark.parametrize("key", ["process", "inputs"])
+@pytest.mark.parametrize("without", [(), ("calendar",)])
+def test_params_reject_reserved_keys(monkeypatch, key, without):
+    def fake(draft, streams, ranges):
+        return Result((), {}, {key: "reserved"}, None)
+
+    monkeypatch.setitem(REGISTRY, "calendar", fake)
+    with pytest.raises(ValueError, match=rf"calendar.*{key}"):
+        generate_typed_panel(PanelRecipe(("calendar",), n_items=2, length=(8, 12)), without=without)
+
+
 def test_extra_arrays_survive_without(monkeypatch):
     def fake(draft, streams, ranges):
         result = fake_driver(draft, streams, ranges)
@@ -404,6 +415,29 @@ def test_nuisance_inputs(monkeypatch):
     assert empty.inputs_of("nuisance") == ()
 
 
+@pytest.mark.parametrize("n_nuisance", [0, 2])
+def test_mechanism_inputs_keep_attribute_before_column(monkeypatch, n_nuisance):
+    def fake(draft, streams, ranges):
+        attribute, column = token(streams.inputs, "z"), token(streams.inputs, "a")
+        draft.add_static(attribute, ["l1"] * draft.recipe.n_items, "category", "static_category")
+        draft.add_dynamic(
+            column,
+            [np.arange(n, dtype=np.float64) for n in draft.lengths],
+            "number",
+            "past",
+            "static_category",
+        )
+        return Result((attribute, column), {}, {}, None)
+
+    monkeypatch.setitem(REGISTRY, "static_category", fake)
+    g = generate_typed_panel(
+        PanelRecipe(("static_category",), n_items=3, length=(64, 64), n_nuisance=n_nuisance)
+    )
+    attribute, column = g.inputs_of("static_category")
+    assert attribute.where == "static" and column.where == "dynamic"
+    assert g.params["static_category"]["inputs"] == (attribute.name, column.name)
+
+
 def test_availability(monkeypatch):
     register_fakes(monkeypatch)
     r = PanelRecipe(("static_number", "known_driver"), n_items=20, length=(100, 200), seed=3)
@@ -444,11 +478,45 @@ def test_availability(monkeypatch):
             size = int(rng.integers(1, 6))
             mask[start : start + size] = True
         assert np.isfinite(complete.dynamic[dynamic.name]).all()
+        observed = ~np.isnan(values)
+        assert_array_equal(values[observed], complete.dynamic[dynamic.name][observed])
+        if item.static[static.name] is not None:
+            assert item.static[static.name] == complete.static[static.name]
         assert_array_equal(complete.dynamic[dynamic.name], unmasked.dynamic[dynamic.name])
         assert_array_equal(targets(item), targets(unmasked))
         for name, values in g.parts[item.item_id].items():
             assert_array_equal(values, all_inputs.parts[item.item_id][name])
-    assert_generated_equal(all_inputs, replace(all_inputs, panel=all_inputs.complete))
+    assert_inputs_equal(all_inputs.panel, all_inputs.complete, all_inputs.inputs)
+
+
+@pytest.mark.parametrize(
+    ("freq", "period", "long_lag"),
+    [("D", 7, 364), ("W-MON", 52, 52), ("ME", 12, 24), ("h", 24, 168), ("YE", 8, None)],
+)
+@pytest.mark.parametrize("seed", [0, 1])
+def test_generated_grid_metadata(monkeypatch, freq, period, long_lag, seed):
+    register_fakes(monkeypatch)
+    recipe = PanelRecipe(("whole_number_code",), n_items=3, length=(64, 64), freq=freq, seed=seed)
+    g = generate_typed_panel(recipe)
+    assert g.grid_length == max(
+        math.ceil(1.25 * max(targets(item).shape[1] for item in g.panel.items)),
+        max(item.start + targets(item).shape[1] for item in g.panel.items),
+    )
+    assert g.period == period
+    assert g.long_lag == long_lag
+
+
+@pytest.mark.parametrize("freq", ["D", "W-MON", "ME", "h", "YE"])
+def test_draft_frequency_class(monkeypatch, freq):
+    observed = []
+
+    def capture(draft, streams, ranges):
+        observed.append(draft.freq_class)
+        return fake_add(draft, streams, ranges)
+
+    monkeypatch.setitem(REGISTRY, "calendar", capture)
+    g = generate_typed_panel(PanelRecipe(("calendar",), n_items=2, length=(8, 12), freq=freq))
+    assert observed == [g.panel.freq_class]
 
 
 def test_grid_hosts_and_short_items(monkeypatch):
@@ -525,6 +593,7 @@ def group_draft(n_items=40, singleton_share=0.25):
         dynamic=[{} for _ in range(n_items)],
         roles={},
         records=[],
+        freq_class=3,
     )
 
 

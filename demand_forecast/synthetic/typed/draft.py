@@ -78,6 +78,7 @@ class Draft:
     dynamic: list[dict[str, np.ndarray]]
     roles: dict[str, str]
     records: list[InputRecord]
+    freq_class: int
 
     def grid(self, i: int) -> np.ndarray:
         return np.arange(self.starts[i], self.starts[i] + self.lengths[i], dtype=np.int64)
@@ -173,6 +174,7 @@ def grid(recipe: PanelRecipe) -> Draft:
         [{} for _ in range(count)],
         {},
         [],
+        freq_class=panel.freq_class,
     )
 
 
