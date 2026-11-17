@@ -142,6 +142,9 @@ class GeneratedPanel:
     short_items: tuple[str, ...]
     hosts: dict[str, str]
     availability: dict[str, float]
+    grid_length: int
+    period: int
+    long_lag: int | None
     shuffled: tuple[str, ...] = ()
     donors: dict[str, dict[str, tuple[str, int]]] = field(default_factory=dict)
 
