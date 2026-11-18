@@ -34,6 +34,8 @@ def apply_control(generated: GeneratedPanel, config: SourceConfig) -> Panel:
     No draws are taken from the source's caller-owned random generator.
     """
     if config.control == "shuffle":
+        if len(generated.panel.items) < 2:
+            raise ValueError("control='shuffle' requires at least two items")
         controlled = generated
         for record in generated.inputs:
             mechanism = record.twin if record.mechanism == "nuisance" else record.mechanism

@@ -98,6 +98,20 @@ def test_shuffle_rejects_too_few_items_at_construction(recipes):
             SourceConfig("typed", 1.0, recipes=recipes, max_items=invalid, control="shuffle")
 
 
+@pytest.mark.parametrize("mechanisms", [(), ("static_category",)])
+@pytest.mark.parametrize("items", [0, 1])
+def test_apply_shuffle_rejects_short_panels_even_without_inputs(mechanisms, items):
+    module = api()
+    generated = module.generate_typed_panel(
+        PanelRecipe(mechanisms=mechanisms, n_items=1, length=(64, 64), seed=7)
+    )
+    generated = replace(
+        generated, panel=replace(generated.panel, items=generated.panel.items[:items])
+    )
+    with pytest.raises(ValueError, match="shuffle"):
+        module.apply_control(generated, SourceConfig("typed", 1, control="shuffle"))
+
+
 def test_shuffle_raises_sampled_single_item_to_two_without_extra_rng_draws(monkeypatch):
     def one_item_recipe(seed, *, heldout):
         return PanelRecipe(
