@@ -10,6 +10,7 @@ import numpy as np
 
 from demand_forecast.data.episode import Item, Panel
 from demand_forecast.synthetic.typed import (
+    GeneratedPanel,
     PanelRecipe,
     generate_typed_panel,
     sample_recipe,
@@ -22,6 +23,31 @@ from .corpus import CorpusIndex, RowCache, read_values
 
 class PanelSource(Protocol):
     def panel(self, rng: np.random.Generator) -> tuple[Panel, dict]: ...
+
+
+def apply_control(generated: GeneratedPanel, config: SourceConfig) -> Panel:
+    """Return the exposed panel, with input controls addressed by the recipe seed.
+
+    Shuffle includes nuisance twins and moves each hierarchy pair together once.
+    ``None`` and ``missing_as_zero`` leave the exposed panel unchanged; the
+    sampler fills missing target history after choosing the episode's anchor.
+    No draws are taken from the source's caller-owned random generator.
+    """
+    if config.control == "shuffle":
+        controlled = generated
+        for record in generated.inputs:
+            mechanism = record.twin if record.mechanism == "nuisance" else record.mechanism
+            if mechanism not in generated.recipe.mechanisms or record.name in controlled.shuffled:
+                continue
+            if config.control_inputs == "attribute" and record.where != "static":
+                continue
+            if config.control_inputs == "column" and record.where != "dynamic":
+                continue
+            controlled = shuffle_assignment(controlled, record.name, seed=generated.recipe.seed)
+        return controlled.panel
+    if config.control == "no_dates":
+        return replace(generated.panel, epoch=None)
+    return generated.panel
 
 
 class TypedSource:
@@ -63,22 +89,7 @@ class TypedSource:
                 n_items = max(2, n_items)
             recipe = replace(recipe, n_items=n_items)
         generated = generate_typed_panel(recipe)
-        panel = generated.panel
-        if config.control == "shuffle":
-            controlled = generated
-            for record in generated.inputs:
-                mechanism = record.twin if record.mechanism == "nuisance" else record.mechanism
-                if mechanism not in recipe.mechanisms or record.name in controlled.shuffled:
-                    continue
-                if config.control_inputs == "attribute" and record.where != "static":
-                    continue
-                if config.control_inputs == "column" and record.where != "dynamic":
-                    continue
-                controlled = shuffle_assignment(controlled, record.name, seed=recipe.seed)
-            panel = controlled.panel
-        elif config.control == "no_dates":
-            panel = replace(panel, epoch=None)
-        return panel, {
+        return apply_control(generated, config), {
             "source": "typed",
             "generated": generated,
             "recipe": recipe,

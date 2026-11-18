@@ -29,7 +29,7 @@ from .corpus import (
 )
 from .loop import IdentityError, TrainResult, load_model, parameter_groups, train
 from .sampler import EpisodePlan, loader, make_batch, plan_panel
-from .sources import CorpusSource, PanelSource, SourceMix, TypedSource
+from .sources import CorpusSource, PanelSource, SourceMix, TypedSource, apply_control
 from .support import PROTECT, supported
 
 __all__ = [
@@ -58,6 +58,7 @@ __all__ = [
     "TypedSource",
     "TrainResult",
     "V5TrainConfig",
+    "apply_control",
     "file_digest",
     "identity",
     "latest_checkpoint",

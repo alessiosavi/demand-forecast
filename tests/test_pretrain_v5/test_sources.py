@@ -18,7 +18,8 @@ def api():
 
 
 def equal_panels(left, right):
-    assert (left.freq, left.epoch, left.aligned, left.roles) == (
+    assert (left.name, left.freq, left.epoch, left.aligned, left.roles) == (
+        right.name,
         right.freq,
         right.epoch,
         right.aligned,
@@ -30,7 +31,11 @@ def equal_panels(left, right):
         for family in ("targets", "dynamic"):
             assert getattr(a, family).keys() == getattr(b, family).keys()
             for name in getattr(a, family):
-                np.testing.assert_array_equal(getattr(a, family)[name], getattr(b, family)[name])
+                x, y = getattr(a, family)[name], getattr(b, family)[name]
+                np.testing.assert_array_equal(x, y)
+                assert (x.dtype, x.shape) == (y.dtype, y.shape)
+                if not x.dtype.hasobject:
+                    assert x.tobytes() == y.tobytes()
 
 
 def typed_config(**kwargs):
@@ -217,6 +222,48 @@ def test_other_controls_preserve_uncontrolled_record_and_rng(control):
     equal_panels(record["generated"].panel, true)
     assert record["control"] == control
     equal_panels(panel, replace(true, epoch=None) if control == "no_dates" else true)
+
+
+@pytest.mark.parametrize("mechanism", ["hierarchy", "event_response"])
+@pytest.mark.parametrize(
+    "control,selection",
+    [
+        (None, "all"),
+        ("shuffle", "all"),
+        ("shuffle", "attribute"),
+        ("shuffle", "column"),
+        ("no_dates", "all"),
+        ("missing_as_zero", "all"),
+    ],
+)
+def test_apply_control_matches_recipe_seed_and_input_selection(mechanism, control, selection):
+    module = api()
+    config = replace(
+        typed_config(n_nuisance=2, nuisance_from=(mechanism,)),
+        recipes=((mechanism,),),
+        max_items=64,
+        control=control,
+        control_inputs=selection,
+    )
+    rng, duplicate = np.random.default_rng(20), np.random.default_rng(20)
+    _, original = module.TypedSource(replace(config, control=None)).panel(duplicate)
+    generated = original["generated"]
+    expected = generated
+    if control == "shuffle":
+        for record in generated.inputs:
+            if record.name in expected.shuffled:
+                continue
+            if selection == "attribute" and record.where != "static":
+                continue
+            if selection == "column" and record.where != "dynamic":
+                continue
+            expected = shuffle_assignment(expected, record.name, seed=generated.recipe.seed)
+    panel = replace(expected.panel, epoch=None) if control == "no_dates" else expected.panel
+    equal_panels(module.apply_control(generated, config), panel)
+    exposed, record = module.TypedSource(config).panel(rng)
+    equal_panels(exposed, panel)
+    equal_panels(record["generated"].panel, generated.panel)
+    assert rng.bit_generator.state == duplicate.bit_generator.state
 
 
 def test_all_corpus_variates_reachable_and_panel_limits(tmp_path):
