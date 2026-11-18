@@ -1,12 +1,21 @@
 """Task 6 contracts: availability, typed rows, budgets and batch padding."""
 
+from collections import Counter
 from dataclasses import fields, replace
 
 import numpy as np
 import pytest
 import torch
 
-from demand_forecast.data.episode import EpisodeBuilder, EpisodeRequest, collate
+from demand_forecast.data.episode import (
+    EpisodeBuilder,
+    EpisodeRequest,
+    Item,
+    Panel,
+    collate,
+    panel_stats,
+)
+from demand_forecast.data.episode import builder as episode_builder
 from demand_forecast.data.episode.bank import summary_vectors
 from demand_forecast.data.episode.builder import DROPPABLE
 from demand_forecast.data.episode.kinds import flag_codes
@@ -501,6 +510,11 @@ def test_budgets_after_expansion():
     assert any(name.endswith("~effect") for name in e.row_names)
     assert not any(name.startswith("huge=") for name in e.attr_names)
     assert "huge" not in e.cand_names
+    dispositions = {(c.source, c.name): c.removed for c in e.trace}
+    assert dispositions["static", "huge"] == "budget"
+    for name in p.roles:
+        has_row = any(row.startswith((f"{name}=", f"{name}~")) for row in e.row_names)
+        assert dispositions["known", name] == (None if has_row else "budget")
     assert len(e.attr_stats) <= 16 and len(e.static_num) <= 16
     assert np.isin(e.row_role, [ROLE_PEER, ROLE_PANEL]).sum() <= 8
 
@@ -537,6 +551,8 @@ def test_drop_switches(drop):
         assert not b.x[..., CH_STEP + family.start : CH_STEP + family.stop].any()
         assert not b.x[..., CH_STEP_FLAG + family.start : CH_STEP_FLAG + family.stop].any()
         np.testing.assert_array_equal(a.x[..., CH_VALUE], b.x[..., CH_VALUE])
+    elif drop == "value_effects":
+        _equal_inputs(a, b)
     else:
         assert not (b.row_kind == KIND_CATEGORY).any()
         assert "event~effect" in b.row_names
@@ -566,25 +582,80 @@ def test_order_independence():
 
 
 def test_statistics_are_cached(monkeypatch):
-    import demand_forecast.data.episode.builder as module
-
     calls = []
-    original = module.PanelStats
+    original = PanelStats.__init__
 
-    def counted(panel, target, cutoff):
+    def counted(self, panel, target, cutoff):
         calls.append((target, cutoff))
-        return original(panel, target, cutoff)
+        original(self, panel, target, cutoff)
 
-    monkeypatch.setattr(module, "PanelStats", counted)
+    monkeypatch.setattr(PanelStats, "__init__", counted)
     builder = EpisodeBuilder(toy_panel(n_targets=2))
     for i in range(6):
         for target in ("y", "y1"):
             builder.build(EpisodeRequest(i, (336,), 5, context=64, target=target))
     assert calls == [("y", 336), ("y1", 336)]
-    for cutoff in range(300, 308):
+    for cutoff in range(300, 316):
         builder.build(EpisodeRequest(0, (336,), 5, context=64, cutoff=cutoff, target="y"))
     builder.build(EpisodeRequest(0, (336,), 5, context=64, target="y"))
     assert calls.count(("y", 336)) == 2
+
+
+@pytest.mark.parametrize("use_default", [True, False], ids=["default", "unbounded"])
+def test_statistics_are_constructed_once_per_target_and_cutoff(monkeypatch, use_default):
+    panel = _plain(toy_panel(n_items=1, length=96, n_targets=9))
+    panel = replace(panel, items=(replace(panel.items[0], static={"id": "only"}),))
+    targets = sorted(panel.items[0].targets)
+    calls = Counter()
+    original = PanelStats.__init__
+
+    def counted(self, panel, target, cutoff):
+        calls[target, cutoff] += 1
+        original(self, panel, target, cutoff)
+
+    monkeypatch.setattr(PanelStats, "__init__", counted)
+    provider = None if use_default else panel_stats.PanelStatsProvider(panel, limit=None)
+    builder = EpisodeBuilder(panel, stats=provider)
+    (joint,) = builder.plan_requests(0, (64,), 5, context=64)
+    assert joint.target is None
+    builder.build(joint)
+    for target in targets:
+        builder.build(replace(joint, target=target))
+
+    builds = sum(calls.values())
+    assert builds == 9, f"Expected 9 statistics constructions, got {builds} (B0 built 17)"
+    assert builder.stats.builds == builds
+    assert calls == {(target, 64): 1 for target in targets}
+
+
+def test_default_builder_is_bounded_at_sixteen():
+    p = _plain(toy_panel(n_items=1, length=96, n_targets=16))
+    builder = EpisodeBuilder(p)
+    (joint,) = builder.plan_requests(0, (64,), 5, context=64)
+    assert builder.stats.builds == 1
+    targets = sorted(p.items[0].targets)
+    for target in targets:
+        builder.build(replace(joint, target=target))
+    assert builder.stats.builds == 16
+
+    builder.build(replace(joint, target=targets[0]))  # Refresh the first pair.
+    builder.build(replace(joint, target=targets[0], cutoff=63))
+    builder.build(replace(joint, target=targets[0]))
+    assert builder.stats.builds == 17
+    builder.build(replace(joint, target=targets[1]))
+    assert builder.stats.builds == 18
+
+
+def test_release_frees_a_cutoff():
+    provider = panel_stats.PanelStatsProvider(toy_panel(n_targets=2), limit=None)
+    released = [provider.get(target, 320) for target in ("y", "y1")]
+    retained = provider.get("y", 336)
+    provider.release(320)
+    provider.release(320)
+    assert provider.get("y", 336) is retained
+    for target, old in zip(("y", "y1"), released, strict=True):
+        assert provider.get(target, 320) is not old
+    assert provider.builds == 5
 
 
 def test_collate_pads():
@@ -642,6 +713,7 @@ def test_expanded_feature_budget_breaks_score_ties_by_row_name():
         EpisodeRequest(0, (80,), 5, context=64, drop=frozenset({"value_stats"}))
     )
     assert [e.row_names[i] for i in e.known_rows] == [*(f"a{j:02}" for j in range(15)), "z=a"]
+    assert all(c.removed is None for c in e.trace)
 
 
 def test_keep_columns_filters_before_allocating_budgets():
@@ -723,7 +795,12 @@ def test_collate_preserves_all_unpadded_fields():
     )
     a = EpisodeBuilder(p).build(req)
     b = EpisodeBuilder(p).build(EpisodeRequest(0, (320, 336), 33, context=96, target="y"))
+    assert a.trace and b.trace
+    reasons = {(c.source, c.name): c.removed for c in a.trace}
+    assert reasons["sibling", "y1"] == "siblings"
+    assert reasons["known", "event"] == "keep_columns"
     batch = collate([a, b])
+    assert not hasattr(batch, "trace")
     for index, episode in enumerate((a, b)):
         for field in fields(episode):
             name = field.name
@@ -741,3 +818,47 @@ def test_collate_preserves_all_unpadded_fields():
             np.testing.assert_array_equal(restored.numpy(), expected, err_msg=name)
     assert batch.loc.dtype == batch.scale.dtype == torch.float64
     assert batch.x.dtype == batch.xh.dtype == torch.float32
+
+
+def test_value_effects_can_be_dropped_from_the_category_fallback():
+    p = toy_panel()
+    builder = EpisodeBuilder(p)
+    request = EpisodeRequest(0, (336,), 16, context=64, drop=frozenset({"value_stats"}))
+    both_drops = replace(request, drop=request.drop | {"value_effects"})
+    full = builder.build(request)
+    flags = builder.build(both_drops)
+    assert "value_effects" in DROPPABLE
+    assert "event~effect" in full.row_names
+    assert flags.row_names == [name for name in full.row_names if name != "event~effect"]
+    assert any(name.startswith("event=") for name in flags.row_names)
+    for index, name in enumerate(flags.row_names):
+        np.testing.assert_array_equal(flags.x[index], full.x[full.row_names.index(name)])
+    assert not flags.x[..., CH_VALUE_STATS:].any()
+
+
+def test_known_category_with_no_observed_prefix_has_no_removal_disposition():
+    event = np.array([None] * 16 + ["a", "b", "c"] * 6, dtype=object)
+    item = Item("only", 0, {"y": np.arange(len(event), dtype=np.float64)}, {"event": event}, {})
+    panel = Panel("late event", (item,), {"event": "known"}, None, None, False)
+    request = EpisodeRequest(
+        0, (16,), 16, context=16, drop=frozenset({"value_stats", "value_effects"})
+    )
+
+    episode = EpisodeBuilder(panel).build(request)
+
+    assert episode.row_names == ["y"]
+    (candidate,) = episode.trace
+    assert (candidate.source, candidate.name, candidate.kind) == ("known", "event", KIND_CATEGORY)
+    assert candidate.removed is None
+
+
+def test_apply_summary_off_returns_the_transformed_episode():
+    episode = EpisodeBuilder(toy_panel()).build(EpisodeRequest(0, (336,), 5, context=64))
+    original = episode.row_summary.copy()
+    i = SUMMARY_FEATURES.index("log_length")
+    assert original[..., i].any()
+    result = episode_builder.apply_summary_off(episode, ("log_length",))
+    original[..., i] = 0
+    np.testing.assert_array_equal(result.row_summary, original)
+    assert not result.cand_flags[..., i].any()
+    assert not result.row_summary_flags[..., i].any()

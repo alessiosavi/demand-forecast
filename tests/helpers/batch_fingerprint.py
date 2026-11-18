@@ -14,16 +14,26 @@ def _fingerprint(name: str, value: object) -> object:
     ):
         return [_fingerprint(name, item) for item in value]
 
+    dtype = None
     if isinstance(value, torch.Tensor):
         tensor = value.detach().cpu()
-        value = (tensor.double() if tensor.is_floating_point() else tensor).numpy()
+        try:
+            value = tensor.resolve_neg().numpy()
+        except TypeError:
+            if not tensor.is_floating_point():
+                raise
+            # Some Torch floating formats, such as bfloat16, have no NumPy dtype.
+            dtype = str(tensor.dtype)
+            value = tensor.double().numpy()
 
     if isinstance(value, np.ndarray) and np.issubdtype(value.dtype, np.floating):
+        dtype = value.dtype.str if dtype is None else dtype
         flat = value.astype(np.float64, copy=False).ravel()
         nan = np.isnan(flat)
         flat = np.where(nan, 0.0, flat)
         weights = np.arange(1, flat.size + 1, dtype=np.float64) / max(1, flat.size)
         return {
+            "dtype": dtype,
             "shape": list(value.shape),
             "nan": int(nan.sum()),
             "sums": [float(flat.sum()), float(np.abs(flat).sum()), float((flat * weights).sum())],
@@ -57,7 +67,8 @@ def _matches(actual: object, expected: object) -> bool:
     ):
         tolerance = 1e-5 * (1 + expected["sums"][1])
         return (
-            actual["shape"] == expected["shape"]
+            ("dtype" not in expected or actual["dtype"] == expected["dtype"])
+            and actual["shape"] == expected["shape"]
             and actual["nan"] == expected["nan"]
             and all(
                 isclose(a, e, rel_tol=0, abs_tol=tolerance)

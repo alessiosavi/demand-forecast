@@ -1,5 +1,6 @@
 """Cutoff statistics and leave-one-out typed context for one panel target."""
 
+from collections import OrderedDict
 from dataclasses import dataclass
 
 import numpy as np
@@ -272,3 +273,32 @@ class PanelStats:
         values = np.array([self._numbers[name][0][item_index] for name in names], dtype=np.float32)
         flags = np.array([self._numbers[name][1][item_index] for name in names], dtype=bool)
         return names, values, flags
+
+
+class PanelStatsProvider:
+    """Cache panel statistics by target and cutoff, optionally bounding retention."""
+
+    def __init__(self, panel: Panel, *, limit: int | None = 16) -> None:
+        if limit is not None and limit < 0:
+            raise ValueError("statistics cache limit must be nonnegative")
+        self.panel = panel
+        self.builds = 0
+        self._limit = limit
+        self._cache: OrderedDict[tuple[str, int], PanelStats] = OrderedDict()
+
+    def get(self, target: str, cutoff: int) -> PanelStats:
+        key = target, cutoff
+        stats = self._cache.get(key)
+        if stats is None:
+            stats = PanelStats(self.panel, target, cutoff)
+            self.builds += 1
+            self._cache[key] = stats
+        self._cache.move_to_end(key)
+        if self._limit is not None and len(self._cache) > self._limit:
+            self._cache.popitem(last=False)
+        return stats
+
+    def release(self, cutoff: int) -> None:
+        """Discard all cached targets at the given cutoff."""
+        for key in [key for key in self._cache if key[1] == cutoff]:
+            del self._cache[key]

@@ -14,9 +14,9 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
-from demand_forecast.data.episode import EpisodeBuilder, EpisodeRequest, Panel
+from demand_forecast.data.episode import EpisodeBuilder, EpisodeRequest, Panel, apply_summary_off
 from demand_forecast.data.episode.collate import EpisodeBatch, collate
-from demand_forecast.data.episode.schema import N_SUMMARY, PATCH, SUMMARY_FEATURES
+from demand_forecast.data.episode.schema import PATCH
 from demand_forecast.data.episode.screening import ScreeningConfig
 from demand_forecast.synthetic.typed import necessary_items
 from demand_forecast.synthetic.typed.draft import INPUT_MECHANISMS, stream
@@ -238,14 +238,7 @@ def _supervised(episode):
 
 
 def _postprocess(episode, config):
-    for name in config.summary_off:
-        j = SUMMARY_FEATURES.index(name)
-        episode.row_summary[..., j] = 0
-        episode.row_summary_flags[..., j] = False
-        episode.cand_summary[..., j] = 0
-        episode.cand_flags[..., j] = False
-        episode.attr_stats[..., j] = 0
-        episode.attr_stats[..., N_SUMMARY + j] = 0
+    apply_summary_off(episode, config.summary_off)
     if config.designate_target:
         episode.label_mask[:, ~episode.keep, :] = False
 
