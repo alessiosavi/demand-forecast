@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import shutil
 import signal
+import sys
 from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -61,6 +63,15 @@ def _parser() -> argparse.ArgumentParser:
         if action == "train":
             sub.add_argument("--init-file", type=Path)
             sub.add_argument("--init-sha256", type=lambda v: _hex(v, 64))
+    sub = actions.add_parser("t1-compare")
+    sub.add_argument("--base", type=Path, required=True)
+    sub.add_argument("--code", type=lambda v: _hex(v, 40), required=True)
+    sub.add_argument("--path", choices=t1.PATHS, required=True)
+    sub.add_argument("--seed", type=int, required=True)
+    sub.add_argument("--episodes", type=_positive, required=True)
+    sub.add_argument("--max-panels", type=_positive, required=True)
+    sub.add_argument("--arm", action="append", default=[])
+    sub.add_argument("--out", type=Path, required=True)
     return parser
 
 
@@ -83,6 +94,120 @@ def _complete(unit: Path, expected: dict) -> bool:
         return True
     (unit / "unit.json").unlink(missing_ok=True)
     return False
+
+
+def _comparison_arm(directory: Path, expected: dict, config: V5TrainConfig) -> tuple[dict, dict]:
+    """Read a copied unit without the cloud completion helper's invalidation writes."""
+    unit = read_manifest(directory / "unit.json")
+    if unit is None or "result.json" not in unit["files"]:
+        raise ValueError("unit.json does not validate its artifacts, including result.json")
+    for key, value in expected.items():
+        if unit.get(key) != value:
+            raise ValueError(f"{key} mismatch in unit.json")
+    for key in ("env_sha256", "eval_digest"):
+        if not isinstance(unit.get(key), str):
+            raise ValueError(f"missing or invalid {key} in unit.json")
+        try:
+            _hex(unit[key], 64)
+        except argparse.ArgumentTypeError as error:
+            raise ValueError(f"invalid {key} in unit.json: {error}") from error
+    requested = identity(
+        config, code=expected["code"], corpus=None, init=None, env=unit["env_sha256"]
+    )
+    if unit.get("identity") != requested:
+        raise ValueError("training identity mismatch in unit.json")
+    result = json.loads((directory / "result.json").read_text())
+    if not isinstance(result, dict):
+        raise ValueError("result.json must hold an evaluation object")
+    if result.get("eval_digest") != unit["eval_digest"]:
+        raise ValueError("eval_digest mismatch between result.json and unit.json")
+    losses = result.get("loss")
+    if not isinstance(losses, list) or any(
+        type(value) not in (int, float) or not math.isfinite(value) or value < 0 for value in losses
+    ):
+        raise ValueError("result.json losses must be a list of finite nonnegative numbers")
+    return unit, result
+
+
+def _t1_compare(args) -> int:
+    entry = t1.PATHS[args.path]
+    directories = {}
+    for argument in args.arm:
+        arm, separator, directory = argument.partition("=")
+        if not separator or not directory:
+            raise ValueError(f"{arm}: expected --arm NAME=DIR")
+        if arm in directories:
+            raise ValueError(f"{arm}: repeated arm")
+        if arm not in entry["arms"]:
+            raise ValueError(f"{arm}: extra arm for {args.path}")
+        directories[arm] = Path(directory)
+    for arm in entry["arms"]:
+        if arm not in directories:
+            raise ValueError(f"{arm}: missing arm for {args.path}")
+
+    base = V5TrainConfig.from_yaml(args.base)
+    expected = dict(
+        path=args.path,
+        seed=args.seed,
+        code=args.code,
+        base_sha256=file_digest(args.base),
+        episodes=args.episodes,
+        max_panels=args.max_panels,
+    )
+    units, results, hashes = {}, {}, {}
+    for arm in entry["arms"]:
+        try:
+            config = t1.t1_config(args.path, arm, seed=args.seed, base=base)
+            unit, result = _comparison_arm(directories[arm], {**expected, "arm": arm}, config)
+            if units:
+                reference = next(iter(units.values()))
+                for key in ("env_sha256", "eval_digest"):
+                    if unit[key] != reference[key]:
+                        raise ValueError(f"{key} differs across arms")
+            hashes[arm] = file_digest(directories[arm] / "unit.json")
+            units[arm], results[arm] = unit, result
+        except Exception as error:
+            raise ValueError(f"{arm}: {error}") from error
+
+    episodes = t1.eval_set(args.path, episodes=args.episodes, max_panels=args.max_panels)
+    digest = t1.eval_digest(episodes)
+    for arm, unit in units.items():
+        if unit["eval_digest"] != digest:
+            raise ValueError(f"{arm}: eval_digest differs from rebuilt evaluation set")
+        if len(results[arm]["loss"]) != len(episodes):
+            raise ValueError(f"{arm}: result.json losses do not align with evaluation episodes")
+
+    comparisons = []
+    for true, null, decides in entry["comparisons"]:
+        comparison = t1.compare(
+            results[true]["loss"],
+            results[null]["loss"],
+            episodes=episodes,
+            required=entry["required"],
+        )
+        comparisons.append({"true": true, "null": null, "decides": decides, **comparison})
+    outcomes = [c["outcome"] for c in comparisons if c["decides"]]
+    report = {
+        **expected,
+        "env_sha256": next(iter(units.values()))["env_sha256"],
+        "eval_digest": digest,
+        "units": hashes,
+        "comparisons": comparisons,
+        "outcome": "fail"
+        if "fail" in outcomes
+        else "inconclusive"
+        if not outcomes or "inconclusive" in outcomes
+        else "pass",
+    }
+    if args.path == "selection":
+        try:
+            report["selection_report"] = t1.selection_report(
+                results["true"], results["null"], results["gates_one"], episodes
+            )
+        except Exception as error:
+            raise ValueError(f"selection arms true/null/gates_one: {error}") from error
+    _json(args.out / "compare.json", report)
+    return 0
 
 
 def _run(args, unit: Path, training: Path) -> int:
@@ -206,6 +331,12 @@ def _run(args, unit: Path, training: Path) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if args.action == "t1-compare":
+        try:
+            return _t1_compare(args)
+        except Exception as error:
+            print(f"t1-compare: {error}", file=sys.stderr)
+            return 1
     if not args.run_dir.is_absolute():
         raise SystemExit("run-dir must be absolute")
     if args.action == "t1":
