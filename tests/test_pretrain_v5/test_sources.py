@@ -8,9 +8,13 @@ import numpy as np
 import pytest
 
 from demand_forecast.data.episode import is_missing
+from demand_forecast.data.episode.schema import FREQ_CLASSES
+from demand_forecast.data.frequency import to_offset
 from demand_forecast.pretrain.v5.config import SourceConfig
+from demand_forecast.pretrain.v5.sampler import make_batch
 from demand_forecast.synthetic.typed import PanelRecipe, sample_recipe, shuffle_assignment
 from tests.helpers.corpus_v4_fixture import write_corpus, write_malformed_row, write_rows
+from tests.helpers.v5_sampler import config
 
 
 def api():
@@ -278,6 +282,87 @@ def test_apply_control_matches_recipe_seed_and_input_selection(mechanism, contro
     equal_panels(exposed, panel)
     equal_panels(record["generated"].panel, generated.panel)
     assert rng.bit_generator.state == duplicate.bit_generator.state
+
+
+@pytest.mark.parametrize(
+    "label",
+    [
+        "30T",
+        "S",
+        "5T",
+        "D",
+        "H",
+        "20S",
+        "T",
+        "native_irregular_seconds",
+        "3H",
+        "10T",
+        "12500us",
+        "irregular",
+        "native_sample_index",
+        "h",
+        "30min",
+        "4S",
+        "W",
+        "4ms",
+        "W-SAT",
+        "3min",
+        "MS",
+        "5ms",
+        "15T",
+        "2ms",
+        "33ms",
+        "100ms",
+        "6min",
+        "s",
+        "min",
+        "1m",
+        "6h",
+        "3h",
+        "M",
+    ],
+)
+def test_every_v41_corpus_frequency_label_yields_a_valid_panel(tmp_path, label):
+    pytest.importorskip("pyarrow")
+    target = np.arange(40)
+    write_rows(tmp_path / "univariate/a/train-000.parquet", [[target]], freqs=[label])
+    source = api().CorpusSource(SourceConfig("corpus", 1.0), root=tmp_path)
+    assert source.index.rows == 1
+    row = api().read_values(source.index, 0, source.cache)
+    np.testing.assert_array_equal(row["targets"], [target])
+    panel, record = source.panel(np.random.default_rng(0))
+    panel.validate()
+    assert panel.epoch is None and panel.aligned is False
+    assert record["source"] == "corpus" and record["row"] == row["row"] == 0
+    if label in {"irregular", "native_irregular_seconds", "native_sample_index", "1m"}:
+        assert row["freq"] is None and panel.freq is None
+        assert source.index.unparsed_frequencies == {label: 1}
+        assert panel.season == 1 and panel.long_lag is None
+        assert FREQ_CLASSES[panel.freq_class] == "undated"
+        assert panel.timestamps(0, len(target)) is None
+    else:
+        assert row["freq"] == panel.freq == label
+        seconds = {"S": 1, "20S": 20, "4S": 4}
+        if label in seconds:
+            assert to_offset(panel.freq).nanos == seconds[label] * 1_000_000_000
+            assert FREQ_CLASSES[panel.freq_class] == "subhourly"
+
+
+def test_corpus_only_batch_without_frequencies(tmp_path):
+    pytest.importorskip("pyarrow")
+    write_rows(
+        tmp_path / "univariate/a/train-000.parquet",
+        [[np.arange(96)], [np.arange(96) + 1]],
+        freqs=["irregular", None],
+    )
+    settings = replace(config(), sources=(SourceConfig("corpus", 1, root=str(tmp_path)),))
+    batch, report = make_batch(settings, 0)
+    assert report["episodes"] == settings.sampler.episodes_per_batch
+    assert report["sources"] == {"corpus": report["episodes"]}
+    assert report["supervised"] > 0
+    assert (batch.freq_class == FREQ_CLASSES.index("undated")).all()
+    assert (batch.cal_phases == 0).all() and (batch.calh_phases == 0).all()
+    assert (batch.cal_ids == -1).all() and (batch.calh_ids == -1).all()
 
 
 def test_all_corpus_variates_reachable_and_panel_limits(tmp_path):

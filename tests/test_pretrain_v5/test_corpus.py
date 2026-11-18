@@ -29,6 +29,7 @@ def test_index_order_counts_and_footer_identity(tmp_path):
     )
     assert index.rows == 10 and index.excluded == ()
     assert index.digest == api().CorpusIndex.build(tmp_path).digest
+    assert isinstance(hash(index), int)
     assert len(paths) == 3
 
 
@@ -146,13 +147,80 @@ def test_long_ids_never_decoded_or_charged_to_numeric_budget(tmp_path, monkeypat
     assert ("target",) in requested
 
 
-def test_bad_frequency_names_file_even_in_excluded_group(tmp_path):
-    path = write_rows(
-        tmp_path / "univariate/a/train-bad.parquet", [[np.zeros(32)]], freqs=["nonsense"]
+def test_excluded_group_with_unparsed_frequency_is_scanned_but_not_counted(tmp_path, monkeypatch):
+    write_rows(tmp_path / "univariate/a/train-bad.parquet", [[np.zeros(32)]], freqs=["nonsense"])
+    original = pq.ParquetFile.read_row_group
+    scanned = []
+
+    def read(reader, i, columns=None, **kwargs):
+        scanned.append((i, columns))
+        return original(reader, i, columns=columns, **kwargs)
+
+    monkeypatch.setattr(pq.ParquetFile, "read_row_group", read)
+    index = api().CorpusIndex.build(tmp_path, max_group_bytes=1)
+    assert index.rows == 0
+    assert index.excluded[0][:2] == ("univariate/a/train-bad.parquet", 0)
+    assert scanned == [(0, ["freq"])]
+    assert index.unparsed_frequencies == {}
+
+
+def test_mixed_frequencies_keep_row_order_and_count_labels_across_groups(tmp_path):
+    freqs = ["1m", "D", "1m", "D", "irregular", "1m"]
+    write_rows(
+        tmp_path / "univariate/a/train-000.parquet",
+        [[np.arange(32) + i] for i in range(len(freqs))],
+        freqs=freqs,
+        row_group_size=3,
     )
-    with pytest.raises(ValueError, match="train-bad.parquet.*nonsense"):
-        api().CorpusIndex.build(tmp_path, max_group_bytes=1)
-    assert path.exists()
+    module = api()
+    index, cache = module.CorpusIndex.build(tmp_path), module.RowCache()
+    assert index.rows == len(freqs)
+    assert index.unparsed_frequencies == {"1m": 3, "irregular": 1}
+    for i, expected in enumerate([None, "D", None, "D", None, None]):
+        row = module.read_values(index, i, cache)
+        assert row["freq"] == expected and row["row"] == i
+        np.testing.assert_array_equal(row["targets"], [np.arange(32) + i])
+
+
+@pytest.mark.parametrize("freqs", [[None, None], ["D", None, "h", None]])
+def test_null_frequencies_are_counted_and_read_as_none(tmp_path, freqs):
+    write_rows(
+        tmp_path / "univariate/a/train-000.parquet",
+        [[np.arange(32)]] * len(freqs),
+        freqs=freqs,
+        row_group_size=len(freqs),
+    )
+    module = api()
+    index, cache = module.CorpusIndex.build(tmp_path), module.RowCache()
+    assert index.unparsed_frequencies == {"null": 2}
+    assert [module.read_values(index, i, cache)["freq"] for i in range(index.rows)] == freqs
+
+
+def test_unparsed_label_and_nulls_in_one_group_are_counted_and_read_as_none(tmp_path):
+    write_rows(
+        tmp_path / "univariate/a/train-000.parquet",
+        [[np.arange(32)]] * 4,
+        freqs=["D", None, "nonsense", None],
+        row_group_size=4,
+    )
+    module = api()
+    index, cache = module.CorpusIndex.build(tmp_path), module.RowCache()
+    assert index.unparsed_frequencies == {"nonsense": 1, "null": 2}
+    assert [module.read_values(index, i, cache)["freq"] for i in range(index.rows)] == [
+        "D",
+        None,
+        None,
+        None,
+    ]
+
+
+@pytest.mark.parametrize("label", ["", "0D", "-2h", "999999999999999999999s"])
+def test_empty_nonpositive_and_overflowing_frequencies_are_unparsed(tmp_path, label):
+    write_rows(tmp_path / "univariate/a/train-000.parquet", [[np.arange(32)]], freqs=[label])
+    module = api()
+    index = module.CorpusIndex.build(tmp_path)
+    assert index.unparsed_frequencies == {label: 1}
+    assert module.read_values(index, 0, module.RowCache())["freq"] is None
 
 
 @pytest.mark.parametrize("distinct", [("D",), ("h", "D", "ME")])

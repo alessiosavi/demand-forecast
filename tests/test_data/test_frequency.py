@@ -74,6 +74,43 @@ def test_to_offset_normalizes_legacy_aliases_without_warnings(alias, expected):
         assert to_offset(expected) == expected
 
 
+@pytest.mark.parametrize(
+    "label,expected",
+    [
+        ("S", pd.offsets.Second()),
+        ("20S", pd.offsets.Second(20)),
+        ("4S", pd.offsets.Second(4)),
+        ("MS", pd.offsets.MonthBegin()),
+        ("W-SAT", pd.offsets.Week(weekday=5)),
+        ("s", pd.offsets.Second()),
+        ("4ms", pd.offsets.Milli(4)),
+        ("12500us", pd.offsets.Micro(12500)),
+        ("M", pd.offsets.MonthEnd()),
+    ],
+)
+def test_to_offset_seconds_alias_preserves_other_frequencies(label, expected):
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert to_offset(label) == expected
+
+
+def test_to_offset_leaves_embedded_seconds_alias_to_pandas(monkeypatch):
+    label = "1min2S"
+    offset = pd.offsets.Second(62)
+
+    def parse(value):
+        assert value == label
+        return offset
+
+    monkeypatch.setattr(pd.tseries.frequencies, "to_offset", parse)
+    assert to_offset(label) is offset
+
+
+@pytest.mark.parametrize("label", ["SMS", "BMS", "2MS", "QS", "YS"])
+def test_to_offset_preserves_anchored_offsets_ending_in_s(label):
+    assert to_offset(label) == pd.tseries.frequencies.to_offset(label)
+
+
 def test_resolve_freq_infers_sunday_weeks_and_short_series_inherit():
     long = pd.date_range("2023-01-01", periods=10, freq="W-SUN")
     short = pd.DatetimeIndex(["2023-03-05", "2023-04-02"])

@@ -157,8 +157,9 @@ unit for typed 0.5 + corpus 0.5 with the corpus options. `qualify.json` measures
 full and T1 models, throughput and supervised/padded cells for worker counts,
 summed host and peak GPU memory, one and configured origins, worst-batch forward
 and backward, cold index/first-batch/restore times, excluded corpus row share,
-checkpoint write time and size, parameter counts, and full-panel inference for
-30,490 series. Q selects nothing automatically. The operator uses these
+admitted corpus rows per unparsed label (`unparsed_frequency_rows`), checkpoint
+write time and size, parameter counts, and full-panel inference for 30,490
+series. Q selects nothing automatically. The operator uses these
 measurements to register the bases, batch shapes, workers, checkpoint cadence,
 recovery bound and revised cost ceilings before S1.
 
