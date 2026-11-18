@@ -6,6 +6,7 @@ from .checkpoint import (
     file_digest,
     latest_checkpoint,
     read_manifest,
+    read_payload,
     save_checkpoint,
     write_manifest,
 )
@@ -66,6 +67,7 @@ __all__ = [
     "load_model",
     "parameter_groups",
     "read_manifest",
+    "read_payload",
     "read_values",
     "save_checkpoint",
     "train",

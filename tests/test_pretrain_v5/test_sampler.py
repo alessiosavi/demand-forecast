@@ -1,6 +1,5 @@
 """The batch index, rather than worker scheduling, addresses the stream."""
 
-import hashlib
 import importlib
 from copy import deepcopy
 from dataclasses import fields, replace
@@ -18,6 +17,7 @@ from demand_forecast.pretrain.v5.config import SourceConfig
 from demand_forecast.pretrain.v5.corpus import CorpusValueError, ShortRow
 from demand_forecast.pretrain.v5.sources import SourceMix, TypedSource
 from demand_forecast.synthetic.typed import PanelRecipe, generate_typed_panel
+from tests.helpers.batch_fingerprint import assert_fingerprint
 from tests.helpers.corpus_v4_fixture import write_rows
 from tests.helpers.v5_sampler import FixedSource, config, equal_batches, fixed_mix, panel
 
@@ -34,6 +34,121 @@ def test_batch_is_pure():
     assert ra == rb and ra["episodes"] == 4 and ra["supervised"] > 0
 
 
+# Captured from the default batch after verifying the original byte pin.
+_BASE_BATCH_FINGERPRINT = {
+    "x": {
+        "shape": [4, 5, 4, 16, 39],
+        "nan": 0,
+        "sums": [7603.942322080315, 10569.192989855248, 2981.167578761939],
+    },
+    "patch_valid": {"sha256": "40d4295b1d046b32fb1512afa1a246abd391d3c228c1744d1f0f9233312117c3"},
+    "row_kind": {"sha256": "c50f83c4be15cc4026d790456c4a7dc76dc33b9397674dccc9fcc8ddac364d65"},
+    "row_role": {"sha256": "f3b7e1440151dd1d9bab4f205e17532c648f7c20475c1246cba93cdb71b45cad"},
+    "row_names": {"sha256": "f48341a6d92d0bd4066b0bc9eb5f6ad0b1e79e69da8c28ce34645a0e1c3bd171"},
+    "row_summary": {
+        "shape": [4, 5, 28],
+        "nan": 0,
+        "sums": [24.95725216716528, 66.92101139947772, 7.296810248700371],
+    },
+    "row_summary_flags": {
+        "sha256": "0496f87a661e46b03776acc528e75b7fe583fa3486dc97924c765324ea372667"
+    },
+    "row_score": {
+        "shape": [4, 5],
+        "nan": 0,
+        "sums": [9.71929798531346, 9.71929798531346, 4.004607424407731],
+    },
+    "row_cand": {"sha256": "cfba54ed55e48887711a3df2102e3455733cabcb0e03b7879b8ae4ce2dc7cd4d"},
+    "forecast_rows": {"sha256": "d9b405550f8ba937554a2debb8cedcfc60819e43bf46ce546fe3de5ea85480f9"},
+    "keep": {"sha256": "c33098e12386fa12ccf1c095fb5c2970b6fc77d81c77049e31446fda97c48118"},
+    "labels": {
+        "shape": [4, 2, 1, 16],
+        "nan": 0,
+        "sums": [-36.73539087176323, 70.0549784898758, -21.345336115686223],
+    },
+    "label_mask": {"sha256": "867726bc2b4795f845b0fa02f78ceb93ec3981d917fe3bf6fd62fa1c2f0873c4"},
+    "loc": {
+        "shape": [4, 1],
+        "nan": 0,
+        "sums": [665.2580041191961, 665.2580041191961, 565.2572249599358],
+    },
+    "scale": {
+        "shape": [4, 1],
+        "nan": 0,
+        "sums": [487.8132051421306, 487.8132051421306, 448.84613740597064],
+    },
+    "fallback": {"sha256": "db7efe99401db002249bb62c50516312e56b7603670e2ca82c65b4b70b2a7b14"},
+    "known_rows": {"sha256": "32019a29d4fabbce5d372e432300c2821923c06bb3b8066be1eff088033f5583"},
+    "xh": {
+        "shape": [4, 2, 1, 1, 16, 39],
+        "nan": 0,
+        "sums": [75.53048648685217, 82.93639671802521, 35.76268566896817],
+    },
+    "cal_phases": {
+        "shape": [4, 4, 16, 16],
+        "nan": 0,
+        "sums": [-967.6367303989828, 1622.4486486576498, -482.09265684501406],
+    },
+    "cal_ids": {"sha256": "ffa9852dda0b1fc88af13e492109a4f17a081a62d8d7b9b9c6a3b6a80f2a1117"},
+    "calh_phases": {
+        "shape": [4, 2, 1, 16, 16],
+        "nan": 0,
+        "sums": [-126.77930046990514, 443.5837578885257, -57.88633335596023],
+    },
+    "calh_ids": {"sha256": "a8150d68fe149b463367dd739c2148da0ab4cce13f11fe5aa093616377e372b7"},
+    "cand_names": {"sha256": "8588bf453a5cf737f6517f53971c2e3fe5ae8fd438e6d53936dd2f30399355cb"},
+    "cand_kind": {"sha256": "0176a3baacf9e4bee69f8e17fe9efb7c5ff0d2a2fb441fa0f5df5989949c92f4"},
+    "cand_summary": {
+        "shape": [4, 2, 28],
+        "nan": 0,
+        "sums": [17.524523993663024, 57.61646507837577, 6.026995040776196],
+    },
+    "cand_flags": {"sha256": "5165afe560216db57c679ea14b1c3c907809ed942e530ae8d2d49ecc11deaa81"},
+    "cand_score": {
+        "shape": [4, 2],
+        "nan": 0,
+        "sums": [5.909398555755615, 5.909398555755615, 3.2973566353321075],
+    },
+    "attr_stats": {
+        "shape": [4, 2, 57],
+        "nan": 0,
+        "sums": [28.157332506971784, 68.24927359168453, 7.738828159630274],
+    },
+    "attr_flags": {"sha256": "372fed7dfd6774f17a890fa9260d16935780be8c889bbf9e7c7a16730ed21306"},
+    "attr_cand": {"sha256": "f2b2afad083e2d21c3dde2c55099624041b97310a87d6b293e791169bf55c7ed"},
+    "attr_names": {"sha256": "05269ac5c67c028eb8a73b1cfbd65eeb9ac4f0ac390d70d62761d61d376da9c6"},
+    "static_num": {
+        "shape": [4, 2],
+        "nan": 0,
+        "sums": [-0.09850254654884338, 7.898325473070145, -1.2052506729960442],
+    },
+    "static_num_flags": {
+        "sha256": "33731f74ef5f96de17cdcd3ad9302827adfbe62f8c6f037d434467470296a709"
+    },
+    "static_num_cand": {
+        "sha256": "bc907162f3924eb228c4f88004159039bdac4bf41dbd7f9f01300bd9002d04d0"
+    },
+    "freq_class": {"sha256": "4f6d44463ea6c07f86e34e7367ebaf4834bca9843f886f0a60fb4aef93a6e10f"},
+    "horizon": {"sha256": "12ce5f5f1732e2a6e3571b22c5fa4c728242f10f9a9a5c683a3795352a00a374"},
+    "origin_patches": {
+        "sha256": "490e558305cc4cbaef890f0692e7e5112e7b041a02df2e469ac6a32d5d7701eb"
+    },
+    "context_target": {
+        "sha256": "60ecf51984c70257e47f21dcf6a885d7812adddfadd74c117730392618baaeb3"
+    },
+    "row_mask": {"sha256": "5622fa40b9b470762a613cae820435b282b1ce533a502db465791f63d56be3dc"},
+    "forecast_mask": {"sha256": "4a2bf737d8509d9b4f7a0351c09a53e7b3cbfea3ea6d893012b246bfa6f02de1"},
+    "known_mask": {"sha256": "6cc3a4279a316b4b2e867b340db06d1bfd36293fb34d92b037edeb82883c396d"},
+    "cand_mask": {"sha256": "3f0c88411489f5672257c039c0cfe718ada438254cb10b472ab4189bc00ede60"},
+    "attr_mask": {"sha256": "35a862cd7dcd9fd0ddfda9c54a9aa7d81dde7a7c54992e9be3a38a7952539a3d"},
+    "static_num_mask": {
+        "sha256": "64301f73f7cc57f8325cc83b23ef58ab4efbf8dc9cb4d1fd27b22cc81571c749"
+    },
+    "origin_mask": {"sha256": "dd14965ba984fd76d9d65a48e090f399d9c254a0755c404dde0e000767d67bcd"},
+    "horizon_mask": {"sha256": "8a39239b3f6cea9702fa8ec16b8b9d918adb0e6ce07bfa140259cf994028a67e"},
+}
+
+
 def test_default_level_reproduces_the_base_batch():
     c = replace(config(drop=()), seed=12)
     source = replace(
@@ -46,16 +161,7 @@ def test_default_level_reproduces_the_base_batch():
     )
     batch, _ = api().make_batch(replace(c, sources=(source,)), 3)
     assert any(batch.cand_names)
-    digest = hashlib.sha256()
-    for field in fields(batch):
-        value = getattr(batch, field.name)
-        if isinstance(value, torch.Tensor):
-            array = value.cpu().numpy()
-            digest.update(repr((str(array.dtype), array.shape)).encode())
-            digest.update(array.tobytes())
-        else:
-            digest.update(repr(value).encode())
-    assert digest.hexdigest() == "7ec9b575c54464f37eaa28444ccd32ac89c0dfc9ada04f0339bec948f7bc2437"
+    assert_fingerprint(batch, _BASE_BATCH_FINGERPRINT)
 
 
 @pytest.mark.parametrize("designate_target", [False, True])

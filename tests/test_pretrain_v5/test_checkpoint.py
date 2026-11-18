@@ -21,6 +21,12 @@ def payload(batch=1, saves=1):
     return {"counters": {"batch": batch, "saves": saves}, "model": {"weight": torch.arange(3)}}
 
 
+def test_read_payload_exported_from_package():
+    from demand_forecast.pretrain.v5 import read_payload
+
+    assert read_payload is checkpoint_module().read_payload
+
+
 def test_read_payload_keys_and_damaged_footer(tmp_path):
     api = checkpoint_module()
     original = payload()
