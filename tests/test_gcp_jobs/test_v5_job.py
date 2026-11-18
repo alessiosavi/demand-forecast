@@ -59,6 +59,9 @@ def test_bash_determinism_embedded_configuration_and_digest(jobs, settings, tmp_
     assert "shutdown" not in first
     assert "shutdown" not in (ROOT / "scripts/gcp/jobs/make_v5_job.py").read_text()
     assert all("--exclude" in line for line in first.splitlines() if "quarantine" in line)
+    # An empty array under `set -u` is an error before bash 4.4 (the macOS system shell).
+    guarded = '${extra[@]+"${extra[@]}"}'
+    assert guarded in first and '"${extra[@]}"' not in first.replace(guarded, "")
     assert base64.b64encode(settings.read_bytes()).decode() in first
     assert hashlib.sha256(settings.read_bytes()).hexdigest() in first
     helper = tmp_path / "helper.py"

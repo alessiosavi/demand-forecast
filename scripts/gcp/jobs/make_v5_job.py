@@ -341,7 +341,7 @@ extra+=(--init-file "$scratch/initial.pt" --init-sha256 {init_sha256})
     script += f"""python3 "$helper" config {shlex.quote(packed_config)} {config_sha} "$scratch/config.yaml"
 exec "$python" -m demand_forecast.pretrain.v5.job {command_text} \\
     {config_flag} "$scratch/config.yaml" --run-dir "$RUN_DIR" --code {repo_sha} \\
-    --job-sha256 "$job_sha256" --env-sha256 "$env_sha256" "${{extra[@]}}"
+    --job-sha256 "$job_sha256" --env-sha256 "$env_sha256" ${{extra[@]+"${{extra[@]}}"}}
 """
     return script
 
