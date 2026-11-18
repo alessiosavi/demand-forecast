@@ -45,7 +45,8 @@ class V5Config:
                 raise ValueError(f"{name} must be finite")
             if kind is int and value != int(value):
                 raise ValueError(f"{name} must be an integer")
-            return kind(value)
+            # Adding zero turns -0.0 into 0.0, so equal configurations serialise identically.
+            return kind(value) + 0
 
         for field in fields(self):
             if field.type in (int, float):

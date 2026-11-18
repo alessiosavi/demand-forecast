@@ -31,6 +31,14 @@ def test_screen_rejects_mismatched_cutoff(cutoff):
     assert screen(panel, stats, 0, ("y",), 48)
 
 
+def test_screen_reports_a_bad_item_before_a_bad_cutoff():
+    # The first error stays the one the function always reported.
+    panel = toy_panel(length=80)
+    stats = PanelStats(panel, "y", 48)
+    with pytest.raises(IndexError):
+        screen(panel, stats, 99, ("y",), 0)
+
+
 @pytest.mark.parametrize("cell_limit", [650, 10])
 def test_summary_chunks_obey_cell_and_row_caps(monkeypatch, cell_limit):
     panel = toy_panel(n_items=8)

@@ -263,10 +263,10 @@ def screen(
     config: ScreeningConfig = ScreeningConfig(),
 ) -> list[Candidate]:
     """Return every candidate in (source, name) order, using only permitted history."""
-    if cutoff != stats.cutoff:
-        raise ValueError("cutoff must match stats.cutoff")
     if not 0 <= item_index < len(panel.items):
         raise IndexError("item index outside the panel")
+    if cutoff != stats.cutoff:
+        raise ValueError("cutoff must match stats.cutoff")
     item = panel.items[item_index]
     end = max(0, cutoff - item.start)
     histories = []

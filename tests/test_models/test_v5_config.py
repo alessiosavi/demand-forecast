@@ -52,3 +52,10 @@ def test_float_fields_store_ints_as_floats(field):
 def test_quantile_levels_reject_wrong_kinds_and_nonfinite(value):
     with pytest.raises(ValueError, match="quantiles"):
         V5Config(quantiles=(value, 0.5, 0.9))
+
+
+def test_negative_zero_serialises_like_zero():
+    # Equal configurations must serialise identically, also for a signed zero.
+    a, b = V5Config(sparsity_weight=-0.0), V5Config(sparsity_weight=0.0)
+    assert a == b
+    assert json.dumps(asdict(a)) == json.dumps(asdict(b))
