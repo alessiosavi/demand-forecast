@@ -29,14 +29,13 @@ from demand_forecast.models.v5.model import prune
 from demand_forecast.synthetic.typed import (
     PanelRecipe,
     generate_typed_panel,
-    shuffle_assignment,
 )
 from demand_forecast.synthetic.typed.draft import stream
 
 from .config import T1_BASE, SourceConfig, V5TrainConfig
 from .loop import load_model
 from .sampler import _postprocess, _supervised, plan_panel
-from .sources import TypedSource
+from .sources import TypedSource, apply_control
 from .support import supported
 
 
@@ -151,7 +150,11 @@ _BANK = {
 
 
 def _present(path, generated, episode, mechanisms):
-    """Check the actual build, including flags rather than feature values."""
+    """Check actual inputs and validity flags rather than feature values.
+
+    Bank presence requires at least one context step with a valid flag in the
+    mechanism's family (``flags.any()``), plus its named summary entry valid.
+    """
     presence = PATHS[path]["present"]
     if presence == "always":
         return True
@@ -192,22 +195,8 @@ def _present(path, generated, episode, mechanisms):
 def _build(generated, entry, config):
     """Replay one frozen request; controls use the recipe seed, as TypedSource does."""
     source = config.sources[0]
-    panel = generated.panel
-    if source.control == "shuffle":
-        controlled = generated
-        for record in generated.inputs:
-            mechanism = record.twin if record.mechanism == "nuisance" else record.mechanism
-            if mechanism not in generated.recipe.mechanisms or record.name in controlled.shuffled:
-                continue
-            if source.control_inputs == "attribute" and record.where != "static":
-                continue
-            if source.control_inputs == "column" and record.where != "dynamic":
-                continue
-            controlled = shuffle_assignment(controlled, record.name, seed=generated.recipe.seed)
-        panel = controlled.panel
-    elif source.control == "no_dates":
-        panel = replace(panel, epoch=None)
-    elif source.control == "missing_as_zero":
+    panel = apply_control(generated, source)
+    if source.control == "missing_as_zero":
         items = []
         for item in panel.items:
             targets = {name: values.copy() for name, values in item.targets.items()}
@@ -574,8 +563,23 @@ def compare(
     }
 
 
-def selection_report(true: dict, null: dict, gates_one: dict, episodes: list[dict]) -> dict:
-    """R2 decisions, using only present candidates and live driver interventions."""
+def selection_report(
+    true: dict,
+    null: dict,
+    gates_one: dict,
+    episodes: list[dict],
+    *,
+    min_count: int = 30,
+    resamples: int = 10_000,
+    seed: int = 0,
+) -> dict:
+    """R2 decisions over present inputs, as candidates or rows, and live drivers.
+
+    Every decision uses ``min_count`` episodes as its evidence floor; all
+    bootstrap intervals use the requested ``resamples`` and ``seed``.
+    """
+    if resamples < 1 or min_count < 1:
+        raise ValueError("resamples and min_count must be positive")
     learned, shuffled = _loss_arrays(true["loss"], null["loss"])
     _, ones = _loss_arrays(true["loss"], gates_one["loss"])
     if len(episodes) != len(learned) or len(true["gates"]) != len(learned):
@@ -596,7 +600,7 @@ def selection_report(true: dict, null: dict, gates_one: dict, episodes: list[dic
             "share_zero": share,
             "inputs": len(values),
             "n": len(indices),
-            "outcome": "inconclusive" if len(indices) < 30 else "pass" if passed else "fail",
+            "outcome": "inconclusive" if len(indices) < min_count else "pass" if passed else "fail",
         }
     pruning["outcome"] = _outcome(pruning[k]["outcome"] for k in ("nuisance", "drivers"))
     forced = {}
@@ -616,13 +620,13 @@ def selection_report(true: dict, null: dict, gates_one: dict, episodes: list[dic
                 if not np.isfinite(losses[i]):
                     raise ValueError("forced losses must be finite")
                 differences.append(losses[i] - learned[i])
-        record = _interval(differences)
+        record = _interval(differences, min_count=min_count, resamples=resamples, seed=seed)
         record["outcome"] = (
             "inconclusive" if record["low"] is None else "pass" if record["low"] > 0 else "fail"
         )
         forced[mechanism] = record
     forced["outcome"] = _outcome(r["outcome"] for r in forced.values())
-    advantage = _interval(learned - ones, ones)
+    advantage = _interval(learned - ones, ones, min_count=min_count, resamples=resamples, seed=seed)
     advantage["outcome"] = (
         "inconclusive"
         if advantage["high"] is None
@@ -633,7 +637,7 @@ def selection_report(true: dict, null: dict, gates_one: dict, episodes: list[dic
     report = {
         "pruning": pruning,
         "forced": forced,
-        "shuffle": compare(learned, shuffled),
+        "shuffle": compare(learned, shuffled, min_count=min_count, resamples=resamples, seed=seed),
         "gates_one": advantage,
         "pruned": dict(true["pruned"]),
     }

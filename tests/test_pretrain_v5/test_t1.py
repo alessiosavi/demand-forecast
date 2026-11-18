@@ -12,6 +12,7 @@ import torch
 from demand_forecast.data.episode.schema import (
     CH_STEP_FLAG,
     N_SUMMARY,
+    ROLE_PAST,
     ROLE_PEER,
     STEP_FAMILIES,
     SUMMARY_FEATURES,
@@ -21,6 +22,7 @@ from demand_forecast.pretrain.v5 import loop
 from demand_forecast.pretrain.v5.support import supported
 from demand_forecast.synthetic.typed import PanelRecipe, generate_typed_panel
 from tests.helpers.v5_loop import config
+from tests.test_pretrain_v5.test_sources import equal_panels
 
 PATH_NAMES = (
     "static_category",
@@ -310,6 +312,67 @@ def test_evaluate_all_arms_same_requests_cells_and_finite_losses(small, monkeypa
         assert batches == batch_reference
 
 
+@pytest.mark.parametrize("mechanism", ["hierarchy", "event_response"])
+@pytest.mark.parametrize(
+    "control,selection",
+    [
+        (None, "all"),
+        ("shuffle", "all"),
+        ("shuffle", "attribute"),
+        ("shuffle", "column"),
+        ("no_dates", "all"),
+        ("missing_as_zero", "all"),
+    ],
+)
+def test_evaluate_replays_shared_source_control(small, monkeypatch, mechanism, control, selection):
+    sources = importlib.import_module("demand_forecast.pretrain.v5.sources")
+    path = small.PATHS["event_response"]
+    path["sets"] = ((mechanism,),)
+    path["both"]["source"].update(
+        max_items=64, n_nuisance=2, nuisance_from=(mechanism,), heldout=True
+    )
+    path["arms"]["null"] = {"source": {"control": control, "control_inputs": selection}}
+    entries = small.eval_set("event_response", episodes=1, min_count=1, max_panels=60)
+    assert entries
+    entry = entries[0]
+    generated = generate_typed_panel(PanelRecipe(**entry["recipe"]))
+    cfg = small.t1_config("event_response", "null", seed=0, base=tiny())
+    expected = sources.apply_control(generated, cfg.sources[0])
+
+    class FrozenRecipeRng:
+        def __init__(self):
+            self.draws = iter([(0, 2**63, generated.recipe.seed), (1, None, 0)])
+
+        def integers(self, low, high=None):
+            want_low, want_high, value = next(self.draws)
+            assert (low, high) == (want_low, want_high)
+            return value
+
+    exposed, record = sources.TypedSource(cfg.sources[0]).panel(FrozenRecipeRng())
+    assert record["recipe"] == generated.recipe
+    equal_panels(exposed, expected)
+    # missing_as_zero is applied at the frozen origin after the source exposes
+    # its unchanged panel, just as the sampler does after choosing an anchor.
+    if control == "missing_as_zero":
+        expected = copy.deepcopy(expected)
+        for item in expected.items:
+            for values in item.targets.values():
+                prefix = values[: max(0, entry["origin"] - item.start)]
+                prefix[np.isnan(prefix)] = 0
+    model = V5Model(tiny().model)
+    monkeypatch.setattr(small, "load_model", lambda *a, **kw: (model, tiny()))
+    real_build, observed = small.EpisodeBuilder.build, []
+
+    def observe(builder, request):
+        observed.append(builder.panel)
+        return real_build(builder, request)
+
+    monkeypatch.setattr(small.EpisodeBuilder, "build", observe)
+    small.evaluate(Path("unused"), "event_response", "null", [entry])
+    assert len(observed) == 2
+    equal_panels(observed[1], expected)
+
+
 def test_real_export_checkpoint_and_rolled_repeat(small, tmp_path):
     trained = loop.train(tiny(), tmp_path)
     episodes = small.eval_set("routing", episodes=3, min_count=1, max_panels=30)
@@ -388,6 +451,38 @@ def test_forced_drivers_zero_inherited_peer_rows(small, monkeypatch):
     assert checked and sum(checked) > 0
     assert set(result["forced"]) == {r["mechanism"] for e in episodes for r in e["drivers"]}
     assert all(len(values) == len(episodes) for values in result["forced"].values())
+
+
+def test_forced_dynamic_driver_zeroes_past_row_and_changes_loss(small, monkeypatch):
+    entries = small.eval_set("past_driver", episodes=1, min_count=1, max_panels=30)
+    model = V5Model(tiny().model)
+    # Ensure the learned driver gate is live before the intervention.
+    with torch.no_grad():
+        model.gate_net.net[-1].bias.fill_(100)
+    monkeypatch.setattr(small, "load_model", lambda *a, **kw: (model, tiny()))
+    real_gates, observed = model.gates, []
+
+    def gates(batch, **kwargs):
+        result = real_gates(batch, **kwargs)
+        driver = entries[0]["drivers"][0]["name"]
+        row = batch.row_names[0].index(driver)
+        assert batch.row_role[0, row] == ROLE_PAST
+        assert driver not in batch.cand_names[0]
+        if kwargs.get("zero_rows") is not None:
+            assert kwargs["zero_rows"][0, row]
+            assert not kwargs["zero_candidates"].any()
+            assert result.row[0, row] == 0
+        else:
+            assert result.row[0, row] > 0
+        observed.append(float(result.row[0, row]))
+        return result
+
+    monkeypatch.setattr(model, "gates", gates)
+    result = small.evaluate(Path("unused"), "past_driver", "true", entries, forced=True)
+    assert len(observed) == 2 and observed[0] > 0 and observed[1] == 0
+    forced = result["forced"]["delayed_past_driver"][0]
+    assert forced is not None and np.isfinite(forced)
+    assert abs(forced - result["loss"][0]) > 1e-8
 
 
 def test_pruning_reports_real_rows_tokens_and_padded_cells_removed(small, monkeypatch):
@@ -482,6 +577,10 @@ def test_bank_presence_requires_both_step_and_summary(small, mechanism, family, 
     span = STEP_FAMILIES[family]
     built.x[..., CH_STEP_FLAG + span.start : CH_STEP_FLAG + span.stop] = 0
     assert not small._present("bank", generated, built, {mechanism})
+    row = built.forecast_rows[built.keep][0]
+    built.x[row, 0, 0, CH_STEP_FLAG + span.start] = 1
+    assert small._present("bank", generated, built, {mechanism})
+    assert not small._present("bank", generated, missing_summary, {mechanism})
 
 
 def test_bank_null_all_clears_every_summary_and_keeps_target(small):
@@ -614,3 +713,76 @@ def test_selection_absent_candidates_and_short_decisions_inconclusive():
         result[k]["outcome"] == "inconclusive"
         for k in ("pruning", "forced", "shuffle", "gates_one")
     )
+
+
+def test_selection_pruning_counts_row_only_nuisance_inputs():
+    true, null, ones, episodes = selection_inputs()
+    for entry in episodes:
+        entry["nuisance"] = (
+            *entry["nuisance"],
+            {
+                "name": "past_noise",
+                "mechanism": "nuisance",
+                "where": "dynamic",
+                "role": "past",
+                "twin": "delayed_past_driver",
+            },
+        )
+    for gates in true["gates"]:
+        gates.update(noise=1.0, past_noise=0.0)
+    result = api().selection_report(true, null, ones, episodes)
+    assert result["pruning"]["nuisance"] == {
+        "share_zero": 0.5,
+        "inputs": 80,
+        "n": 40,
+        "outcome": "pass",
+    }
+    assert result["outcome"] == "pass"
+
+
+@pytest.mark.parametrize("min_count,outcome", [(6, "pass"), (7, "inconclusive")])
+def test_selection_report_configurable_evidence_floor(min_count, outcome):
+    true, null, ones, episodes = selection_inputs()
+    true["loss"], true["gates"] = true["loss"][:6], true["gates"][:6]
+    true["forced"]["static_category"] = true["forced"]["static_category"][:6]
+    null["loss"], ones["loss"] = null["loss"][:6], ones["loss"][:6]
+    result = api().selection_report(
+        true, null, ones, episodes[:6], min_count=min_count, resamples=23, seed=91
+    )
+    assert result["outcome"] == outcome
+    assert all(
+        result[k]["outcome"] == outcome for k in ("pruning", "forced", "shuffle", "gates_one")
+    )
+    assert result["pruning"]["nuisance"]["n"] == 6
+    assert result["forced"]["static_category"]["n"] == 6
+
+
+def test_selection_report_threads_bootstrap_seed_and_resamples():
+    from demand_forecast.synthetic.typed.draft import stream
+
+    true, null, ones, episodes = selection_inputs()
+    true["loss"] = [0.5, 0.7, 0.9, 0.92, 0.94, 0.95]
+    true["gates"] = true["gates"][:6]
+    true["forced"]["static_category"] = [0.6, 0.72, 0.95, 0.99, 1.0, 1.1]
+    null["loss"], ones["loss"] = [1.0] * 6, [0.7, 0.8, 0.9, 0.9, 0.92, 0.97]
+    result = api().selection_report(
+        true, null, ones, episodes[:6], min_count=6, resamples=23, seed=91
+    )
+    indices = stream(91, "bootstrap").integers(6, size=(23, 6))
+    learned, shuffled, gates_one, forced = map(
+        np.asarray, (true["loss"], null["loss"], ones["loss"], true["forced"]["static_category"])
+    )
+    draws = {
+        "forced": (forced - learned)[indices].mean(axis=1),
+        "shuffle": (shuffled - learned)[indices].sum(axis=1) / shuffled[indices].sum(axis=1),
+        "gates_one": (learned - gates_one)[indices].sum(axis=1) / gates_one[indices].sum(axis=1),
+    }
+    records = {
+        "forced": result["forced"]["static_category"],
+        "shuffle": result["shuffle"]["all"],
+        "gates_one": result["gates_one"],
+    }
+    for name, record in records.items():
+        assert (record["low"], record["high"]) == pytest.approx(
+            np.quantile(draws[name], (0.05, 0.95))
+        )
