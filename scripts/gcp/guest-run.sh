@@ -124,7 +124,42 @@ job_uri = os.environ["JOB_URI"]
 stop = threading.Event()
 children = set()
 children_lock = threading.RLock()
-copy_lock = threading.Lock()
+shutdown_requested = False
+deadline_expired = False
+deadline_trace = None
+SHUTDOWN_SLICE = 0.05  # Keep signal response independent of the test budget scale.
+
+
+def exit_if_requested():
+    if shutdown_requested and threading.current_thread() is threading.main_thread():
+        raise SystemExit(0)
+
+
+class CopyLock:
+    def __init__(self):
+        self.lock = threading.Lock()
+
+    def __enter__(self):
+        return self.lock.__enter__()
+
+    def __exit__(self, *exc):
+        return self.lock.__exit__(*exc)
+
+    def acquire(self, *, timeout):
+        deadline = time.monotonic() + timeout
+        while True:
+            exit_if_requested()
+            remaining = max(0, deadline - time.monotonic())
+            if self.lock.acquire(timeout=min(SHUTDOWN_SLICE, remaining)):
+                return True
+            if remaining <= SHUTDOWN_SLICE:
+                return False
+
+    def release(self):
+        self.lock.release()
+
+
+copy_lock = CopyLock()
 
 
 def budget_seconds(seconds):
@@ -139,6 +174,9 @@ def log(message):
 
 
 def command(argv, budget, capture=False, cancel_if_stopped=False):
+    sliced = budget is not None and threading.current_thread() is threading.main_thread()
+    if sliced:
+        exit_if_requested()
     if budget is not None and budget <= 0:
         return None
     with children_lock:
@@ -152,7 +190,27 @@ def command(argv, budget, capture=False, cancel_if_stopped=False):
         )
         children.add(child)
     try:
-        out, _ = child.communicate(timeout=budget)
+        if sliced:
+            remaining = budget
+            deadline = time.monotonic() + budget
+            out = None
+            while not shutdown_requested:
+                try:
+                    out, _ = child.communicate(timeout=min(SHUTDOWN_SLICE, remaining))
+                    break
+                except subprocess.TimeoutExpired:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0 and not shutdown_requested:
+                        raise
+            if shutdown_requested:
+                # A reaped child's pid may already belong to another process group.
+                if child.returncode is None:
+                    cancel_child(child, reap_missing_group=True)
+                with children_lock:
+                    children.discard(child)
+                exit_if_requested()
+        else:
+            out, _ = child.communicate(timeout=budget)
         return (
             out
             if capture and child.returncode == 0
@@ -166,31 +224,39 @@ def command(argv, budget, capture=False, cancel_if_stopped=False):
         return None
     finally:
         with children_lock:
-            children.discard(child)
+            if child.returncode is not None:
+                children.discard(child)
+
+
+def cancel_child(child, *, reap_missing_group=False):
+    try:
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            if not reap_missing_group:
+                return
+        child.wait(timeout=budget_seconds(0.2))
+    except (ProcessLookupError, subprocess.TimeoutExpired):
+        pass
+    except PermissionError as denied:
+        # A completed child may leave a vanished/denied process group
+        # before its command thread removes it from children.
+        # Reap it: poll() can report None while communicate() waits.
+        try:
+            child.wait(timeout=budget_seconds(0.2))
+        except subprocess.TimeoutExpired:
+            raise denied from None
 
 
 def cancel_children():
     with children_lock:
         for child in list(children):
-            try:
-                os.killpg(child.pid, signal.SIGKILL)
-                child.wait(timeout=budget_seconds(0.2))
-            except (ProcessLookupError, subprocess.TimeoutExpired):
-                pass
-            except PermissionError as denied:
-                # A completed child may leave a vanished/denied process group
-                # before its command thread removes it from children.
-                # Reap it: poll() can report None while communicate() waits.
-                try:
-                    child.wait(timeout=budget_seconds(0.2))
-                except subprocess.TimeoutExpired:
-                    raise denied from None
+            cancel_child(child)
 
 
 def terminate(*_):
-    stop.set()
-    cancel_children()
-    raise SystemExit(0)
+    global shutdown_requested
+    shutdown_requested = True
 
 
 signal.signal(signal.SIGTERM, terminate)
@@ -277,9 +343,19 @@ def upload(path, key, budget):
     )
 
 
+def lock_outcome(lock):
+    while True:
+        exit_if_requested()
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            time.sleep(SHUTDOWN_SLICE)
+
+
 def claim(source):
     with (root / ".outcome-lock").open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        lock_outcome(lock)
         if source == "normal":
             if (root / ".preempting").exists():
                 return False
@@ -352,10 +428,13 @@ def periodic():
 
 
 def preempt(save_deadline):
-    # The alarm also bounds directory traversal and local checkpoint operations.
+    global deadline_trace
+    # The alarm is checked every 50 ms at most during child waits, checkpoint
+    # negotiation and copy-lock waits, and between entries during state inventory.
+    # Not interrupted: a local file operation in progress, and the unbounded wait
+    # after a command's own budget has expired and its group has been killed.
     started = time.monotonic()
     trace_path = root / ".preempt-trace.jsonl"
-    trace_path.write_text("")
 
     def trace(step, outcome, **details):
         record = dict(
@@ -376,14 +455,17 @@ def preempt(save_deadline):
         upload(trace_path, f"logs/{label}.preempt.jsonl", min(budget_seconds(1.5), max(0, save_deadline - time.monotonic())))
 
     def expired(*_):
-        trace("deadline", "expired")
-        log("24 s save deadline reached")
-        terminate()
+        global deadline_expired, shutdown_requested
+        deadline_expired = True
+        shutdown_requested = True
 
-    signal.signal(signal.SIGALRM, expired)
-    signal.setitimer(signal.ITIMER_REAL, max(0.001, save_deadline - time.monotonic()))
     try:
+        trace_path.write_text("")
+        deadline_trace = trace
+        signal.signal(signal.SIGALRM, expired)
+        signal.setitimer(signal.ITIMER_REAL, max(0.001, save_deadline - time.monotonic()))
         trace("preemption", "observed", label=label, job_uri=job_uri)
+        exit_if_requested()
         if marker("PREEMPTED", "watcher"):
             (root / ".PREEMPTED.published").touch()
             trace("marker", "uploaded")
@@ -392,10 +474,12 @@ def preempt(save_deadline):
             trace("marker", "failed")
         # Stop periodic writers only AFTER the first marker attempt; never the job.
         stop.set()
+        exit_if_requested()
         cancel_children()
         acquired = copy_lock.acquire(timeout=budget_seconds(0.5))
-        trace("periodic_stop", "stopped" if acquired else "lock_unavailable")
         try:
+            exit_if_requested()
+            trace("periodic_stop", "stopped" if acquired else "lock_unavailable")
             nonce = uuid.uuid4().hex
             request = root / "checkpoint-request"
             temporary = root / ".checkpoint-request"
@@ -409,6 +493,7 @@ def preempt(save_deadline):
             deadline = time.monotonic() + budget_seconds(wait)
             outcome = "timed_out"
             while time.monotonic() < deadline:
+                exit_if_requested()
                 try:
                     if (root / "checkpoint-done").read_text().strip() == nonce:
                         outcome = "acknowledged"
@@ -418,7 +503,8 @@ def preempt(save_deadline):
                 if (root / ".job-ended").exists():
                     outcome = "job_ended"
                     break
-                time.sleep(min(0.05, max(0, deadline - time.monotonic())))
+                time.sleep(min(SHUTDOWN_SLICE, max(0, deadline - time.monotonic())))
+            exit_if_requested()
             trace("checkpoint_wait", outcome)
             diagnostics()
             # Newest immutable generations first. Reserve seven seconds for
@@ -466,12 +552,16 @@ def preempt(save_deadline):
 
 def inventory():
     try:
+        exit_if_requested()
         files = []
         for path in (root / "state").rglob("*"):
+            exit_if_requested()
             if path.is_file() and not path.is_symlink():
                 stat = path.stat()
                 files.append((path, stat.st_mtime_ns, stat.st_size))
-        return sorted(files, key=lambda row: (row[1], str(row[0])), reverse=True)
+        files.sort(key=lambda row: (row[1], str(row[0])), reverse=True)
+        exit_if_requested()
+        return files
     except OSError:
         log("state inventory changed or could not be read")
         return None
@@ -495,51 +585,62 @@ def reconcile(status):
 
 
 mode = sys.argv[1]
-if mode == "claim-normal":
-    sys.exit(0 if claim("normal") else 1)
-if mode == "hook":
-    if not (root / ".finished").exists() and not (root / ".PREEMPTED.published").exists():
-        with (root / ".outcome-lock").open("a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            if (
-                not (root / ".finished").exists()
-                and not (root / ".PREEMPTED.published").exists()
-                and not (root / ".job-ended").exists()
-                and not (root / ".preempting").exists()
-            ):
-                (root / ".preempting").write_text("hook")
-                if marker("PREEMPTED", "hook"):
-                    (root / ".PREEMPTED.published").touch()
-                else:
-                    log("preemption marker failed")
-    sys.exit(0)
+try:
+    if mode == "claim-normal":
+        sys.exit(0 if claim("normal") else 1)
+    if mode == "hook":
+        if not (root / ".finished").exists() and not (root / ".PREEMPTED.published").exists():
+            with (root / ".outcome-lock").open("a") as lock:
+                lock_outcome(lock)
+                if (
+                    not (root / ".finished").exists()
+                    and not (root / ".PREEMPTED.published").exists()
+                    and not (root / ".job-ended").exists()
+                    and not (root / ".preempting").exists()
+                ):
+                    (root / ".preempting").write_text("hook")
+                    if marker("PREEMPTED", "hook"):
+                        (root / ".PREEMPTED.published").touch()
+                    else:
+                        log("preemption marker failed")
+        sys.exit(0)
 
-threading.Thread(target=periodic, daemon=True).start()
-while not stop.is_set():
-    response = command(
-        [
-            "curl",
-            "--fail",
-            "--silent",
-            "--show-error",
-            "--connect-timeout",
-            str(budget_seconds(0.5)),
-            "--max-time",
-            str(budget_seconds(1.5)),
-            "-H",
-            "Metadata-Flavor: Google",
-            "http://metadata.google.internal/computeMetadata/v1/instance/preempted",
-        ],
-        budget_seconds(1.5),
-        True,
-    )
-    if response in (b"TRUE", b"TRUE\n"):
-        save_deadline = time.monotonic() + budget_seconds(24)
-        if claim("watcher"):
-            preempt(save_deadline)
-        break
-    command(["sleep", "1"], budget_seconds(2))
-terminate()
+    threading.Thread(target=periodic, daemon=True).start()
+    while not stop.is_set():
+        exit_if_requested()
+        response = command(
+            [
+                "curl",
+                "--fail",
+                "--silent",
+                "--show-error",
+                "--connect-timeout",
+                str(budget_seconds(0.5)),
+                "--max-time",
+                str(budget_seconds(1.5)),
+                "-H",
+                "Metadata-Flavor: Google",
+                "http://metadata.google.internal/computeMetadata/v1/instance/preempted",
+            ],
+            budget_seconds(1.5),
+            True,
+        )
+        if response in (b"TRUE", b"TRUE\n"):
+            save_deadline = time.monotonic() + budget_seconds(24)
+            if claim("watcher"):
+                preempt(save_deadline)
+            break
+        command(["sleep", "1"], budget_seconds(2))
+    raise SystemExit(0)
+finally:
+    stop.set()
+    try:
+        # Recorded before the children are cancelled, as the alarm always did.
+        if deadline_expired:
+            deadline_trace("deadline", "expired")
+            log("24 s save deadline reached")
+    finally:
+        cancel_children()
 GCP_CONTROL_PY
 fi
 
