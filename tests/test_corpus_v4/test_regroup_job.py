@@ -449,7 +449,18 @@ def test_status_only_retry_completes_without_parent_or_regroup(machine, monkeypa
 
 
 @pytest.mark.parametrize(
-    "damage", ["identity", "size", "crc", "missing", "extra", "attribution", "ledger"]
+    "damage",
+    [
+        "identity",
+        "repo-sha",
+        "inventory",
+        "size",
+        "crc",
+        "missing",
+        "extra",
+        "attribution",
+        "ledger",
+    ],
 )
 def test_status_only_retry_refuses_foreign_status_or_changed_output(machine, damage):
     failed = invoke(machine, "completion")
@@ -458,10 +469,17 @@ def test_status_only_retry_refuses_foreign_status_or_changed_output(machine, dam
     output = machine["output"]
     status_path = output / "attempt-status.json"
     assert status_path.is_file()
-    if damage == "identity":
+    if damage in {"identity", "repo-sha", "inventory"}:
         status = read_json(status_path)
-        status["identity"] = "0" * 64
-        status_path.write_text(json.dumps(status))
+        if damage == "identity":
+            status["identity"] = "0" * 64
+        elif damage == "repo-sha":
+            status["repo_sha"] = "b" * 40
+        else:
+            del status["output_listing"][ATTRIBUTION[0]]
+        status_path.write_bytes(
+            (json.dumps(status, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
+        )
     elif damage == "size":
         (output / UNI).write_bytes((output / UNI).read_bytes() + b"damage")
     elif damage == "crc":
@@ -480,12 +498,15 @@ def test_status_only_retry_refuses_foreign_status_or_changed_output(machine, dam
     machine["events"].write_text("")
 
     retry = invoke(machine)
-    assert retry.returncode != 0
+    assert retry.returncode != 0, retry.stderr
     message = {
         "identity": "regroup status has different identity",
+        "repo-sha": "regroup status record differs",
+        "inventory": "regroup ledger inventory differs from status",
         "ledger": "regroup ledger SHA-256 differs",
     }.get(damage, "status output listing differs")
-    assert message in retry.stderr
+    assert message in retry.stderr, retry.stderr
+    assert writes(machine) == []
     assert not machine["completion"].exists()
     assert all(
         command[:3]
