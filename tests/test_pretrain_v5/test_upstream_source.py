@@ -17,15 +17,27 @@ from tests.helpers.v5_sampler import equal_batches
 from tests.test_pretrain_v5.test_sources import equal_panels
 
 
+def loaded_simons():
+    return [name for name in sys.modules if name == "simons" or name.startswith("simons.")]
+
+
 @pytest.fixture
 def upstream(monkeypatch):
     location = os.environ.get("SIMONS_UPSTREAM")
-    if not location or not (Path(location) / "src/simons/training/spot_job.py").is_file():
-        pytest.skip("set SIMONS_UPSTREAM to a prepared checkout at third_party/simons/PINNED")
+    if not location or not (Path(location) / "src/simons/synth").is_dir():
+        pytest.skip("set SIMONS_UPSTREAM to a Simons clone at third_party/simons/PINNED")
+    # Other suites import a patched copy of the package into this process. Take every
+    # module of it out for the test, so the import below is this checkout's own and
+    # "no trainer loaded" is a statement about this source, whatever ran before.
+    for name in loaded_simons():
+        monkeypatch.delitem(sys.modules, name)
     monkeypatch.syspath_prepend(str(Path(location) / "src"))
     module = importlib.import_module("simons.synth")
     assert Path(module.__file__).is_relative_to(Path(location).resolve())
-    return importlib.import_module("demand_forecast.pretrain.v5.sources")
+    yield importlib.import_module("demand_forecast.pretrain.v5.sources")
+    # Drop what this test imported; monkeypatch then puts back what was loaded before.
+    for name in loaded_simons():
+        del sys.modules[name]
 
 
 def test_absent_package_is_lazy_and_explains_setup():

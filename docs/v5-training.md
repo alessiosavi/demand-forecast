@@ -50,7 +50,8 @@ Base sampling uses `families=("kernel", "sarima")`, `noise=0.0`, `missing=0.1`,
 `min_observed=96`, `weights=None` and `pad=0.0`; leading padding is off because it
 can leave the history entirely missing before covariate-effect normalization.
 Generator options remain typed-only; `control: missing_as_zero` is applied by
-the sampler. Local tests use `SIMONS_UPSTREAM` pointing at a prepared checkout.
+the sampler. Local tests use `SIMONS_UPSTREAM` pointing at a clone at the pin (the clean clone the
+other upstream tests use; no preparation is needed).
 
 For corpus jobs, add `--corpus-uri gs://bucket/corpus-v4.1 --corpus-digest <hex>`.
 Corpus sources in the YAML must have `root: null`. Only `univariate/` and
