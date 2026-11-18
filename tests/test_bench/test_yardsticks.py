@@ -5,6 +5,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import pytest
 import yaml
 
@@ -16,6 +17,7 @@ from demand_forecast.bench.yardsticks import (  # noqa: E402
     load_tasks,
     run_yardstick,
 )
+from demand_forecast.bench.yardsticks.runner import prepare_windows  # noqa: E402
 from tests.helpers.fev_fixture import write_fev_fixture  # noqa: E402
 
 
@@ -77,6 +79,183 @@ def scenario(tmp_path):
     (weights / "config.json").write_text("{}")
     options = Options(model="chronos2", weights=str(weights), model_name="reference", device="cpu")
     return load_tasks(task_file), options, tmp_path / "out"
+
+
+@pytest.fixture
+def panel_task():
+    from datasets import ClassLabel, Dataset, Features, Sequence, Value
+
+    data = Dataset.from_dict(
+        {
+            "id": ["a", "b"],
+            "timestamp": [
+                pd.date_range("2024-01-01", periods=7),
+                pd.date_range("2024-01-03", periods=6),
+            ],
+            "target": [[1, 2, 3, 4, 5, 6, 7], [11, 12, 13, 14, 15, 16]],
+            "other": [[21, 22, 23, 24, 25, 26, 27], [31, 32, 33, 34, 35, 36]],
+            "oil": [[1, 2, 3, 4, 5, 6, 7], [11, 12, 13, 14, 15, 16]],
+            "event": [[0, 1, 0, 1, 2, 1, 0], [2, 1, 2, 1, 0, 2]],
+            "flag": [[True, False, True, False, True, False, True], [False] * 6],
+            "promo": [[10, 20, 30, 40, None, 60, None], [None, None, None, None, 150, None]],
+            "group": [1, 0],
+            "region": ["north", "south"],
+            "size": [4.5, None],
+        },
+        features=Features(
+            {
+                "id": Value("string"),
+                "timestamp": Sequence(Value("timestamp[ns]")),
+                "target": Sequence(Value("float32")),
+                "other": Sequence(Value("float32")),
+                "oil": Sequence(Value("int32")),
+                "event": Sequence(ClassLabel(names=["regular", "sale", "holiday"])),
+                "flag": Sequence(Value("bool")),
+                "promo": Sequence(Value("int32")),
+                "group": ClassLabel(names=["small", "large"]),
+                "region": Value("string"),
+                "size": Value("float64"),
+            }
+        ),
+    ).with_format("numpy")
+    task = fev.Task(
+        dataset_path="in-memory",
+        target=["target", "other"],
+        known_dynamic_columns=["promo"],
+        past_dynamic_columns=["oil", "event", "flag"],
+        static_columns=["size", "region", "group"],
+        horizon=2,
+        num_windows=2,
+        min_context_length=1,
+    )
+    # Supply the loaded dataset in memory, then use fev's real window splitter.
+    task._full_dataset = data
+    task._freq = pd.infer_freq(data[0]["timestamp"])
+    return task
+
+
+def test_prepare_windows_for_v5(panel_task):
+    options = Options("v5", ".", "test", max_context=2)
+    first, second = prepare_windows(panel_task, options)
+    for window, lengths in ((first, (3, 2)), (second, (5, 4))):
+        assert window.ids == ["a", "b"]
+        assert window.targets == ["other", "target"]
+        assert window.freq == "D"
+        assert window.declared == {
+            "event": "class_label",
+            "flag": "boolean",
+            "oil": "number",
+            "promo": "number",
+            "group": "class_label",
+            "region": "string",
+            "size": "number",
+        }
+        assert window.class_labels == {
+            "event": ("regular", "sale", "holiday"),
+            "group": ("small", "large"),
+        }
+        a, b = window.items
+        for item, date, length in zip((a, b), ("2024-01-01", "2024-01-03"), lengths, strict=True):
+            assert item.axis.first == pd.Timestamp(date)
+            assert item.axis.on_grid and item.axis.reason is None
+            assert item.target.shape == (2, length)
+            assert {len(values) for values in item.past.values()} == {length}
+        assert a.static == {"group": 1, "region": "north", "size": 4.5}
+        assert b.static.keys() == {"group", "region", "size"}
+        assert b.static["group"] == 0 and b.static["region"] == "south"
+        assert pd.isna(b.static["size"])
+    np.testing.assert_array_equal(second.items[0].target, [[21, 22, 23, 24, 25], [1, 2, 3, 4, 5]])
+    np.testing.assert_array_equal(second.items[0].past["promo"], [10, 20, 30, 40, np.nan])
+    np.testing.assert_array_equal(second.items[0].future["promo"], [60, np.nan])
+    np.testing.assert_array_equal(second.items[1].past["promo"], [np.nan] * 4)
+    np.testing.assert_array_equal(second.items[1].future["promo"], [150, np.nan])
+
+
+def test_v5_grid_proof_parses_once_per_window(panel_task, monkeypatch):
+    from demand_forecast.bench import v5_panels
+    from demand_forecast.data import frequency
+    from demand_forecast.data.episode import schema
+
+    parse_calls = []
+    validate_calls = []
+    parse = frequency.to_offset
+    validate = frequency.validate_on_grid
+
+    def count_parse(freq):
+        parse_calls.append(freq)
+        return parse(freq)
+
+    def count_validate(*args):
+        validate_calls.append(args)
+        return validate(*args)
+
+    for module in (frequency, schema, v5_panels):
+        monkeypatch.setattr(module, "to_offset", count_parse)
+    for module in (frequency, v5_panels):
+        monkeypatch.setattr(module, "validate_on_grid", count_validate, raising=False)
+
+    windows = prepare_windows(panel_task, Options("v5", ".", "test"))
+    assert len(windows) == 2
+    for i, window in enumerate(windows):
+        assert len(window.items) == 2 and all(item.axis.on_grid for item in window.items)
+        result = v5_panels.window_panels(
+            window,
+            name="example",
+            horizon=panel_task.horizon,
+            known=panel_task.known_dynamic_columns,
+            past=panel_task.past_dynamic_columns,
+            max_origins=0 if i == 0 else 16,
+        )
+        assert len(result.parts) == (2 if i == 0 else 1)
+    assert validate_calls == []
+    assert parse_calls == ["D", "D"]
+
+
+@pytest.mark.parametrize(
+    ("model", "cross_series"),
+    [("chronos2", "on"), ("chronos2", "off"), ("timestral", "on"), ("simons", "on")],
+)
+def test_prepare_windows_unchanged_for_other_models(panel_task, model, cross_series):
+    options = Options(model, ".", "test", max_context=2, cross_series=cross_series)
+    # Captured by running prepare_windows at 375bd39 on this exact task.
+    # Each row pins target, past event/flag/oil/promo, and future promo.
+    expected = [
+        [
+            ([[22, 23], [2, 3]], [1, 0], [False, True], [2, 3], [20, 30], [40, np.nan]),
+            ([[31, 32], [11, 12]], [2, 1], [False, False], [11, 12], [np.nan] * 2, [np.nan] * 2),
+        ],
+        [
+            ([[24, 25], [4, 5]], [1, 2], [False, True], [4, 5], [40, np.nan], [60, np.nan]),
+            ([[33, 34], [13, 14]], [2, 1], [False, False], [13, 14], [np.nan] * 2, [150, np.nan]),
+        ],
+    ]
+    windows = prepare_windows(panel_task, options)
+    for window_index, (window, rows) in enumerate(zip(windows, expected, strict=True)):
+        assert window.ids == ["a", "b"]
+        assert window.targets == ["other", "target"]
+        groups = [
+            (item_index, indices, [target, *covariates])
+            for item_index, (targets, *covariates) in enumerate(rows)
+            for indices, target in (
+                [((0,), targets[:1]), ((1,), targets[1:])]
+                if cross_series == "off"
+                else [((0, 1), targets)]
+            )
+        ]
+        for item, (item_index, indices, row) in zip(window.items, groups, strict=True):
+            assert item.item_index == item_index
+            assert item.target_indices == indices
+            assert list(item.past) == ["event", "flag", "oil", "promo"]
+            assert list(item.future) == ["promo"]
+            arrays = [item.target, *item.past.values(), item.future["promo"]]
+            past_promo_dtype = np.float32 if (window_index or item_index) else np.int64
+            dtypes = (np.float64, np.int64, np.bool_, np.int64, past_promo_dtype, np.float32)
+            for actual, values, dtype in zip(arrays, row, dtypes, strict=True):
+                assert actual.dtype == dtype
+                np.testing.assert_array_equal(actual, values)
+            assert item.axis is None and item.static is None
+        assert window.freq is None and window.declared is None and window.class_labels is None
+        assert window.parsed_frequency is None
 
 
 def test_runner_same_fev_inputs_multitarget_audit_and_resume(scenario):
