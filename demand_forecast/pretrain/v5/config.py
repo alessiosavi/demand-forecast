@@ -87,9 +87,15 @@ class SourceConfig:
             raise ValueError("kind must be typed, corpus or upstream")
         if self.kind != "typed":
             for field in fields(self):
-                if field.name not in ("kind", "weight", "root"):
-                    if getattr(self, field.name) != field.default:
-                        raise ValueError(f"{field.name} is only valid for typed sources")
+                if field.name in ("kind", "weight", "root"):
+                    continue
+                value = getattr(self, field.name)
+                # The sampler fills missing history on any panel; the other controls
+                # act inside the typed generator and stay typed-only.
+                if field.name == "control" and value == "missing_as_zero":
+                    continue
+                if value != field.default:
+                    raise ValueError(f"{field.name} is only valid for typed sources")
         if self.root is not None and self.kind != "corpus":
             raise ValueError("root is only valid for corpus sources")
         if self.control not in (None, "shuffle", "no_dates", "missing_as_zero"):
