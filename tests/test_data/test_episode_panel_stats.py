@@ -467,3 +467,25 @@ def test_empty_panel_and_empty_cutoff_are_finite():
     assert not stats.summaries.any() and not stats.summary_flags.any()
     assert stats.members("brand", "shared").size == 0
     assert not stats.panel_row(-1, 0, 2)[1].any()
+
+
+def test_spread_at_a_large_level_keeps_small_variation():
+    # Raw moments cancel at this level (float64 ulp of 1e16 is 2); the spread must still be sqrt(2/3).
+    values, flags = category_step_stats(
+        np.array(["a"] * 4, dtype=object), 1e8 + np.arange(4), left=0, right=4
+    )
+    assert flags[-1]
+    assert values[-1, 1] == pytest.approx(np.sqrt(2 / 3), abs=1e-6)
+
+
+def test_huge_responses_stay_finite():
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        values, flags = category_step_stats(
+            np.array(["a"] * 4, dtype=object),
+            np.array([1e155, 1.1e155, 1.2e155, 1.3e155]),
+            left=0,
+            right=4,
+        )
+    assert values.dtype == np.float32 and np.isfinite(values).all()
+    np.testing.assert_array_equal(flags, [False, True, True, True])
