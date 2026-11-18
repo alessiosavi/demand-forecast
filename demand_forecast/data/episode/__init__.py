@@ -43,8 +43,20 @@ from .schema import (
     Panel,
 )
 
+# Screening imports Panel from this package, so expose the schema first.
+# isort: split
+from .builder import DROPPABLE, Episode, EpisodeBuilder, EpisodeRequest
+from .collate import EpisodeBatch, collate
+from .screening import ScreeningConfig
+
 __all__ = [
     "BANK_WINDOW",
+    "DROPPABLE",
+    "Episode",
+    "EpisodeBatch",
+    "EpisodeBuilder",
+    "EpisodeRequest",
+    "ScreeningConfig",
     "CALENDAR_FIELDS",
     "CALENDAR_SIZES",
     "CH_OBSERVED",
@@ -84,6 +96,7 @@ __all__ = [
     "Panel",
     "Scale",
     "compress",
+    "collate",
     "fit_scale",
     "flag_codes",
     "infer_kind",
