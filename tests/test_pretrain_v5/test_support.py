@@ -14,6 +14,12 @@ def api():
     return importlib.import_module("demand_forecast.pretrain.v5.support")
 
 
+def test_supported_rejects_unknown_item_with_id():
+    generated = generate_typed_panel(PanelRecipe(("calendar",), n_items=2, length=(32, 32), seed=4))
+    with pytest.raises(ValueError, match="absent-item"):
+        api().supported(generated, "calendar", "absent-item", 16, context=16, horizon=16, cutoff=16)
+
+
 @pytest.mark.parametrize("mechanism", MECHANISMS)
 def test_supported_table_against_generated_columns(mechanism):
     generated = generate_typed_panel(

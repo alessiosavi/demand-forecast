@@ -292,6 +292,64 @@ def test_fallback_checked_on_uncontrolled_panel():
     assert not plans and skips["fallback"] == 1
 
 
+def test_missing_as_zero_admission_uses_uncontrolled_record(monkeypatch):
+    p = panel(length=17, count=4)
+    complete = deepcopy(p)
+    p.items[0].targets["y0"][:16] = np.nan
+    p.items[0].targets["y0"][0] = 7.0
+    filled = deepcopy(p)
+    filled.items[0].targets["y0"][1:16] = 0.0
+    # At the only possible cutoff (16), one observation becomes {7, 0}.
+    assert np.isfinite(p.items[0].targets["y0"][:16]).sum() == 1
+    assert np.unique(filled.items[0].targets["y0"][:16]).tolist() == [0.0, 7.0]
+    generated = replace(
+        generate_typed_panel(PanelRecipe(("calendar",), n_items=4, length=(17, 17))),
+        panel=p,
+        complete=complete,
+    )
+    record = {"source": "typed", "generated": generated}
+    c = config(
+        designate_target=True,
+        origins=1,
+        cutoff_at_origin=1,
+        path_share=0.5,
+        drop=(),
+        drop_always=("panel_row",),
+    )
+    built = []
+    real_build = api().EpisodeBuilder.build
+
+    def track_build(builder, request):
+        episode = real_build(builder, request)
+        built.append((builder.panel.items[request.item_index].item_id, request))
+        return episode
+
+    monkeypatch.setattr(api().EpisodeBuilder, "build", track_build)
+    results = []
+    for control, exposed in ((None, p), ("missing_as_zero", filled)):
+        arm = replace(c, sources=(replace(c.sources[0], control=control),))
+        # The exposed control differs from the original in record["generated"].
+        _, plans, skips = api().plan_panel(
+            exposed, record, arm.sampler, arm.sources[0], np.random.default_rng(1)
+        )
+        assert skips == {"fallback": 1}
+        assert {plan.item_id for plan in plans} == {"1", "2", "3"}
+        built.clear()
+        batch, report = api().make_batch(
+            arm, 0, sources=fixed_mix(arm, FixedSource(exposed, record))
+        )
+        assert report["episodes"] == len(built) == 4
+        assert report["skips"]["fallback"] >= 1
+        assert report["paths"] == {"calendar": 2}
+        assert {item_id for item_id, _ in built[:3]} == {"1", "2", "3"}
+        assert all(item_id != "0" for item_id, _ in built)
+        results.append((plans, skips, tuple(built), batch, report))
+    true, null = results
+    assert true[:3] == null[:3]  # Kept items and requests include later panel draws.
+    assert true[4] == null[4]  # Includes skips and paths after filling the batch.
+    equal_batches(true[3], null[3])
+
+
 def test_sampled_recipes_never_keep_unsupervised():
     # Real sampled recipes, with a small item cap; batches remain tiny.
     c = replace(config(episodes_per_batch=1), sources=(SourceConfig("typed", 1, max_items=2),))

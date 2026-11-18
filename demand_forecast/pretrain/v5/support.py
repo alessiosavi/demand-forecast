@@ -88,7 +88,9 @@ def supported(
     cutoff: int,
 ) -> bool:
     """Use exposed availability and recorded truth, never inferred input kinds."""
-    item = next(item for item in generated.panel.items if item.item_id == item_id)
+    item = next((item for item in generated.panel.items if item.item_id == item_id), None)
+    if item is None:
+        raise ValueError(f"unknown item: {item_id!r}")
     if mechanism not in MECHANISMS:
         raise ValueError(f"unknown mechanism: {mechanism}")
     if mechanism in STATIC_MECHANISMS:
