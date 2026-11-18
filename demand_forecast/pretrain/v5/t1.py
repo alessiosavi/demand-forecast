@@ -57,8 +57,13 @@ def _path(sets, *, both=None, arms=None, slices=(), required=(), present="inputs
 
 
 PATHS: dict[str, dict] = {
-    name: _path(((name,),)) for name in ("static_category", "multi_label", "static_number")
+    name: _path(
+        ((name,),),
+        both={"sampler": {"cold_share": 1.0, "cold_steps": (3, 4), "episodes_per_panel": 1}},
+    )
+    for name in ("static_category", "multi_label")
 }
+PATHS["static_number"] = _path((("static_number",),))
 PATHS.update(
     {
         f"category_{effect}": _path(
@@ -79,7 +84,9 @@ PATHS.update(
     ),
     several_targets=_path(
         (("multi_target",),),
-        both={"sampler": {"designate_target": True}},
+        # Requested horizons of 1 to 4 steps: the sampler truncates a log-uniform draw, so the
+        # upper bound of the range is exclusive.
+        both={"sampler": {"designate_target": True, "horizon": (1, 5)}},
         arms={"null": {"sampler": {"drop_always": ("siblings",)}}},
         present="siblings",
     ),

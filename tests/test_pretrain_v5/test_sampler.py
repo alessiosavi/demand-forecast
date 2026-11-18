@@ -1,9 +1,12 @@
 """The batch index, rather than worker scheduling, addresses the stream."""
 
 import importlib
+import json
+from ast import literal_eval
 from copy import deepcopy
 from dataclasses import fields, replace
 from itertools import islice
+from unittest.mock import DEFAULT, Mock, call
 
 import numpy as np
 import pytest
@@ -15,9 +18,11 @@ from demand_forecast.data.episode.schema import (
     KIND_CATEGORY,
     MAX_FEATURE_ROWS,
     N_SUMMARY,
+    ROLE_PEER,
     SUMMARY_FEATURES,
 )
 from demand_forecast.data.episode.screening import screen
+from demand_forecast.pretrain.v5 import t1
 from demand_forecast.pretrain.v5.config import SourceConfig
 from demand_forecast.pretrain.v5.corpus import CorpusValueError, ShortRow
 from demand_forecast.pretrain.v5.sources import SourceMix, TypedSource
@@ -37,6 +42,171 @@ def test_batch_is_pure():
     b, rb = api().make_batch(c, 3)
     equal_batches(a, b)
     assert ra == rb and ra["episodes"] == 4 and ra["supervised"] > 0
+
+
+# Batch index 3 at 508a326. Floating arrays use the helper's tolerant summaries.
+_COLD_BASE_FINGERPRINTS = {
+    7: json.loads("""
+{
+    "x": {"dtype": "<f4", "shape": [2, 3, 4, 16, 39], "nan": 0, "sums": [1424.219102236093, 1851.7186012727907, 737.0235014183104]},
+    "patch_valid": {"sha256": "95afa6bd44943e23d7f9c329bf3d98c1ab4e44b1083308a8e47d8acd9dc699fd"},
+    "row_kind": {"sha256": "a3f6cd9e680eed19970eb58897d27402f5ea7d6b53b20da59aea24254d658f42"},
+    "row_role": {"sha256": "1e98e879abf9a2b53079f95ff74cc972355e2eb5950222aac669dd607e38c092"},
+    "row_names": {"sha256": "0a9a677a4b7caa83630d395cedef1e91f14213a2978258dfaef817a27a28dc60"},
+    "row_summary": {"dtype": "<f4", "shape": [2, 3, 28], "nan": 0, "sums": [9.012979259714484, 23.707878237590194, 3.537778970175644]},
+    "row_summary_flags": {"sha256": "1b2ceb9d965e7f68f1216406489f8e4f1336ed08585cd1dbfbf5a326851417a6"},
+    "row_score": {"dtype": "<f4", "shape": [2, 3], "nan": 0, "sums": [4.05058066546917, 4.05058066546917, 2.0355967332919436]},
+    "row_cand": {"sha256": "020c4665397abd9245b2d798424cbdf0904dbf76d2ab7e090df25da50da677fb"},
+    "forecast_rows": {"sha256": "8b2a91af6870eeaa9471a55b682f27a05cdebf042c542d42e494896353899d10"},
+    "keep": {"sha256": "6ace9e1c9c001921a3649a9e0840f93f6931745fed9495712302cf42e1bfa497"},
+    "labels": {"dtype": "<f4", "shape": [2, 1, 1, 16], "nan": 0, "sums": [0.4499250443186611, 22.014989951392636, 2.7879090781061677]},
+    "label_mask": {"sha256": "8e9562682e534552507f03538f76e2281d9011a9165ece88f8dd95ba1c72e1f9"},
+    "loc": {"dtype": "<f8", "shape": [2, 1], "nan": 0, "sums": [116.44840613513641, 116.44840613513641, 112.65383921994614]},
+    "scale": {"dtype": "<f8", "shape": [2, 1], "nan": 0, "sums": [55.51352855564641, 55.51352855564641, 54.037619391295564]},
+    "fallback": {"sha256": "fbfde07e36e7b3d3d4ddb21a47f907a0dd9450c3d1a93c6dbb4a813ffdb2e149"},
+    "known_rows": {"sha256": "63730b9ffa8f008a6a0b206d07dcf6e99f6e0d8361576906fb3a0707a5f4206c"},
+    "xh": {"dtype": "<f4", "shape": [2, 1, 0, 1, 16, 39], "nan": 0, "sums": [0.0, 0.0, 0.0]},
+    "cal_phases": {"dtype": "<f4", "shape": [2, 4, 16, 16], "nan": 0, "sums": [-449.4098955914378, 803.2651589997113, -209.9487302859343]},
+    "cal_ids": {"sha256": "280ed3db0504778b758e282b0fca6ba68fb6dd64954fa9df4b35e340138ba00e"},
+    "calh_phases": {"dtype": "<f4", "shape": [2, 1, 1, 16, 16], "nan": 0, "sums": [-73.65367571264505, 177.6252521649003, -35.182470519212075]},
+    "calh_ids": {"sha256": "38bc19a775baff77b54f98eeb25cac7a60805d22ca9b0d72318fd0ce8407f51f"},
+    "cand_names": {"sha256": "8ed2852fa2229720b58266608cef13729cad0d7ae0ee8c272c46c7940c31e4e0"},
+    "cand_kind": {"sha256": "ec61fc8472f8dd3db3098a181e9797eea7a0edc70c3ab0e7db7f316ea5e42577"},
+    "cand_summary": {"dtype": "<f4", "shape": [2, 1, 28], "nan": 0, "sums": [10.136119433678687, 42.27769184950739, 4.978625895056342]},
+    "cand_flags": {"sha256": "29bb065446799325cd5c81804c7b39ea16a43f8ab4b239391702de0114350234"},
+    "cand_score": {"dtype": "<f4", "shape": [2, 1], "nan": 0, "sums": [1.2005667686462402, 1.2005667686462402, 0.9004250764846802]},
+    "attr_stats": {"dtype": "<f4", "shape": [2, 1, 57], "nan": 0, "sums": [46.30832657311112, 78.44989898893982, 27.725162405553352]},
+    "attr_flags": {"sha256": "4c07f09597417753080b94ec18bf00031a72d67002b8722b94370b5a13868d30"},
+    "attr_cand": {"sha256": "712245c87bc23c0d392e0e77e1806d5aa012ddcd22b8d3c0459c7650df06a5fc"},
+    "attr_names": {"sha256": "6488d3eaf92ddd23b015859f69e029d713c81ccbb827fbe06dbf8e94cc1da3e1"},
+    "static_num": {"dtype": "<f4", "shape": [2, 0], "nan": 0, "sums": [0.0, 0.0, 0.0]},
+    "static_num_flags": {"sha256": "cd3d6d5bbd792b75d8a0b8e9ee7d8cc98612f58af73b5273e4f87997f937ef1a"},
+    "static_num_cand": {"sha256": "07391ee9c6db75d1dd0916911fdf30a76a813f3f9f318d3f12c67b0536a7040e"},
+    "freq_class": {"sha256": "aea8703e8437caebcb69bca5317b6b1299e25364a9bcb61197e78b9e6b0e1973"},
+    "horizon": {"sha256": "edfaf6e16a71913b1a3dbaf89fcadcf7bf9a74f80c7c6273096dc5945a775ede"},
+    "origin_patches": {"sha256": "9a7ec8661b2678a2837580c207c72f657ed7acd818f7f7dbcb3bac143722a43c"},
+    "context_target": {"sha256": "290f3752350d63f6c3714b5d8ac6699e3492b24a757f9a3ab0339c0b06be6539"},
+    "row_mask": {"sha256": "3f47a31804c39fc49c1c9efe7445e91beece44cd3e3b9e922dcf6c47294bb89d"},
+    "forecast_mask": {"sha256": "640c6a26af7b94ebbe74627c779c3dd0342f216664f04852123ca1890a140ffe"},
+    "known_mask": {"sha256": "ada5dbbd63796b07d679cece7a752730263e8a833a343c8ad5779546613a8395"},
+    "cand_mask": {"sha256": "7431b585079924604b9100409e15bda1e4fb04927cb9b4959273e9383a8b27c6"},
+    "attr_mask": {"sha256": "9f456d02994ace0c383c295ae9f3f0bfb379df56aa30b8e5ad935a163a526fe7"},
+    "static_num_mask": {"sha256": "67d5149cf6f7003d83efeb558ad39b8f5d0e2a6351d573e78c8ea562d497d80b"},
+    "origin_mask": {"sha256": "bbe08fe912f325e568aadccdbf6a0dff8e7586044c40fcb3847dacac1827e924"},
+    "horizon_mask": {"sha256": "8ae6ee72f134a2600033a027ab1aef5fea56e49159c3da8f2c856164b440cb53"}
+}
+"""),
+    12: json.loads("""
+{
+    "x": {"dtype": "<f4", "shape": [2, 3, 4, 16, 39], "nan": 0, "sums": [1666.9372142059729, 2200.4786044349894, 814.1164096445025]},
+    "patch_valid": {"sha256": "b866507832ea435e5af944b1ea40fb0c91bc82b0d457155c3e2094fbcfffd666"},
+    "row_kind": {"sha256": "a3f6cd9e680eed19970eb58897d27402f5ea7d6b53b20da59aea24254d658f42"},
+    "row_role": {"sha256": "1e98e879abf9a2b53079f95ff74cc972355e2eb5950222aac669dd607e38c092"},
+    "row_names": {"sha256": "bdef2bea9cfe148e65178995089ec6385e09107b8f2681bf2ebdf06a03de25c2"},
+    "row_summary": {"dtype": "<f4", "shape": [2, 3, 28], "nan": 0, "sums": [16.21811730414629, 35.94975741952658, 4.912792791612446]},
+    "row_summary_flags": {"sha256": "1b2ceb9d965e7f68f1216406489f8e4f1336ed08585cd1dbfbf5a326851417a6"},
+    "row_score": {"dtype": "<f4", "shape": [2, 3], "nan": 0, "sums": [4.571596175432205, 4.571596175432205, 2.4694478611151376]},
+    "row_cand": {"sha256": "020c4665397abd9245b2d798424cbdf0904dbf76d2ab7e090df25da50da677fb"},
+    "forecast_rows": {"sha256": "8b2a91af6870eeaa9471a55b682f27a05cdebf042c542d42e494896353899d10"},
+    "keep": {"sha256": "6ace9e1c9c001921a3649a9e0840f93f6931745fed9495712302cf42e1bfa497"},
+    "labels": {"dtype": "<f4", "shape": [2, 1, 1, 16], "nan": 0, "sums": [4.586226940155029, 7.704958438873291, 0.6213695351034403]},
+    "label_mask": {"sha256": "09b726b5195cfc4de7cb62c6bc6e4beac27b59bddf5cb7ac50ee2b445404d518"},
+    "loc": {"dtype": "<f8", "shape": [2, 1], "nan": 0, "sums": [4.2911928079199, 4.2911928079199, 2.7144746558567983]},
+    "scale": {"dtype": "<f8", "shape": [2, 1], "nan": 0, "sums": [1.3983661187396565, 1.3983661187396565, 0.8223754054451353]},
+    "fallback": {"sha256": "fbfde07e36e7b3d3d4ddb21a47f907a0dd9450c3d1a93c6dbb4a813ffdb2e149"},
+    "known_rows": {"sha256": "63730b9ffa8f008a6a0b206d07dcf6e99f6e0d8361576906fb3a0707a5f4206c"},
+    "xh": {"dtype": "<f4", "shape": [2, 1, 0, 1, 16, 39], "nan": 0, "sums": [0.0, 0.0, 0.0]},
+    "cal_phases": {"dtype": "<f4", "shape": [2, 4, 16, 16], "nan": 0, "sums": [-149.68964175134897, 810.2480550762266, -109.44892658174649]},
+    "cal_ids": {"sha256": "8b3c3580a86c7cdd1dddec4f721e7692867edaedd05db1f53f703552eff4330a"},
+    "calh_phases": {"dtype": "<f4", "shape": [2, 1, 1, 16, 16], "nan": 0, "sums": [30.36466570198536, 152.4492011219263, 11.320530368349864]},
+    "calh_ids": {"sha256": "f75c6d2bf08e62be40b02cbd3cadb991ac0086b8a016da870a71ddb6269e3b6c"},
+    "cand_names": {"sha256": "780550f099540085b8bb39fb65cc8aed2c1a465358e464c6e0f9989e53152ca6"},
+    "cand_kind": {"sha256": "ec61fc8472f8dd3db3098a181e9797eea7a0edc70c3ab0e7db7f316ea5e42577"},
+    "cand_summary": {"dtype": "<f4", "shape": [2, 1, 28], "nan": 0, "sums": [11.930494380998425, 39.564147200551815, 5.737912122133172]},
+    "cand_flags": {"sha256": "29bb065446799325cd5c81804c7b39ea16a43f8ab4b239391702de0114350234"},
+    "cand_score": {"dtype": "<f4", "shape": [2, 1], "nan": 0, "sums": [1.2369352579116821, 1.2369352579116821, 0.9616312682628632]},
+    "attr_stats": {"dtype": "<f4", "shape": [2, 1, 57], "nan": 0, "sums": [50.981629058602266, 78.61528187815566, 31.167058409606273]},
+    "attr_flags": {"sha256": "4c07f09597417753080b94ec18bf00031a72d67002b8722b94370b5a13868d30"},
+    "attr_cand": {"sha256": "712245c87bc23c0d392e0e77e1806d5aa012ddcd22b8d3c0459c7650df06a5fc"},
+    "attr_names": {"sha256": "a9e78d1666d7d261b718f05aeb80e358c55046a175d1ad692091812d6c2b05a6"},
+    "static_num": {"dtype": "<f4", "shape": [2, 0], "nan": 0, "sums": [0.0, 0.0, 0.0]},
+    "static_num_flags": {"sha256": "cd3d6d5bbd792b75d8a0b8e9ee7d8cc98612f58af73b5273e4f87997f937ef1a"},
+    "static_num_cand": {"sha256": "07391ee9c6db75d1dd0916911fdf30a76a813f3f9f318d3f12c67b0536a7040e"},
+    "freq_class": {"sha256": "aea8703e8437caebcb69bca5317b6b1299e25364a9bcb61197e78b9e6b0e1973"},
+    "horizon": {"sha256": "e64e717b6c0edb728487a86d75e53ebb310e2e6dbf6e7bd2f802f7eb94741db9"},
+    "origin_patches": {"sha256": "9a7ec8661b2678a2837580c207c72f657ed7acd818f7f7dbcb3bac143722a43c"},
+    "context_target": {"sha256": "290f3752350d63f6c3714b5d8ac6699e3492b24a757f9a3ab0339c0b06be6539"},
+    "row_mask": {"sha256": "3f47a31804c39fc49c1c9efe7445e91beece44cd3e3b9e922dcf6c47294bb89d"},
+    "forecast_mask": {"sha256": "640c6a26af7b94ebbe74627c779c3dd0342f216664f04852123ca1890a140ffe"},
+    "known_mask": {"sha256": "ada5dbbd63796b07d679cece7a752730263e8a833a343c8ad5779546613a8395"},
+    "cand_mask": {"sha256": "7431b585079924604b9100409e15bda1e4fb04927cb9b4959273e9383a8b27c6"},
+    "attr_mask": {"sha256": "9f456d02994ace0c383c295ae9f3f0bfb379df56aa30b8e5ad935a163a526fe7"},
+    "static_num_mask": {"sha256": "67d5149cf6f7003d83efeb558ad39b8f5d0e2a6351d573e78c8ea562d497d80b"},
+    "origin_mask": {"sha256": "bbe08fe912f325e568aadccdbf6a0dff8e7586044c40fcb3847dacac1827e924"},
+    "horizon_mask": {"sha256": "8ae6ee72f134a2600033a027ab1aef5fea56e49159c3da8f2c856164b440cb53"}
+}
+"""),
+    31: json.loads("""
+{
+    "x": {"dtype": "<f4", "shape": [2, 3, 4, 16, 39], "nan": 0, "sums": [1837.2535877772607, 2680.1371777676977, 929.4237397062727]},
+    "patch_valid": {"sha256": "b866507832ea435e5af944b1ea40fb0c91bc82b0d457155c3e2094fbcfffd666"},
+    "row_kind": {"sha256": "a3f6cd9e680eed19970eb58897d27402f5ea7d6b53b20da59aea24254d658f42"},
+    "row_role": {"sha256": "1e98e879abf9a2b53079f95ff74cc972355e2eb5950222aac669dd607e38c092"},
+    "row_names": {"sha256": "103f7c708246f45788f97f27152ff1bbd3ffb39da8f3991306cf78f3c7cdf2d0"},
+    "row_summary": {"dtype": "<f4", "shape": [2, 3, 28], "nan": 0, "sums": [12.088519237426226, 38.82740180888504, 5.6667011196127755]},
+    "row_summary_flags": {"sha256": "1b2ceb9d965e7f68f1216406489f8e4f1336ed08585cd1dbfbf5a326851417a6"},
+    "row_score": {"dtype": "<f4", "shape": [2, 3], "nan": 0, "sums": [4.087208420038223, 4.087208420038223, 2.147775575518608]},
+    "row_cand": {"sha256": "020c4665397abd9245b2d798424cbdf0904dbf76d2ab7e090df25da50da677fb"},
+    "forecast_rows": {"sha256": "8b2a91af6870eeaa9471a55b682f27a05cdebf042c542d42e494896353899d10"},
+    "keep": {"sha256": "6ace9e1c9c001921a3649a9e0840f93f6931745fed9495712302cf42e1bfa497"},
+    "labels": {"dtype": "<f4", "shape": [2, 1, 1, 16], "nan": 0, "sums": [-0.30631808936595917, 32.34649269282818, -0.8994014305062592]},
+    "label_mask": {"sha256": "8086fc4ccc0b40324a7d64c71ef7dea5facd2e1b52b8b2f5df5be89dabaa1088"},
+    "loc": {"dtype": "<f8", "shape": [2, 1], "nan": 0, "sums": [993.4993192740998, 993.4993192740998, 991.5426981747759]},
+    "scale": {"dtype": "<f8", "shape": [2, 1], "nan": 0, "sums": [106.66481790810698, 106.66481790810698, 106.37799228662256]},
+    "fallback": {"sha256": "fbfde07e36e7b3d3d4ddb21a47f907a0dd9450c3d1a93c6dbb4a813ffdb2e149"},
+    "known_rows": {"sha256": "63730b9ffa8f008a6a0b206d07dcf6e99f6e0d8361576906fb3a0707a5f4206c"},
+    "xh": {"dtype": "<f4", "shape": [2, 1, 0, 1, 16, 39], "nan": 0, "sums": [0.0, 0.0, 0.0]},
+    "cal_phases": {"dtype": "<f4", "shape": [2, 4, 16, 16], "nan": 0, "sums": [-357.0515031889081, 821.2261561807245, -199.9245217142161]},
+    "cal_ids": {"sha256": "521caa502f5fab76ef865aa4372a8bed66e016637fa0705c74667be7d6b9d875"},
+    "calh_phases": {"dtype": "<f4", "shape": [2, 1, 1, 16, 16], "nan": 0, "sums": [-30.77334886044264, 146.0799094364047, -21.814883736136835]},
+    "calh_ids": {"sha256": "938cf4a3ba1acbde1d1d85ae2759d12b44b482b2dcfae833d0f159c906b21bf7"},
+    "cand_names": {"sha256": "d2957d00eb7ecad632fc659b55c2b83b7b4d99e2eed429e56d18be54147b0c9f"},
+    "cand_kind": {"sha256": "ec61fc8472f8dd3db3098a181e9797eea7a0edc70c3ab0e7db7f316ea5e42577"},
+    "cand_summary": {"dtype": "<f4", "shape": [2, 1, 28], "nan": 0, "sums": [14.800240138079971, 64.71682283794507, 5.684248237571281]},
+    "cand_flags": {"sha256": "29bb065446799325cd5c81804c7b39ea16a43f8ab4b239391702de0114350234"},
+    "cand_score": {"dtype": "<f4", "shape": [2, 1], "nan": 0, "sums": [1.3472567200660706, 1.3472567200660706, 0.9285810589790344]},
+    "attr_stats": {"dtype": "<f4", "shape": [2, 1, 57], "nan": 0, "sums": [62.21064047096297, 112.12722317082807, 34.75149635248409]},
+    "attr_flags": {"sha256": "4c07f09597417753080b94ec18bf00031a72d67002b8722b94370b5a13868d30"},
+    "attr_cand": {"sha256": "712245c87bc23c0d392e0e77e1806d5aa012ddcd22b8d3c0459c7650df06a5fc"},
+    "attr_names": {"sha256": "1484d0b8ce5757268c093fa12f29359a4c1fb71ca8614ccff08abbc5f5a05581"},
+    "static_num": {"dtype": "<f4", "shape": [2, 0], "nan": 0, "sums": [0.0, 0.0, 0.0]},
+    "static_num_flags": {"sha256": "cd3d6d5bbd792b75d8a0b8e9ee7d8cc98612f58af73b5273e4f87997f937ef1a"},
+    "static_num_cand": {"sha256": "07391ee9c6db75d1dd0916911fdf30a76a813f3f9f318d3f12c67b0536a7040e"},
+    "freq_class": {"sha256": "aea8703e8437caebcb69bca5317b6b1299e25364a9bcb61197e78b9e6b0e1973"},
+    "horizon": {"sha256": "52c9d465baa469dea824e26440d3da1ce0c2bde528df3358ef5039c0ec22498a"},
+    "origin_patches": {"sha256": "9a7ec8661b2678a2837580c207c72f657ed7acd818f7f7dbcb3bac143722a43c"},
+    "context_target": {"sha256": "290f3752350d63f6c3714b5d8ac6699e3492b24a757f9a3ab0339c0b06be6539"},
+    "row_mask": {"sha256": "3f47a31804c39fc49c1c9efe7445e91beece44cd3e3b9e922dcf6c47294bb89d"},
+    "forecast_mask": {"sha256": "640c6a26af7b94ebbe74627c779c3dd0342f216664f04852123ca1890a140ffe"},
+    "known_mask": {"sha256": "ada5dbbd63796b07d679cece7a752730263e8a833a343c8ad5779546613a8395"},
+    "cand_mask": {"sha256": "7431b585079924604b9100409e15bda1e4fb04927cb9b4959273e9383a8b27c6"},
+    "attr_mask": {"sha256": "9f456d02994ace0c383c295ae9f3f0bfb379df56aa30b8e5ad935a163a526fe7"},
+    "static_num_mask": {"sha256": "67d5149cf6f7003d83efeb558ad39b8f5d0e2a6351d573e78c8ea562d497d80b"},
+    "origin_mask": {"sha256": "bbe08fe912f325e568aadccdbf6a0dff8e7586044c40fcb3847dacac1827e924"},
+    "horizon_mask": {"sha256": "8ae6ee72f134a2600033a027ab1aef5fea56e49159c3da8f2c856164b440cb53"}
+}
+"""),
+}
+
+_COLD_BASE_REPORT = {
+    "episodes": 2,
+    "supervised": 19,
+    "cells": 416,
+    "skips": {},
+    "sources": {"typed": 2},
+    "paths": {"static_category": 2},
+    "paths_without_candidate": {},
+}
 
 
 # Captured from the default batch after verifying the original byte pin.
@@ -879,6 +1049,278 @@ def test_loader_resume_workers_and_default_torch_generator(workers, monkeypatch)
         assert k == j and ra == rb
         equal_batches(a, b)
     assert torch.equal(initial, torch.get_rng_state())
+
+
+def static_batch_config(**sampler):
+    defaults = dict(
+        episodes_per_batch=2, episodes_per_panel=2, designate_target=True, path_share=1, drop=()
+    )
+    c = config(**(defaults | sampler))
+    source = replace(c.sources[0], recipes=(("static_category",),), max_items=24, length=(128, 160))
+    return replace(c, sources=(source,), seed=7)
+
+
+@pytest.mark.parametrize("seed", [7, 12, 31])
+def test_defaults_reproduce_the_base_batches(seed):
+    batch, _ = api().make_batch(replace(static_batch_config(), seed=seed), 3)
+    assert_fingerprint(batch, _COLD_BASE_FINGERPRINTS[seed])
+
+
+@pytest.fixture
+def cold_panel():
+    generated = generate_typed_panel(PanelRecipe(("static_category",), n_items=4, seed=8))
+    attribute = generated.inputs_of("static_category")[0].name
+    items = []
+    for i, (start, length, label) in enumerate(
+        [(32, 32, "a"), (32, 32, "b"), (0, 96, "a"), (0, 96, "b")]
+    ):
+        values = np.arange(length, dtype=np.float64) + i
+        items.append(
+            Item(str(i), start, {"y0": values}, {"past": values.copy()}, {attribute: label})
+        )
+    p = Panel("cold", tuple(items), {"past": "past"}, None, None, True)
+    return {
+        "source": "typed",
+        "generated": replace(generated, panel=p, complete=p, short_items=("0", "1")),
+    }
+
+
+def scripted_cold_rng(indices=(0,), steps=(3,), coins=(0.2,)):
+    rng = Mock(wraps=np.random.default_rng(11))
+    rng.choice.side_effect = [64, "static_category", *indices, "y0"]
+    rng.integers.side_effect = [50 + i for i in range(len(indices))]
+    rng.attach_mock(Mock(), "cold")
+    rng.spawn.return_value = [rng.cold]
+    rng.cold.random.side_effect = coins
+    rng.cold.integers.side_effect = steps
+    return rng
+
+
+def plan_cold(record, rng, **sampler):
+    c = static_batch_config(**({"cold_share": 1.0, "episodes_per_panel": 1} | sampler))
+    return api().plan_panel(record["generated"].panel, record, c.sampler, c.sources[0], rng)
+
+
+def test_cold_lead_frame(cold_panel):
+    rng = scripted_cold_rng(steps=(4,))
+    p, (plan,), counts = plan_cold(cold_panel, rng)
+    request = plan.request
+    item = p.items[request.item_index]
+    assert plan.cold and plan.mechanism == "static_category"
+    assert request.origins == (item.start + 4,) and request.cutoff == request.origins[0]
+    values = item.targets[request.target]
+    assert np.isfinite(values[:4]).any() and np.isfinite(values[4 : 4 + request.horizon]).any()
+    episode = EpisodeBuilder(p).build(request)
+    assert episode.label_mask.any()
+    (attribute,) = item.static
+    assert any(
+        role == ROLE_PEER and name == f"{attribute}={item.static[attribute]}"
+        for name, role in zip(episode.row_names, episode.row_role, strict=True)
+    )
+    assert np.isfinite(episode.loc).all()
+    assert (np.isfinite(episode.scale) & (episode.scale > 0)).all()
+    assert counts.get("fallback", 0) == 0
+    rng.spawn.assert_called_once_with(1)
+    rng.cold.random.assert_called_once_with()
+    rng.cold.integers.assert_called_once_with(3, 5)
+
+
+@pytest.mark.parametrize("constant", [False, True])
+def test_cold_lead_with_a_missing_step(cold_panel, constant):
+    values = cold_panel["generated"].panel.items[0].targets["y0"]
+    values[:3] = [np.nan, 4, 4 if constant else 7]
+    _, plans, counts = plan_cold(cold_panel, scripted_cold_rng())
+    assert counts["cold_attempted"] == 1 and counts["cold_planned"] == int(not constant)
+    assert counts.get("fallback", 0) == int(constant)
+    if constant:
+        assert not plans
+    else:
+        (plan,) = plans
+        assert plan.cold and plan.request.origins == (35,)
+
+
+def test_cold_does_not_move_the_other_episodes(cold_panel, monkeypatch):
+    support_calls = Mock(wraps=api().supported)
+    monkeypatch.setattr(api(), "supported", support_calls)
+    results = []
+    for share in (0.0, 1.0):
+        rng = np.random.default_rng(19)
+        recorded = Mock(wraps=rng)
+        anchors = []
+
+        def record_anchor(low, high):
+            anchor = rng.integers(low, high)
+            anchors.append(anchor)
+            return anchor
+
+        recorded.integers.side_effect = record_anchor
+        support_calls.reset_mock()
+        _, plans, _ = plan_cold(
+            cold_panel,
+            recorded,
+            cold_share=share,
+            episodes_per_panel=4,
+            episodes_per_batch=4,
+            path_share=0.5,
+            drop=(("peers", 0.5), ("zeros", 0.5)),
+        )
+        (anchor,) = anchors  # Each run accepted its first choose.
+        assert support_calls.call_args_list[0].args[2] == plans[0].item_id
+        results.append((plans, anchor, rng.bit_generator.state))
+    (ordinary, ordinary_anchor, ordinary_state), (cold, cold_anchor, cold_state) = results
+    assert ordinary[0].item_id == cold[0].item_id
+    assert ordinary_anchor == cold_anchor == ordinary[0].request.origins[-1]
+    assert not ordinary[0].cold and cold[0].cold
+    assert len(ordinary) == len(cold) == 4 and ordinary[1:] == cold[1:]
+    assert ordinary_state == cold_state
+
+
+@pytest.mark.parametrize("rejection", [None, "fallback", "no_labels"])
+def test_cold_retry_and_rejection(cold_panel, monkeypatch, rejection):
+    values = cold_panel["generated"].panel.items[1].targets["y0"]
+    if rejection == "fallback":
+        values[:4] = 1
+    elif rejection == "no_labels":
+        values[4:] = np.nan
+    support = Mock(wraps=api().supported, side_effect=[False, DEFAULT])
+    monkeypatch.setattr(api(), "supported", support)
+    rng = scripted_cold_rng(indices=(0, 1), steps=(3, 4), coins=(0.6, 0.7))
+    _, plans, counts = plan_cold(cold_panel, rng)
+    assert support.call_count == 2
+    assert [(c.args[2:4], c.kwargs["cutoff"]) for c in support.call_args_list] == [
+        (("0", 35), 35),
+        (("1", 36), 36),
+    ]
+    assert rng.mock_calls[5:14] == [
+        call.spawn(1),
+        call.choice([0, 1]),
+        call.integers(48, 64),
+        call.cold.random(),
+        call.cold.integers(3, 5),
+        call.choice([0, 1]),
+        call.integers(48, 64),
+        call.cold.random(),
+        call.cold.integers(3, 5),
+    ]
+    assert counts["cold_attempted"] == 2 and counts["cold_planned"] == int(rejection is None)
+    if rejection:
+        assert not plans and counts[rejection] == 1
+    else:
+        (plan,) = plans
+        assert plan.cold and plan.request.origins == (36,)
+
+
+def test_cold_counts_are_reported_apart_from_skips():
+    c = static_batch_config()
+    _, default = api().make_batch(c, 3)
+    assert default == _COLD_BASE_REPORT
+    assert "cold" not in default
+    cold = replace(c, sampler=replace(c.sampler, cold_share=1.0))
+    _, report = api().make_batch(cold, 3)
+    assert set(report["cold"]) == {"attempted", "planned"}
+    assert report["cold"]["attempted"] >= report["cold"]["planned"] > 0
+    assert report["skips"].keys().isdisjoint({"cold_attempted", "cold_planned"})
+
+
+def test_empty_cold_batch_reports_counts_apart_from_skips():
+    c = static_batch_config(cold_share=1.0, episodes_per_batch=1, episodes_per_panel=1, max_cells=1)
+    with pytest.raises(RuntimeError, match="no episodes after panel limit") as error:
+        api().make_batch(c, 3)
+    message = str(error.value)
+    skips_text, cold_marker, cold_text = message.split("skips=", 1)[1].partition("; cold=")
+    skips = literal_eval(skips_text)
+    assert skips.keys().isdisjoint({"cold_attempted", "cold_planned"})
+    assert skips["oversized"] > 0
+    assert cold_marker, message
+    cold = literal_eval(cold_text)
+    assert cold["attempted"] >= cold["planned"] > 0
+
+
+def test_cold_share_refuses_missing_as_zero_source_mix_override():
+    c = static_batch_config(cold_share=1.0, origins=1)
+    sources = SourceMix((replace(c.sources[0], control="missing_as_zero"),))
+    with pytest.raises(RuntimeError, match=r"missing_as_zero.*cold_share"):
+        api().make_batch(c, 3, sources=sources)
+
+
+@pytest.mark.parametrize(
+    "mechanism", ["known_driver", "event_response", "label_lag", "static_number"]
+)
+def test_cold_applies_to_two_mechanisms_only(mechanism):
+    c = static_batch_config(path_share=0.5)
+    source = replace(c.sources[0], recipes=((mechanism,),))
+    p, record = TypedSource(source).panel(np.random.default_rng(2))
+    default_rng, cold_rng = (Mock(wraps=np.random.default_rng(5)) for _ in range(2))
+    _, ordinary, _ = api().plan_panel(p, record, c.sampler, source, default_rng)
+    _, cold, counts = api().plan_panel(
+        p, record, replace(c.sampler, cold_share=1.0), source, cold_rng
+    )
+    assert ordinary and cold == ordinary and not any(plan.cold for plan in cold)
+    assert counts["cold_attempted"] == counts["cold_planned"] == 0
+    default_rng.spawn.assert_not_called()
+    cold_rng.spawn.assert_not_called()
+    assert default_rng.mock_calls == cold_rng.mock_calls
+
+
+def test_no_value_at_or_after_the_origin_reaches_a_cold_episode(cold_panel):
+    p, (plan,), _ = plan_cold(cold_panel, scripted_cold_rng())
+    request = plan.request
+    original = EpisodeBuilder(p).build(request)
+    changed = deepcopy(p)
+    for i, item in enumerate(changed.items):
+        if i != request.item_index:
+            offset = max(0, request.origins[0] - item.start)
+            for values in (*item.targets.values(), *item.dynamic.values()):
+                assert values[offset:].size > 0
+                values[offset:] = -9999
+    rebuilt = EpisodeBuilder(changed).build(request)
+    assert plan.cold and (original.row_role == ROLE_PEER).any()
+    for field in fields(original):
+        np.testing.assert_equal(
+            getattr(rebuilt, field.name), getattr(original, field.name), field.name
+        )
+
+
+@pytest.mark.parametrize("path", ["static_category", "multi_label"])
+def test_true_and_shuffled_builds_of_a_cold_entry(path):
+    (entry,) = t1.eval_set(path, episodes=1, max_panels=80)
+    generated = generate_typed_panel(PanelRecipe(**entry["recipe"]))
+    item = next(item for item in generated.panel.items if item.item_id == entry["item_id"])
+    assert entry["origin"] - item.start in (3, 4) and entry["origin"] == entry["cutoff"]
+    true, null = (
+        t1._build(generated, entry, t1.t1_config(path, arm, seed=7)) for arm in ("true", "null")
+    )
+    assert true.context_target == null.context_target == entry["target"]
+    for field in ("origin_patches", "labels", "label_mask", "loc", "scale"):
+        np.testing.assert_array_equal(getattr(true, field), getattr(null, field), err_msg=field)
+    assert (
+        not np.array_equal(true.x[true.row_role == ROLE_PEER], null.x[null.row_role == ROLE_PEER])
+        or true.attr_names != null.attr_names
+        or not np.array_equal(true.attr_stats, null.attr_stats)
+    )
+
+
+def test_cold_batches_are_equal_for_workers():
+    c = static_batch_config(cold_share=1.0)
+    serial, parallel = (list(islice(api().loader(replace(c, workers=n), 3), 4)) for n in (0, 2))
+    for (k, batch, report), (j, other_batch, other_report) in zip(serial, parallel, strict=True):
+        assert k == j and report == other_report and report["cold"]["planned"] > 0
+        equal_batches(batch, other_batch)
+
+
+@pytest.mark.parametrize("path", ["static_category", "multi_label"])
+@pytest.mark.parametrize("arm", ["true", "null"])
+def test_static_path_batches_are_full(path, arm, monkeypatch):
+    c = t1.t1_config(path, arm, seed=7)
+    draw = Mock(wraps=api()._draw)
+    monkeypatch.setattr(api(), "_draw", draw)
+    for k in (0, 1, 2):
+        draw.reset_mock()
+        batch, report = api().make_batch(c, k)
+        assert batch.x.shape[0] == report["episodes"] == c.sampler.episodes_per_batch
+        assert c.sampler.episodes_per_batch <= draw.call_count <= 4 * c.sampler.episodes_per_batch
+        assert 0 < report["paths"][path] <= report["cold"]["planned"] <= report["cold"]["attempted"]
+        print(f"{path}/{arm} batch {k}: {draw.call_count} panels, cold={report['cold']}")
 
 
 def test_requests_share_patch_anchor_and_fit_context():
