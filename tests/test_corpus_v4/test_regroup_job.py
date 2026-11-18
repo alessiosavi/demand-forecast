@@ -91,9 +91,35 @@ elif name == 'gcloud':
         print(json.dumps(rows[1:]))
     elif verb == 'hash':
         assert options[:2] == ['--skip-md5', '--format=json'], options
-        print(json.dumps([dict(url=p, digest_format='base64',
-                               crc32c_hash=crc32c(pathlib.Path(p).read_bytes()))
-                          for p in options[2:]]))
+        framing = os.environ.get('FAKE_HASH_FRAMING', 'array-of-paths')
+        paths = [pathlib.Path(p) for p in options[2:]]
+        rows = [dict(url=str(path), digest_format='base64',
+                     crc32c_hash=crc32c(path.read_bytes())) for path in paths]
+        if framing == 'concatenated-objects':
+            for index, (row, path) in enumerate(zip(rows, paths)):
+                row['url'] = path.as_uri()
+                if index % 2:
+                    row['url'] = row['url'].replace('file://', 'file://localhost', 1)
+        if fault == 'hash-unrequested':
+            rows.append(dict(rows[0], url=str(paths[0].with_name('unrequested.bin'))))
+        elif fault == 'hash-duplicate':
+            rows.append(dict(rows[0], url=paths[0].as_uri()))
+        elif fault == 'hash-missing':
+            rows.pop()
+        elif fault == 'hash-format':
+            rows[0]['digest_format'] = 'hex'
+        elif fault == 'hash-empty-crc':
+            rows[0]['crc32c_hash'] = ''
+        elif fault == 'hash-remote-host':
+            rows[0]['url'] = paths[0].as_uri().replace('file://', 'file://remote', 1)
+        if framing == 'array-of-paths':
+            print(json.dumps(rows))
+        elif framing == 'concatenated-objects':
+            print(''.join(map(json.dumps, rows)))
+        else:
+            assert framing == 'concatenated-arrays', framing
+            print(json.dumps(rows[:1]))
+            print(json.dumps(rows[1:]))
     elif verb == 'rsync':
         assert options[0] == '--recursive', options
         src, dst = local(options[-2]), pathlib.Path(options[-1])
@@ -278,7 +304,13 @@ def test_cli_embeds_yaml_and_has_portable_shell(tmp_path):
         assert result.returncode == 0, result.stderr
 
 
-def test_publication_order_identity_digest_groups_and_noop(machine, monkeypatch):
+@pytest.mark.parametrize(
+    "framing", ["array-of-paths", "concatenated-objects", "concatenated-arrays"]
+)
+def test_publication_order_identity_digest_groups_and_noop(machine, monkeypatch, framing):
+    machine["env"].update(
+        FAKE_HASH_FRAMING=framing, RUN_DIR=str(machine["work"] / "run with spaces %#")
+    )
     config = machine["work"] / "config.yaml"
     config.write_text(yaml.safe_dump(dict(parent="corpus-v4.1", **SMALL)))
     monkeypatch.setattr(jobs, "CONFIG_PATH", config)
@@ -332,6 +364,24 @@ def test_publication_order_identity_digest_groups_and_noop(machine, monkeypatch)
     assert retry.returncode == 0, retry.stderr
     assert writes(machine) == []
     assert not any(c[0] == "git" or c[:3] == ["gcloud", "storage", "rsync"] for c in calls(machine))
+
+
+@pytest.mark.parametrize(
+    ("fault", "message"),
+    [
+        ("hash-unrequested", "local CRC32C listing does not match requested files"),
+        ("hash-duplicate", "invalid local CRC32C"),
+        ("hash-missing", "local CRC32C listing does not match requested files"),
+        ("hash-format", "invalid local CRC32C"),
+        ("hash-empty-crc", "invalid local CRC32C"),
+        ("hash-remote-host", "non-local file URL"),
+    ],
+)
+def test_invalid_local_hashes_publish_nothing(machine, fault, message):
+    result = invoke(machine, fault, FAKE_HASH_FRAMING="array-of-paths")
+    assert result.returncode != 0
+    assert message in result.stderr
+    assert writes(machine) == []
 
 
 @pytest.mark.parametrize(

@@ -27,6 +27,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path, PurePosixPath
+from urllib.parse import unquote, urlsplit
 
 TREES = ("univariate", "covariates")
 ATTRIBUTION = {"LICENSE.md", "articles.csv"}
@@ -156,6 +157,15 @@ def local_files(root):
     return files
 
 
+def hash_rows(text):
+    decoder = json.JSONDecoder()
+    remaining = text.strip()
+    while remaining:
+        frame, end = decoder.raw_decode(remaining)
+        yield from frame if isinstance(frame, list) else (frame,)
+        remaining = remaining[end:].lstrip()
+
+
 def local_fingerprints(root, files):
     objects = {}
     for start in range(0, len(files), 128):
@@ -164,8 +174,14 @@ def local_fingerprints(root, files):
             ["gcloud", "storage", "hash", "--skip-md5", "--format=json", *map(str, paths)], text=True,
         )
         hashes = {}
-        for row in json.loads(result):
-            path, crc = Path(row["url"]), row["crc32c_hash"]
+        for row in hash_rows(result):
+            url = row["url"]
+            if url[:7].lower() == "file://":
+                uri = urlsplit(url)
+                if uri.netloc.lower() not in ("", "localhost"):
+                    raise ValueError(f"non-local file URL in local CRC32C listing: {url}")
+                url = unquote(uri.path)
+            path, crc = Path(url), row["crc32c_hash"]
             if path in hashes or row["digest_format"] != "base64" or not crc:
                 raise ValueError(f"invalid local CRC32C: {path}")
             hashes[path] = crc
