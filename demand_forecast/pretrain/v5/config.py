@@ -13,7 +13,7 @@ from pathlib import Path
 import yaml
 
 from demand_forecast.data.episode.builder import DROPPABLE
-from demand_forecast.data.episode.schema import SUMMARY_FEATURES
+from demand_forecast.data.episode.schema import MAX_CONTEXT, MAX_HORIZON, PATCH, SUMMARY_FEATURES
 from demand_forecast.models.v5.config import V5Config
 
 
@@ -47,10 +47,12 @@ def _normalize(record, name: str, **bounds) -> None:
     object.__setattr__(record, name, _numeric(getattr(record, name), name, **bounds))
 
 
-def _range(value, name: str, *, maximum=None) -> tuple[int, int]:
+def _range(value, name: str, *, minimum=1, maximum=None) -> tuple[int, int]:
     if not isinstance(value, (tuple, list)) or len(value) != 2:
         raise ValueError(f"{name} requires two ordered bounds")
-    lower, upper = (_numeric(v, name, integer=True, minimum=1, maximum=maximum) for v in value)
+    lower, upper = (
+        _numeric(v, name, integer=True, minimum=minimum, maximum=maximum) for v in value
+    )
     if lower > upper:
         raise ValueError(f"{name} requires ordered bounds")
     return lower, upper
@@ -64,7 +66,7 @@ class SourceConfig:
     heldout: bool = False
     recipes: tuple[tuple[str, ...], ...] = ()
     freq: str | None = None
-    length: tuple[int, int] = (64, 2048)
+    length: tuple[int, int] = (64, MAX_CONTEXT)
     max_items: int = 48
     n_nuisance: int = 0
     nuisance_from: tuple[str, ...] | None = None
@@ -80,9 +82,22 @@ class SourceConfig:
             raise ValueError("weight must be positive")
         _normalize(self, "max_items", integer=True, minimum=1)
         _normalize(self, "n_nuisance", integer=True, minimum=0)
-        object.__setattr__(self, "length", _range(self.length, "length"))
+        object.__setattr__(self, "length", _range(self.length, "length", minimum=8))
         if self.kind not in ("typed", "corpus", "upstream"):
             raise ValueError("kind must be typed, corpus or upstream")
+        if self.kind != "typed":
+            for field in fields(self):
+                if field.name in ("kind", "weight", "root"):
+                    continue
+                value = getattr(self, field.name)
+                # The sampler fills missing history on any panel; the other controls
+                # act inside the typed generator and stay typed-only.
+                if field.name == "control" and value == "missing_as_zero":
+                    continue
+                if value != field.default:
+                    raise ValueError(f"{field.name} is only valid for typed sources")
+        if self.root is not None and self.kind != "corpus":
+            raise ValueError("root is only valid for corpus sources")
         if self.control not in (None, "shuffle", "no_dates", "missing_as_zero"):
             raise ValueError("control must be None, shuffle, no_dates or missing_as_zero")
         if self.control_inputs not in ("all", "attribute", "column"):
@@ -96,7 +111,7 @@ class SamplerConfig:
     origins: int = 4
     origin_stride: int = 2
     contexts: tuple[int, ...] = (256, 512, 1024)
-    horizon: tuple[int, int] = (16, 288)
+    horizon: tuple[int, int] = (PATCH, MAX_HORIZON)
     cutoff_at_origin: float = 0.5
     drop: tuple[tuple[str, float], ...] = (
         ("features", 0.1),
@@ -122,11 +137,14 @@ class SamplerConfig:
             _normalize(self, name, integer=True, minimum=1)
         if not self.contexts:
             raise ValueError("contexts must be non-empty")
-        contexts = tuple(_numeric(v, "contexts", integer=True, minimum=1) for v in self.contexts)
-        if any(v % 16 for v in contexts):
-            raise ValueError("contexts must be positive multiples of 16")
+        contexts = tuple(
+            _numeric(v, "contexts", integer=True, minimum=1, maximum=MAX_CONTEXT)
+            for v in self.contexts
+        )
+        if any(v % PATCH for v in contexts):
+            raise ValueError(f"contexts must be positive multiples of {PATCH}")
         object.__setattr__(self, "contexts", contexts)
-        object.__setattr__(self, "horizon", _range(self.horizon, "horizon", maximum=288))
+        object.__setattr__(self, "horizon", _range(self.horizon, "horizon", maximum=MAX_HORIZON))
         for name in ("cutoff_at_origin", "path_share"):
             _normalize(self, name, minimum=0, maximum=1)
         if self.max_cells is not None:
@@ -210,7 +228,7 @@ class V5TrainConfig:
     gates: str = "learned"
 
     def __post_init__(self) -> None:
-        _normalize(self, "seed", integer=True)
+        _normalize(self, "seed", integer=True, minimum=0)
         _normalize(self, "workers", integer=True, minimum=0)
         if not isinstance(self.device, str) or not re.fullmatch(
             r"auto|cpu|cuda(?::[0-9]+)?|mps", self.device
