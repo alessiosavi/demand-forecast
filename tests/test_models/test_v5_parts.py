@@ -499,6 +499,19 @@ def test_router():
     expected_balance = (mean[positive] * (mean[positive] * TINY.n_experts).log()).sum()
     torch.testing.assert_close(balance, expected_balance)
 
+    padded_weights, padded_balance = router(
+        context,
+        torch.cat((summary, torch.randn(2, 2, N_SUMMARY)), dim=1),
+        torch.cat((flags, torch.zeros(2, 2, N_SUMMARY, dtype=torch.bool)), dim=1),
+        torch.cat((mask, torch.zeros(2, 2, dtype=torch.bool)), dim=1),
+    )
+    torch.testing.assert_close(weights, padded_weights[:, :3])
+    torch.testing.assert_close(balance, padded_balance)
+    _, empty_balance = router(context, summary, flags, torch.zeros_like(mask))
+    assert empty_balance == 0 and torch.isfinite(empty_balance)
+    (weights.square().sum() + balance + empty_balance).backward()
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in router.parameters())
+
 
 def test_router_scatter_survives_a_softmax_that_changes_precision(monkeypatch):
     """Accelerator autocast returns float32 from softmax for half-precision logits.
@@ -520,18 +533,6 @@ def test_router_scatter_survives_a_softmax_that_changes_precision(monkeypatch):
     assert weights.dtype == torch.float64
     torch.testing.assert_close(weights.float(), expected)
     assert torch.isfinite(balance)
-    padded_weights, padded_balance = router(
-        context,
-        torch.cat((summary, torch.randn(2, 2, N_SUMMARY)), dim=1),
-        torch.cat((flags, torch.zeros(2, 2, N_SUMMARY, dtype=torch.bool)), dim=1),
-        torch.cat((mask, torch.zeros(2, 2, dtype=torch.bool)), dim=1),
-    )
-    torch.testing.assert_close(weights, padded_weights[:, :3])
-    torch.testing.assert_close(balance, padded_balance)
-    _, empty_balance = router(context, summary, flags, torch.zeros_like(mask))
-    assert empty_balance == 0 and torch.isfinite(empty_balance)
-    (weights.square().sum() + balance + empty_balance).backward()
-    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in router.parameters())
 
 
 def test_calendar_embedding_ignores_inactive_ids():
