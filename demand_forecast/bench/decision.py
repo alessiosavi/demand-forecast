@@ -50,6 +50,9 @@ def relative(errors: _Scores, baseline: _Scores, tasks: Sequence[str]) -> _Score
             raise ValueError(f"baseline error must be finite and positive for task {task!r}")
         error = errors.get(task, math.nan)
         if math.isfinite(error):
+            if error < 0:
+                # Clipping would turn an invalid negative error into the best possible ratio.
+                raise ValueError(f"system error must not be negative for task {task!r}")
             result[task] = min(100.0, max(0.01, error / denominator))
     return result
 

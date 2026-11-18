@@ -9,6 +9,8 @@ import math
 from dataclasses import asdict
 from pathlib import Path
 
+import yaml
+
 from demand_forecast.bench import decision
 
 _RUNTIME_NOTE = "The registration's runtime criterion is unavailable."
@@ -52,6 +54,8 @@ def _read_scores(path: Path, label: str | None) -> dict[str, float]:
                 scores[task] = float(error) if error else math.nan
             except ValueError as exc:
                 raise ValueError(f"{path}:{reader.line_num}: invalid test_error {error!r}") from exc
+            if scores[task] < 0:
+                raise ValueError(f"{path}:{reader.line_num}: negative test_error {error!r}")
 
         if label is not None and not scores:
             raise ValueError(f"{path}: no rows for model_name {label!r}")
@@ -241,7 +245,10 @@ def main(argv: list[str] | None = None) -> int:
             )
             (args.out / "decision.md").write_text(markdown, encoding="utf-8")
         print(markdown, end="")
-    except (ImportError, OSError, ValueError, csv.Error) as exc:
+    except KeyError as exc:
+        # The task loader raises KeyError for an entry without a required field.
+        parser.error(f"task definition lacks {exc}")
+    except (ImportError, OSError, ValueError, csv.Error, yaml.YAMLError) as exc:
         parser.error(str(exc))
     return 0
 

@@ -25,6 +25,12 @@ def test_relative_clips_both_bounds():
     }
 
 
+def test_negative_system_error_is_refused_not_clipped_to_the_best_ratio():
+    # -1 / 2 would clip to 0.01, the best possible ratio: an invalid error must not win a task.
+    with pytest.raises(ValueError, match="negative.*bad"):
+        decision.relative({"bad": -1.0}, {"bad": 2.0}, ["bad"])
+
+
 @pytest.mark.parametrize("error", [0.0, -1.0, float("inf"), float("nan"), None])
 def test_baseline_validated_even_for_unscored_tasks(error):
     baseline = {"scored": 1.0}
@@ -360,6 +366,30 @@ def test_cli_writes_figures_and_empty_slices(cli, tmp_path):
     assert "static (empty)" in result.stdout
     assert "runtime criterion is unavailable" in result.stdout
     assert (tmp_path / "out/decision.md").read_text(encoding="utf-8") == result.stdout
+
+
+@pytest.mark.bench
+def test_cli_refuses_a_negative_error(cli, tmp_path):
+    (tmp_path / "candidate.csv").write_text(
+        "task_name,test_error,model_name\nwalk,-2,fresh\nroll,2,fresh\n", encoding="utf-8"
+    )
+    result = cli()
+    assert result.returncode == 2
+    assert "candidate.csv" in result.stderr and "negative" in result.stderr
+
+
+@pytest.mark.bench
+@pytest.mark.parametrize(
+    "content",
+    ["tasks:\n- name: walk\n  horizon: 1\n", "tasks: [unclosed\n"],
+    ids=["entry-without-dataset-path", "malformed-yaml"],
+)
+def test_cli_reports_a_bad_task_file_as_a_usage_error(cli, tmp_path, content):
+    (tmp_path / "tasks.yaml").write_text(content, encoding="utf-8")
+    result = cli()
+    # A usage error (exit 2) naming the problem, not a traceback (exit 1).
+    assert result.returncode == 2
+    assert "Traceback" not in result.stderr
 
 
 @pytest.mark.bench
