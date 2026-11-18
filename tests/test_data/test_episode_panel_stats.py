@@ -176,6 +176,37 @@ def test_category_response_profile_uses_completed_responses_and_base_support():
     assert flags[0]
 
 
+def test_category_spread_preserves_small_variation_at_large_level():
+    values, flags = category_step_stats(
+        np.array(["a"] * 4, dtype=object), 1e8 + np.arange(4), left=0, right=4
+    )
+    assert flags[-1]
+    assert values[-1, 1] == pytest.approx(np.sqrt(2 / 3), abs=1e-6)
+
+
+def test_category_large_responses_are_finite_without_runtime_warnings():
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        values, flags = category_step_stats(
+            np.array(["a"] * 4, dtype=object),
+            np.array([1e155, 1.1e155, 1.2e155, 1.3e155]),
+            left=0,
+            right=4,
+        )
+    assert values.dtype == np.float32 and np.isfinite(values).all()
+    np.testing.assert_array_equal(flags, [False, True, True, True])
+
+
+@pytest.mark.parametrize("item_index", [-1, 2])
+def test_item_accessors_reject_out_of_range_indices(item_index):
+    stats = PanelStats(small_panel([[1, 2], [3, 4]]), "y", 2)
+    for attribute in ("brand", "unknown"):
+        with pytest.raises(IndexError):
+            stats.labels(attribute, item_index)
+    with pytest.raises(IndexError):
+        stats.static_numbers(item_index)
+
+
 def test_category_stats_slices_and_label_renaming():
     labels = np.array(["a", "b", "a", "c", "b", "a", "a", "b"], dtype=object)
     target = np.arange(8, dtype=np.float64)
@@ -427,7 +458,10 @@ def test_summaries_use_grid_cutoff_bank_window_and_own_scale(monkeypatch):
 def test_empty_panel_and_empty_cutoff_are_finite():
     empty = PanelStats(small_panel([]), "y", 0)
     assert empty.summaries.shape == (0, 28) and empty.scales == []
-    assert empty.static_numbers(0)[0] == []
+    with pytest.raises(IndexError):
+        empty.static_numbers(0)
+    with pytest.raises(IndexError):
+        empty.labels("brand", 0)
     stats = PanelStats(small_panel([[1, 2], [3, 4]]), "y", -1)
     assert stats.scales == [Scale(0, 1), Scale(0, 1)]
     assert not stats.summaries.any() and not stats.summary_flags.any()

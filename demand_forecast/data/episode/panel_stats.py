@@ -27,6 +27,7 @@ class PanelStats:
         self.panel = panel
         self.target = target
         self.cutoff = cutoff
+        self.screen_cache: dict = {}
         self.scales: list[Scale] = []
         self._eligible = np.zeros(len(panel.items), dtype=bool)
         for i, item in enumerate(panel.items):
@@ -122,6 +123,8 @@ class PanelStats:
 
     def labels(self, attribute: str, item_index: int) -> tuple[str, ...]:
         """Return the item's canonical, deduplicated labels, including number bins."""
+        if not 0 <= item_index < len(self.panel.items):
+            raise IndexError("item index outside the panel")
         labels = self._labels.get(attribute)
         return () if labels is None else labels[item_index]
 
@@ -257,6 +260,8 @@ class PanelStats:
 
     def static_numbers(self, item_index: int) -> tuple[list[str], np.ndarray, np.ndarray]:
         """Standardised numeric attributes in name order; missing is zero and false."""
+        if not 0 <= item_index < len(self.panel.items):
+            raise IndexError("item index outside the panel")
         names = sorted(self._numbers)
         values = np.array([self._numbers[name][0][item_index] for name in names], dtype=np.float32)
         flags = np.array([self._numbers[name][1][item_index] for name in names], dtype=bool)

@@ -304,12 +304,16 @@ def test_panel_frequency_properties(freq, epoch, freq_class, season, long_lag):
     [
         ("BME", "2024-01-31", "monthly"),
         ("BMS", "2024-01-01", "monthly"),
+        ("CBMS", "2024-01-01", "monthly"),
+        ("CBME", "2024-01-31", "monthly"),
         ("BQE", "2024-03-29", "quarterly"),
         ("BQS", "2024-01-01", "quarterly"),
         ("BYE", "2024-12-31", "yearly"),
         ("BYS", "2024-01-01", "yearly"),
         ("bh", "2024-01-01 09:00", "hourly"),
+        ("cbh", "2024-01-01 09:00", "hourly"),
         ("B", "2024-01-01", "daily"),
+        ("C", "2024-01-01", "daily"),
     ],
 )
 def test_business_anchors_get_their_family_class(freq, epoch, freq_class):
