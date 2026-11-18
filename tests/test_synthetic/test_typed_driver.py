@@ -241,10 +241,7 @@ def test_promised_events_exist(mechanism):
         assert any(item.dynamic[column].any() for item in g.complete.items)
         if mechanism == "planned_event":
             for item in g.complete.items:
-                if (
-                    len(item.dynamic[column]) >= 300
-                    and item.item_id not in g.params[mechanism]["late_items"]
-                ):
+                if item.item_id in g.params[mechanism]["late_items"]:
                     assert item.dynamic[column].any(), (seed, item.item_id)
 
 

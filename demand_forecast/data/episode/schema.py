@@ -213,7 +213,7 @@ class Panel:
                 "monthly",
             ),
             ((pd.offsets.Week,), "weekly"),
-            ((pd.offsets.BusinessHour,), "hourly"),
+            ((pd.offsets.BusinessHour, pd.offsets.CustomBusinessHour), "hourly"),
         ):
             if isinstance(offset, classes):
                 return FREQ_CLASSES.index(name)

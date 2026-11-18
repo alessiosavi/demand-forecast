@@ -10,7 +10,6 @@ import numpy as np
 import pandas as pd
 from scipy.stats import rankdata
 
-from . import Panel
 from .kinds import flag_codes, infer_kind, is_missing, label_of
 from .panel_stats import PanelStats
 from .scale import fit_scale, to_scaled
@@ -22,6 +21,7 @@ from .schema import (
     MAX_FEATURE_ROWS,
     MAX_FORECAST_ROWS,
     MAX_STATIC_NUMBERS,
+    Panel,
 )
 
 
@@ -263,6 +263,8 @@ def screen(
     config: ScreeningConfig = ScreeningConfig(),
 ) -> list[Candidate]:
     """Return every candidate in (source, name) order, using only permitted history."""
+    if cutoff != stats.cutoff:
+        raise ValueError("cutoff must match stats.cutoff")
     if not 0 <= item_index < len(panel.items):
         raise IndexError("item index outside the panel")
     item = panel.items[item_index]

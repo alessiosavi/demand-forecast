@@ -22,6 +22,7 @@ class PanelStats:
     """Statistics shared by all items at a target's fixed statistics cutoff."""
 
     SUMMARY_CHUNK = 2048
+    SUMMARY_CHUNK_CELLS = 4_000_000
 
     def __init__(self, panel: Panel, target: str, cutoff: int) -> None:
         self.panel = panel
@@ -38,38 +39,43 @@ class PanelStats:
 
         self.summaries = np.zeros((len(panel.items), N_SUMMARY), dtype=np.float32)
         self.summary_flags = np.zeros(self.summaries.shape, dtype=bool)
-        for first in range(0, len(panel.items), self.SUMMARY_CHUNK):
-            items = panel.items[first : first + self.SUMMARY_CHUNK]
+        for group_first in range(0, len(panel.items), self.SUMMARY_CHUNK):
+            group = panel.items[group_first : group_first + self.SUMMARY_CHUNK]
             length = min(
                 BANK_WINDOW,
                 max(
-                    (max(0, cutoff - item.start) for item in items if target in item.targets),
+                    (max(0, cutoff - item.start) for item in group if target in item.targets),
                     default=0,
                 ),
             )
-            raw = np.full((len(items), length), np.nan, dtype=np.float64)
-            for row, item in enumerate(items):
-                values = item.targets.get(target)
-                if values is None:
-                    continue
-                left = max(item.start, cutoff - length)
-                right = min(cutoff, item.start + len(values))
-                if left < right:
-                    raw[row, left - cutoff + length : right - cutoff + length] = values[
-                        left - item.start : right - item.start
-                    ]
-            scales = self.scales[first : first + len(items)]
-            loc = np.array([s.loc for s in scales])[:, None]
-            scale = np.array([s.scale for s in scales])[:, None]
-            summaries, flags = summary_vectors(
-                (raw - loc) / scale,
-                raw,
-                season=panel.season,
-                long_lag=panel.long_lag,
-                end=cutoff,
-            )
-            self.summaries[first : first + len(items)] = summaries
-            self.summary_flags[first : first + len(items)] = flags
+            # Preserve the original group's padding width and reduction order.
+            rows = max(1, self.SUMMARY_CHUNK_CELLS // max(1, length))
+            for offset in range(0, len(group), rows):
+                first = group_first + offset
+                items = group[offset : offset + rows]
+                raw = np.full((len(items), length), np.nan, dtype=np.float64)
+                for row, item in enumerate(items):
+                    values = item.targets.get(target)
+                    if values is None:
+                        continue
+                    left = max(item.start, cutoff - length)
+                    right = min(cutoff, item.start + len(values))
+                    if left < right:
+                        raw[row, left - cutoff + length : right - cutoff + length] = values[
+                            left - item.start : right - item.start
+                        ]
+                scales = self.scales[first : first + len(items)]
+                loc = np.array([s.loc for s in scales])[:, None]
+                scale = np.array([s.scale for s in scales])[:, None]
+                summaries, flags = summary_vectors(
+                    (raw - loc) / scale,
+                    raw,
+                    season=panel.season,
+                    long_lag=panel.long_lag,
+                    end=cutoff,
+                )
+                self.summaries[first : first + len(items)] = summaries
+                self.summary_flags[first : first + len(items)] = flags
 
         self.static_kinds: dict[str, str] = {}
         self._labels: dict[str, list[tuple[str, ...]]] = {}

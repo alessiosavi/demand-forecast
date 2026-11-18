@@ -10,8 +10,9 @@ from dataclasses import replace
 import numpy as np
 import pytest
 
+from demand_forecast.data.episode import FREQ_CLASSES
 from demand_forecast.synthetic.typed import RANGES, PanelRecipe, generate_typed_panel
-from demand_forecast.synthetic.typed.draft import grid, stream
+from demand_forecast.synthetic.typed.draft import Streams, grid, stream
 from demand_forecast.synthetic.typed.structure import STRUCTURE
 
 ALL = (
@@ -22,6 +23,14 @@ ALL = (
     "level_shift",
     "missing_vs_zero",
 )
+
+
+def test_calendar_uses_draft_frequency_class():
+    draft = grid(PanelRecipe(("calendar",), n_items=2, length=(32, 32), freq="D"))
+    draft = replace(draft, freq_class=FREQ_CLASSES.index("hourly"))
+    streams = Streams(stream(0, "process"), stream(0, "inputs"), stream(0, "effect"))
+    result = STRUCTURE["calendar"](draft, streams, lambda _: (0.1, 0.2))
+    assert result.params["fields"] == ("hour", "dow")
 
 
 def targets(item):

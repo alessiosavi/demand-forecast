@@ -1,6 +1,8 @@
 """Architecture and regularisation settings for v5."""
 
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, fields
+from numbers import Real
 
 from demand_forecast.data.episode.schema import QUANTILES
 
@@ -31,6 +33,28 @@ class V5Config:
 
     def __post_init__(self) -> None:
         """Reject invalid dimensions and regularisation before constructing layers."""
+
+        def numeric(value: object, name: str, kind: type) -> int | float:
+            if isinstance(value, bool) or not isinstance(value, Real):
+                raise ValueError(f"{name} must be a finite {kind.__name__}")
+            try:
+                finite = math.isfinite(value)
+            except OverflowError:
+                finite = False
+            if not finite:
+                raise ValueError(f"{name} must be finite")
+            if kind is int and value != int(value):
+                raise ValueError(f"{name} must be an integer")
+            return kind(value)
+
+        for field in fields(self):
+            if field.type in (int, float):
+                object.__setattr__(
+                    self, field.name, numeric(getattr(self, field.name), field.name, field.type)
+                )
+        object.__setattr__(
+            self, "quantiles", tuple(numeric(q, "quantiles", float) for q in self.quantiles)
+        )
         for name in (
             "d_model",
             "nhead",
@@ -68,3 +92,5 @@ class V5Config:
             or any(b <= a for a, b in zip(self.quantiles, self.quantiles[1:]))
         ):
             raise ValueError("quantiles must be strictly increasing inside (0, 1)")
+        if 0.5 not in self.quantiles:
+            raise ValueError("quantiles must contain 0.5")
