@@ -12,6 +12,7 @@ from demand_forecast.data.episode.schema import (
     KIND_NUMBER,
     N_SUMMARY,
     PATCH,
+    ROLE_FORECAST,
     ROLE_PANEL,
     ROLE_PAST,
     ROLE_PEER,
@@ -40,7 +41,11 @@ class Gates:
 
 @dataclass
 class V5Output:
-    """Scaled quantiles, applied gates, per-row expert weights and penalties."""
+    """Scaled quantiles, applied gates, per-row expert weights and penalties.
+
+    ``router`` holds the expert weights applied in the forward pass, including
+    the null weights under ``"uniform"`` and ``"rolled"`` routing.
+    """
 
     quantiles: Tensor
     gates: Gates
@@ -98,61 +103,96 @@ class V5Model(nn.Module):
         self.step_projection = nn.Linear(config.d_model, PATCH * config.d_out)
         self.head = MonotoneQuantileHead(config.d_out, config.quantiles, config.width_factor)
 
-    def gates(self, batch: EpisodeBatch, *, mode: str = "learned") -> Gates:
-        """Choose gates exclusively from cutoff statistics, without encoding tokens."""
-        if mode == "ones":
-            return Gates(
-                torch.ones_like(batch.row_score),
-                torch.ones_like(batch.cand_score),
-                batch.x.new_ones((batch.x.shape[0], len(STEP_FAMILIES))),
-                batch.x.new_ones(N_SUMMARY),
-                batch.x.new_zeros(()),
-            )
-        if mode != "learned":
+    def gates(
+        self,
+        batch: EpisodeBatch,
+        *,
+        mode: str = "learned",
+        zero_candidates: Tensor | None = None,
+        zero_rows: Tensor | None = None,
+    ) -> Gates:
+        """Choose cutoff-only gates, then force zeros without changing expected L0.
+
+        ``zero_candidates`` zeros candidate gates and their inherited peer gates.
+        ``zero_rows`` may force any real row except ``ROLE_FORECAST``, including
+        siblings and known-future rows (overriding their gate floor).
+        A forced sibling behaves like a sibling with a learned zero gate: its
+        forecast slot remains in the output until ``prune`` removes it. Callers
+        scoring forecasts must select kept rows (``keep & forecast_mask``).
+        """
+        if mode not in ("learned", "ones"):
             raise ValueError("gate mode must be 'learned' or 'ones'")
-        # Evaluate GlobalMask once. Forward consumes this exact sample as well.
-        summary_mask, _ = self.global_mask(
-            batch.x.new_ones(N_SUMMARY),
-            torch.ones(N_SUMMARY, dtype=torch.bool, device=batch.x.device),
-        )
-        summary = batch.row_summary * summary_mask
-        flags = batch.row_summary_flags & (summary_mask > 0)
-        ref, ref_flags = _reference(batch, summary, flags)
-        row, row_l0 = self.gate_net(
-            summary, flags, batch.row_score, batch.row_kind, batch.row_role, ref, ref_flags
-        )
-        cand, cand_l0 = self.gate_net(
-            batch.cand_summary * summary_mask,
-            batch.cand_flags & (summary_mask > 0),
-            batch.cand_score,
-            batch.cand_kind,
-            torch.full_like(batch.cand_kind, ROLE_PEER),
-            ref,
-            ref_flags,
-        )
+        for name, mask, shape in (
+            ("zero_candidates", zero_candidates, batch.cand_mask.shape),
+            ("zero_rows", zero_rows, batch.row_mask.shape),
+        ):
+            if mask is not None and (mask.dtype != torch.bool or mask.shape != shape):
+                raise ValueError(f"{name} must be a boolean mask with shape {tuple(shape)}")
+        if (
+            zero_rows is not None
+            and (zero_rows & batch.row_mask & (batch.row_role == ROLE_FORECAST)).any()
+        ):
+            raise ValueError("cannot force forecast rows to zero")
+        if mode == "ones":
+            row = torch.ones_like(batch.row_score)
+            cand = torch.ones_like(batch.cand_score)
+            family = batch.x.new_ones((batch.x.shape[0], len(STEP_FAMILIES)))
+            summary_mask = batch.x.new_ones(N_SUMMARY)
+            expected_l0 = batch.x.new_zeros(())
+        else:
+            # Evaluate GlobalMask once. Forward consumes this exact sample as well.
+            summary_mask, _ = self.global_mask(
+                batch.x.new_ones(N_SUMMARY),
+                torch.ones(N_SUMMARY, dtype=torch.bool, device=batch.x.device),
+            )
+            summary = batch.row_summary * summary_mask
+            flags = batch.row_summary_flags & (summary_mask > 0)
+            ref, ref_flags = _reference(batch, summary, flags)
+            row, row_l0 = self.gate_net(
+                summary, flags, batch.row_score, batch.row_kind, batch.row_role, ref, ref_flags
+            )
+            cand, cand_l0 = self.gate_net(
+                batch.cand_summary * summary_mask,
+                batch.cand_flags & (summary_mask > 0),
+                batch.cand_score,
+                batch.cand_kind,
+                torch.full_like(batch.cand_kind, ROLE_PEER),
+                ref,
+                ref_flags,
+            )
+            logits = self.family_logits(torch.cat((ref, ref_flags.to(ref.dtype)), dim=-1))
+            family = self.family_gate(logits)
+            independent = batch.row_mask & (
+                (batch.row_role == ROLE_SIBLING)
+                | (batch.row_role == ROLE_PAST)
+                | (batch.row_role == ROLE_PANEL)
+            )
+            family_l0 = self.family_gate.expected_l0(logits)
+            count = independent.sum() + batch.cand_mask.sum() + family_l0.numel()
+            expected_l0 = (
+                row_l0.masked_fill(~independent, 0).sum()
+                + cand_l0.masked_fill(~batch.cand_mask, 0).sum()
+                + family_l0.sum()
+            ) / count.clamp_min(1)
+            expected_l0 = expected_l0 + self.global_mask.expected_l0().mean()
+
+        if zero_candidates is not None:
+            cand = cand.masked_fill(zero_candidates, 0)
         peer_gate = _candidate_weights(cand, batch.row_cand, batch.row_mask)
         row = torch.where(batch.row_role == ROLE_PEER, peer_gate, row)
-        row = row.masked_fill(~batch.row_mask, 0)
-        cand = cand.masked_fill(~batch.cand_mask, 0)
-        logits = self.family_logits(torch.cat((ref, ref_flags.to(ref.dtype)), dim=-1))
-        family = self.family_gate(logits)
-        independent = batch.row_mask & (
-            (batch.row_role == ROLE_SIBLING)
-            | (batch.row_role == ROLE_PAST)
-            | (batch.row_role == ROLE_PANEL)
-        )
-        family_l0 = self.family_gate.expected_l0(logits)
-        count = independent.sum() + batch.cand_mask.sum() + family_l0.numel()
-        expected_l0 = (
-            row_l0.masked_fill(~independent, 0).sum()
-            + cand_l0.masked_fill(~batch.cand_mask, 0).sum()
-            + family_l0.sum()
-        ) / count.clamp_min(1)
-        expected_l0 = expected_l0 + self.global_mask.expected_l0().mean()
+        if mode == "learned":
+            row = row.masked_fill(~batch.row_mask, 0)
+            cand = cand.masked_fill(~batch.cand_mask, 0)
+        if zero_rows is not None:
+            row = row.masked_fill(zero_rows, 0)
         return Gates(row, cand, family, summary_mask, expected_l0)
 
-    def forward(self, batch: EpisodeBatch, gates: Gates | None = None) -> V5Output:
-        """Encode once, then decode every origin using only its visible memory."""
+    def forward(
+        self, batch: EpisodeBatch, gates: Gates | None = None, *, router: str = "learned"
+    ) -> V5Output:
+        """Encode and decode with learned, uniform or deterministically rolled routing."""
+        if router not in ("learned", "uniform", "rolled"):
+            raise ValueError("router must be 'learned', 'uniform' or 'rolled'")
         gates = self.gates(batch) if gates is None else gates
         summary = batch.row_summary * gates.summary_mask
         flags = batch.row_summary_flags & (gates.summary_mask > 0)
@@ -187,7 +227,11 @@ class V5Model(nn.Module):
             ref_flags,
             batch.freq_class,
         )
-        router, balance = self.router(context, summary, flags, batch.row_mask)
+        weights, balance = self.router(context, summary, flags, batch.row_mask)
+        if router == "uniform":
+            weights = torch.full_like(weights, 1 / self.config.n_experts)
+        elif router == "rolled":
+            weights = weights.roll(max(1, weights.shape[0] // 2), dims=0)
         cal = self.calendar(batch.cal_phases, batch.cal_ids)[:, None]
         tokens = self.patch_encoder(
             x,
@@ -197,7 +241,7 @@ class V5Model(nn.Module):
         )
         tokens = self.scale_shift(tokens * gates.row[..., None, None], context)
         for block in self.encoder:
-            tokens = block(tokens, batch.patch_valid, batch.row_mask, gates.row, router)
+            tokens = block(tokens, batch.patch_valid, batch.row_mask, gates.row, weights)
 
         steps = torch.arange(batch.calh_phases.shape[2] * PATCH, device=x.device)
         step_mask = (steps[None] < batch.horizon[:, None]).reshape(
@@ -222,7 +266,7 @@ class V5Model(nn.Module):
         dec_gate = _rows(gates.row, dec_rows)
         horizon_tokens = torch.cat((forecast_tokens, known_tokens), dim=2)
         h = self.scale_shift(horizon_tokens * dec_gate[:, None, :, None, None], context)
-        dec_weights = _rows(router, dec_rows)
+        dec_weights = _rows(weights, dec_rows)
         for block in self.decoder:
             h = block(
                 h,
@@ -240,7 +284,7 @@ class V5Model(nn.Module):
         real = batch.origin_mask[:, :, None, None] & batch.forecast_mask[:, None, :, None]
         quantiles = quantiles.masked_fill(~real[..., None], 0)
         return V5Output(
-            quantiles, gates, router, {"sparsity": gates.expected_l0, "balance": balance}
+            quantiles, gates, weights, {"sparsity": gates.expected_l0, "balance": balance}
         )
 
 
