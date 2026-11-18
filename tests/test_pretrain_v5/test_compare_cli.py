@@ -213,6 +213,18 @@ def test_malformed_arm_is_named(copied, capsys):
     rejected(command, arms, out, capsys, "broken", "name=dir")
 
 
+@pytest.mark.parametrize("kind", ["missing", "file", "symlink", "broken_symlink"])
+def test_arm_requires_an_existing_real_directory(copied, tmp_path, capsys, kind):
+    _, arms, out, command = copied()
+    directory = tmp_path / "invalid-arm"
+    if kind == "file":
+        directory.write_text("not a directory")
+    elif kind in ("symlink", "broken_symlink"):
+        directory.symlink_to(arms["null"] if kind == "symlink" else tmp_path / "absent")
+    arms["null"] = directory
+    rejected(command, arms, out, capsys, "null", "directory")
+
+
 @pytest.mark.parametrize(
     "field,value",
     [
@@ -398,6 +410,33 @@ def test_selection_publishes_all_r2_decisions(copied):
     assert selection["pruned"] == json.loads((arms["true"] / "result.json").read_text())["pruned"]
     assert set(report["units"]) == {"true", "null", "gates_one"}
     assert [p.name for p in out.iterdir()] == ["compare.json"]
+
+
+@pytest.mark.parametrize(
+    "comparison_outcome,selection_outcome,want",
+    [
+        ("pass", "pass", "pass"),
+        ("pass", "inconclusive", "inconclusive"),
+        ("pass", "fail", "fail"),
+        ("inconclusive", "pass", "inconclusive"),
+        ("inconclusive", "inconclusive", "inconclusive"),
+        ("inconclusive", "fail", "fail"),
+        ("fail", "pass", "fail"),
+        ("fail", "inconclusive", "fail"),
+        ("fail", "fail", "fail"),
+    ],
+)
+def test_selection_verdict_combines_comparison_and_r2(
+    copied, monkeypatch, comparison_outcome, selection_outcome, want
+):
+    _, arms, out, command = copied("selection")
+    monkeypatch.setattr(t1, "compare", lambda *a, **kw: {"outcome": comparison_outcome})
+    monkeypatch.setattr(t1, "selection_report", lambda *a, **kw: {"outcome": selection_outcome})
+    assert invoke(command, arms) == 0
+    report = json.loads((out / "compare.json").read_text())
+    assert report["comparisons"][0]["outcome"] == comparison_outcome
+    assert report["selection_report"]["outcome"] == selection_outcome
+    assert report["outcome"] == want
 
 
 def test_failure_preserves_existing_output(copied, capsys):

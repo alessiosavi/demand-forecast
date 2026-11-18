@@ -9,9 +9,7 @@ import re
 import shlex
 from pathlib import Path
 
-import yaml
-
-from demand_forecast.pretrain.v5 import job
+T1_EVAL_DEFAULTS = (200, 1000)
 
 # This helper deliberately uses only the image interpreter's standard library.
 # It runs before repository or environment installation, including on a retry.
@@ -226,8 +224,8 @@ def generate(
         if type(seed) is not int:
             raise ValueError("t1 requires an integer seed")
         episodes, max_panels = (
-            _count(episodes, job.T1_EVAL_DEFAULTS[0]),
-            _count(max_panels, job.T1_EVAL_DEFAULTS[1]),
+            _count(episodes, T1_EVAL_DEFAULTS[0]),
+            _count(max_panels, T1_EVAL_DEFAULTS[1]),
         )
         unit = f"state/t1/{path}-{arm}-s{seed}/eval-{episodes}-{max_panels}"
         command += [
@@ -255,16 +253,19 @@ def generate(
         command += ["--name", unit_name]
         config_path, config_flag = config, "--config"
     data = Path(config_path).read_bytes()
-    parsed = yaml.safe_load(data)
-    if not isinstance(parsed, dict):
-        raise ValueError("configuration requires a mapping")
-    sources = parsed.get("sources", [])
-    if any(s.get("kind") == "corpus" and s.get("root") is not None for s in sources):
-        raise ValueError("cloud corpus sources must carry root: null")
-    if action != "t1" and any(s.get("kind") == "corpus" for s in sources) != (
-        corpus_uri is not None
-    ):
-        raise ValueError("corpus sources and corpus_uri must be supplied together")
+    # T1 embeds the exact base bytes; the installed job validates the YAML.
+    # Only train/qualify need to inspect corpus settings during generation.
+    if action != "t1":
+        import yaml
+
+        parsed = yaml.safe_load(data)
+        if not isinstance(parsed, dict):
+            raise ValueError("configuration requires a mapping")
+        sources = parsed.get("sources", [])
+        if any(s.get("kind") == "corpus" and s.get("root") is not None for s in sources):
+            raise ValueError("cloud corpus sources must carry root: null")
+        if any(s.get("kind") == "corpus" for s in sources) != (corpus_uri is not None):
+            raise ValueError("corpus sources and corpus_uri must be supplied together")
     packed_helper = base64.b64encode(GUEST.encode()).decode()
     packed_config = base64.b64encode(data).decode()
     config_sha = hashlib.sha256(data).hexdigest()

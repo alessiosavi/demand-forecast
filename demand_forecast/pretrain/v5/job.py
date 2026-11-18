@@ -142,7 +142,10 @@ def _t1_compare(args) -> int:
             raise ValueError(f"{arm}: repeated arm")
         if arm not in entry["arms"]:
             raise ValueError(f"{arm}: extra arm for {args.path}")
-        directories[arm] = Path(directory)
+        directory = Path(directory)
+        if not directory.is_dir() or directory.is_symlink():
+            raise ValueError(f"{arm}: requires an existing real directory without a symlink")
+        directories[arm] = directory
     for arm in entry["arms"]:
         if arm not in directories:
             raise ValueError(f"{arm}: missing arm for {args.path}")
@@ -195,19 +198,16 @@ def _t1_compare(args) -> int:
         "eval_digest": digest,
         "units": hashes,
         "comparisons": comparisons,
-        "outcome": "fail"
-        if "fail" in outcomes
-        else "inconclusive"
-        if not outcomes or "inconclusive" in outcomes
-        else "pass",
     }
     if args.path == "selection":
         try:
             report["selection_report"] = t1.selection_report(
                 results["true"], results["null"], results["gates_one"], episodes
             )
+            outcomes.append(report["selection_report"]["outcome"])
         except Exception as error:
             raise ValueError(f"selection arms true/null/gates_one: {error}") from error
+    report["outcome"] = t1._outcome(outcomes)
     _json(args.out / "compare.json", report)
     return 0
 

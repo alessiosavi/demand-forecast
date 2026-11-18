@@ -336,6 +336,7 @@ def test_generator_and_cli_share_default_unit(jobs, settings, machine, monkeypat
 
     if defaults is not None:
         monkeypatch.setattr(job, "T1_EVAL_DEFAULTS", defaults, raising=False)
+        monkeypatch.setattr(jobs, "T1_EVAL_DEFAULTS", defaults, raising=False)
     expected = "eval-200-1000" if defaults is None else "eval-3-17"
     run, execute = machine
     result, events = execute(
@@ -388,6 +389,78 @@ def test_generator_and_cli_share_default_unit(jobs, settings, machine, monkeypat
     )
     assert visited == [root / expected]
     assert (root / expected).is_dir()
+
+
+def test_generator_t1_defaults_match_job(jobs):
+    from demand_forecast.pretrain.v5 import job
+
+    assert jobs.T1_EVAL_DEFAULTS == job.T1_EVAL_DEFAULTS
+
+
+@pytest.mark.parametrize("action", ["help", "t1"])
+def test_generator_runs_without_site_packages_or_project_imports(jobs, settings, tmp_path, action):
+    output = tmp_path / "isolated.sh"
+    arguments = ["--help"]
+    if action == "t1":
+        arguments = [
+            "--name",
+            "isolated",
+            "--action",
+            "t1",
+            "--repo-sha",
+            SHA,
+            "--base",
+            str(settings),
+            "--path",
+            "static_category",
+            "--arm",
+            "true",
+            "--seed",
+            "7",
+            "--output",
+            str(output),
+        ]
+    isolated = textwrap.dedent("""
+        import runpy
+        import sys
+
+        blocked = []
+        class BlockProjectImports:
+            def find_spec(self, fullname, path=None, target=None):
+                if fullname.split('.')[0] in {'demand_forecast', 'torch', 'numpy'}:
+                    blocked.append(fullname)
+                    raise ModuleNotFoundError(fullname, name=fullname)
+
+        sys.meta_path.insert(0, BlockProjectImports())
+        try:
+            import demand_forecast
+        except ModuleNotFoundError as error:
+            assert error.name == 'demand_forecast'
+        else:
+            raise AssertionError('project must not be importable')
+        blocked.clear()
+        sys.argv = sys.argv[1:]
+        try:
+            runpy.run_path(sys.argv[0], run_name='__main__')
+        finally:
+            assert not blocked, f'generator attempted forbidden imports: {blocked}'
+    """)
+    result = subprocess.run(
+        [sys.executable, "-I", "-S", "-c", isolated, jobs.__file__, *arguments],
+        cwd=ROOT,
+        env={**os.environ, "PYTHONPATH": ""},
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert result.returncode == 0, result.stderr
+    if action == "help":
+        assert "usage:" in result.stdout
+    else:
+        assert os.access(output, os.X_OK)
+        script = output.read_text()
+        assert "state/t1/static_category-true-s7/eval-200-1000" in script
+        assert base64.b64encode(settings.read_bytes()).decode() in script
 
 
 def test_sha_mismatch_exits_before_environment(jobs, settings, machine):

@@ -68,6 +68,7 @@ the job exits, assuming the final state copy and marker upload succeed:
 | 75 (unfinished unit) | `FAILED` | `exit_status=75` |
 | 1 | `FAILED` | `exit_status=1` |
 | 2 (script validation failure) | `FAILED` | `exit_status=2` |
+| 143 or 130 (guest TERM or INT trap) | `FAILED` | `exit_status=143` or `exit_status=130` |
 | 124 or 137 | `TIMEOUT` | `exit_status=124` or `exit_status=137` |
 
 A failed final copy prevents `DONE`: a successful job is then recorded as
@@ -82,12 +83,17 @@ job finishes during the watcher's copy and the copied state inventory is
 unchanged, the watcher can archive `PREEMPTED` and reconcile it to the final
 `DONE`, `FAILED` or `TIMEOUT` using the same exit-status mapping above.
 
-Operator relaunch rule: after `PREEMPTED`, or `FAILED` whose body says
-`exit_status=75`, relaunch the **same job URI on the same state prefix** so the
-unfinished unit resumes. Any other `FAILED` is a real failure: read the unit's
-`failure.json` (if present) and the log; do not relaunch it. In particular, exit
-2 for a wrong revision or corpus listing mismatch must never be relaunched
-unchanged; script validation can fail before a unit `failure.json` exists.
+Operator relaunch rule: first check the unit directory in the bucket for
+`failure.json`. If it is absent, relaunch the **same job URI on the same state
+prefix** after `PREEMPTED`, after `TIMEOUT`, or after `FAILED` whose body says
+`exit_status=74`, `75`, `130` or `143`. This resumes unfinished work or retries
+publication of an already completed unit after a failed final copy.
+
+`FAILED` with `exit_status=1` or `2`, or **any outcome with a unit
+`failure.json`**, is a real failure: read that file (if present) and the log;
+do not relaunch unchanged. In particular, exit 2 for a wrong revision or corpus
+listing mismatch is a real failure even before a unit `failure.json` exists.
+For other `FAILED` statuses, inspect the log and diagnose before deciding.
 
 At startup the guest refuses a `DONE` for the same job URI, and also refuses a
 legacy `DONE` without a job URI. A `DONE` for a different URI is archived before
@@ -157,10 +163,16 @@ training is validated and reused. For an inconclusive result, double both
 the same arm's state prefix. Training parameters and identity are unchanged;
 only the new `eval-N-M/` is evaluated and published. One extension is allowed by
 S1; unresolved results go back to the owner. Copy each arm's evaluation directory
-locally for `t1-compare` (implemented separately in task P7b): provide the same
-base, code, path, seed and evaluation parameters and one `--arm NAME=DIR` per
-required arm. This job generator does not perform that local comparison. S1
-also requires plan 4's fitted-table checks inside its registered ceiling.
+locally for `t1-compare`: provide the **byte-exact base file used to generate
+the arms**, code, path, seed and evaluation parameters and one `--arm NAME=DIR`
+per required arm. The base file's SHA-256 is compared, so even changes only to
+`workers`, `device` or YAML formatting are refused, although `workers` and
+`device` are excluded from the training identity. Each arm must name an existing
+real directory, not a symlink. For `selection`, the top-level `compare.json`
+outcome combines the deciding comparison and `selection_report.outcome`: either
+failure means fail; otherwise either inconclusive means inconclusive; only two
+passes mean pass. This job generator does not perform that local comparison.
+S1 also requires plan 4's fitted-table checks inside its registered ceiling.
 
 On a preemption, training acknowledges the guest's request only when its last
 checkpoint write plus the longest recent update fits within six seconds. If the
