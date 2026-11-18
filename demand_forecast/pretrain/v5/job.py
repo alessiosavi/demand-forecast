@@ -9,6 +9,7 @@ import re
 import shutil
 import signal
 import sys
+import traceback
 from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -362,7 +363,12 @@ def main(argv: list[str] | None = None) -> int:
         return 75
     except Exception as error:
         (unit / "unit.json").unlink(missing_ok=True)
-        _json(unit / "failure.json", {"reason": f"{type(error).__name__}: {error}"})
+        trace = traceback.format_exc()
+        print(trace, file=sys.stderr, flush=True)  # The guest copies the job's log to the bucket.
+        _json(
+            unit / "failure.json",
+            {"reason": f"{type(error).__name__}: {error}", "traceback": trace},
+        )
         return 1
     finally:
         signal.signal(signal.SIGTERM, previous)
