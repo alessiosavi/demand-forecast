@@ -17,6 +17,7 @@ from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 from demand_forecast.data.episode import EpisodeBuilder, EpisodeRequest, Panel
 from demand_forecast.data.episode.collate import EpisodeBatch, collate
 from demand_forecast.data.episode.schema import N_SUMMARY, PATCH, SUMMARY_FEATURES
+from demand_forecast.data.episode.screening import ScreeningConfig
 from demand_forecast.synthetic.typed import necessary_items
 from demand_forecast.synthetic.typed.draft import INPUT_MECHANISMS, stream
 
@@ -179,7 +180,9 @@ def _plan_panel(panel, record, config, source, rng, *, path_quota=None, ordinary
             request = EpisodeRequest(index, origins, horizon, context, target, cutoff)
         else:
             if builder is None:
-                builder = EpisodeBuilder(original)
+                builder = EpisodeBuilder(
+                    original, ScreeningConfig(no_evidence=config.screen_no_evidence)
+                )
             requests = builder.plan_requests(
                 index, origins, horizon, context=context, cutoff=cutoff
             )
@@ -308,7 +311,9 @@ def _make_batch(config, k, sources):
             if not plans:
                 continue
             if builder is None or builder.panel is not panel:
-                builder = EpisodeBuilder(panel)
+                builder = EpisodeBuilder(
+                    panel, ScreeningConfig(no_evidence=config.sampler.screen_no_evidence)
+                )
         except SamplerSkip as error:
             skips[_skip_reason(error)] += 1
             continue

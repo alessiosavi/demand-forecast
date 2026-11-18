@@ -52,6 +52,49 @@ def test_yaml_round_trip_is_plain_and_restores_tuples(tmp_path):
     assert isinstance(restored.model.quantiles, tuple)
 
 
+@pytest.mark.parametrize(
+    "value", [-0.01, 1.0, 1.01, False, True, "0.5", float("nan"), float("inf")]
+)
+def test_screen_no_evidence_rejects_invalid_values(value):
+    with pytest.raises(ValueError, match="screen_no_evidence"):
+        config_module().SamplerConfig(screen_no_evidence=value)
+
+
+def test_screen_no_evidence_yaml_round_trip_and_identity(tmp_path):
+    base = training_config()
+    cfg = replace(base, sampler=replace(base.sampler, screen_no_evidence=0.999))
+    path = tmp_path / "train.yaml"
+    cfg.to_yaml(path)
+    raw = yaml.safe_load(path.read_text())
+    assert raw["sampler"]["screen_no_evidence"] == 0.999
+    assert type(cfg).from_yaml(path) == cfg
+    assert cfg.canonical()["sampler"]["screen_no_evidence"] == 0.999
+    parts = dict(code="0" * 40, corpus=None, init=None, env="e" * 64)
+    identity = config_module().identity
+    assert identity(cfg, **parts) != identity(base, **parts)
+
+    del raw["sampler"]["screen_no_evidence"]
+    path.write_text(yaml.safe_dump(raw))
+    assert type(cfg).from_yaml(path) == base
+
+
+@pytest.mark.parametrize(
+    "with_corpus,expected",
+    [
+        (False, "5864f0742ee6db2d2e4f82229c7265f1d99f880767d2336f5686caf8c3e9213c"),
+        (True, "d2f2e89d63f935af94d8f198f02105097d1169803a26ffbcdb0cff19203e01d2"),
+    ],
+)
+def test_default_screen_no_evidence_keeps_base_identities(with_corpus, expected):
+    api = config_module()
+    sources = (api.SourceConfig("typed", 1.0),)
+    if with_corpus:
+        sources += (api.SourceConfig("corpus", 1.0, root="/corpus"),)
+    cfg = replace(api.T1_BASE, sources=sources)
+    assert "screen_no_evidence" not in cfg.canonical()["sampler"]
+    assert api.identity(cfg, code="0" * 40, corpus=None, init=None, env="e" * 64) == expected
+
+
 @pytest.mark.parametrize("section", [None, "model", "sources", "sampler", "optim"])
 def test_yaml_rejects_unknown_keys_at_every_level(tmp_path, section):
     cfg = training_config()

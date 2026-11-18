@@ -1,7 +1,7 @@
 """Fixed screening and cutoff-only relevance, before learned feature gates.
 
-``no_evidence`` only zeroes scores below it; it removes nothing. Scores feed
-the learned gates and the order inside each budget.
+``no_evidence`` zeroes scores below the threshold. Scores feed the learned gates
+and the order inside each budget.
 """
 
 from dataclasses import dataclass, replace
@@ -27,7 +27,11 @@ from .schema import (
 
 @dataclass(frozen=True)
 class ScreeningConfig:
-    """Minimum common support and the diagnostic no-evidence threshold."""
+    """Minimum common support and the no-evidence threshold.
+
+    Scores below the threshold become zero. Within each budget's existing
+    priorities, zero scores rank last and are cut first when the budget binds.
+    """
 
     min_steps: int = 16
     min_items: int = 8

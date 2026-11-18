@@ -17,8 +17,10 @@ from demand_forecast.data.episode.schema import (
     STEP_FAMILIES,
     SUMMARY_FEATURES,
 )
+from demand_forecast.data.episode.screening import ScreeningConfig
 from demand_forecast.models.v5 import V5Model
 from demand_forecast.pretrain.v5 import loop
+from demand_forecast.pretrain.v5.checkpoint import save_checkpoint
 from demand_forecast.pretrain.v5.support import supported
 from demand_forecast.synthetic.typed import PanelRecipe, generate_typed_panel
 from tests.helpers.v5_loop import config
@@ -146,6 +148,21 @@ def test_eval_set_supported_present_labelled_deterministic(small, path):
         assert not built.label_mask[:, ~built.keep].any()
 
 
+def test_default_eval_set_reproduces_the_base_revision_digest():
+    module = api()
+    options = {"episodes": 5, "max_panels": 50}
+    entries = module.eval_set("static_category", **options)
+    assert len(entries) == 5
+    assert (
+        module.eval_digest(entries)
+        == "5148acb083e74aaf075e190a3155d3e085aa522699a8d06bd8f4f0a95e18ca25"
+    )
+    assert module.eval_set("static_category", base=module.T1_BASE, **options) == entries
+    custom_sampler = replace(module.T1_BASE.sampler, contexts=(64,), horizon=(16, 24))
+    custom_base = replace(module.T1_BASE, sampler=custom_sampler)
+    assert module.eval_set("static_category", base=custom_base, **options) == entries
+
+
 def test_eval_limit_required_bank_quota_and_digest_order(small):
     short = small.eval_set("known_driver", episodes=40, max_panels=1)
     assert len(short) <= 1
@@ -229,6 +246,54 @@ def test_null_checkpoint_controls_do_not_contaminate_true_reference(small, monke
     small.evaluate(Path("unused"), "bank", "null_all", [entry])
     assert observed[0].row_summary_flags.any()
     assert not observed[1].row_summary_flags.any()
+
+
+def test_eval_set_passes_the_base_screening_config_to_admission(monkeypatch):
+    module = api()
+    base = module.T1_BASE
+    base = replace(base, sampler=replace(base.sampler, screen_no_evidence=0.9))
+    observed = []
+    builder = module.EpisodeBuilder
+
+    def observe(panel, screening):
+        observed.append(screening)
+        return builder(panel, screening)
+
+    monkeypatch.setattr(module, "EpisodeBuilder", observe)
+    episodes = module.eval_set("static_category", episodes=1, max_panels=30, base=base)
+    assert len(episodes) == 1
+    assert observed and all(screening == ScreeningConfig(no_evidence=0.9) for screening in observed)
+
+
+def test_t1_evaluation_uses_the_configured_level(monkeypatch, tmp_path):
+    module = api()
+    level = 0.75
+    base = tiny()
+    base = replace(base, sampler=replace(base.sampler, screen_no_evidence=level))
+    observed = []
+    real_build = module.EpisodeBuilder.build
+
+    def observe(builder, request):
+        observed.append(builder.config)
+        return real_build(builder, request)
+
+    monkeypatch.setattr(module.EpisodeBuilder, "build", observe)
+    episodes = module.eval_set("static_category", episodes=1, min_count=1, max_panels=30, base=base)
+    assert len(episodes) == 1
+    expected = ScreeningConfig(no_evidence=level)
+    assert observed and all(screening == expected for screening in observed)
+
+    saved = module.t1_config("static_category", "true", seed=0, base=base)
+    payload = {
+        "config": asdict(saved),
+        "counters": {"batch": 0, "saves": 0},
+        "export": "model",
+        "model": V5Model(saved.model).state_dict(),
+    }
+    checkpoint, _ = save_checkpoint(tmp_path, payload, counter=0)
+    observed.clear()
+    module.evaluate(checkpoint, "static_category", "null", episodes)
+    assert observed == [expected, expected]
 
 
 def test_absent_screened_candidate_is_counted_and_still_scored(small, monkeypatch):

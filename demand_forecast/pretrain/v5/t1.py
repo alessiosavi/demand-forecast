@@ -1,7 +1,8 @@
 """Frozen, paired T1 evaluations and their bootstrap decisions.
 
 Training arms fit their own scales. Scoring always uses the true build's real
-label cells and affine frame; an arm's screening never selects the test set.
+label cells and affine frame. Admission uses the common base's screening level
+on true held-out panels.
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ from demand_forecast.data.episode.schema import (
     STEP_FAMILIES,
     SUMMARY_FEATURES,
 )
+from demand_forecast.data.episode.screening import ScreeningConfig
 from demand_forecast.models.v5.model import prune
 from demand_forecast.synthetic.typed import (
     PanelRecipe,
@@ -215,7 +217,8 @@ def _build(generated, entry, config):
         entry["cutoff"],
         frozenset(config.sampler.drop_always),
     )
-    episode = EpisodeBuilder(panel).build(request)
+    screening = ScreeningConfig(no_evidence=config.sampler.screen_no_evidence)
+    episode = EpisodeBuilder(panel, screening).build(request)
     _postprocess(episode, replace(config.sampler, designate_target=True))
     return episode
 
@@ -250,6 +253,7 @@ def _slices(path, generated, item_id, origin, horizon):
 def eval_set(
     path: str,
     *,
+    base: V5TrainConfig = T1_BASE,
     episodes: int = 200,
     max_panels: int = 1000,
     seed: int = 10_000,
@@ -257,6 +261,8 @@ def eval_set(
 ) -> list[dict]:
     """Plan on true held-out panels, retaining at most one episode per panel.
 
+    The training base supplies the screening level. The held-out sampler uses
+    the fixed T1 settings and path overrides to preserve replay digests.
     A scoring episode has one origin. Admission, cutoff fallback, target choice
     and the nonconstant-prefix/observed-label checks belong to P3's planner.
     """
@@ -272,7 +278,9 @@ def eval_set(
         path_share=1.0,
         drop=(),
         designate_target=True,
+        screen_no_evidence=base.sampler.screen_no_evidence,
     )
+    screening = ScreeningConfig(no_evidence=sampler.screen_no_evidence)
     results, counts = [], Counter()
     for i in range(max_panels):
         if len(results) >= episodes and all(
@@ -303,7 +311,7 @@ def eval_set(
         )
         if path != "selection" and len(mechanisms) != len(generated.recipe.mechanisms):
             continue
-        built = EpisodeBuilder(panel).build(request)
+        built = EpisodeBuilder(panel, screening).build(request)
         _postprocess(built, sampler)
         if not _supervised(built) or not _present(path, generated, built, mechanisms):
             continue

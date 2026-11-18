@@ -27,6 +27,7 @@ from .checkpoint import (
     _read_checkpoint,
     file_digest,
     read_manifest,
+    read_payload,
     save_checkpoint,
     write_manifest,
 )
@@ -123,7 +124,7 @@ def _configuration(data: dict) -> V5TrainConfig:
 
 def load_model(path: Path, *, weights: str = "export") -> tuple[V5Model, V5TrainConfig]:
     """Validate the footer and load raw, EMA, or the checkpoint's chosen export."""
-    saved = _read_checkpoint(Path(path))
+    saved = read_payload(Path(path))
     key = saved["export"] if weights == "export" else {"raw": "model", "ema": "ema"}.get(weights)
     if key not in ("model", "ema") or saved[key] is None:
         raise ValueError(f"unavailable checkpoint weights: {weights}")

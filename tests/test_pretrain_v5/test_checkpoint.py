@@ -21,6 +21,30 @@ def payload(batch=1, saves=1):
     return {"counters": {"batch": batch, "saves": saves}, "model": {"weight": torch.arange(3)}}
 
 
+def test_read_payload_keys_and_damaged_footer(tmp_path):
+    api = checkpoint_module()
+    original = payload()
+    path, _ = api.save_checkpoint(tmp_path, original, counter=0)
+    restored = api.read_payload(path)
+    assert restored.keys() == original.keys()
+    assert restored["counters"] == original["counters"]
+    assert torch.equal(restored["model"]["weight"], original["model"]["weight"])
+
+    data = bytearray(path.read_bytes())
+    data[-1] ^= 1
+    path.write_bytes(data)
+    with pytest.raises(api.CheckpointError, match="SHA-256 footer mismatch"):
+        api.read_payload(path)
+
+
+def test_private_reader_name_still_works(tmp_path):
+    api = checkpoint_module()
+    original = {"counters": {"batch": 0, "saves": 0}}
+    path, _ = api.save_checkpoint(tmp_path, original, counter=0)
+    assert api._read_checkpoint(path) == original
+    assert api._read_checkpoint is api.read_payload
+
+
 def test_slots_alternate_and_round_trip_tensors(tmp_path):
     api = checkpoint_module()
     for counter in range(4):

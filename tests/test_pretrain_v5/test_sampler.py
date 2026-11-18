@@ -1,5 +1,6 @@
 """The batch index, rather than worker scheduling, addresses the stream."""
 
+import hashlib
 import importlib
 from copy import deepcopy
 from dataclasses import fields, replace
@@ -9,8 +10,10 @@ import numpy as np
 import pytest
 import torch
 
-from demand_forecast.data.episode import EpisodeBuilder, EpisodeRequest
-from demand_forecast.data.episode.schema import N_SUMMARY, SUMMARY_FEATURES
+from demand_forecast.data.episode import EpisodeBuilder, EpisodeRequest, Item, Panel
+from demand_forecast.data.episode.panel_stats import PanelStats
+from demand_forecast.data.episode.schema import MAX_FEATURE_ROWS, N_SUMMARY, SUMMARY_FEATURES
+from demand_forecast.data.episode.screening import screen
 from demand_forecast.pretrain.v5.config import SourceConfig
 from demand_forecast.pretrain.v5.corpus import CorpusValueError, ShortRow
 from demand_forecast.pretrain.v5.sources import SourceMix, TypedSource
@@ -29,6 +32,118 @@ def test_batch_is_pure():
     b, rb = api().make_batch(c, 3)
     equal_batches(a, b)
     assert ra == rb and ra["episodes"] == 4 and ra["supervised"] > 0
+
+
+def test_default_level_reproduces_the_base_batch():
+    c = replace(config(drop=()), seed=12)
+    source = replace(
+        c.sources[0],
+        recipes=(("static_number", "known_driver"),),
+        max_items=20,
+        length=(128, 160),
+        n_nuisance=1,
+        nuisance_from=("static_number",),
+    )
+    batch, _ = api().make_batch(replace(c, sources=(source,)), 3)
+    assert any(batch.cand_names)
+    digest = hashlib.sha256()
+    for field in fields(batch):
+        value = getattr(batch, field.name)
+        if isinstance(value, torch.Tensor):
+            array = value.cpu().numpy()
+            digest.update(repr((str(array.dtype), array.shape)).encode())
+            digest.update(array.tobytes())
+        else:
+            digest.update(repr(value).encode())
+    assert digest.hexdigest() == "7ec9b575c54464f37eaa28444ccd32ac89c0dfc9ada04f0339bec948f7bc2437"
+
+
+@pytest.mark.parametrize("designate_target", [False, True])
+def test_level_zeroes_scores_and_keeps_every_candidate_within_budget(designate_target):
+    generated = generate_typed_panel(
+        PanelRecipe(
+            ("static_category",),
+            n_items=20,
+            length=(128, 160),
+            n_nuisance=1,
+            nuisance_from=("static_category",),
+            complete_inputs=True,
+            seed=2,
+        )
+    )
+    nuisance = generated.inputs_of("nuisance")[0].name
+    base = config(drop=(), designate_target=designate_target, cutoff_at_origin=1)
+    sources = fixed_mix(base, FixedSource(generated.panel))
+    level = 0.75
+    cfg = replace(base, sampler=replace(base.sampler, screen_no_evidence=level))
+    reference, _ = api().make_batch(base, 3, sources=sources)
+    screened, _ = api().make_batch(cfg, 3, sources=sources)
+
+    candidate_index = reference.cand_names[0].index(nuisance)
+    row = next(name for name in reference.row_names[0] if name.startswith(f"{nuisance}="))
+    assert 0 < reference.cand_score[0, candidate_index] < level
+    assert 0 < reference.row_score[0, reference.row_names[0].index(row)] < level
+    assert screened.cand_names == reference.cand_names
+    assert screened.cand_score[0, candidate_index] == 0
+    assert screened.row_score[0, screened.row_names[0].index(row)] == 0
+
+
+def test_level_puts_candidates_without_evidence_last_when_the_budget_binds(monkeypatch):
+    rng = np.random.default_rng(0)
+    length = 160
+    target = np.sin(np.arange(length) / 5)
+    known = {f"k{i:02d}": rng.normal(size=length) for i in range(20)}
+    known["k19"] = target + rng.normal(scale=0.03, size=length)
+    data = Panel(
+        "feature-budget",
+        (Item("i", 0, {"y": target}, known, {}),),
+        dict.fromkeys(known, "known"),
+        "D",
+        None,
+        True,
+    )
+    base = config(
+        drop=(), cutoff_at_origin=1, episodes_per_batch=1, episodes_per_panel=1, origins=1
+    )
+    sources = fixed_mix(base, FixedSource(data))
+    requests = []
+    build = EpisodeBuilder.build
+
+    def observe(builder, request):
+        requests.append(request)
+        return build(builder, request)
+
+    monkeypatch.setattr(EpisodeBuilder, "build", observe)
+    level = 0.75
+    cfg = replace(base, sampler=replace(base.sampler, screen_no_evidence=level))
+    reference, _ = api().make_batch(base, 3, sources=sources)
+    screened, _ = api().make_batch(cfg, 3, sources=sources)
+    request, screened_request = requests
+    assert screened_request == request
+    reference_names = set(reference.row_names[0]) & known.keys()
+    assert reference_names == set(
+        "k01 k02 k03 k04 k05 k06 k08 k10 k11 k12 k14 k15 k16 k17 k18 k19".split()
+    )
+
+    stats = PanelStats(data, "y", request.cutoff)
+    scores = {
+        candidate.name: float(np.float32(candidate.score)) if candidate.score >= level else 0.0
+        for candidate in screen(data, stats, request.item_index, ("y",), request.cutoff)
+        if candidate.removed is None
+    }
+    names = screened.row_names[0]
+    admitted = {
+        name: score.item()
+        for name, score in zip(names, screened.row_score[0, : len(names)], strict=True)
+        if name in known
+    }
+    cut = scores.keys() - admitted.keys()
+    assert len(scores) == len(known) > MAX_FEATURE_ROWS == len(admitted)
+    assert admitted.keys() != reference_names
+    assert admitted == {name: scores[name] for name in admitted}
+    assert {scores[name] for name in cut} == {0.0}
+    assert min(admitted.values()) >= max(scores[name] for name in cut)
+    assert max(admitted.values()) >= level
 
 
 @pytest.mark.parametrize("mechanism", ["static_category", "known_driver"])

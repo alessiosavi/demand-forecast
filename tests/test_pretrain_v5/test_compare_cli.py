@@ -147,10 +147,21 @@ def rejected(command, arms, out, capsys, arm, reason):
 
 
 @pytest.mark.parametrize("path", ["static_category", "category_mean"])
-def test_copied_units_publish_figures_slices_hashes_and_deterministic_bytes(copied, path):
-    _, arms, out, command = copied(path)
+def test_copied_units_publish_figures_slices_hashes_and_deterministic_bytes(
+    copied, path, monkeypatch
+):
+    base, arms, out, command = copied(path)
+    eval_set = t1.eval_set
+    observed = []
+
+    def observe(*args, **kwargs):
+        observed.append(kwargs.get("base"))
+        return eval_set(*args, **kwargs)
+
+    monkeypatch.setattr(t1, "eval_set", observe)
     before = snapshot(arms)
     assert invoke(command, arms) == 0
+    assert observed == [V5TrainConfig.from_yaml(base)]
     assert [p.name for p in out.iterdir()] == ["compare.json"]
     payload = (out / "compare.json").read_bytes()
     report = json.loads(payload)
