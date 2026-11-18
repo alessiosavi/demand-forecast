@@ -6,7 +6,6 @@ import subprocess
 import sys
 import textwrap
 from dataclasses import replace
-from time import perf_counter
 
 import numpy as np
 import pandas as pd
@@ -162,11 +161,9 @@ def test_category_grouping_does_not_rescan_history_per_label(monkeypatch):
         return original(values)
 
     monkeypatch.setattr(np, "flatnonzero", counted)
-    start = perf_counter()
     values, flags = category_step_stats(labels, np.arange(2000.0), left=0, right=2000)
-    elapsed = perf_counter() - start
     assert flags.sum() == 1000 and values.shape == (2000, 6)
-    assert elapsed < 0.75, elapsed
+    # No wall-clock bound: shared CI runners vary; the scan count below proves the property.
     assert sum(scanned) <= 4 * len(labels), sum(scanned)
 
 
