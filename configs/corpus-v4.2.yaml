@@ -1,0 +1,5 @@
+version: '4.2'
+parent: corpus-v4.1
+threshold_bytes: 100663296
+group_bytes: 33554432
+group_rows: 4096

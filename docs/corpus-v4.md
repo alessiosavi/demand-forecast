@@ -1168,3 +1168,55 @@ uses the existing generator with the derived corpus URI and
 full recipe, stage3/stage4/stage4-long/export, from a receipt-free stage2 fork.
 The audited gate remains closed. Registering and training the two-seed
 covariate-data arm, including its spend decision, is a separate next task.
+
+## Version 4.2: a training view with bounded row groups
+
+Version 4.2 preserves the 4.1 shards' names, row order and values. The CPU
+regroup job copies shards whose row groups are at most 96 MiB by the training
+reader's estimate. It rewrites any shard with a larger group using targets of
+32 MiB and 4,096 rows per group. A row above the group byte target gets its own
+group and is counted in `regroup.json`. The tool verifies the output against
+the parent and enforces the reader's 256 MiB admission limit before publication.
+The generation defaults are in `configs/corpus-v4.2.yaml`.
+
+Version 4.2 is a training view and does not constitute a corpus release. It
+carries `LICENSE.md` and `articles.csv` byte for byte and omits the folder
+receipts and statistics by design. The 4.1 release checker
+(`scripts/corpus_v4/verify_published.py`) and the release inventory require
+those records and refuse a 4.2 prefix. Use 4.1 for the overlap audit.
+
+Generate the guest script with the full code revision in `REPO_SHA` and the
+reviewed 4.1 training-tree listing digest in `PARENT_DIGEST`.
+
+```bash
+python -m scripts.corpus_v4.make_regroup_job \
+  --name regroup-example --repo-sha "$REPO_SHA" \
+  --parent-uri gs://example-bucket/corpus-v4.1 --parent-digest "$PARENT_DIGEST" \
+  --output-uri gs://example-bucket/corpus-v4.2 --output /tmp/regroup-example.sh
+```
+
+Give the guest an absolute `RUN_DIR` and a `STATE_URI` disjoint from both corpus
+prefixes. The guest checks the parent digest, confirms object generations stayed
+stable during the copy, and compares the local sizes and CRC32C checksums. The
+first output write is `regroup-claim.json`, after local row verification. Every
+upload is create-only. After the payload passes size and CRC32C read-back,
+the guest writes `regroup.json` and then `attempt-status.json` as the last
+object in the output prefix.
+
+`$STATE_URI/regroup/<name>/completed.json` records group counts before and after
+by folder and the `corpus_digest` for the published training trees. Before the
+status is published, a retry reconciles existing output against the verified
+local files. If the completion record is absent and `attempt-status.json`
+matches, the retry verifies the published ledger and object listing against the
+recorded sizes and CRC32C checksums, then writes the completion record directly.
+With a matching completion, the guest checks the recorded output listing and
+exits. A missing, extra or changed output object makes either check fail.
+
+To verify a published 4.2 tree, copy the pinned 4.1 training trees and
+attribution files into `parent_copy`, omitting `quarantine/`. Copy the 4.2
+payload and `regroup.json` into `output_copy`. Keep `regroup-claim.json` and
+`attempt-status.json` outside the local output copy. Read the ledger bytes
+from `regroup.json` and call
+`regroup_corpus.verify_tree(parent_copy, output_copy, json.loads(ledger_bytes))`.
+Compare `corpus_digest` in `completed.json` with the listing digest the training
+job computes for the published `univariate/` and `covariates/` trees.

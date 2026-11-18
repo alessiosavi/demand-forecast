@@ -53,7 +53,11 @@ Generator options remain typed-only; `control: missing_as_zero` is applied by
 the sampler. Local tests use `SIMONS_UPSTREAM` pointing at a clone at the pin (the clean clone the
 other upstream tests use; no preparation is needed).
 
-For corpus jobs, add `--corpus-uri gs://bucket/corpus-v4.1 --corpus-digest <hex>`.
+For corpus jobs using the [4.2 training view](corpus-v4.md#version-42-a-training-view-with-bounded-row-groups),
+add `--corpus-uri gs://example-bucket/corpus-v4.2 --corpus-digest <hex>`.
+Use the `corpus_digest` in the regroup job's
+`$STATE_URI/regroup/<name>/completed.json`. It covers the published `univariate/`
+and `covariates/` trees. For a 4.1 run, use its own URI and listing digest.
 Corpus sources in the YAML must have `root: null`. Only `univariate/` and
 `covariates/` are copied. The script validates the relative name, size and CRC32C
 listing digest, clears the volatile corpus cache before copying, and checks the
