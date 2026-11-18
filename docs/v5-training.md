@@ -25,8 +25,11 @@ seeded Python 3.12 environment with uv, installs torch 2.8.0 from the cu128 inde
 installs `requirements-v5.txt` and the editable corpus extra, and runs `pip check`.
 The fingerprint of sorted `pip freeze --exclude-editable` lines is part of the
 training identity. A changed dependency environment cannot resume an old run.
-The requirements were resolved for Linux x86_64 and Python 3.12; the command and
-torch constraint are recorded in the file header.
+`requirements-v5.txt` is authoritative for the guest environment. Its pins were
+resolved for Linux x86_64 and Python 3.12; the command, torch constraint and
+nvidia-pin filtering are recorded in its header. Regenerate only deliberately
+and record the environment change in the stage plan: existing states become
+unresumable under the changed environment by design.
 
 For corpus jobs, add `--corpus-uri gs://bucket/corpus-v4.1 --corpus-digest <hex>`.
 Corpus sources in the YAML must have `root: null`. Only `univariate/` and
@@ -55,6 +58,44 @@ including training's TERM and stop-after outcomes. Exit 1 records the reason in
 the unit's `failure.json`; nonfinite training is a failure. Script revision or
 corpus validation failures exit 2. A failure removes the attempted unit's old
 completion marker; it does not declare another configuration complete.
+
+The guest (`scripts/gcp/guest-run.sh`) publishes these bucket outcomes after
+the job exits, assuming the final state copy and marker upload succeed:
+
+| Job exit status | Guest marker | Marker body |
+| --- | --- | --- |
+| 0 | `DONE` | `exit_status=0` |
+| 75 (unfinished unit) | `FAILED` | `exit_status=75` |
+| 1 | `FAILED` | `exit_status=1` |
+| 2 (script validation failure) | `FAILED` | `exit_status=2` |
+| 124 or 137 | `TIMEOUT` | `exit_status=124` or `exit_status=137` |
+
+A failed final copy prevents `DONE`: a successful job is then recorded as
+`FAILED` with `exit_status=74`. Marker or log upload failures also make the
+guest exit 74, so inspect its log if publication is incomplete.
+
+On preemption, the metadata watcher first publishes `PREEMPTED` with
+`exit_status=interrupted` and `source=watcher`, then requests a checkpoint and
+attempts a bounded state copy while leaving the job running. The platform hook
+is a marker-only fallback (`source=hook`, also `exit_status=interrupted`). If the
+job finishes during the watcher's copy and the copied state inventory is
+unchanged, the watcher can archive `PREEMPTED` and reconcile it to the final
+`DONE`, `FAILED` or `TIMEOUT` using the same exit-status mapping above.
+
+Operator relaunch rule: after `PREEMPTED`, or `FAILED` whose body says
+`exit_status=75`, relaunch the **same job URI on the same state prefix** so the
+unfinished unit resumes. Any other `FAILED` is a real failure: read the unit's
+`failure.json` (if present) and the log; do not relaunch it. In particular, exit
+2 for a wrong revision or corpus listing mismatch must never be relaunched
+unchanged; script validation can fail before a unit `failure.json` exists.
+
+At startup the guest refuses a `DONE` for the same job URI, and also refuses a
+legacy `DONE` without a job URI. A `DONE` for a different URI is archived before
+admitting the new job. `FAILED`, `TIMEOUT` and `PREEMPTED` are read and archived
+as well, including outcomes for the same URI; the guest does not block those
+URIs or automatically apply the operator's retry rule. It restores state only
+after this admission and archival step. Inspect the current marker before
+deciding to launch.
 
 State layout:
 

@@ -18,6 +18,8 @@ from .checkpoint import _atomic_write, file_digest, read_manifest, write_manifes
 from .config import V5TrainConfig, identity
 from .sources import SourceMix
 
+T1_EVAL_DEFAULTS = (200, 1000)
+
 
 def _name(value: str) -> str:
     if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_-]*", value):
@@ -52,8 +54,8 @@ def _parser() -> argparse.ArgumentParser:
             sub.add_argument("--path", choices=t1.PATHS, required=True)
             sub.add_argument("--arm", type=_name, required=True)
             sub.add_argument("--seed", type=int, required=True)
-            sub.add_argument("--episodes", type=_positive, default=200)
-            sub.add_argument("--max-panels", type=_positive, default=1000)
+            sub.add_argument("--episodes", type=_positive, default=T1_EVAL_DEFAULTS[0])
+            sub.add_argument("--max-panels", type=_positive, default=T1_EVAL_DEFAULTS[1])
         else:
             sub.add_argument("--config", type=Path, required=True)
             sub.add_argument("--name", type=_name, required=True)

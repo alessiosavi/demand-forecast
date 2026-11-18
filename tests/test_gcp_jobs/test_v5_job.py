@@ -275,6 +275,121 @@ def test_valid_unit_skips_only_the_same_job(jobs, settings, machine, same):
     assert any(e[0] == "uv" for e in events) == (not same)
 
 
+def snapshot(directory):
+    return {p.relative_to(directory): p.read_bytes() for p in directory.rglob("*") if p.is_file()}
+
+
+def test_t1_extension_preserves_old_unit_and_training(jobs, settings, machine):
+    run, execute = machine
+    options = dict(
+        action="t1", repo_sha=SHA, base=str(settings), path="static_category", arm="true", seed=7
+    )
+    first = jobs.generate(name="first", **options, episodes=200, max_panels=1000)
+    result, events = execute(first)
+    assert result.returncode == 0, result.stderr
+    root = run / "state/t1/static_category-true-s7"
+    training = root / "train"
+    unit = root / "eval-200-1000"
+    for directory in (training, unit):
+        directory.mkdir(parents=True)
+        (directory / "checkpoint-final.pt").write_bytes(b"finished checkpoint")
+        write_manifest(directory / "train.json", {"files": ["checkpoint-final.pt"]})
+    (unit / "result.json").write_text('{"loss": [1.0]}')
+    write_manifest(
+        unit / "unit.json",
+        {
+            "files": ["checkpoint-final.pt", "train.json", "result.json"],
+            "job_sha256": hashlib.sha256(first.encode()).hexdigest(),
+        },
+    )
+    old_training, old_unit = snapshot(training), snapshot(unit)
+    second = jobs.generate(name="extended", **options, episodes=400, max_panels=2000)
+    previous_events = len(events)
+    result, events = execute(second)
+    assert result.returncode == 0, result.stderr
+    extension = events[previous_events:]
+    assert any(e[0] == "git" for e in extension)
+    assert any(e[0] == "uv" for e in extension)
+    preflight = next(e for e in extension if "preflight" in e)
+    assert preflight[preflight.index("preflight") + 1] == str(root / "eval-400-2000")
+    final = extension[-1]
+    assert final[:4] == ["python", "-m", "demand_forecast.pretrain.v5.job", "t1"]
+    from demand_forecast.pretrain.v5 import job
+
+    parsed = job._parser().parse_args(final[3:])
+    assert (parsed.path, parsed.arm, parsed.seed) == ("static_category", "true", 7)
+    assert f"eval-{parsed.episodes}-{parsed.max_panels}" == "eval-400-2000"
+    assert snapshot(training) == old_training
+    assert snapshot(unit) == old_unit
+    previous_events = len(events)
+    result, events = execute(first)
+    assert result.returncode == 0, result.stderr
+    assert not any(e[0] in ("git", "uv") for e in events[previous_events:])
+    assert not any("demand_forecast.pretrain.v5.job" in e for e in events[previous_events:])
+    assert snapshot(training) == old_training
+    assert snapshot(unit) == old_unit
+
+
+@pytest.mark.parametrize("defaults", [None, (3, 17)])
+def test_generator_and_cli_share_default_unit(jobs, settings, machine, monkeypatch, defaults):
+    from demand_forecast.pretrain.v5 import job
+
+    if defaults is not None:
+        monkeypatch.setattr(job, "T1_EVAL_DEFAULTS", defaults, raising=False)
+    expected = "eval-200-1000" if defaults is None else "eval-3-17"
+    run, execute = machine
+    result, events = execute(
+        jobs.generate(
+            name="defaults",
+            action="t1",
+            repo_sha=SHA,
+            base=str(settings),
+            path="static_category",
+            arm="true",
+            seed=7,
+        )
+    )
+    assert result.returncode == 0, result.stderr
+    root = run / "state/t1/static_category-true-s7"
+    preflight = next(e for e in events if "preflight" in e)
+    assert preflight[preflight.index("preflight") + 1] == str(root / expected)
+    parsed = job._parser().parse_args(events[-1][3:])
+    assert f"eval-{parsed.episodes}-{parsed.max_panels}" == expected
+    visited = []
+
+    def unfinished(args, unit, training):
+        visited.append(unit)
+        return 75
+
+    monkeypatch.setattr(job, "_run", unfinished)
+    assert (
+        job.main(
+            [
+                "t1",
+                "--run-dir",
+                str(run),
+                "--code",
+                SHA,
+                "--job-sha256",
+                "b" * 64,
+                "--env-sha256",
+                "c" * 64,
+                "--base",
+                str(settings),
+                "--path",
+                "static_category",
+                "--arm",
+                "true",
+                "--seed",
+                "7",
+            ]
+        )
+        == 75
+    )
+    assert visited == [root / expected]
+    assert (root / expected).is_dir()
+
+
 def test_sha_mismatch_exits_before_environment(jobs, settings, machine):
     _, execute = machine
     result, events = execute(jobs.generate(**arguments(settings)), FETCHED_SHA="e" * 40)

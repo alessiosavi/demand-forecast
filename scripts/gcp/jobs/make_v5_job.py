@@ -11,6 +11,8 @@ from pathlib import Path
 
 import yaml
 
+from demand_forecast.pretrain.v5 import job
+
 # This helper deliberately uses only the image interpreter's standard library.
 # It runs before repository or environment installation, including on a retry.
 GUEST = r"""
@@ -223,7 +225,10 @@ def generate(
         _name(arm, "arm")
         if type(seed) is not int:
             raise ValueError("t1 requires an integer seed")
-        episodes, max_panels = _count(episodes, 200), _count(max_panels, 1000)
+        episodes, max_panels = (
+            _count(episodes, job.T1_EVAL_DEFAULTS[0]),
+            _count(max_panels, job.T1_EVAL_DEFAULTS[1]),
+        )
         unit = f"state/t1/{path}-{arm}-s{seed}/eval-{episodes}-{max_panels}"
         command += [
             "--path",

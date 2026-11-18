@@ -6,7 +6,9 @@ import json
 import signal
 import subprocess
 import sys
+import time
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
@@ -156,6 +158,112 @@ def test_t1_interrupt_after_training_resumes_evaluation_only(job, small_t1, tmp_
         2,
         40,
     )
+
+
+def killable_t1(boundary, command):
+    """Child process barriers preserve real training, checkpointing and evaluation."""
+    import torch
+
+    from demand_forecast.pretrain.v5 import job
+
+    torch.set_num_threads(1)
+    run = Path(command[command.index("--run-dir") + 1])
+    root = run / "state/t1/static_category-true-s7"
+    paths = copy.deepcopy(t1.PATHS)
+    for entry in paths.values():
+        entry["both"].setdefault("source", {}).update(max_items=8, length=(128, 160))
+    t1.PATHS = paths
+
+    def wait_for_release():
+        (run / "ready").touch()
+        deadline = time.monotonic() + 30
+        while not (run / "release").exists():
+            if time.monotonic() >= deadline:
+                raise TimeoutError("parent did not release child")
+            time.sleep(0.01)
+
+    real_loss, real_evaluate = loop.v5_loss, t1.evaluate
+
+    def loss(*a, **kw):
+        if boundary == "training":
+            saved = latest_checkpoint(root / "train")
+            if saved is not None and saved[1]["counters"]["batch"] > 0:
+                wait_for_release()
+        with (run / "loss-calls").open("a") as stream:
+            stream.write("update\n")
+        return real_loss(*a, **kw)
+
+    def evaluate(*a, **kw):
+        if boundary == "evaluation":
+            wait_for_release()
+        return real_evaluate(*a, **kw)
+
+    loop.v5_loss, t1.evaluate = loss, evaluate
+    raise SystemExit(job.main(command))
+
+
+@pytest.mark.parametrize("boundary", ["training", "evaluation"])
+def test_t1_sigkill_resumes_from_published_training_or_slot(small_t1, tmp_path, boundary):
+    base = replace(
+        config(steps=4),
+        sampler=replace(config().sampler, designate_target=True, contexts=(64,), horizon=(16, 24)),
+    )
+    base = replace(base, optim=replace(base.optim, checkpoint_minutes=1e-9))
+    base.to_yaml(small_t1)
+    command = t1_args(tmp_path, small_t1)
+    child_command = [
+        sys.executable,
+        "-c",
+        "import sys; from tests.test_pretrain_v5.test_job import killable_t1; "
+        "killable_t1(sys.argv[1], sys.argv[2:])",
+        boundary,
+        *command,
+    ]
+    root = tmp_path / "state/t1/static_category-true-s7"
+    unit = root / "eval-2-40/unit.json"
+    with (tmp_path / "child.log").open("w+") as log:
+        process = subprocess.Popen(child_command, stdout=log, stderr=log)
+        try:
+            deadline = time.monotonic() + 30
+            manifest = root / "train/train.json"
+            while not (tmp_path / "ready").exists() or (
+                boundary == "evaluation" and not manifest.exists()
+            ):
+                assert process.poll() is None, (tmp_path / "child.log").read_text()
+                assert time.monotonic() < deadline, (tmp_path / "child.log").read_text()
+                time.sleep(0.01)
+            assert not unit.exists()
+            if boundary == "evaluation":
+                assert read_manifest(manifest) is not None
+                final_bytes = (root / "train/checkpoint-final.pt").read_bytes()
+            else:
+                saved = latest_checkpoint(root / "train")
+                assert saved is not None
+                assert saved[1]["counters"]["batch"] == 1
+                assert not manifest.exists()
+            process.send_signal(signal.SIGKILL)
+            assert process.wait(timeout=10) == -signal.SIGKILL
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=10)
+    assert not unit.exists()
+    assert not (unit.parent / "failure.json").exists()
+    calls_before = (tmp_path / "loss-calls").read_text().splitlines()
+    (tmp_path / "release").touch()
+    result = subprocess.run(child_command, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    assert read_manifest(unit) is not None
+    assert len(json.loads((unit.parent / "result.json").read_text())["loss"]) == 2
+    calls_after = (tmp_path / "loss-calls").read_text().splitlines()
+    assert len(calls_after) == 4  # Retraining would repeat the completed updates.
+    if boundary == "evaluation":
+        assert calls_after == calls_before
+        assert (root / "train/checkpoint-final.pt").read_bytes() == final_bytes
+    else:
+        assert len(calls_after) - len(calls_before) == 3
+        final = loop._read_checkpoint(root / "train/checkpoint-final.pt")
+        assert final["counters"]["batch"] == 4
 
 
 @pytest.mark.parametrize(
