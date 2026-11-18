@@ -1,5 +1,7 @@
 """Public v5 episode records, dimensions, kind rules and scaling helpers."""
 
+from .builder import DROPPABLE, Episode, EpisodeBuilder, EpisodeRequest
+from .collate import EpisodeBatch, collate
 from .kinds import flag_codes, infer_kind, infer_static_kind, is_missing, label_of
 from .scale import Scale, compress, fit_scale, to_scaled
 from .schema import (
@@ -42,11 +44,6 @@ from .schema import (
     Item,
     Panel,
 )
-
-# Screening imports Panel from this package, so expose the schema first.
-# isort: split
-from .builder import DROPPABLE, Episode, EpisodeBuilder, EpisodeRequest
-from .collate import EpisodeBatch, collate
 from .screening import ScreeningConfig
 
 __all__ = [
