@@ -354,6 +354,7 @@ def _copy_shard(source, target):
             bytes=source.stat().st_size,
             groups=parquet.num_row_groups,
             largest_estimate=largest,
+            rows=rows,
             rows_sha256=rows_sha256,
         )
     shutil.copyfile(source, target)
@@ -370,6 +371,8 @@ def regroup_tree(parent, out, *, threshold_bytes, group_bytes, group_rows) -> di
     if out.exists():
         raise ValueError(f"output already exists: {out}")
     shards, other = _parent_inventory(parent)
+    if not shards:
+        raise ValueError(f"corpus root has no shards: {parent}")
     # Inspect every shard's schema and footer before creating any output paths.
     to_regroup = {
         name
@@ -507,13 +510,21 @@ def verify_tree(parent, out, record) -> None:
             if copied:
                 _check_record_keys(shard, "shard record", "sha256", "rows_sha256")
                 _verify_copied(source, target, shard["sha256"])
-                metadata = pq.read_metadata(target)
-                largest, _ = _check_groups(metadata, target.name)
+                with _open_parquet(target) as parquet:
+                    metadata = parquet.metadata
+                    largest, _ = _check_groups(metadata, target.name)
+                    rows, rows_sha256 = _rows_evidence(parquet)
+                if rows != metadata.num_rows:
+                    raise ValueError("streamed row count mismatch")
+                # Earlier copied-shard records did not include a row count.
+                if "rows" in shard:
+                    _check_record(shard, rows=rows)
                 _check_record(
                     shard,
                     bytes=target.stat().st_size,
                     groups=metadata.num_row_groups,
                     largest_estimate=largest,
+                    rows_sha256=rows_sha256,
                 )
             else:
                 _verify_rewritten(

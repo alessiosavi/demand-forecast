@@ -7,14 +7,15 @@ import subprocess
 import sys
 
 import numpy as np
-import pyarrow as pa
-import pyarrow.parquet as pq
 import pytest
 
-from demand_forecast.pretrain.v5.config import SourceConfig
-from demand_forecast.pretrain.v5.corpus import CorpusIndex, RowCache, read_values
-from demand_forecast.pretrain.v5.sources import CorpusSource
-from tests.helpers.corpus_v4_fixture import write_rows
+pa = pytest.importorskip("pyarrow")
+pq = pytest.importorskip("pyarrow.parquet")
+
+from demand_forecast.pretrain.v5.config import SourceConfig  # noqa: E402
+from demand_forecast.pretrain.v5.corpus import CorpusIndex, RowCache, read_values  # noqa: E402
+from demand_forecast.pretrain.v5.sources import CorpusSource  # noqa: E402
+from tests.helpers.corpus_v4_fixture import write_rows  # noqa: E402
 
 UNI = "univariate/a/train-000.parquet"
 COV = "covariates/b/validation-000.parquet"
@@ -235,6 +236,29 @@ def test_cli_rejects_parameters_above_admission_limit(regroup, tmp_path, paramet
     assert not out.exists()
 
 
+def test_tree_rejects_root_without_shards(regroup, tmp_path):
+    parent, out = tmp_path / "parent", tmp_path / "out"
+    parent.mkdir()
+
+    with pytest.raises(ValueError, match="corpus root has no shards") as caught:
+        regroup.regroup_tree(parent, out, **PARAMETERS)
+    assert str(caught.value) == f"corpus root has no shards: {parent}"
+    assert not out.exists()
+
+
+def test_cli_rejects_root_with_attribution_but_no_shards(tmp_path):
+    parent, out = tmp_path / "parent", tmp_path / "out"
+    license_file = parent / LICENSE
+    license_file.parent.mkdir(parents=True)
+    license_file.write_text("Fixture license", encoding="utf-8")
+
+    result = _run_cli(parent, out)
+
+    assert result.returncode != 0
+    assert f"corpus root has no shards: {parent}" in result.stderr
+    assert not out.exists()
+
+
 @pytest.mark.parametrize("column", ["target", "covariates"])
 def test_fixed_size_list_is_rejected_before_output(regroup, tmp_path, column):
     parent, out = _tree(tmp_path / "parent"), tmp_path / "out"
@@ -343,6 +367,7 @@ def test_reads_one_row_at_a_time(regroup, tmp_path, monkeypatch):
     assert {group for path, group in reads if path == out / UNI} == set(
         range(record["shards"][UNI]["output_groups"])
     )
+    assert {group for path, group in reads if path == out / COV} == {0}
 
 
 @pytest.mark.parametrize("stored", [False, True])
@@ -468,10 +493,12 @@ def test_tree_inventory(regroup, tmp_path, bad_path):
         "bytes",
         "groups",
         "largest_estimate",
+        "rows",
         "rows_sha256",
     }
     assert record["shards"][COV]["copied"] is True
     assert record["shards"][COV]["sha256"] == _sha256(parent / COV)
+    assert record["shards"][COV]["rows"] == 1
     for relative in (LICENSE, ARTICLES, COV):
         assert (out / relative).read_bytes() == (parent / relative).read_bytes()
     regroup.verify_tree(parent, out, record)
@@ -536,6 +563,33 @@ def test_verify_accepts_the_cli_ledger_and_rejects_changes(regroup, tmp_path):
     ledger.write_text(json.dumps({**record, "parameters": parameters}), encoding="utf-8")
     with pytest.raises(ValueError, match=r"regroup\.json"):
         regroup.verify_tree(parent, out, record)
+
+
+@pytest.mark.parametrize(
+    ("key", "value"), [("rows_sha256", "0" * 64), ("rows", 2)], ids=["digest", "row-count"]
+)
+def test_verify_rejects_changed_copied_row_evidence(regroup, tmp_path, key, value):
+    parent, out = _tree(tmp_path / "parent"), tmp_path / "out"
+    result = _run_cli(parent, out)
+    assert result.returncode == 0, result.stderr
+    ledger = out / "regroup.json"
+    record = json.loads(ledger.read_text(encoding="utf-8"))
+
+    copied = record["shards"][COV]
+    assert copied["copied"] is True
+    copied[key] = value
+    ledger.write_text(json.dumps(record), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=rf"{COV}.*{key}"):
+        regroup.verify_tree(parent, out, record)
+
+
+def test_verify_accepts_copied_record_without_row_count(regroup, tmp_path):
+    parent, out = _tree(tmp_path / "parent"), tmp_path / "out"
+    record = regroup.regroup_tree(parent, out, **PARAMETERS)
+    record["shards"][COV].pop("rows", None)
+
+    regroup.verify_tree(parent, out, record)
 
 
 def test_verify_rejects_extra_empty_directory(regroup, tmp_path):
