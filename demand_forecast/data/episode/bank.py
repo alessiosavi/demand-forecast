@@ -118,6 +118,42 @@ def step_features(
     return values.astype(np.float32), flags
 
 
+def _sample_shape_statistics(
+    centered: np.ndarray, sum_squares: np.ndarray, count: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return adjusted skewness and excess kurtosis from zero-padded deviations."""
+    n = count.astype(np.float64)
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        # These agree with pandas 3.1.1's reducers up to floating-point rounding
+        # when the common offset is not many orders of magnitude above the spread.
+        # The affine scale's median location removes the offset when the fitting
+        # history represents the summary window. For a row constant up to rounding
+        # noise around a large offset, both reducers work on rounding noise and
+        # their results can differ. This calculation is deterministic across NumPy
+        # versions and corrects the central sums for the residual mean.
+        residual = centered.sum(axis=1)
+        shift = residual / n
+        shift_squared = shift * shift
+        correction = residual * shift
+        squared = centered * centered
+        cubes = (squared * centered).sum(axis=1)
+        fourth_powers = (squared * squared).sum(axis=1)
+        m2 = np.maximum(sum_squares - correction, 0.0)
+        m3 = (cubes - 3 * sum_squares * shift) + (shift + shift) * correction
+        m4 = ((fourth_powers - 4 * cubes * shift) + 6 * sum_squares * shift_squared) - (
+            3 * correction * shift_squared
+        )
+        m4 = np.maximum(m4, 0.0)
+
+        skewness = (m3 / (m2 * np.sqrt(m2))) * (n * np.sqrt(n - 1) / (n - 2))
+        kurtosis = ((m4 / (m2 * m2)) * ((n + 1) * n) - 3 * (n - 1)) * (
+            (n - 1) / ((n - 2) * (n - 3))
+        )
+    return np.where((count >= 3) & (m2 > 0), skewness, np.nan), np.where(
+        (count >= 4) & (m2 > 0), kurtosis, np.nan
+    )
+
+
 def summary_vectors(
     scaled: np.ndarray,
     raw: np.ndarray,
@@ -178,10 +214,10 @@ def summary_vectors(
         sum_squares = (centered**2).sum(axis=1)
         variance = sum_squares / safe_count
         nonconstant = ((packed != packed[:, :1]) & packed_valid).any(axis=1)
-        # pandas uses the same bias corrections and constant convention as tsfresh.
-        frame = pd.DataFrame(np.where(packed_valid, packed, np.nan))
-        store("skewness", frame.skew(axis=1).to_numpy(), count >= 4)
-        store("kurtosis", frame.kurt(axis=1).to_numpy(), count >= 4)
+        skewness, kurtosis = _sample_shape_statistics(centered, sum_squares, count)
+        shape_valid = (count >= 4) & nonconstant
+        store("skewness", skewness, shape_valid)
+        store("kurtosis", kurtosis, shape_valid)
 
         raw_mean = packed_raw.sum(axis=1) / safe_count
         raw_variance = np.where(packed_valid, packed_raw - raw_mean[:, None], 0.0)

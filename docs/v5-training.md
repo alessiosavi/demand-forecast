@@ -30,6 +30,9 @@ resolved for Linux x86_64 and Python 3.12; the command, torch constraint and
 nvidia-pin filtering are recorded in its header. Regenerate only deliberately
 and record the environment change in the stage plan: existing states become
 unresumable under the changed environment by design.
+The v5 export adds `safetensors==0.6.2`, which gives jobs generated from the
+merged export revision onward a new environment hash. The registered S1 and Q
+units still fetch older revisions with their own requirements files.
 
 For a source with `kind: upstream`, add `--upstream` to job generation. For
 train/qualify the generator parses YAML locally and requires the upstream source
@@ -65,6 +68,38 @@ Q records that copy time so the stage-2 plan can budget it.
 An initial export checkpoint applies only to `train`:
 `--init-uri gs://bucket/initial.pt --init-sha256 <hex>`. Its bytes are verified
 before training, and its digest participates in the training identity.
+
+## Scoring export and parity
+
+Export one checkpoint in the training environment and check the resulting
+directory in the scoring environment.
+
+```bash
+python -m demand_forecast.models.v5.export write --checkpoint checkpoint-final.pt --out v5-export
+python -m demand_forecast.models.v5.export check v5-export
+```
+
+The destination must be absent or empty. The export is published as one
+directory after verification. It contains the checkpoint's selected raw or EMA
+state dict in `model.safetensors`, provenance and file digests in `config.json`,
+and eight replayable cases in `parity.npz`. Load it with
+`demand_forecast.models.v5.export.load_export` and use `require_parity` before
+scoring. Each case stores its panel and requests, every collated batch field,
+and the model's scaled CPU float32 quantiles and gates. The archive opens with
+`numpy.load(..., allow_pickle=False)`.
+
+The check reports exact comparisons for discrete fields, names, shapes and
+dtypes. It shows the largest fraction of the allowed error for each case's
+floating batch and output fields. Ratios above 1 or exact mismatches give exit
+status 1. Batch tolerances are `atol=rtol=1e-6`. Output tolerances are
+`atol=rtol=1e-4` on CPU and `atol=rtol=2e-3` on another device
+(`check v5-export --device DEVICE`). NaN positions must match.
+
+Run `bash scripts/ci/v5_parity.sh` to run the Linux CI gate locally. It uses
+Python 3.12, CPU torch 2.8.0 and the relevant training and scoring pins. It
+creates a seeded, untrained tiny export with `selftest` in the training
+environment and checks it in the scoring environment. If the gate fails on
+merged code, scoring work pauses while the environment choice is revisited.
 
 The module also runs directly under the guest contract:
 
