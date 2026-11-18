@@ -182,9 +182,11 @@ def test_shuffle_preserves_targets_uncontrolled_record_and_rng(selection):
 @pytest.mark.parametrize("selection", ["all", "attribute"])
 def test_hierarchy_and_its_twins_are_each_shuffled_once(monkeypatch, selection):
     config = replace(
-        typed_config(n_nuisance=2, nuisance_from=("hierarchy",)),
+        typed_config(),
         recipes=(("hierarchy",),),
         max_items=64,
+        n_nuisance=2,
+        nuisance_from=("hierarchy",),
     )
     module = api()
     calls = []
@@ -257,9 +259,11 @@ def test_other_controls_preserve_uncontrolled_record_and_rng(control):
 def test_apply_control_matches_recipe_seed_and_input_selection(mechanism, control, selection):
     module = api()
     config = replace(
-        typed_config(n_nuisance=2, nuisance_from=(mechanism,)),
+        typed_config(),
         recipes=((mechanism,),),
         max_items=64,
+        n_nuisance=2,
+        nuisance_from=(mechanism,),
         control=control,
         control_inputs=selection,
     )

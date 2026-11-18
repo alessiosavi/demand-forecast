@@ -218,10 +218,7 @@ class CorpusIndex:
                         if group.column(j).path_in_schema.split(".")[0] in columns
                     )
                     estimate = 24 * num_values + 64 * group.num_rows
-                    too_large = estimate > max_group_bytes
-                    # Scan frequency labels in excluded groups too.
-                    freq = _frequencies(parquet, i, None if too_large else unparsed_frequencies)
-                    if too_large:
+                    if estimate > max_group_bytes:
                         excluded.append(
                             (
                                 relative,
@@ -231,7 +228,7 @@ class CorpusIndex:
                         )
                     else:
                         groups.append((kind, relative, i, group.num_rows))
-                        frequencies.append(freq)
+                        frequencies.append(_frequencies(parquet, i, unparsed_frequencies))
                         starts.append(file_start)
                         rows += group.num_rows
                         ends.append(rows)
