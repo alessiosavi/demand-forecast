@@ -335,22 +335,24 @@ def _trial(config, directory, device):
 def _corpus_measure(config, device):
     sources = [source for source in config.sources if source.kind == "corpus"]
     if not sources:
-        return None, None
+        return None, None, None
     roots = sorted({source.root for source in sources if source.root is not None})
     if len(roots) != len({source.root for source in sources}):
         raise ValueError("qualification corpus sources require source.root")
     indices, seconds = _timed(device, lambda: [CorpusIndex.build(Path(root)) for root in roots])
     admitted, excluded = sum(index.rows for index in indices), 0
+    unparsed_frequency_rows: Counter[str] = Counter()
     # excluded stores (relative file, row-group id, reason), not row counts.
     # Use footer metadata; never decode an excluded group's numeric values.
     import pyarrow.parquet as pq
 
     for index in indices:
+        unparsed_frequency_rows.update(index.unparsed_frequencies)
         for relative, group, _ in index.excluded:
             with pq.ParquetFile(index.root / relative) as parquet:
                 excluded += parquet.metadata.row_group(group).num_rows
     total = admitted + excluded
-    return seconds, excluded / total if total else None
+    return seconds, excluded / total if total else None, dict(unparsed_frequency_rows)
 
 
 def _checkpoint_measure(path, directory, device):
@@ -477,7 +479,7 @@ def qualify(
             config.optim, max_steps=updates, log_every=1, ema_decay=config.optim.ema_decay or 0.999
         ),
     )
-    index_seconds, excluded_share = _corpus_measure(base, device)
+    index_seconds, excluded_share, unparsed_frequency_rows = _corpus_measure(base, device)
     first_iterator = None
 
     def first_batch():
@@ -496,6 +498,7 @@ def qualify(
         "first_batch_seconds": first_seconds,
         "restore_seconds": {},
         "excluded_row_share": excluded_share,
+        "unparsed_frequency_rows": unparsed_frequency_rows,
     }
     report = {"cold_start": cold, "models": {}}
     out = Path(out)

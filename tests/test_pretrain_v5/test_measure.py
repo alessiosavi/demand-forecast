@@ -369,8 +369,10 @@ def test_qualify_measures_all_sections_and_only_writes_json(tmp_path, workers, m
         "first_batch_seconds",
         "restore_seconds",
         "excluded_row_share",
+        "unparsed_frequency_rows",
     } <= cold.keys()
     assert cold["corpus_index_seconds"] is None and cold["excluded_row_share"] is None
+    assert cold["unparsed_frequency_rows"] is None
     assert_numbers(cold)
     for name, architecture in models.items():
         measured = report["models"][name]
@@ -467,7 +469,14 @@ def test_qualify_uses_expensive_settings_and_real_optimizer_ema_checkpoint(tmp_p
     assert not checkpoints[-1]["config"]["sampler"]["drop"]
 
 
-def test_qualify_corpus_exclusion_is_rows_not_groups(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "labels,expected",
+    [(["D", "D"], {}), (["D", "nonsense"], {"nonsense": 1})],
+    ids=["all_parsed", "unparsed"],
+)
+def test_qualify_corpus_reports_exclusions_and_unparsed_rows(
+    tmp_path, monkeypatch, labels, expected
+):
     pytest.importorskip("pyarrow")
     from demand_forecast.pretrain.v5.config import SourceConfig
     from demand_forecast.pretrain.v5.corpus import CorpusIndex
@@ -479,9 +488,10 @@ def test_qualify_corpus_exclusion_is_rows_not_groups(tmp_path, monkeypatch):
     write_rows(
         root / "univariate/a/train-000.parquet",
         [[np.arange(64)], [np.arange(64)]],
+        freqs=labels,
         row_group_size=2,
     )
-    write_rows(root / "univariate/b/train-000.parquet", [[np.arange(512)]])
+    write_rows(root / "univariate/b/train-000.parquet", [[np.arange(512)]], freqs=["nonsense"])
     build = CorpusIndex.build
 
     def limited(cls, location, **kwargs):
@@ -501,6 +511,7 @@ def test_qualify_corpus_exclusion_is_rows_not_groups(tmp_path, monkeypatch):
     )
     assert report["cold_start"]["corpus_index_seconds"] >= 0
     assert report["cold_start"]["excluded_row_share"] == pytest.approx(1 / 3)
+    assert report["cold_start"]["unparsed_frequency_rows"] == expected
 
 
 def test_checkpoint_measure_serializes_state_on_measured_device(tmp_path, monkeypatch):

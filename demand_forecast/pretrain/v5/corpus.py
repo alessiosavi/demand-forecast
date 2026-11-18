@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 from bisect import bisect_right
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -48,36 +48,57 @@ def _footer_digest(path: Path) -> str:
 
 @dataclass(frozen=True)
 class _Frequencies:
-    values: tuple[str, ...]
+    values: tuple[str | None, ...]
     codes: bytes = b""
     width: int = 0
 
-    def at(self, row: int) -> str:
+    def at(self, row: int) -> str | None:
         code = int.from_bytes(self.codes[row * self.width : (row + 1) * self.width], "little")
         return self.values[code]
 
 
-def _frequencies(parquet, group: int, relative: str) -> _Frequencies:
+def _frequencies(parquet, group: int, unparsed_frequencies: Counter[str] | None) -> _Frequencies:
     column = parquet.read_row_group(group, columns=["freq"], use_threads=False)["freq"]
     encoded = column.dictionary_encode().combine_chunks()
     # Only the dictionary crosses into Python; per-row aliases remain Arrow codes.
     aliases = encoded.dictionary.to_pylist()
-    invalid = [None] if encoded.null_count else []
-    for value in aliases:
+    parsed_aliases = []
+    invalid = {}
+    for code, label in enumerate(aliases):
+        freq = None
         try:
-            if not isinstance(value, str) or not value or to_offset(value).n <= 0:
-                raise ValueError("frequency must be a positive offset")
-        except (TypeError, ValueError, AttributeError):
-            invalid.append(value)
-    if invalid:
-        raise ValueError(f"invalid frequency in {relative}: {invalid!r}")
-    values = tuple(sorted(aliases))
+            if isinstance(label, str) and label and to_offset(label).n > 0:
+                freq = label
+        except (TypeError, ValueError, AttributeError, OverflowError):
+            pass
+        parsed_aliases.append(freq)
+        if freq is None:
+            invalid[code] = "null" if label is None else str(label)
+
+    indices = encoded.indices
+    null_count = encoded.null_count
+    if unparsed_frequencies is not None:
+        if invalid:
+            # Reduce the row codes in Arrow before materialising the distinct counts.
+            for entry in indices.value_counts().to_pylist():
+                label = invalid.get(entry["values"])
+                if label is not None:
+                    unparsed_frequencies[label] += entry["counts"]
+        if null_count:
+            unparsed_frequencies["null"] += null_count
+
+    values = tuple(sorted(freq for freq in parsed_aliases if freq is not None))
+    if invalid or null_count:
+        values += (None,)
     if len(values) <= 1:
         return _Frequencies(values)
     lookup = {value: i for i, value in enumerate(values)}
     width = 1 if len(values) <= 256 else 2 if len(values) <= 65536 else 4
-    dictionary_codes = np.fromiter((lookup[value] for value in aliases), dtype=f"<u{width}")
-    codes = dictionary_codes[encoded.indices.to_numpy(zero_copy_only=False)]
+    if null_count:
+        indices = indices.fill_null(len(parsed_aliases))
+        parsed_aliases.append(None)
+    dictionary_codes = np.fromiter((lookup[freq] for freq in parsed_aliases), dtype=f"<u{width}")
+    codes = dictionary_codes[indices.to_numpy(zero_copy_only=False)]
     return _Frequencies(values, codes.tobytes(), width)
 
 
@@ -111,6 +132,8 @@ def _check_numeric_schema(parquet, kind: str, relative: str) -> tuple[str, ...]:
 
 @dataclass(frozen=True)
 class CorpusIndex:
+    """Index of admitted corpus rows."""
+
     root: Path
     groups: tuple[tuple[str, str, int, int], ...]
     excluded: tuple[tuple[str, int, str], ...]
@@ -118,6 +141,8 @@ class CorpusIndex:
     _frequencies: tuple[_Frequencies, ...] = field(default=(), repr=False)
     _ends: tuple[int, ...] = field(default=(), repr=False)
     _file_starts: tuple[int, ...] = field(default=(), repr=False)
+    unparsed_frequencies: dict[str, int] = field(default_factory=dict, hash=False)
+    """Unparsed label counts for admitted rows, with ``rows`` as the denominator."""
 
     @classmethod
     def build(cls, root: Path, *, max_group_bytes: int = 256 << 20) -> CorpusIndex:
@@ -175,6 +200,7 @@ class CorpusIndex:
             )
 
         groups, excluded, frequencies, ends, starts = [], [], [], [], []
+        unparsed_frequencies: Counter[str] = Counter()
         rows = 0
         for path in paths:
             relative = path.relative_to(root).as_posix()
@@ -186,14 +212,16 @@ class CorpusIndex:
                 file_start = 0
                 for i in range(parquet.num_row_groups):
                     group = parquet.metadata.row_group(i)
-                    freq = _frequencies(parquet, i, relative)
                     num_values = sum(
                         group.column(j).num_values
                         for j in range(group.num_columns)
                         if group.column(j).path_in_schema.split(".")[0] in columns
                     )
                     estimate = 24 * num_values + 64 * group.num_rows
-                    if estimate > max_group_bytes:
+                    too_large = estimate > max_group_bytes
+                    # Scan frequency labels in excluded groups too.
+                    freq = _frequencies(parquet, i, None if too_large else unparsed_frequencies)
+                    if too_large:
                         excluded.append(
                             (
                                 relative,
@@ -216,6 +244,7 @@ class CorpusIndex:
             tuple(frequencies),
             tuple(ends),
             tuple(starts),
+            unparsed_frequencies=dict(unparsed_frequencies),
         )
 
     @property
