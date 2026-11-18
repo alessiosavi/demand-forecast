@@ -206,6 +206,14 @@ arms and their shared held-out evaluation: requested horizons of 1 to 4 steps,
 because the sampler truncates a log-uniform draw and the range's upper bound is
 exclusive.
 
+Both `event_response` arms and their shared held-out evaluation enable
+`sampler.first_event_only`. A path episode qualifies only if the complete
+event flag has no event from that item's start up to the forecast origin,
+including positions with missing targets or flags in the exposed data. An
+event at the origin is part of the horizon. The existing visible horizon
+event and same-label peer requirements still apply. The option defaults to
+`false` and applies only to `event_response` path episodes.
+
 After a stop between training and evaluation, rerun the same job: the completed
 training is validated and reused. For an inconclusive result, double both
 `--episodes` and `--max-panels`, give the script a new name and job URI, and use

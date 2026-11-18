@@ -142,6 +142,30 @@ def test_cold_share_refuses_missing_as_zero():
         replace(base, sampler=sampler, sources=sources)
 
 
+def test_first_event_only_yaml_and_identity(tmp_path):
+    base = training_config()
+    assert base.sampler.first_event_only is False
+    assert "first_event_only" not in base.canonical()["sampler"]
+    cfg = replace(base, sampler=replace(base.sampler, first_event_only=True))
+    path = tmp_path / "first-event.yaml"
+    cfg.to_yaml(path)
+    raw = yaml.safe_load(path.read_text())
+    assert raw["sampler"]["first_event_only"] is True
+    assert type(cfg).from_yaml(path) == cfg
+    assert cfg.canonical()["sampler"]["first_event_only"] is True
+    parts = dict(code="0" * 40, corpus=None, init=None, env="e" * 64)
+    identity = config_module().identity
+    assert identity(cfg, **parts) != identity(base, **parts)
+
+    raw["sampler"]["first_event_only"] = "false"
+    path.write_text(yaml.safe_dump(raw))
+    with pytest.raises(ValueError, match="first_event_only"):
+        type(cfg).from_yaml(path)
+    del raw["sampler"]["first_event_only"]
+    path.write_text(yaml.safe_dump(raw))
+    assert type(cfg).from_yaml(path) == base
+
+
 @pytest.mark.parametrize("section", [None, "model", "sources", "sampler", "optim"])
 def test_yaml_rejects_unknown_keys_at_every_level(tmp_path, section):
     cfg = training_config()

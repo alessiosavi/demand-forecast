@@ -5,6 +5,7 @@ from __future__ import annotations
 import numpy as np
 
 from demand_forecast.data.episode.kinds import is_missing
+from demand_forecast.data.episode.schema import Item
 from demand_forecast.data.episode.screening import ScreeningConfig
 from demand_forecast.synthetic.typed import GeneratedPanel, necessary_items
 from demand_forecast.synthetic.typed.draft import INPUT_MECHANISMS, STATIC_MECHANISMS
@@ -42,6 +43,11 @@ _MIN = ScreeningConfig()
 
 def _slice(item, values, left, right):
     return values[max(0, left - item.start) : max(0, right - item.start)]
+
+
+def has_prior_event(item: Item, column: str, origin: int) -> bool:
+    """Check the complete event flag from the item's start up to the origin."""
+    return bool((_slice(item, item.dynamic[column], item.start, origin) == 1).any())
 
 
 def _available(values):
@@ -86,6 +92,7 @@ def supported(
     context: int,
     horizon: int,
     cutoff: int,
+    first_event_only: bool = False,
 ) -> bool:
     """Use exposed availability and recorded truth, never inferred input kinds."""
     item = next((item for item in generated.panel.items if item.item_id == item_id), None)
@@ -112,6 +119,12 @@ def supported(
             return bool(_available(history).sum() >= _MIN.min_steps and _available(future).any())
         if mechanism in ("planned_event", "event_response"):
             truth = next(i for i in generated.complete.items if i.item_id == item_id)
+            if (
+                first_event_only
+                and mechanism == "event_response"
+                and has_prior_event(truth, record.name, origin)
+            ):
+                return False
             events = _slice(truth, truth.dynamic[record.name], origin, origin + horizon)
             return bool((_available(future) & (events == 1)).any())
         if mechanism.startswith("dynamic_category_"):

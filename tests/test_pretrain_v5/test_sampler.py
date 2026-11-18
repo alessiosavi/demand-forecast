@@ -1323,6 +1323,40 @@ def test_static_path_batches_are_full(path, arm, monkeypatch):
         print(f"{path}/{arm} batch {k}: {draw.call_count} panels, cold={report['cold']}")
 
 
+@pytest.mark.parametrize("arm", ["true", "null"])
+def test_event_response_path_batches_are_full(arm, monkeypatch):
+    path = "event_response"
+    c = t1.t1_config(path, arm, seed=7)
+    draw = Mock(wraps=api()._draw)
+    monkeypatch.setattr(api(), "_draw", draw)
+    plan_panel = api()._plan_panel
+    prior_events = []
+
+    def check_plans(panel, record, *args, **kwargs):
+        planned = plan_panel(panel, record, *args, **kwargs)
+        generated = record["generated"]
+        flag = next(r.name for r in generated.inputs_of(path) if r.where == "dynamic")
+        for plan in planned[1]:
+            if plan.mechanism == path:
+                item = generated.complete.items[plan.request.item_index]
+                stop = plan.request.origins[-1] - item.start
+                if (item.dynamic[flag][:stop] == 1).any():
+                    prior_events.append((item.item_id, plan.request.origins[-1]))
+        return planned
+
+    monkeypatch.setattr(api(), "_plan_panel", check_plans)
+    for k in (0, 1, 2):
+        draw.reset_mock()
+        batch, report = api().make_batch(c, k)
+        print(
+            f"{path}/{arm} batch {k}: {report['episodes']} episodes, {draw.call_count} panels, "
+            f"no_support={report['skips'].get('no_support', 0)}"
+        )
+        assert batch.x.shape[0] == report["episodes"] == c.sampler.episodes_per_batch
+        assert report["paths"][path] == round(c.sampler.path_share * c.sampler.episodes_per_batch)
+        assert not prior_events
+
+
 def test_requests_share_patch_anchor_and_fit_context():
     p = panel()
     c = config().sampler
