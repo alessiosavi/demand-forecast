@@ -203,7 +203,6 @@ def test_router_and_gates_reject_unknown_modes(field):
 _TYPED_OPTIONS = (
     ("control", "shuffle"),
     ("control", "no_dates"),
-    ("control", "missing_as_zero"),
     ("control", False),
     ("control_inputs", "attribute"),
     ("control_inputs", "column"),
@@ -228,6 +227,27 @@ def test_non_typed_sources_reject_typed_options(kind, field, value):
 @pytest.mark.parametrize("field,value", [row for row in _TYPED_OPTIONS if row[1] is not False])
 def test_typed_sources_accept_typed_options(field, value):
     assert getattr(config_module().SourceConfig("typed", 1.0, **{field: value}), field) == value
+
+
+@pytest.mark.parametrize("kind", ["typed", "corpus", "upstream"])
+def test_missing_as_zero_is_valid_for_every_source_kind(kind):
+    """The sampler fills missing history on any panel, so this control is not typed-only."""
+    api = config_module()
+    source = api.SourceConfig(kind, 1.0, control="missing_as_zero")
+    assert source.control == "missing_as_zero"
+    base = api.T1_BASE
+    with pytest.raises(ValueError, match="origins"):
+        replace(base, sources=(source,))
+    cfg = replace(base, sources=(source,), sampler=replace(base.sampler, origins=1))
+    assert cfg.sources[0].control == "missing_as_zero"
+
+
+@pytest.mark.parametrize("kind", ["corpus", "upstream"])
+def test_missing_as_zero_does_not_admit_other_typed_options(kind):
+    with pytest.raises(ValueError, match="control_inputs"):
+        config_module().SourceConfig(
+            kind, 1.0, control="missing_as_zero", control_inputs="attribute"
+        )
 
 
 @pytest.mark.parametrize("kind", ["typed", "upstream"])
