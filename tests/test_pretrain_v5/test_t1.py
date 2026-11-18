@@ -250,7 +250,7 @@ def test_absent_screened_candidate_is_counted_and_still_scored(small, monkeypatc
 
 @pytest.mark.parametrize("path", PATH_NAMES)
 def test_evaluate_all_arms_same_requests_cells_and_finite_losses(small, monkeypatch, path):
-    episodes = small.eval_set(path, episodes=1, max_panels=60, min_count=1)
+    episodes = small.eval_set(path, episodes=2, max_panels=60, min_count=1)
     assert episodes
     model = V5Model(tiny().model)
     # Loading is replaced here only; builds, gates, model, pruning and scoring are real.
@@ -378,6 +378,52 @@ def test_real_export_checkpoint_and_rolled_repeat(small, tmp_path):
     episodes = small.eval_set("routing", episodes=3, min_count=1, max_panels=30)
     left = small.evaluate(trained.checkpoint, "routing", "null_rolled", episodes)
     assert left == small.evaluate(trained.checkpoint, "routing", "null_rolled", episodes)
+
+
+@pytest.mark.parametrize("batch_episodes,expected", [(1, [2, 3]), (2, [2, 3]), (4, [5])])
+def test_rolled_evaluation_merges_singleton_batches(small, monkeypatch, batch_episodes, expected):
+    episodes = small.eval_set("routing", episodes=5, min_count=1, max_panels=60)
+    assert len(episodes) == 5
+    model = V5Model(tiny().model)
+    monkeypatch.setattr(small, "load_model", lambda *a, **kw: (model, tiny()))
+    forward, sizes = model.forward, []
+
+    def observe(batch, gates, *, router):
+        sizes.append(batch.x.shape[0])
+        assert router == "rolled"
+        assert batch.x.shape[0] >= 2, "a rolled singleton uses learned routing"
+        return forward(batch, gates, router=router)
+
+    monkeypatch.setattr(model, "forward", observe)
+    result = small.evaluate(
+        Path("unused"), "routing", "null_rolled", episodes, batch_episodes=batch_episodes
+    )
+    assert sizes == expected
+    assert len(result["loss"]) == len(result["gates"]) == len(episodes)
+    assert np.isfinite(result["loss"]).all()
+    assert result["eval_digest"] == small.eval_digest(episodes)
+
+
+def test_rolled_evaluation_requires_at_least_two_episodes(small, monkeypatch):
+    episodes = small.eval_set("routing", episodes=1, min_count=1, max_panels=60)
+    assert len(episodes) == 1
+    monkeypatch.setattr(small, "load_model", lambda *a, **kw: (V5Model(tiny().model), tiny()))
+    with pytest.raises(ValueError, match="rolled.*at least two episodes"):
+        small.evaluate(Path("unused"), "routing", "null_rolled", episodes)
+
+
+@pytest.mark.parametrize("arm", ["true", "null_uniform"])
+def test_other_routing_arms_preserve_per_episode_losses(small, monkeypatch, arm):
+    episodes = small.eval_set("routing", episodes=5, min_count=1, max_panels=60)
+    assert len(episodes) == 5
+    model = V5Model(tiny().model)
+    monkeypatch.setattr(small, "load_model", lambda *a, **kw: (model, tiny()))
+    reference = small.evaluate(Path("unused"), "routing", arm, episodes, batch_episodes=1)
+    for batch_episodes in (2, 4):
+        result = small.evaluate(
+            Path("unused"), "routing", arm, episodes, batch_episodes=batch_episodes
+        )
+        np.testing.assert_allclose(result["loss"], reference["loss"], rtol=1e-6, atol=1e-7)
 
 
 def test_missing_zero_erases_history_and_scores_in_true_frame(small, monkeypatch):
@@ -603,6 +649,31 @@ def test_compare_hand_calculated_gains(true, count, outcome):
     assert result["outcome"] == outcome
     assert result["all"]["gain"] == pytest.approx(1 - true)
     assert result["all"]["n"] == count
+
+
+@pytest.mark.parametrize("seed", [0, 17, 10_000])
+@pytest.mark.parametrize("paired", [False, True])
+def test_bootstrap_interval_matches_original_expression(seed, paired):
+    from demand_forecast.synthetic.typed.draft import stream
+
+    numerator = np.linspace(-0.2, 0.4, 37)
+    denominator = np.linspace(0.5, 2.0, 37) if paired else np.ones(37)
+    resamples = 259  # Two full chunks and one partial chunk.
+    rng, draws = stream(seed, "bootstrap"), []
+    for offset in range(0, resamples, 128):
+        indices = rng.integers(len(numerator), size=(min(128, resamples - offset), len(numerator)))
+        bottom = denominator[indices].sum(axis=1)
+        # Keep the original scalar-list expression as the numerical reference.
+        draws.extend(numerator[indices].sum(axis=1) / bottom)
+    low, high = (float(v) for v in np.quantile(draws, (0.05, 0.95)))
+    assert api()._interval(
+        numerator, denominator if paired else None, resamples=resamples, seed=seed
+    ) == {
+        "gain": float(numerator.sum() / denominator.sum()),
+        "low": low,
+        "high": high,
+        "n": 37,
+    }
 
 
 def test_compare_paired_bootstrap_seed_and_required_slice():
