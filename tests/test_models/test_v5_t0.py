@@ -110,6 +110,11 @@ def test_gates_start_open(model: V5Model) -> None:
     assert batch.cand_mask.any()
     assert torch.equal(gates.cand[batch.cand_mask], torch.ones_like(gates.cand[batch.cand_mask]))
     assert (gates.row[batch.row_mask] >= 0.95).all()
+    known = batch.row_mask & (batch.row_role == ROLE_KNOWN)
+    assert known.any()
+    floor = model.config.known_gate_floor
+    expected = floor + (1 - floor) * torch.sigmoid(batch.x.new_tensor(model.config.gate_init))
+    assert torch.equal(gates.row[known], expected.expand_as(gates.row[known]))
 
 
 def _batch(panel: Panel, request: EpisodeRequest = REQUEST) -> EpisodeBatch:
@@ -382,6 +387,17 @@ def test_peers_after_origin(
     first, second = model(a, mixed_gates(a)), model(b, mixed_gates(b))
     _equal(_kept(first, a)[:1], _kept(second, b)[:1])
     _equal(first.router, second.router)
+    open_values = {
+        name: 1.0 for name, role in zip(a.row_names[0], a.row_role[0]) if role == ROLE_PANEL
+    }
+    open_values.update(dict.fromkeys(a.cand_names[0], 1.0))
+    ga, gb = mixed_gates(a, open_values), mixed_gates(b, open_values)
+    for batch, gates in ((a, ga), (b, gb)):
+        assert (gates.row[batch.row_role == ROLE_PANEL] > 0).all()
+        assert (gates.row[batch.row_role == ROLE_PEER] > 0).any()
+    first, second = model(a, ga), model(b, gb)
+    _equal(_kept(first, a)[:1], _kept(second, b)[:1])
+    _equal(first.router, second.router)
 
 
 @pytest.mark.usefixtures("input_sensitive_model")
@@ -648,6 +664,8 @@ def test_no_dataset_parameters(model: V5Model) -> None:
     assert all(left.isdisjoint(right) for left, right in zip(names(first), names(renamed)))
     assert shapes == {name: tuple(value.shape) for name, value in other.state_dict().items()}
     for candidate in (model, other):
+        parameters = {name: value.detach().clone() for name, value in candidate.named_parameters()}
+        buffers = {name: value.detach().clone() for name, value in candidate.named_buffers()}
         for seen, request in (
             (first, REQUEST),
             (renamed, replace(REQUEST, target="other_y")),
@@ -657,6 +675,10 @@ def test_no_dataset_parameters(model: V5Model) -> None:
             assert shapes == {
                 name: tuple(value.shape) for name, value in candidate.state_dict().items()
             }
+            for name, value in candidate.named_parameters():
+                assert torch.equal(value, parameters[name]), name
+            for name, value in candidate.named_buffers():
+                assert torch.equal(value, buffers[name]), name
 
 
 @pytest.mark.usefixtures("input_sensitive_model")

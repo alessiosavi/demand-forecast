@@ -37,14 +37,17 @@ def category_step_stats(
     names = np.frompyfunc(label_of, 1, 1)(labels)
     names[missing] = None
     codes, unique = pd.factorize(names, sort=False)
-    bounds = steps if frozen_at is None else np.minimum(steps, frozen_at)
+    # Stable grouping retains chronological accumulation within every label.
+    order = np.argsort(codes, kind="stable")
+    edges = np.searchsorted(codes[order], np.arange(len(unique) + 1))
     for code in range(len(unique)):
-        selected = codes[steps] == code
-        if not selected.any():
+        occurrences = order[edges[code] : edges[code + 1]]
+        start, stop = np.searchsorted(occurrences, [steps[0], steps[-1] + 1])
+        selected = occurrences[start:stop]
+        if not len(selected):
             continue
-        rows = steps[selected] - left
-        ends = bounds[selected]
-        occurrences = np.flatnonzero(codes == code)
+        rows = selected - left
+        ends = selected if frozen_at is None else np.minimum(selected, frozen_at)
         means = np.zeros((len(rows), 4), dtype=np.float64)
         spread = np.zeros(len(rows), dtype=np.float64)
         support = np.zeros(len(rows), dtype=np.int64)

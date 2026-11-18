@@ -222,6 +222,7 @@ class EpisodeBuilder:
         context: int = MAX_CONTEXT,
         cutoff: int | None = None,
         drop: frozenset[str] = frozenset(),
+        keep_columns: frozenset[str] | None = None,
     ) -> list[EpisodeRequest]:
         """Split multi-target items when typed context needs a designated column."""
         if not 0 <= item_index < len(self.panel.items):
@@ -229,14 +230,18 @@ class EpisodeBuilder:
         targets = sorted(self.panel.items[item_index].targets)
         if not targets:
             raise ValueError("a forecast target must exist")
-        probe = EpisodeRequest(item_index, origins, horizon, context, targets[0], cutoff, drop)
+        probe = EpisodeRequest(
+            item_index, origins, horizon, context, targets[0], cutoff, drop, keep_columns
+        )
         end = self._validate(probe)
         candidates = screen(
             self.panel, self._stats(targets[0], end), item_index, (targets[0],), end, self.config
         )
         split = len(targets) > MAX_FORECAST_ROWS or self._typed(self._restricted(candidates, probe))
         return [
-            EpisodeRequest(item_index, origins, horizon, context, target, cutoff, drop)
+            EpisodeRequest(
+                item_index, origins, horizon, context, target, cutoff, drop, keep_columns
+            )
             for target in (targets if split and len(targets) > 1 else [None])
         ]
 

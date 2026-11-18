@@ -8,6 +8,7 @@ from dataclasses import FrozenInstanceError, replace
 import pytest
 import yaml
 
+from demand_forecast.data.episode.schema import MAX_CONTEXT, MAX_HORIZON, PATCH
 from demand_forecast.models.v5 import V5Config, V5Model
 
 
@@ -95,7 +96,10 @@ def test_canonical_ignores_only_location_and_execution_settings():
         cfg,
         workers=5,
         device="cuda",
-        sources=tuple(replace(source, root="/elsewhere") for source in cfg.sources),
+        sources=tuple(
+            replace(source, root="/elsewhere") if source.kind == "corpus" else source
+            for source in cfg.sources
+        ),
     )
     assert cfg.canonical() == moved.canonical()
     canonical = cfg.canonical()
@@ -194,6 +198,90 @@ def test_fixed_removals_require_unbudgeted_designated_episodes(removal, violatio
 def test_router_and_gates_reject_unknown_modes(field):
     with pytest.raises(ValueError, match=field):
         replace(config_module().T1_BASE, **{field: "unrecognised"})
+
+
+_TYPED_OPTIONS = (
+    ("control", "shuffle"),
+    ("control", "no_dates"),
+    ("control", False),
+    ("control_inputs", "attribute"),
+    ("control_inputs", "column"),
+    ("heldout", True),
+    ("recipes", (("trend",),)),
+    ("freq", "D"),
+    ("length", (64, 128)),
+    ("max_items", 2),
+    ("n_nuisance", 1),
+    ("nuisance_from", ("noise",)),
+    ("singleton_share", 0.5),
+)
+
+
+@pytest.mark.parametrize("kind", ["corpus", "upstream"])
+@pytest.mark.parametrize("field,value", _TYPED_OPTIONS)
+def test_non_typed_sources_reject_typed_options(kind, field, value):
+    with pytest.raises(ValueError, match=field):
+        config_module().SourceConfig(kind, 1.0, **{field: value})
+
+
+@pytest.mark.parametrize("field,value", [row for row in _TYPED_OPTIONS if row[1] is not False])
+def test_typed_sources_accept_typed_options(field, value):
+    assert getattr(config_module().SourceConfig("typed", 1.0, **{field: value}), field) == value
+
+
+@pytest.mark.parametrize("kind", ["typed", "corpus", "upstream"])
+def test_missing_as_zero_is_valid_for_every_source_kind(kind):
+    """The sampler fills missing history on any panel, so this control is not typed-only."""
+    api = config_module()
+    source = api.SourceConfig(kind, 1.0, control="missing_as_zero")
+    assert source.control == "missing_as_zero"
+    base = api.T1_BASE
+    with pytest.raises(ValueError, match="origins"):
+        replace(base, sources=(source,))
+    cfg = replace(base, sources=(source,), sampler=replace(base.sampler, origins=1))
+    assert cfg.sources[0].control == "missing_as_zero"
+
+
+@pytest.mark.parametrize("kind", ["corpus", "upstream"])
+def test_missing_as_zero_does_not_admit_other_typed_options(kind):
+    with pytest.raises(ValueError, match="control_inputs"):
+        config_module().SourceConfig(
+            kind, 1.0, control="missing_as_zero", control_inputs="attribute"
+        )
+
+
+@pytest.mark.parametrize("kind", ["typed", "upstream"])
+@pytest.mark.parametrize("root", ["/corpus", ""])
+def test_root_is_only_valid_for_corpus_sources(kind, root):
+    with pytest.raises(ValueError, match="root"):
+        config_module().SourceConfig(kind, 1.0, root=root)
+
+
+@pytest.mark.parametrize("kind", ["typed", "corpus", "upstream"])
+def test_source_defaults_are_valid_for_every_kind(kind):
+    assert config_module().SourceConfig(kind, 1.0).kind == kind
+
+
+def test_sampler_rejects_context_beyond_schema_limit():
+    with pytest.raises(ValueError, match="contexts"):
+        config_module().SamplerConfig(contexts=(MAX_CONTEXT + PATCH,))
+    assert config_module().SamplerConfig(contexts=(MAX_CONTEXT,)).contexts == (MAX_CONTEXT,)
+    assert config_module().SamplerConfig(horizon=(PATCH, MAX_HORIZON)).horizon == (
+        PATCH,
+        MAX_HORIZON,
+    )
+
+
+def test_negative_seed_is_rejected_before_training():
+    with pytest.raises(ValueError, match="seed"):
+        replace(training_config(), seed=-1)
+    assert replace(training_config(), seed=0).seed == 0
+
+
+def test_source_length_respects_panel_recipe_minimum():
+    with pytest.raises(ValueError, match="length"):
+        config_module().SourceConfig("typed", 1.0, length=(4, 8))
+    assert config_module().SourceConfig("typed", 1.0, length=(8, 8)).length == (8, 8)
 
 
 # Each row catches a missing range/type guard, before invalid values reach the sampler/loop.

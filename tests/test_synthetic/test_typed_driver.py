@@ -240,12 +240,14 @@ def test_promised_events_exist(mechanism):
         column = g.inputs_of(mechanism)[-1].name
         assert any(item.dynamic[column].any() for item in g.complete.items)
         if mechanism == "planned_event":
+            late = g.params[mechanism]["late_items"]
             for item in g.complete.items:
-                if (
-                    len(item.dynamic[column]) >= 300
-                    and item.item_id not in g.params[mechanism]["late_items"]
-                ):
+                if item.item_id in late:
                     assert item.dynamic[column].any(), (seed, item.item_id)
+            # Late items get a forced run; the others depend on the event rate alone.
+            assert any(
+                item.dynamic[column].any() for item in g.complete.items if item.item_id not in late
+            ), seed
 
 
 @pytest.mark.parametrize("pool", [None, ("known_driver",), ("planned_event",), ("label_lag",)])

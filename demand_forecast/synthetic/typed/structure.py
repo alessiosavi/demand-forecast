@@ -5,7 +5,7 @@ import math
 import numpy as np
 from scipy.signal import lfilter
 
-from demand_forecast.data.episode import FREQ_CLASSES, Panel
+from demand_forecast.data.episode import FREQ_CLASSES
 from demand_forecast.synthetic.typed.draft import (
     Contribution,
     Draft,
@@ -52,8 +52,7 @@ def _calendar(draft: Draft, streams: Streams, ranges: RangeFn) -> Result:
     rng = streams.effect
     if rng is None:
         return Result((), {}, {}, None)
-    panel = Panel("typed", (), {}, draft.freq, draft.epoch, True)
-    freq_class = FREQ_CLASSES[panel.freq_class]
+    freq_class = FREQ_CLASSES[draft.freq_class]
     fields = {
         "subhourly": ("hour", "dow"),
         "hourly": ("hour", "dow"),
