@@ -81,6 +81,16 @@ def test_forecast_panel_late_item_fallback(panel):
         np.testing.assert_array_equal(result[late.item_id, name], np.zeros((8, 9)))
 
 
+def test_forecast_panel_accepts_float64_model(panel):
+    panel = replace(panel, items=panel.items[:2])
+    model = V5Model(config().model).double()
+
+    result = api().forecast_panel(model, panel, 80, 8, context=32)
+
+    assert result.keys() == {(item.item_id, name) for item in panel.items for name in item.targets}
+    assert all(value.dtype == np.float64 and np.isfinite(value).all() for value in result.values())
+
+
 def test_forecast_panel_restores_training_mode_and_is_repeatable(panel):
     model = V5Model(config().model).train()
     first = api().forecast_panel(model, panel, 80, 8, context=32, batch_episodes=7)
@@ -124,8 +134,16 @@ def test_forecast_panel_rejects_device_mismatch(panel, model_device, requested):
     assert all(parameter.device == torch.device(model_device) for parameter in model.parameters())
 
 
+def test_forecast_panel_rejects_invalid_batch_size_before_device_mismatch(panel):
+    model = V5Model(config().model)
+
+    with pytest.raises(ValueError, match="batch_episodes must be a positive integer"):
+        api().forecast_panel(model, panel, 80, 8, context=32, batch_episodes=0, device="meta")
+
+
 def test_forecast_panel_never_materializes_more_than_batch_episodes(panel, monkeypatch):
     measure = api()
+    batch_forecast = importlib.import_module("demand_forecast.models.v5.batch_forecast")
     references, sizes = [], []
     real_build = EpisodeBuilder.build
 
@@ -140,7 +158,7 @@ def test_forecast_panel_never_materializes_more_than_batch_episodes(panel, monke
         return collate(episodes)
 
     monkeypatch.setattr(EpisodeBuilder, "build", build)
-    monkeypatch.setattr(measure, "collate", counted)
+    monkeypatch.setattr(batch_forecast, "collate", counted)
     result = measure.forecast_panel(
         V5Model(config().model), panel, 80, 8, context=32, batch_episodes=7
     )
