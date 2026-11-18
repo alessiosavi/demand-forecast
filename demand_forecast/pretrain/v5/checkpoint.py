@@ -8,6 +8,7 @@ import json
 import os
 import tempfile
 import time
+from collections import OrderedDict
 from collections.abc import Callable
 from pathlib import Path
 from typing import BinaryIO
@@ -64,16 +65,45 @@ def _counters(payload: dict) -> tuple[int, int]:
     return batch, saves
 
 
+def _validate_payload(value, path: str = "") -> None:
+    if type(value) in (dict, OrderedDict):
+        for key, item in value.items():
+            if type(key) not in (str, int):
+                raise TypeError(f"unsupported checkpoint key at {path or '<payload>'}[{key!r}]")
+            item_path = f"{path}[{key}]" if type(key) is int else f"{path}.{key}" if path else key
+            _validate_payload(item, item_path)
+    elif type(value) in (list, tuple):
+        for index, item in enumerate(value):
+            _validate_payload(item, f"{path}[{index}]")
+    elif value is not None and type(value) not in (
+        torch.Tensor,
+        torch.nn.Parameter,
+        int,
+        float,
+        bool,
+        str,
+    ):
+        raise TypeError(
+            f"unsupported checkpoint value at {path or '<payload>'}: {type(value).__name__}"
+        )
+
+
 def save_checkpoint(
     directory: Path | str, payload: dict, *, counter: int, staging: Path | str | None = None
 ) -> tuple[Path, float]:
     """Publish torch bytes followed by their 32-byte binary SHA-256 digest.
 
+    Payloads may contain dictionaries (including OrderedDict), lists, tuples,
+    tensors, native int/float/bool/str values and None, so weights_only=True can
+    restore them. Keys must be native strings or native integers (an optimiser's
+    state is keyed by parameter index); a bool or NumPy key is refused. NumPy values and
+    arbitrary objects raise TypeError with their path before any files are written.
     A directory fsync failure raises even after the rename has published the slot.
     """
     directory = Path(directory)
     staging = None if staging is None else Path(staging)
     started = time.perf_counter()
+    _validate_payload(payload)
     _counters(payload)
     destination = directory / f"checkpoint-slot-{counter % 2}.pt"
 

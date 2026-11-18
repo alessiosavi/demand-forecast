@@ -398,6 +398,13 @@ def evaluate(
     )
     config = t1_config(path, arm, seed=saved.seed, base=base)
     true_config = t1_config(path, "true", seed=saved.seed, base=base)
+    if config.router == "rolled":
+        if len(episodes) < 2:
+            raise ValueError("the rolled null needs at least two episodes")
+        batch_episodes = max(2, batch_episodes)
+    starts = list(range(0, len(episodes), batch_episodes))
+    if config.router == "rolled" and len(starts) > 1 and len(episodes) - starts[-1] == 1:
+        starts.pop()  # Merge the singleton tail into the preceding batch.
     mechanisms = sorted({r["mechanism"] for e in episodes for r in e["drivers"]})
     result = {
         "loss": [],
@@ -408,8 +415,9 @@ def evaluate(
     }
     if forced:
         result["forced"] = {m: [] for m in mechanisms}
-    for start in range(0, len(episodes), batch_episodes):
-        entries = episodes[start : start + batch_episodes]
+    for i, start in enumerate(starts):
+        stop = starts[i + 1] if i + 1 < len(starts) else len(episodes)
+        entries = episodes[start:stop]
         true_episodes, arm_episodes = [], []
         for entry in entries:
             generated = generate_typed_panel(PanelRecipe(**entry["recipe"]))
@@ -493,8 +501,11 @@ def _interval(numerator, denominator=None, *, resamples=10_000, seed=0, min_coun
         bottom = denominator[indices].sum(axis=1)
         if (bottom <= 0).any():
             return record
-        draws.extend(numerator[indices].sum(axis=1) / bottom)
-    record["low"], record["high"] = (float(v) for v in np.quantile(draws, (0.05, 0.95)))
+        chunk = numerator[indices].sum(axis=1) / bottom
+        draws.append(chunk)
+    record["low"], record["high"] = (
+        float(v) for v in np.quantile(np.concatenate(draws), (0.05, 0.95))
+    )
     return record
 
 
