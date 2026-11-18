@@ -8,6 +8,7 @@ import sys
 import time
 import weakref
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 import torch
@@ -149,10 +150,11 @@ def test_nonfinite_skips_resume_schedule_and_ema(tmp_path, monkeypatch, stop):
     training_equal(reference, payload(resumed))
 
 
-def test_nonfinite_streak_is_terminal_without_completion(tmp_path, monkeypatch):
+@pytest.mark.parametrize("steps", [20, 30])
+def test_nonfinite_streak_is_terminal_without_completion(tmp_path, monkeypatch, steps):
     loop = api()
     inject_faults(monkeypatch, dict.fromkeys(range(20), "loss"))
-    c = config(steps=30)
+    c = config(steps=steps)
     first = loop.train(c, tmp_path, stop_after=9)
     assert first.skipped == 9
     result = loop.train(c, tmp_path)
@@ -164,9 +166,14 @@ def test_nonfinite_streak_is_terminal_without_completion(tmp_path, monkeypatch):
     )
     assert payload(result)["counters"]["consecutive_nonfinite"] == 20
     unfinished(tmp_path)
-    # A terminal nonfinite checkpoint cannot consume more on another invocation.
-    again = loop.train(c, tmp_path)
-    assert again.stop_reason == "nonfinite" and again.batch == 20
+    slots = {path: path.read_bytes() for path in tmp_path.glob("checkpoint-slot-*.pt")}
+    telemetry = (tmp_path / "telemetry.jsonl").read_bytes()
+    monkeypatch.setattr(loop, "loader", lambda *a, **kw: pytest.fail("built terminal loader"))
+    for _ in range(3):
+        assert loop.train(c, tmp_path) == result
+        assert {path: path.read_bytes() for path in tmp_path.glob("checkpoint-slot-*.pt")} == slots
+        assert (tmp_path / "telemetry.jsonl").read_bytes() == telemetry
+        unfinished(tmp_path)
 
 
 def test_sigterm_finishes_current_update_and_checkpoints(tmp_path):
@@ -251,6 +258,79 @@ def test_two_damaged_slots_raise(tmp_path):
     with pytest.raises(CheckpointError):
         api().train(config(), tmp_path)
     unfinished(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "damaged", [b'{"identity":', b"not JSON", b"[]", b"null", b"{}", b'{"identity": []}', b"\xff"]
+)
+@pytest.mark.parametrize("state_kind", ["fresh", "slot", "manifest"])
+def test_unreadable_sidecar_is_rewritten(tmp_path, damaged, state_kind):
+    loop = api()
+    c = config(steps=3)
+    previous = None
+    if state_kind != "fresh":
+        previous = loop.train(c, tmp_path, stop_after=None if state_kind == "manifest" else 1)
+    (tmp_path / "identity.json").write_bytes(damaged)
+    result = loop.train(c, tmp_path)
+    assert result.stop_reason == "max_steps"
+    assert json.loads((tmp_path / "identity.json").read_text()) == {
+        "identity": payload(result)["identity"]
+    }
+    if state_kind == "manifest":
+        assert result == previous
+
+
+@pytest.mark.parametrize("state_kind", ["slot", "manifest"])
+def test_unreadable_sidecar_does_not_hide_foreign_embedded_identity(tmp_path, state_kind):
+    loop = api()
+    c = config(steps=3)
+    previous = loop.train(c, tmp_path, stop_after=None if state_kind == "manifest" else 1)
+    foreign_identity = payload(previous)["identity"]
+    (tmp_path / "identity.json").write_text('{"identity":')
+    with pytest.raises(loop.IdentityError, match="identity"):
+        loop.train(replace(c, seed=c.seed + 1), tmp_path)
+    assert json.loads((tmp_path / "identity.json").read_text())["identity"] != foreign_identity
+
+
+@pytest.mark.parametrize("order", ["batch", "saves", "damaged", "both_damaged", "foreign"])
+def test_slots_are_opened_once_and_selected_by_batch_then_saves(tmp_path, monkeypatch, order):
+    loop = api()
+    c = config(steps=6)
+    interrupted = loop.train(c, tmp_path, stop_after=1)
+    older = _read_checkpoint(tmp_path / "checkpoint-slot-1.pt")
+    newer = payload(interrupted)
+    if order == "saves":
+        older = payload(interrupted)
+    # Write the selected payload to slot 0, which is visited first. In the batch
+    # case it must win even though the older payload has a larger saves counter.
+    older["counters"]["saves"] = 10
+    newer["counters"]["saves"] = 20 if order == "saves" else 2
+    if order == "foreign":
+        older["identity"] = "foreign"
+    save_checkpoint(tmp_path, newer, counter=0)
+    save_checkpoint(tmp_path, older, counter=1)
+    if order in ("damaged", "both_damaged"):
+        (tmp_path / "checkpoint-slot-1.pt").write_bytes(b"damaged")
+    if order == "both_damaged":
+        (tmp_path / "checkpoint-slot-0.pt").write_bytes(b"damaged")
+    opened = []
+    real_open = Path.open
+
+    def counted_open(path, mode="r", *args, **kwargs):
+        if path.name.startswith("checkpoint-slot-") and mode == "rb":
+            opened.append(path.name)
+        return real_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", counted_open)
+    if order in ("both_damaged", "foreign"):
+        with pytest.raises(loop.IdentityError if order == "foreign" else CheckpointError):
+            loop.train(c, tmp_path)
+    else:
+        result = loop.train(c, tmp_path, stop_after=1)
+        assert (result.batch, result.updates) == (2, 2)
+    assert sorted(opened) == ["checkpoint-slot-0.pt", "checkpoint-slot-1.pt"]
+    if order not in ("both_damaged", "foreign"):
+        assert payload(result)["counters"]["saves"] == newer["counters"]["saves"] + 2
 
 
 @pytest.mark.parametrize("changed", ["code", "corpus", "env", "init", "config"])
@@ -373,6 +453,13 @@ def test_parameter_groups_cover_once_and_exclude_special_weights():
                 special.add(id(parameter))
     assert special <= no_decay
     assert id(model.patch_encoder.encoders[0][0].weight) not in no_decay
+
+
+def test_package_reexports_loop_api():
+    package = importlib.import_module("demand_forecast.pretrain.v5")
+    for name in ("train", "TrainResult", "load_model", "parameter_groups", "IdentityError"):
+        assert name in package.__all__
+        assert getattr(package, name) is getattr(api(), name)
 
 
 def test_init_loads_export_and_load_model_selects_weights(tmp_path):
@@ -498,6 +585,38 @@ def test_final_publication_failure_recovers_completed_slot_without_data(tmp_path
     monkeypatch.setattr(loop, "write_manifest", real_manifest)
     monkeypatch.setattr(loop, "loader", lambda *a, **kw: pytest.fail("consumed a batch"))
     assert loop.train(config(), tmp_path).stop_reason == "max_steps"
+
+
+@pytest.mark.parametrize("raises", [False, True])
+def test_release_failure_preserves_run_outcome_and_is_logged(tmp_path, monkeypatch, raises):
+    loop = api()
+    original = RuntimeError("original loop failure")
+    handler = signal.getsignal(signal.SIGTERM)
+    real_release = loop._release
+
+    def release(iterator):
+        real_release(iterator)
+        raise RuntimeError("injected release failure")
+
+    def failed_loss(*args):
+        raise original
+
+    monkeypatch.setattr(loop, "_release", release)
+    if raises:
+        monkeypatch.setattr(loop, "v5_loss", failed_loss)
+        with pytest.raises(RuntimeError) as caught:
+            loop.train(config(steps=3), tmp_path)
+        assert caught.value is original
+        unfinished(tmp_path)
+    else:
+        result = loop.train(config(steps=3), tmp_path)
+        assert result.stop_reason == "max_steps"
+        assert read_manifest(tmp_path / "train.json")["batch"] == result.batch == 3
+    assert signal.getsignal(signal.SIGTERM) == handler
+    events = [json.loads(line) for line in (tmp_path / "telemetry.jsonl").read_text().splitlines()]
+    failures = [event for event in events if event["event"] == "loader_release_failed"]
+    assert len(failures) == 1
+    assert "injected release failure" in failures[0]["error"]
 
 
 @pytest.mark.parametrize("raises", [False, True])

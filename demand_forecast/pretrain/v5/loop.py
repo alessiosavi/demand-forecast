@@ -23,9 +23,9 @@ from .checkpoint import (
     CheckpointError,
     CheckpointRequest,
     _atomic_write,
+    _counters,
     _read_checkpoint,
     file_digest,
-    latest_checkpoint,
     read_manifest,
     save_checkpoint,
     write_manifest,
@@ -199,6 +199,8 @@ def train(
 
     stop_after counts batches in this invocation. Training counters and history
     are deterministic; saves counts physical writes, including interruptions.
+    A terminal nonfinite streak wins even at max_steps; retries return the saved
+    outcome without writing another checkpoint or constructing the loader.
     """
     if stop_after is not None and (type(stop_after) is not int or stop_after < 1):
         raise ValueError("stop_after must be a positive integer")
@@ -218,11 +220,15 @@ def train(
 
     # (1) Establish identity before consulting any completion or checkpoint.
     sidecar = state_dir / "identity.json"
-    if sidecar.exists():
-        check_identity(json.loads(sidecar.read_text(encoding="utf-8"))["identity"])
-    else:
+    try:
+        sidecar_identity = json.loads(sidecar.read_text(encoding="utf-8"))["identity"]
+        if not isinstance(sidecar_identity, str):
+            raise ValueError("sidecar identity must be a string")
+    except (OSError, ValueError, KeyError, TypeError):
         encoded = json.dumps({"identity": requested}).encode()
         _atomic_write(sidecar, lambda stream: stream.write(encoded))
+    else:
+        check_identity(sidecar_identity)
 
     def result(counters, reason, checkpoint, history):
         return TrainResult(
@@ -241,15 +247,28 @@ def train(
         return result(saved["counters"], "max_steps", final, saved["history"])
 
     # (3) Every valid slot read must belong to this identity, including the older one.
-    for slot in state_dir.glob("checkpoint-slot-*.pt"):
+    latest, errors = None, []
+    for slot_number in (0, 1):
+        slot = state_dir / f"checkpoint-slot-{slot_number}.pt"
+        if not slot.exists():
+            continue
         try:
             candidate = _read_checkpoint(slot)
-        except CheckpointError:
+        except CheckpointError as exc:
+            errors.append(str(exc))
             continue
         check_identity(candidate.get("identity"))
+        if latest is None or _counters(candidate) > _counters(latest[1]):
+            latest = slot, candidate
         del candidate
-    latest = latest_checkpoint(state_dir)  # Intentionally propagate CheckpointError.
+    if latest is None and errors:
+        raise CheckpointError("; ".join(errors))
     saved = None if latest is None else latest[1]
+    if saved is not None:
+        if not 0 <= saved["counters"]["batch"] <= config.optim.max_steps:
+            raise CheckpointError("checkpoint batch counter outside training budget")
+        if saved["counters"]["consecutive_nonfinite"] >= NONFINITE_STOP_AFTER:
+            return result(saved["counters"], "nonfinite", latest[0], saved["history"])
     device = torch.device(
         ("cuda" if torch.cuda.is_available() else "cpu")
         if config.device == "auto"
@@ -286,8 +305,6 @@ def train(
             ema.restore(saved["ema"], device)
         counters, history, pending = saved["counters"], saved["history"], saved["pending"]
     _rewrite_history(state_dir / "history.jsonl", history)
-    if not 0 <= counters["batch"] <= config.optim.max_steps:
-        raise CheckpointError("checkpoint batch counter outside training budget")
     del saved, latest
 
     def checkpoint_payload():
@@ -347,8 +364,6 @@ def train(
         )
         return result(counters, "max_steps", final, history)
 
-    if counters["consecutive_nonfinite"] >= NONFINITE_STOP_AFTER:
-        return result(counters, "nonfinite", save(), history)
     # (4) Recover a completed cursor without ever constructing the infinite loader.
     if counters["batch"] == config.optim.max_steps:
         return finish()
@@ -459,6 +474,15 @@ def train(
         try:
             if iterator is not None:
                 _release(iterator)
+        except Exception as exc:
+            try:
+                _json_line(
+                    state_dir / "telemetry.jsonl",
+                    {"event": "loader_release_failed", "error": str(exc)},
+                )
+            except Exception:
+                # Even a telemetry failure must preserve the run's outcome.
+                pass
         finally:
             iterator = None
             signal.signal(signal.SIGTERM, previous_handler)

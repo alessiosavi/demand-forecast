@@ -27,6 +27,7 @@ from .corpus import (
     listing_digest,
     read_values,
 )
+from .loop import IdentityError, TrainResult, load_model, parameter_groups, train
 from .sampler import EpisodePlan, loader, make_batch, plan_panel
 from .sources import CorpusSource, PanelSource, SourceMix, TypedSource
 from .support import PROTECT, supported
@@ -45,6 +46,7 @@ __all__ = [
     "CorpusIndex",
     "CorpusSource",
     "CorpusValueError",
+    "IdentityError",
     "OptimConfig",
     "PanelSource",
     "RowCache",
@@ -54,13 +56,17 @@ __all__ = [
     "SourceConfig",
     "SourceMix",
     "TypedSource",
+    "TrainResult",
     "V5TrainConfig",
     "file_digest",
     "identity",
     "latest_checkpoint",
     "listing_digest",
+    "load_model",
+    "parameter_groups",
     "read_manifest",
     "read_values",
     "save_checkpoint",
+    "train",
     "write_manifest",
 ]
