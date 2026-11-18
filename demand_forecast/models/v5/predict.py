@@ -1,0 +1,105 @@
+"""Masked v5 training loss and original-unit panel forecasts with gate reports."""
+
+from dataclasses import dataclass
+
+import numpy as np
+import torch
+from torch import Tensor
+
+from demand_forecast.data.episode import (
+    EpisodeBatch,
+    EpisodeBuilder,
+    EpisodeRequest,
+    Panel,
+    collate,
+)
+from demand_forecast.data.episode.schema import PATCH, STEP_FAMILIES
+from demand_forecast.models.losses import pinball_loss
+
+from .config import V5Config
+from .model import V5Model, V5Output, prune
+
+
+def v5_loss(
+    output: V5Output, batch: EpisodeBatch, config: V5Config
+) -> tuple[Tensor, dict[str, float]]:
+    """Supervise real non-fallback rows, including siblings, and add gate/router costs."""
+    eligible = (
+        batch.origin_mask[:, :, None]
+        & batch.forecast_mask[:, None, :]
+        & ~batch.fallback[:, None, :]
+    )
+    horizon = output.quantiles.shape[-2]
+    steps = torch.arange(horizon, device=batch.labels.device)
+    real_steps = steps[None, :] < batch.horizon[:, None]
+    real_steps = real_steps & batch.horizon_mask.repeat_interleave(PATCH, dim=-1)
+    mask = batch.label_mask & real_steps[:, None, None, :]
+    pinball, count = pinball_loss(
+        output.quantiles.flatten(0, 2),
+        batch.labels.flatten(0, 2),
+        mask.flatten(0, 2),
+        eligible.flatten(),
+        output.quantiles.new_tensor(config.quantiles),
+    )
+    sparsity, balance = output.gates.expected_l0, output.aux["balance"]
+    loss = pinball + config.sparsity_weight * sparsity + config.balance_weight * balance
+    return loss, {
+        "pinball": float(pinball.detach()),
+        "sparsity": float(sparsity.detach()),
+        "balance": float(balance.detach()),
+        "total": float(loss.detach()),
+        "n_labels": float(count),
+    }
+
+
+@dataclass
+class ForecastResult:
+    """Kept forecasts in original units and every applied gate, reported by name."""
+
+    quantiles: np.ndarray
+    names: list[str]
+    gates: dict[str, float]
+
+
+@torch.no_grad()
+def forecast(
+    model: V5Model,
+    panel: Panel,
+    request: EpisodeRequest,
+    *,
+    builder: EpisodeBuilder | None = None,
+    gates: str = "learned",
+    pruned: bool = True,
+) -> ForecastResult:
+    """Build one episode, select/prune inputs, and trim kept forecasts to the horizon."""
+    builder = EpisodeBuilder(panel) if builder is None else builder
+    batch = collate([builder.build(request)]).to(next(model.parameters()).device)
+    training = model.training
+    try:
+        model.eval()
+        selected = model.gates(batch, mode=gates)
+        report = {
+            f"row:{name}": float(selected.row[0, i]) for i, name in enumerate(batch.row_names[0])
+        }
+        report.update(
+            {
+                f"candidate:{name}": float(selected.cand[0, i])
+                for i, name in enumerate(batch.cand_names[0])
+            }
+        )
+        report.update(
+            {f"family:{name}": float(selected.family[0, i]) for i, name in enumerate(STEP_FAMILIES)}
+        )
+        if pruned:
+            batch, selected = prune(batch, selected)
+        output = model(batch, selected)
+        quantiles = output.quantiles[0]
+        quantiles = batch.loc[0, :, None, None] + batch.scale[0, :, None, None] * quantiles
+        quantiles = torch.where(
+            batch.fallback[0, :, None, None], batch.loc[0, :, None, None], quantiles
+        )
+        keep = batch.keep[0] & batch.forecast_mask[0]
+        names = [batch.row_names[0][row] for row in batch.forecast_rows[0, keep].tolist()]
+        return ForecastResult(quantiles[:, keep, : request.horizon].cpu().numpy(), names, report)
+    finally:
+        model.train(training)
