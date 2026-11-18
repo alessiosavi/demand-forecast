@@ -27,9 +27,17 @@ from .corpus import (
     listing_digest,
     read_values,
 )
+from .sampler import EpisodePlan, loader, make_batch, plan_panel
 from .sources import CorpusSource, PanelSource, SourceMix, TypedSource
+from .support import PROTECT, supported
 
 __all__ = [
+    "PROTECT",
+    "EpisodePlan",
+    "loader",
+    "make_batch",
+    "plan_panel",
+    "supported",
     "T1_BASE",
     "T1_MODEL",
     "CheckpointError",
