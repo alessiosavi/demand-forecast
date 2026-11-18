@@ -1106,7 +1106,8 @@ def test_monitor_default_budgets_poll_and_save_deadline(control, monkeypatch, sc
     ns["command"] = command
     ns["claim"] = lambda source: True
     ns["preempt"] = deadlines.append
-    monitor = control.source[control.source.index("\nthreading.Thread(target=periodic") :]
+    ns["mode"] = "monitor"
+    monitor = control.source.split("\nmode = sys.argv[1]\n", 1)[1]
     with pytest.raises(SystemExit):
         exec(compile(monitor, "control.py", "exec"), ns)
     assert deadlines == [24 * scale]
