@@ -498,6 +498,7 @@ def test_router():
     positive = mean > 0
     expected_balance = (mean[positive] * (mean[positive] * TINY.n_experts).log()).sum()
     torch.testing.assert_close(balance, expected_balance)
+
     padded_weights, padded_balance = router(
         context,
         torch.cat((summary, torch.randn(2, 2, N_SUMMARY)), dim=1),
@@ -510,6 +511,28 @@ def test_router():
     assert empty_balance == 0 and torch.isfinite(empty_balance)
     (weights.square().sum() + balance + empty_balance).backward()
     assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in router.parameters())
+
+
+def test_router_scatter_survives_a_softmax_that_changes_precision(monkeypatch):
+    """Accelerator autocast returns float32 from softmax for half-precision logits.
+
+    CUDA and MPS do this; a processor's autocast does not, so the case is emulated here by a
+    softmax that returns another dtype than its input. The scatter's two sides must agree anyway.
+    """
+    router = ExpertRouter(TINY).eval()
+    context = torch.randn(2, TINY.d_model)
+    summary = torch.randn(2, 3, N_SUMMARY)
+    flags = torch.ones_like(summary, dtype=torch.bool)
+    mask = torch.ones(2, 3, dtype=torch.bool)
+    expected, _ = router(context, summary, flags, mask)
+    softmax = torch.Tensor.softmax
+    monkeypatch.setattr(
+        torch.Tensor, "softmax", lambda tensor, *a, **k: softmax(tensor, *a, **k).double()
+    )
+    weights, balance = router(context, summary, flags, mask)
+    assert weights.dtype == torch.float64
+    torch.testing.assert_close(weights.float(), expected)
+    assert torch.isfinite(balance)
 
 
 def test_calendar_embedding_ignores_inactive_ids():

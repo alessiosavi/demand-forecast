@@ -94,7 +94,11 @@ class ExpertRouter(nn.Module):
         )
         logits = self.net(inputs)
         selected, indices = logits.topk(self.top_k, dim=-1)
-        weights = torch.zeros_like(logits).scatter(-1, indices, selected.softmax(dim=-1))
+        # Under autocast softmax returns float32 for half-precision logits; scatter needs one dtype.
+        probabilities = selected.softmax(dim=-1)
+        weights = torch.zeros_like(logits, dtype=probabilities.dtype).scatter(
+            -1, indices, probabilities
+        )
         real_weights = weights.masked_fill(~row_mask.unsqueeze(-1), 0)
         mean = real_weights.sum(dim=(0, 1)) / row_mask.sum().clamp_min(1)
         # Clamp only the log argument: empty rows and unused experts contribute 0.

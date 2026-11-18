@@ -65,7 +65,7 @@ def test_train_stop_resume_does_not_repeat_batches(job, settings, tmp_path):
     assert read_manifest(unit / "unit.json") is None
 
 
-def test_wrong_init_digest_fails_with_reason(job, settings, tmp_path):
+def test_wrong_init_digest_fails_with_reason(job, settings, tmp_path, capsys):
     initial = tmp_path / "initial.pt"
     initial.write_bytes(b"wrong contents")
     assert (
@@ -75,6 +75,10 @@ def test_wrong_init_digest_fails_with_reason(job, settings, tmp_path):
     failure = json.loads((tmp_path / "state/train/leg/failure.json").read_text())
     assert "init" in failure["reason"].lower()
     assert not (tmp_path / "state/train/leg/unit.json").exists()
+    # The place of the failure is kept: in the record and in the job's log.
+    assert failure["traceback"].startswith("Traceback (most recent call last)")
+    assert failure["reason"].split(":", 1)[0] in failure["traceback"]
+    assert failure["traceback"] in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("finished", [False, True])

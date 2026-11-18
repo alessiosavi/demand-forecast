@@ -76,8 +76,8 @@ python -m demand_forecast.pretrain.v5.job train \
 
 `--stop-after N` on train and T1 is available for small tests. Exit 0 means a
 validated `unit.json` has been published. Exit 75 means stopped unfinished,
-including training's TERM and stop-after outcomes. Exit 1 records the reason in
-the unit's `failure.json`; nonfinite training is a failure. Script revision or
+including training's TERM and stop-after outcomes. Exit 1 records the reason and the traceback in
+the unit's `failure.json` (the traceback is also printed to the job's log); nonfinite training is a failure. Script revision or
 corpus validation failures exit 2. A failure removes the attempted unit's old
 completion marker; it does not declare another configuration complete.
 
