@@ -31,6 +31,27 @@ nvidia-pin filtering are recorded in its header. Regenerate only deliberately
 and record the environment change in the stage plan: existing states become
 unresumable under the changed environment by design.
 
+For a source with `kind: upstream`, add `--upstream` to job generation. For
+train/qualify the generator parses YAML locally and requires the upstream source
+and `--upstream` together, alongside the existing corpus checks; T1 refuses
+`--upstream`. Before anything is installed, the guest checks that the fetched
+training repository's `third_party/simons/PINNED` holds the pin embedded during
+generation, clones Simons (without blobs it does not need) into volatile scratch
+storage at that pin and verifies HEAD (exit 2 on either mismatch). After the
+environment fingerprint has been taken it exports `<upstream>/src` on
+`PYTHONPATH` for the job and its DataLoader workers. It installs no upstream package and does not run `prepare.py`,
+so dependency installation, `pip check` and the environment fingerprint are
+unchanged by this option.
+The source lazily imports its standalone synthetic APIs and yields one undated
+item with a generated target and numeric covariate effects per panel, using
+local random streams seeded by one caller draw. It generates 2,048 history
+steps plus 288 future steps and assigns each covariate a known or past role.
+Base sampling uses `families=("kernel", "sarima")`, `noise=0.0`, `missing=0.1`,
+`min_observed=96`, `weights=None` and `pad=0.0`; leading padding is off because it
+can leave the history entirely missing before covariate-effect normalization.
+Generator options remain typed-only; `control: missing_as_zero` is applied by
+the sampler. Local tests use `SIMONS_UPSTREAM` pointing at a prepared checkout.
+
 For corpus jobs, add `--corpus-uri gs://bucket/corpus-v4.1 --corpus-digest <hex>`.
 Corpus sources in the YAML must have `root: null`. Only `univariate/` and
 `covariates/` are copied. The script validates the relative name, size and CRC32C
