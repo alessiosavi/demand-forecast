@@ -21,6 +21,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import numpy as np
+import pandas as pd
 import torch
 
 from demand_forecast.core.training import resolve_amp
@@ -40,7 +41,6 @@ from demand_forecast.data.episode.schema import (
 )
 from demand_forecast.models.v5 import V5Config, V5Model, v5_loss
 from demand_forecast.models.v5.model import prune
-from demand_forecast.synthetic.typed import PanelRecipe, generate_typed_panel
 from demand_forecast.synthetic.typed.draft import stream
 
 from . import loop
@@ -62,11 +62,24 @@ def forecast_panel(
     batch_episodes: int = 64,
     gates: str = "learned",
     pruned: bool = True,
-    device: str = "cpu",
+    device: str | None = None,
 ) -> dict[tuple[str, str], np.ndarray]:
-    """Forecast every target with one builder and bounded episode materialisation."""
+    """Forecast bounded batches on the model's device, without moving the model.
+
+    An explicit device must match the model's device. Restore its training mode
+    on success or failure.
+    """
     if type(batch_episodes) is not int or batch_episodes < 1:
         raise ValueError("batch_episodes must be a positive integer")
+    model_device = next(model.parameters()).device
+    if device is not None:
+        requested = torch.device(device)
+        if requested.type == model_device.type == "cuda" and requested.index is None:
+            requested = torch.device("cuda", torch.cuda.current_device())
+        if requested != model_device:
+            raise ValueError(
+                f"requested device {requested} differs from model device {model_device}"
+            )
     builder = EpisodeBuilder(panel)
 
     def requests():
@@ -78,13 +91,13 @@ def forecast_panel(
 
     training = model.training
     try:
-        model.to(device).eval()
+        model.eval()
         planned = requests()
         result = {}
         while group := list(islice(planned, batch_episodes)):
             # The comprehension releases every Episode before forwarding. Never
             # retain a previous group while building the next one's episodes.
-            batch = collate([builder.build(request) for _, request in group]).to(device)
+            batch = collate([builder.build(request) for _, request in group]).to(model_device)
             selected = model.gates(batch, mode=gates)
             if pruned:
                 batch, selected = prune(batch, selected)
@@ -249,6 +262,8 @@ def _trial(config, directory, device):
     The two temporary observers preserve the trainer's artifacts and release its
     actual iterator on success or exception. log_every=1 supplies successful vs
     skipped update counts; no loss/optimiser logic is duplicated here.
+    The per-batch clock excludes periodic checkpoint writes, measured separately
+    in qualification section (e).
     """
     reports, durations = [], []
     real_loader, real_line = loop.loader, loop._json_line
@@ -299,9 +314,7 @@ def _trial(config, directory, device):
         "updates": result.updates,
         "tail_batches": len(tail),
         "batches_per_second": statistics.median(1 / seconds for seconds in tail),
-        "updates_per_second": statistics.median(
-            updated[i] / durations[i] for i in range(tail_start, len(durations))
-        ),
+        "updates_per_second": sum(updated[tail_start:]) / sum(tail),
         "supervised_cells_per_batch": statistics.mean(report["supervised"] for report in reports),
         "padded_cells_per_batch": statistics.mean(report["cells"] for report in reports),
         "supervised_cells_per_update": statistics.mean(reports[i]["supervised"] for i in successful)
@@ -370,6 +383,11 @@ def _checkpoint_measure(path, directory, device):
 
 
 def _worst_measure(config, device):
+    """Time forward and backward only, without optimiser state or EMA.
+
+    The batch-shape decision uses the training trial's peak, which includes
+    optimiser and EMA state, rather than this forward/backward peak.
+    """
     _reset_gpu(device)
     model = V5Model(config.model).to(device).train()
     batch = worst_batch(config).to(device)
@@ -386,10 +404,34 @@ def _worst_measure(config, device):
         device, lambda: (loss if scaler is None else scaler.scale(loss)).backward()
     )
     return {
-        "forward_seconds": forward_seconds,
-        "backward_seconds": backward_seconds,
-        "peak_gpu_bytes": _peak_gpu(device),
+        "forward_backward_seconds": forward_seconds + backward_seconds,
+        "forward_backward_peak_gpu_bytes": _peak_gpu(device),
     }
+
+
+def _inference_panel(*, seed: int, items: int, length: int) -> Panel:
+    """Build aligned daily series with a weekly target, category and known flag."""
+    rng = stream(seed, "qualification:inference")
+    steps = np.arange(length)
+    weekly = 2 * np.sin(2 * np.pi * steps / 7)
+    flag = (steps % 7 == 0).astype(np.float64)
+    return Panel(
+        "qualification-inference",
+        tuple(
+            Item(
+                f"item_{i:05d}",
+                0,
+                {"target": 10 + i + weekly + rng.normal(0, 0.1, size=length)},
+                {"flag": flag},
+                {"category": f"group_{i % 10}"},
+            )
+            for i in range(items)
+        ),
+        {"flag": "known"},
+        "D",
+        pd.Timestamp("2000-01-01"),
+        True,
+    )
 
 
 def qualify(
@@ -404,8 +446,10 @@ def qualify(
 ) -> dict:
     """Measure Q (a) through (g); retain only a finite/null JSON report.
 
-    Rates are medians over batches after discarding floor(20%); batch timings
-    include loader, transfer, forward, backward, optimiser and per-batch logging.
+    Discard floor(20%) of batch timings. Batch rate is a median; update rate is
+    tail updates divided by total tail seconds, including skipped batches.
+    seconds_per_update is the median over successful tail updates. Batch timings
+    include loader, transfer, forward, backward, optimiser and history logging;
     total_seconds also includes startup and checkpoint writes. CPU GPU-memory
     fields and host-memory fields without /proc are null, never estimates.
     """
@@ -489,17 +533,16 @@ def qualify(
                 with TemporaryDirectory(dir=scratch) as trial:
                     measured["origins"]["1"], _ = _trial(single, Path(trial) / "state", device)
             measured["worst_batch"] = _worst_measure(model_config, device)
-            panel = generate_typed_panel(
-                PanelRecipe(
-                    mechanisms=("static_category", "planned_event"),
-                    n_items=panel_items,
-                    length=(panel_length, panel_length),
-                    complete_inputs=True,
-                    seed=config.seed,
-                )
-            ).panel
+            panel = _inference_panel(seed=config.seed, items=panel_items, length=panel_length)
+            origin = panel_length - 28
+            fallback_forecasts = 0
+            # Match EpisodeBuilder's fallback rule on each target's finite prefix.
+            for item in panel.items:
+                for values in item.targets.values():
+                    observed = values[: max(0, origin - item.start)]
+                    observed = observed[np.isfinite(observed)]
+                    fallback_forecasts += int(not observed.size or np.all(observed == observed[0]))
             model = V5Model(architecture).to(device)
-            end = max(item.start + len(next(iter(item.targets.values()))) for item in panel.items)
             _reset_gpu(device)
             with _HostPeak() as memory:
                 forecasts, seconds = _timed(
@@ -507,18 +550,25 @@ def qualify(
                     lambda model=model, panel=panel: forecast_panel(
                         model,
                         panel,
-                        end - 28,
+                        origin,
                         28,
                         context=512,
                         gates="ones",
                         pruned=False,
-                        device=str(device),
                     ),
                 )
+                if len(forecasts) != panel_items or fallback_forecasts:
+                    raise RuntimeError(
+                        f"qualification inference requires {panel_items} forecasts and zero "
+                        f"fallbacks; got {len(forecasts)} forecasts and {fallback_forecasts} fallbacks"
+                    )
                 measured["inference"] = {
                     "seconds": seconds,
                     "peak_gpu_bytes": _peak_gpu(device),
+                    "origin": origin,
+                    "items": len(panel.items),
                     "forecasts": len(forecasts),
+                    "fallback_forecasts": fallback_forecasts,
                 }
             measured["inference"]["host_memory_bytes"] = memory.peak
             parts = Counter()
