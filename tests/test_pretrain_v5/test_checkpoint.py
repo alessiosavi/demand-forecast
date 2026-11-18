@@ -8,6 +8,7 @@ import os
 import stat
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 
@@ -31,6 +32,85 @@ def test_slots_alternate_and_round_trip_tensors(tmp_path):
         assert torch.equal(restored["model"]["weight"], torch.arange(3))
         assert restored["model"]["weight"].device.type == "cpu"
     assert {p.name for p in tmp_path.iterdir()} == {"checkpoint-slot-0.pt", "checkpoint-slot-1.pt"}
+
+
+@pytest.mark.parametrize("value", [np.float64(0.5), np.int64(3), np.arange(3), {1, 2}, object()])
+@pytest.mark.parametrize("existing", [False, True])
+def test_checkpoint_rejects_unsafe_values_before_writing(tmp_path, value, existing):
+    api = checkpoint_module()
+    directory, staging = tmp_path / "state", tmp_path / "staging"
+    if existing:
+        api.save_checkpoint(directory, payload(), counter=0, staging=staging)
+    before = {p: p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()}
+    unsafe = {**payload(2, 2), "history": [{}, {}, {}, {"loss": value}]}
+    with pytest.raises(TypeError, match=r"history\[3\]\.loss"):
+        api.save_checkpoint(directory, unsafe, counter=0, staging=staging)
+    assert {p: p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()} == before
+    if not existing:
+        assert not directory.exists() and not staging.exists()
+    else:
+        assert list(staging.iterdir()) == []
+
+
+def test_checkpoint_accepts_native_integer_keys_anywhere(tmp_path):
+    api = checkpoint_module()
+    api.save_checkpoint(tmp_path / "state", {**payload(), "metadata": {3: "value"}}, counter=0)
+    assert api.latest_checkpoint(tmp_path / "state")[1]["metadata"] == {3: "value"}
+
+
+@pytest.mark.parametrize("key", [True, np.int64(2), 1.5, ("a", "b")])
+def test_checkpoint_rejects_nonstring_mapping_keys(tmp_path, key):
+    with pytest.raises(TypeError, match="metadata"):
+        checkpoint_module().save_checkpoint(
+            tmp_path / "state", {**payload(), "metadata": {key: "value"}}, counter=0
+        )
+    assert not (tmp_path / "state").exists()
+
+
+def test_checkpoint_validates_values_under_optimizer_parameter_ids(tmp_path):
+    unsafe = {**payload(), "optimizer": {"state": {0: {"step": np.float64(1.0)}}}}
+    with pytest.raises(TypeError, match=r"optimizer\.state\[0\]\.step"):
+        checkpoint_module().save_checkpoint(tmp_path / "state", unsafe, counter=0)
+    assert not (tmp_path / "state").exists()
+
+
+def test_training_payload_remains_weights_only_loadable(tmp_path):
+    api = checkpoint_module()
+    # Construct the loop's payload shape here so checkpoint tests can run before
+    # the loop and its fixtures exist when this fix is replayed earlier in the chain.
+    model = torch.nn.Linear(2, 1)
+    optimizer = torch.optim.AdamW(model.parameters())
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: 1.0)
+    model(torch.ones(1, 2)).sum().backward()
+    optimizer.step()
+    scheduler.step()
+    original = {
+        **payload(),
+        "identity": "training-identity",
+        "config": {"seed": 17, "sources": [{"kind": "typed", "recipes": [["trend"]]}]},
+        "model": model.state_dict(),
+        "ema": {name: value.clone() for name, value in model.state_dict().items()},
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        "scaler": torch.amp.GradScaler("cpu").state_dict(),
+        "history": [{"batch": 1, "loss": 0.5, "parts": {"pinball": 0.4}}],
+        "pending": {"loss": 0.0, "parts": {}, "updates": 0},
+        "export": "ema",
+        "values": [None, True, 1, 0.5, "text", (2, 3)],
+    }
+    path, _ = api.save_checkpoint(tmp_path, original, counter=0)
+    restored = torch.load(io.BytesIO(path.read_bytes()[:-32]), weights_only=True)
+    assert restored.keys() == original.keys()
+    for key in original.keys() - {"model", "ema", "optimizer"}:
+        assert restored[key] == original[key]
+    for key in ("model", "ema"):
+        for name, value in original[key].items():
+            assert torch.equal(restored[key][name], value)
+    assert restored["optimizer"]["param_groups"] == original["optimizer"]["param_groups"]
+    for parameter, state in original["optimizer"]["state"].items():
+        for name, value in state.items():
+            assert torch.equal(restored["optimizer"]["state"][parameter][name], value)
+    optimizer.load_state_dict(restored["optimizer"])
 
 
 def test_checkpoint_staging_keeps_temporary_files_out_of_state(tmp_path, monkeypatch):
