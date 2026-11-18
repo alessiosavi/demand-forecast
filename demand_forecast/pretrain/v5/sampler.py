@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import math
+import sys
 from collections import Counter
 from collections.abc import Iterator
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 from pathlib import Path
+from threading import Lock
 
 import numpy as np
 import torch
@@ -22,6 +24,8 @@ from .config import SamplerConfig, SourceConfig, V5TrainConfig
 from .corpus import CorpusValueError, SamplerSkip, ShortRow
 from .sources import SourceMix
 from .support import PROTECT, supported
+
+_FILE_LIMIT_LOCK = Lock()
 
 
 @dataclass(frozen=True)
@@ -369,10 +373,53 @@ class _Batches(IterableDataset):
             index += stride
 
 
+def _ensure_worker_file_limit(workers: int) -> None:
+    try:
+        import resource
+    except ImportError:
+        return
+
+    # Allow two prefetched batches and two more in flight per worker.
+    needed = 256 + workers * 4 * len(fields(EpisodeBatch))
+    preferred = 1_048_576
+    # The limit is process-wide. Serialize reads and raises across loader calls.
+    with _FILE_LIMIT_LOCK:
+        old_soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if old_soft == resource.RLIM_INFINITY:
+            return
+        soft = old_soft
+        cap = max(preferred, needed) if hard == resource.RLIM_INFINITY else hard
+        if soft < min(preferred, cap):
+            candidates = (preferred, 65_536, 16_384, needed)
+            for candidate in dict.fromkeys(min(limit, cap) for limit in candidates):
+                if candidate <= soft:
+                    continue
+                try:
+                    resource.setrlimit(resource.RLIMIT_NOFILE, (candidate, hard))
+                except (ValueError, OSError):
+                    continue
+                soft, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+                break
+
+    if soft == resource.RLIM_INFINITY or soft > old_soft:
+        print(
+            f"v5 loader raised RLIMIT_NOFILE soft limit from {old_soft} to {soft} "
+            f"(hard limit {hard})",
+            file=sys.stderr,
+        )
+    if soft != resource.RLIM_INFINITY and soft < needed:
+        raise RuntimeError(
+            f"RLIMIT_NOFILE soft limit {soft} is below the {needed} file descriptors needed "
+            f"for {workers} v5 DataLoader workers. Raise ulimit -n or use fewer workers."
+        )
+
+
 def loader(
     config: V5TrainConfig, start: int, *, corpus_root: Path | None = None
 ) -> Iterator[tuple[int, EpisodeBatch, dict]]:
     """Each process lazily owns its sources; ordered workers partition indices."""
+    if config.workers > 0:
+        _ensure_worker_file_limit(config.workers)
     generator = torch.Generator().manual_seed(config.seed)
     return iter(
         DataLoader(
