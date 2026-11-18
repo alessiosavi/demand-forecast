@@ -1,0 +1,136 @@
+# Native v5 training jobs
+
+Every cloud run must be registered in the stage-2 plan before launch, with its
+code revision, configuration, state prefix, job URI and cost ceiling. Generating
+a script below is offline; launching it is the operator's work. Q and S1 publish
+experiment artifacts only, not a model release.
+
+Generate a training job from a local YAML configuration:
+
+```bash
+python scripts/gcp/jobs/make_v5_job.py \
+  --name leg-1-job --action train --repo-sha <40-character-revision> \
+  --config leg-1.yaml --leg leg-1 --output /tmp/leg-1-job.sh
+```
+
+The guest supplies absolute `RUN_DIR` and the bucket `STATE_URI`. It alone
+restores, copies and marks the job. Use one state prefix per train or qualify
+unit, and one prefix per T1 arm; allow only one writer per prefix. A fresh job
+name and job URI are required for every evaluation extension, because the guest
+refuses a job URI already recorded as DONE.
+
+The script checks a valid `unit.json` against its own SHA-256 before installing
+anything. It then fetches and verifies the exact repository revision, creates a
+seeded Python 3.12 environment with uv, installs torch 2.8.0 from the cu128 index,
+installs `requirements-v5.txt` and the editable corpus extra, and runs `pip check`.
+The fingerprint of sorted `pip freeze --exclude-editable` lines is part of the
+training identity. A changed dependency environment cannot resume an old run.
+The requirements were resolved for Linux x86_64 and Python 3.12; the command and
+torch constraint are recorded in the file header.
+
+For corpus jobs, add `--corpus-uri gs://bucket/corpus-v4.1 --corpus-digest <hex>`.
+Corpus sources in the YAML must have `root: null`. Only `univariate/` and
+`covariates/` are copied. The script validates the relative name, size and CRC32C
+listing digest, clears the volatile corpus cache before copying, and checks the
+listing again, including object generations. It writes `corpus/manifest.json`
+only after the second listing agrees. Replacing an object during the copy is a
+failure. Copying the corpus again after every preemption costs time and money;
+Q records that copy time so the stage-2 plan can budget it.
+
+An initial export checkpoint applies only to `train`:
+`--init-uri gs://bucket/initial.pt --init-sha256 <hex>`. Its bytes are verified
+before training, and its digest participates in the training identity.
+
+The module also runs directly under the guest contract:
+
+```bash
+python -m demand_forecast.pretrain.v5.job train \
+  --run-dir /absolute/run --code <revision> --job-sha256 <script-hash> \
+  --env-sha256 <freeze-hash> --config leg-1.yaml --name leg-1
+```
+
+`--stop-after N` on train and T1 is available for small tests. Exit 0 means a
+validated `unit.json` has been published. Exit 75 means stopped unfinished,
+including training's TERM and stop-after outcomes. Exit 1 records the reason in
+the unit's `failure.json`; nonfinite training is a failure. Script revision or
+corpus validation failures exit 2. A failure removes the attempted unit's old
+completion marker; it does not declare another configuration complete.
+
+State layout:
+
+```text
+RUN_DIR/
+  state/
+    train/LEG/{identity.json,checkpoint-slot-*.pt,history.jsonl,telemetry.jsonl,
+               checkpoint-final.pt,train.json,unit.json}
+    qualify/NAME/{identity.json,qualify.json,unit.json}
+    t1/PATH-ARM-sSEED/
+      train/{identity.json,checkpoint-slot-*.pt,checkpoint-final.pt,train.json,...}
+      eval-N-M/{checkpoint-final.pt,train.json,result.json,unit.json}
+  staging/          temporary training checkpoint writes and qualification trials
+  v5-cache/         HOME, uv/Python/pip/Hugging Face caches, repository and venv
+  corpus/           volatile corpus cache, rebuilt on every active invocation
+  checkpoint-done   guest request acknowledgement
+```
+
+Everything needed to survive a machine is under `state/`. The corpus,
+repository, environment and configuration copies are disposable caches outside
+it. Training checkpoint temporary files and qualification trials use `staging/`;
+only the completed qualification report is copied into state. Each unit manifest is
+written last with atomic rename and fsync and records artifact sizes and SHA-256
+hashes. Evaluation directories include copies of their training checkpoint and
+manifest, so they remain valid when copied locally; this uses additional disk
+and bucket space per evaluation. There are no parent-relative paths or symlinks
+in a manifest. Checkpoint bytes also carry the training loop's SHA-256 footer.
+
+For Q, use `--action qualify --config q.yaml --name q-typed`; run a separate
+unit for typed 0.5 + corpus 0.5 with the corpus options. `qualify.json` measures
+full and T1 models, throughput and supervised/padded cells for worker counts,
+summed host and peak GPU memory, one and configured origins, worst-batch forward
+and backward, cold index/first-batch/restore times, excluded corpus row share,
+checkpoint write time and size, parameter counts, and full-panel inference for
+30,490 series. Q selects nothing automatically. The operator uses these
+measurements to register the bases, batch shapes, workers, checkpoint cadence,
+recovery bound and revised cost ceilings before S1.
+
+For S1, register a base with fixed episodes per batch, `max_cells: null`, and
+`designate_target: true`. Generate one job per registered arm:
+
+```bash
+python scripts/gcp/jobs/make_v5_job.py \
+  --name static-true-s7 --action t1 --repo-sha <revision> --base s1-base.yaml \
+  --path static_category --arm true --seed 7 --episodes 200 --max-panels 1000 \
+  --output /tmp/static-true-s7.sh
+```
+
+Repeat for `null` under its own prefix. Path-specific arms come from `t1.PATHS`;
+selection has `true`, `null`, and `gates_one`. Its true-arm result includes forced
+interventions. Evaluation uses the registered held-out seed 10,000, independent
+of the training seed, and all arms share the same frozen evaluation digest.
+The unit records path, arm, training seed, base-file hash, requested episodes and
+max panels, and the actual replay digest in addition to its training identity.
+
+After a stop between training and evaluation, rerun the same job: the completed
+training is validated and reused. For an inconclusive result, double both
+`--episodes` and `--max-panels`, give the script a new name and job URI, and use
+the same arm's state prefix. Training parameters and identity are unchanged;
+only the new `eval-N-M/` is evaluated and published. One extension is allowed by
+S1; unresolved results go back to the owner. Copy each arm's evaluation directory
+locally for `t1-compare` (implemented separately in task P7b): provide the same
+base, code, path, seed and evaluation parameters and one `--arm NAME=DIR` per
+required arm. This job generator does not perform that local comparison. S1
+also requires plan 4's fitted-table checks inside its registered ceiling.
+
+On a preemption, training acknowledges the guest's request only when its last
+checkpoint write plus the longest recent update fits within six seconds. If the
+acknowledgement arrives within the guest's eight-second wait and its bounded
+copy completes, recovery uses that requested checkpoint. Otherwise it uses the
+newest valid slot from a completed periodic copy, falling back to the older
+valid slot if needed. With successful copies within their time limit, the bound
+is `C + P + 2*D` plus one update: C is checkpoint cadence, P is the guest copy
+interval (`guard-copy-interval`), and D is the periodic copy limit (540 seconds
+unless `GCP_PERIODIC_COPY_TIMEOUT` changes it). Convert all terms to the same time
+unit. Failed copies permit greater loss; inspect guest logs. Q estimates copy
+lag by comparing checkpoint save times in `telemetry.jsonl` with bucket object
+upload times. The guest does not measure copy durations, so that lag is an
+estimate and must be recorded with its conditions before S1.

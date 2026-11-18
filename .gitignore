@@ -148,6 +148,7 @@ plotly/
 *.png
 *.txt
 !requirements-yardsticks.txt
+!requirements-v5.txt
 # Reviewed row manifests of a derived corpus are part of its contract (hash-pinned in configs/corpus-v4.1.yaml).
 !configs/corpus-v4.1/row-manifest-*.csv
 metafeatures*.csv
