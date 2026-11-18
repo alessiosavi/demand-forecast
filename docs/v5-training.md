@@ -140,6 +140,14 @@ checkpoint write time and size, parameter counts, and full-panel inference for
 measurements to register the bases, batch shapes, workers, checkpoint cadence,
 recovery bound and revised cost ceilings before S1.
 
+On Linux, PyTorch loader workers pass batch tensors through file descriptors,
+and prefetched batches can keep many descriptors open. Before starting workers,
+the v5 loader tries to raise the process's soft open-file limit within its hard
+limit and logs any increase. An `RLIMIT_NOFILE` error at startup means the soft
+limit is still below the budget for the configured workers. Raise `ulimit -n`
+or use fewer workers. During batch transfer, `received 0 items of ancdata` can
+indicate that PyTorch ran out of file descriptors.
+
 For S1, register a base with fixed episodes per batch, `max_cells: null`, and
 `designate_target: true`. Generate one job per registered arm:
 
