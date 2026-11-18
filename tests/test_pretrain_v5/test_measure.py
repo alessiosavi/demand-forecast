@@ -21,6 +21,11 @@ def api():
     return importlib.import_module("demand_forecast.pretrain.v5.measure")
 
 
+@pytest.fixture(autouse=True)
+def serial_inference_on_any_host(monkeypatch):
+    monkeypatch.setattr(api(), "cpu_count", lambda: 1, raising=False)
+
+
 @pytest.fixture(scope="module")
 def panel():
     generated = generate_typed_panel(
@@ -128,7 +133,10 @@ def test_forecast_panel_uses_model_device_without_moving_parameters(panel, monke
 @pytest.mark.parametrize("model_device,requested", [("cpu", "meta"), ("meta", "cpu")])
 def test_forecast_panel_rejects_device_mismatch(panel, model_device, requested):
     model = V5Model(config().model).to(model_device).train()
-    with pytest.raises(ValueError, match=rf"{requested}.*{model_device}"):
+    with pytest.raises(
+        ValueError,
+        match=rf"^requested device {requested} differs from model device {model_device}$",
+    ):
         api().forecast_panel(model, panel, 80, 8, context=32, device=requested)
     assert model.training
     assert all(parameter.device == torch.device(model_device) for parameter in model.parameters())
@@ -139,6 +147,22 @@ def test_forecast_panel_rejects_invalid_batch_size_before_device_mismatch(panel)
 
     with pytest.raises(ValueError, match="batch_episodes must be a positive integer"):
         api().forecast_panel(model, panel, 80, 8, context=32, batch_episodes=0, device="meta")
+
+
+def test_forecast_panel_delegates_worker_validation(panel, monkeypatch):
+    measure = api()
+    real_forecast_items = measure.forecast_items
+    calls = []
+
+    def forecast_items(*args, **kwargs):
+        calls.append((kwargs["workers"], kwargs["prefetch"]))
+        return real_forecast_items(*args, **kwargs)
+
+    monkeypatch.setattr(measure, "forecast_items", forecast_items)
+    model = V5Model(config().model)
+    with pytest.raises(ValueError, match="^workers must be a nonnegative integer$"):
+        measure.forecast_panel(model, panel, 80, 8, workers=-1, prefetch=3)
+    assert calls == [(-1, 3)]
 
 
 def test_forecast_panel_never_materializes_more_than_batch_episodes(panel, monkeypatch):
@@ -437,6 +461,63 @@ def test_qualify_measures_all_sections_and_only_writes_json(tmp_path, workers, m
         assert parameters["total"] == sum(p.numel() for p in V5Model(architecture).parameters())
         assert parameters["total"] == sum(parameters["by_part"].values())
         assert_numbers(parameters)
+
+
+@pytest.mark.parametrize(
+    "platform,cores,expected_workers",
+    [("linux", 17, 0), ("linux", 18, 16), ("linux", None, 0), ("darwin", 18, 0)],
+)
+def test_qualify_keys_are_unchanged(tmp_path, monkeypatch, platform, cores, expected_workers):
+    measure = api()
+    real_forecast_panel = measure.forecast_panel
+    inference_workers = []
+
+    def forecast_panel(*args, **kwargs):
+        inference_workers.append(kwargs.pop("workers", None))
+        return real_forecast_panel(*args, **kwargs)
+
+    monkeypatch.setattr(measure, "sys", SimpleNamespace(platform=platform), raising=False)
+    monkeypatch.setattr(measure, "cpu_count", lambda: cores, raising=False)
+    monkeypatch.setattr(measure, "forecast_panel", forecast_panel)
+    c = config()
+    report = measure.qualify(
+        c,
+        tmp_path,
+        models={"tiny": c.model},
+        updates=1,
+        workers=(0,),
+        panel_items=2,
+        panel_length=64,
+    )
+    assert json.loads((tmp_path / "qualify.json").read_text()) == report
+    assert report.keys() == {"cold_start", "models"}
+    cold = report["cold_start"]
+    assert cold.keys() == {
+        "corpus_index_seconds",
+        "first_batch_seconds",
+        "restore_seconds",
+        "excluded_row_share",
+        "unparsed_frequency_rows",
+    }
+    measured = report["models"]["tiny"]
+    assert measured.keys() == {
+        "workers",
+        "origins",
+        "worst_batch",
+        "checkpoint",
+        "inference",
+        "parameters",
+    }
+    assert measured["inference"].keys() == {
+        "seconds",
+        "peak_gpu_bytes",
+        "host_memory_bytes",
+        "origin",
+        "items",
+        "forecasts",
+        "fallback_forecasts",
+    }
+    assert inference_workers == [expected_workers]
 
 
 def test_qualify_uses_expensive_settings_and_real_optimizer_ema_checkpoint(tmp_path, monkeypatch):

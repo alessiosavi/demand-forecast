@@ -11,10 +11,12 @@ from __future__ import annotations
 import json
 import os
 import statistics
+import sys
 import threading
 import time
 from collections import Counter
 from dataclasses import replace
+from os import cpu_count
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -60,11 +62,13 @@ def forecast_panel(
     gates: str = "learned",
     pruned: bool = True,
     device: str | None = None,
+    workers: int = 0,
+    prefetch: int = 2,
 ) -> dict[tuple[str, str], np.ndarray]:
     """Forecast bounded batches on the model's device, without moving the model.
 
     An explicit device must match the model's device. Restore its training mode
-    on success or failure.
+    on success or failure. On Linux, workers can build and collate episodes.
     """
     if type(batch_episodes) is not int or batch_episodes < 1:
         raise ValueError("batch_episodes must be a positive integer")
@@ -86,6 +90,8 @@ def forecast_panel(
         batch_episodes=batch_episodes,
         gates=gates,
         pruned=pruned,
+        workers=workers,
+        prefetch=prefetch,
     )
     return {
         (panel.items[index].item_id, name): values
@@ -442,6 +448,7 @@ def qualify(
     if not models or any(not isinstance(name, str) or not name for name in models):
         raise ValueError("models requires nonempty string names")
     device = _device(config)
+    inference_workers = 16 if sys.platform == "linux" and (cpu_count() or 0) >= 18 else 0
     # Q always measures the bank and all inputs, even if passed a T1 null arm.
     base = replace(
         config,
@@ -530,6 +537,7 @@ def qualify(
                         context=512,
                         gates="ones",
                         pruned=False,
+                        workers=inference_workers,
                     ),
                 )
                 if len(forecasts) != panel_items or fallback_forecasts:
