@@ -1,14 +1,16 @@
-"""Typed panels and corpus rows through one random-generator-driven interface."""
+"""Typed, corpus and upstream panels through one random-generator-driven interface."""
 
 from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Protocol
 
 import numpy as np
 
 from demand_forecast.data.episode import Item, Panel
+from demand_forecast.data.episode.schema import MAX_CONTEXT, MAX_HORIZON
 from demand_forecast.synthetic.typed import (
     GeneratedPanel,
     PanelRecipe,
@@ -135,6 +137,56 @@ class CorpusSource:
         }
 
 
+class UpstreamSource:
+    """One undated series with upstream numeric covariate effects per panel.
+
+    Only one seed is drawn from the caller. Both upstream generators use local
+    CPU streams; importing sources or constructing a mix never imports Simons.
+    Generator options in SourceConfig remain exclusive to typed sources.
+    """
+
+    def __init__(self, config: SourceConfig):
+        self.config = config
+
+    def panel(self, rng: np.random.Generator) -> tuple[Panel, dict]:
+        try:
+            from simons.synth import generate
+            from simons.synth.covariates.effects import synthetic
+        except ModuleNotFoundError as error:
+            if error.name == "simons" or (error.name or "").startswith("simons."):
+                raise ImportError(
+                    "UpstreamSource requires the pinned Simons source: clone the revision in "
+                    "third_party/simons/PINNED and put <checkout>/src on PYTHONPATH, "
+                    "or generate a guest job with --upstream."
+                ) from error
+            raise
+        import torch
+
+        seed = int(rng.integers(0, 2**63))
+        local = np.random.default_rng(seed)
+        generator = torch.Generator(device="cpu").manual_seed(seed)
+        # Effects normalize the history: upstream padding can otherwise hide
+        # all of it while leaving observations only in the future segment.
+        base = generate(1, MAX_CONTEXT + MAX_HORIZON, generator, "cpu", pad=0.0).numpy()
+        target, covariates = synthetic(
+            SimpleNamespace(uni=[(base[0], None)]), local, MAX_CONTEXT, MAX_HORIZON
+        )
+        dynamic = {f"cov_{i:03d}": values.astype(np.float64) for i, values in enumerate(covariates)}
+        roles = {name: str(local.choice(("known", "past"))) for name in dynamic}
+        item = Item(
+            item_id=f"upstream:{seed}",
+            start=0,
+            targets={"target_000": target.astype(np.float64)},
+            dynamic=dynamic,
+            static={},
+        )
+        return Panel("upstream", (item,), roles, None, None, False), {
+            "source": "upstream",
+            "seed": seed,
+            "target": "target_000",
+        }
+
+
 class SourceMix:
     def __init__(self, sources, *, corpus_root: Path | None = None):
         configs = tuple(sources)
@@ -157,7 +209,7 @@ class SourceMix:
             return TypedSource(config)
         if config.kind == "corpus":
             return CorpusSource(config, root=corpus_root)
-        raise NotImplementedError("upstream source is reserved for Task P8")
+        return UpstreamSource(config)
 
     @property
     def corpus_digest(self) -> str | None:

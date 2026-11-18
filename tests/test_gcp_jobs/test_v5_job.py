@@ -153,6 +153,12 @@ def machine(tmp_path):
                 assert pathlib.Path(a[a.index(config_flag) + 1]).exists()
                 assert a[a.index('--code') + 1] == 'a' * 40
                 assert a[a.index('--env-sha256') + 1] == hashlib.sha256(b'alpha==1\\nzeta==2\\n').hexdigest()
+                if os.environ.get('EXPECT_UPSTREAM'):
+                    import simons, subprocess
+                    source = pathlib.Path(sys.argv[0]).parents[2] / 'upstream/src'
+                    assert str(source) in os.environ['PYTHONPATH'].split(os.pathsep)
+                    assert pathlib.Path(simons.__file__).is_relative_to(source)
+                    subprocess.run([sys.executable, '-c', 'import simons'], check=True)
                 sys.exit(int(os.environ.get('JOB_EXIT', '0')))
             os.execv(sys.executable, [sys.executable, *a])
         """,
@@ -163,7 +169,19 @@ def machine(tmp_path):
             if a[0] == 'init':
                 p = pathlib.Path(a[-1]); p.mkdir(parents=True, exist_ok=True)
                 (p / 'requirements-v5.txt').write_text('alpha==1')
-            if 'rev-parse' in a: print(os.environ.get('FETCHED_SHA', 'a' * 40))
+                pin = os.environ.get('REPO_UPSTREAM_PIN', {upstream_pin!r})
+                if pin:
+                    target = p / 'third_party/simons/PINNED'
+                    target.parent.mkdir(parents=True)
+                    target.write_text(pin + '\\n')
+            if a[0] == 'clone':
+                p = pathlib.Path(a[-1]) / 'src/simons'; p.mkdir(parents=True)
+                (p / '__init__.py').write_text('')
+            if 'rev-parse' in a:
+                if pathlib.Path(a[1]).name == 'upstream':
+                    print(os.environ.get('UPSTREAM_SHA', {upstream_pin!r}))
+                else:
+                    print(os.environ.get('FETCHED_SHA', 'a' * 40))
         """,
         "uv": """
             import json, os, pathlib, sys
@@ -199,6 +217,9 @@ def machine(tmp_path):
             else: sys.exit(91)
         """,
     }
+    programs["git"] = programs["git"].replace(
+        "{upstream_pin!r}", repr((ROOT / "third_party/simons/PINNED").read_text().strip())
+    )
     for name, source in programs.items():
         path = bins / name
         path.write_text(f"#!{sys.executable}\n" + textwrap.dedent(source))
@@ -523,3 +544,133 @@ def test_generator_cli(jobs, settings, tmp_path):
     )
     assert result.returncode == 0, result.stderr
     assert os.access(output, os.X_OK)
+
+
+@pytest.mark.parametrize("fault", ["none", "head", "repo_pin", "missing_repo_pin"])
+def test_upstream_checkout_and_pin_guards(jobs, settings, machine, fault):
+    replace(config(), sources=(SourceConfig("upstream", 1),)).to_yaml(settings)
+    _, execute = machine
+    script = jobs.generate(**arguments(settings), upstream=True)
+    assert script == jobs.generate(**arguments(settings), upstream=True)
+    assert "shutdown" not in script
+    changes = {
+        "none": {},
+        "head": {"UPSTREAM_SHA": "e" * 40},
+        "repo_pin": {"REPO_UPSTREAM_PIN": "e" * 40},
+        "missing_repo_pin": {"REPO_UPSTREAM_PIN": ""},
+    }[fault]
+    result, events = execute(script, EXPECT_UPSTREAM="1", **changes)
+    assert result.returncode == (0 if fault == "none" else 2), result.stderr
+    pin = (ROOT / "third_party/simons/PINNED").read_text().strip()
+    clones = [e for e in events if e[:2] == ["git", "clone"]]
+    if fault in ("repo_pin", "missing_repo_pin"):
+        assert not clones  # The cheaper guard runs first.
+    else:
+        (clone,) = clones
+        assert clone[2:5] == [
+            "--filter=blob:none",
+            "--no-checkout",
+            "https://github.com/Abel-ai-lab/Simons.git",
+        ]
+        assert Path(clone[-1]).parent.name.startswith("install-")
+        checkout = next(e for e in events if e[0] == "git" and pin in e)
+        assert "checkout" in checkout and "--detach" in checkout
+    if fault == "none":
+        assert events[-1][:3] == ["python", "-m", "demand_forecast.pretrain.v5.job"]
+    else:
+        assert "mismatch" in result.stderr.lower()
+        assert not any("demand_forecast.pretrain.v5.job" in e for e in events)
+        # Every guard runs before anything is installed.
+        assert not any(e[0] == "uv" or e[:3] == ["python", "-m", "pip"] for e in events)
+
+
+def test_upstream_keeps_dependency_events_and_fingerprint_unchanged(jobs, settings, machine):
+    _, execute = machine
+    plain = jobs.generate(**arguments(settings))
+    plain_result, plain_events = execute(plain)
+    assert plain_result.returncode == 0, plain_result.stderr
+    replace(config(), sources=(SourceConfig("upstream", 1),)).to_yaml(settings)
+    script = jobs.generate(**arguments(settings), upstream=True)
+    result, all_events = execute(script)
+    assert result.returncode == 0, result.stderr
+    upstream_events = all_events[len(plain_events) :]
+
+    def dependency_events(events):
+        scratch = str(Path(next(e[-1] for e in events if e[0] == "uv")).parent)
+        return [
+            [part.replace(scratch, "$scratch") for part in event]
+            for event in events
+            if event[0] == "uv" or event[:3] == ["python", "-m", "pip"]
+        ]
+
+    assert dependency_events(upstream_events) == dependency_events(plain_events)
+    for events in (plain_events, upstream_events):
+        job = events[-1]
+        assert (
+            job[job.index("--env-sha256") + 1] == hashlib.sha256(b"alpha==1\nzeta==2\n").hexdigest()
+        )
+    assert "prepare.py" not in script
+    assert not any("$upstream" in line for line in script.splitlines() if "pip install" in line)
+    # The checkout becomes importable only after the fingerprint has been taken.
+    lines = script.splitlines()
+    fingerprint = next(i for i, line in enumerate(lines) if line.startswith("env_sha256="))
+    exported = [i for i, line in enumerate(lines) if line.startswith("export PYTHONPATH=")]
+    assert len(exported) == 1 and exported[0] > fingerprint
+    assert "export PYTHONPATH=" not in plain
+
+
+def test_upstream_is_opt_in(jobs, settings, machine):
+    _, execute = machine
+    result, events = execute(jobs.generate(**arguments(settings)))
+    assert result.returncode == 0, result.stderr
+    assert not any(any("/upstream" in part or "prepare.py" in part for part in e) for e in events)
+
+
+@pytest.mark.parametrize("action", ["train", "qualify"])
+@pytest.mark.parametrize("problem", ["root", "missing", "unexpected", "mapping"])
+def test_generator_preserves_corpus_configuration_guards(jobs, settings, action, problem):
+    if problem == "root":
+        replace(config(), sources=(SourceConfig("corpus", 1, root="/local"),)).to_yaml(settings)
+    elif problem == "missing":
+        replace(config(), sources=(SourceConfig("corpus", 1),)).to_yaml(settings)
+    elif problem == "mapping":
+        settings.write_text("[]")
+    options = (
+        {}
+        if problem != "unexpected"
+        else {"corpus_uri": "gs://offline/corpus", "corpus_digest": DIGEST}
+    )
+    values = dict(name="guard", action=action, repo_sha=SHA, config=str(settings), **options)
+    message = {
+        "root": "root: null",
+        "missing": "corpus sources and corpus_uri",
+        "unexpected": "corpus sources and corpus_uri",
+        "mapping": "requires a mapping",
+    }[problem]
+    with pytest.raises(ValueError, match=message):
+        jobs.generate(**values)
+
+
+@pytest.mark.parametrize("action", ["train", "qualify"])
+@pytest.mark.parametrize("has_source,flag", [(True, False), (False, True)])
+def test_generator_requires_upstream_source_and_flag_together(
+    jobs, settings, action, has_source, flag
+):
+    if has_source:
+        replace(config(), sources=(SourceConfig("upstream", 1),)).to_yaml(settings)
+    with pytest.raises(ValueError, match="upstream sources and --upstream"):
+        jobs.generate(name="pair", action=action, repo_sha=SHA, config=str(settings), upstream=flag)
+
+
+def test_t1_rejects_upstream(jobs, settings):
+    with pytest.raises(ValueError, match="--upstream.*t1"):
+        jobs.generate(
+            name="t1",
+            action="t1",
+            repo_sha=SHA,
+            base=str(settings),
+            path="selection",
+            arm="true",
+            seed=1,
+            upstream=True,
+        )

@@ -197,12 +197,17 @@ def generate(
     max_panels: int | None = None,
     corpus_uri: str | None = None,
     corpus_digest: str | None = None,
+    upstream: bool = False,
 ) -> str:
     """Return one deterministic shell script; config/base name local YAML files."""
     _name(name, "name")
     _hex(repo_sha, 40, "repo_sha")
+    if type(upstream) is not bool:
+        raise ValueError("upstream must be a boolean")
     if action not in ("train", "qualify", "t1"):
         raise ValueError("action must be train, qualify or t1")
+    if upstream and action == "t1":
+        raise ValueError("--upstream is not supported for t1")
     if (corpus_uri is None) != (corpus_digest is None):
         raise ValueError("corpus_uri and corpus_digest must be supplied together")
     if (init_uri is None) != (init_sha256 is None):
@@ -266,10 +271,27 @@ def generate(
             raise ValueError("cloud corpus sources must carry root: null")
         if any(s.get("kind") == "corpus" for s in sources) != (corpus_uri is not None):
             raise ValueError("corpus sources and corpus_uri must be supplied together")
+        if any(s.get("kind") == "upstream" for s in sources) != upstream:
+            raise ValueError("upstream sources and --upstream must be supplied together")
     packed_helper = base64.b64encode(GUEST.encode()).decode()
     packed_config = base64.b64encode(data).decode()
     config_sha = hashlib.sha256(data).hexdigest()
     command_text = shlex.join(command)
+    upstream_step = upstream_path = ""
+    if upstream:
+        pin = (
+            (Path(__file__).resolve().parents[3] / "third_party/simons/PINNED").read_text().strip()
+        )
+        _hex(pin, 40, "upstream pin")
+        # Both guards run before anything is installed; the cheaper one first.
+        upstream_step = f"""[[ $(cat "$repo/third_party/simons/PINNED") == {pin} ]] || {{ echo 'upstream pin mismatch' >&2; exit 2; }}
+upstream="$scratch/upstream"
+git clone --filter=blob:none --no-checkout https://github.com/Abel-ai-lab/Simons.git "$upstream"
+git -C "$upstream" checkout --detach {pin}
+[[ $(git -C "$upstream" rev-parse HEAD) == {pin} ]] || {{ echo 'upstream SHA mismatch' >&2; exit 2; }}
+"""
+        # Exported only after the fingerprint: the environment's identity cannot depend on it.
+        upstream_path = 'export PYTHONPATH="$upstream/src${PYTHONPATH:+:$PYTHONPATH}"\n'
     script = f'''#!/usr/bin/env bash
 # v5 job {name}; repository {repo_sha}
 set -euo pipefail
@@ -308,7 +330,7 @@ git -C "$repo" remote add origin https://github.com/alessiosavi/demand-forecast.
 git -C "$repo" fetch --depth=1 origin {repo_sha}
 git -C "$repo" checkout --detach FETCH_HEAD
 [[ $(git -C "$repo" rev-parse HEAD) == {repo_sha} ]] || {{ echo 'repository SHA mismatch' >&2; exit 2; }}
-if ! command -v uv >/dev/null 2>&1; then
+{upstream_step}if ! command -v uv >/dev/null 2>&1; then
     python3 -m pip install --target "$scratch/uv-bootstrap" uv
     export PATH="$scratch/uv-bootstrap/bin:$PATH"
 fi
@@ -318,7 +340,7 @@ python="$scratch/venv/bin/python"
 "$python" -m pip install -r "$repo/requirements-v5.txt" --editable "$repo[corpus]"
 "$python" -m pip check
 env_sha256=$("$python" -m pip freeze --exclude-editable | python3 "$helper" environment)
-extra=()
+{upstream_path}extra=()
 '''
     if corpus_uri is not None:
         uri = shlex.quote(corpus_uri)
@@ -364,6 +386,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.add_argument("--" + key)
     for key in ("seed", "episodes", "max-panels"):
         parser.add_argument("--" + key, type=int)
+    parser.add_argument("--upstream", action="store_true", help="expose the pinned Simons source")
     parser.add_argument("--output", type=Path, required=True)
     args = vars(parser.parse_args(argv))
     output = args.pop("output")
