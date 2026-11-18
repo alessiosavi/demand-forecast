@@ -1,0 +1,643 @@
+"""Frozen, paired T1 evaluations and their bootstrap decisions.
+
+Training arms fit their own scales. Scoring always uses the true build's real
+label cells and affine frame; an arm's screening never selects the test set.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from collections import Counter
+from dataclasses import asdict, replace
+from pathlib import Path
+
+import numpy as np
+import torch
+
+from demand_forecast.data.episode import EpisodeBuilder, EpisodeRequest
+from demand_forecast.data.episode.collate import collate
+from demand_forecast.data.episode.schema import (
+    CALENDAR_SIZES,
+    CH_STEP_FLAG,
+    PATCH,
+    ROLE_SIBLING,
+    STEP_FAMILIES,
+    SUMMARY_FEATURES,
+)
+from demand_forecast.models.v5.model import prune
+from demand_forecast.synthetic.typed import (
+    PanelRecipe,
+    generate_typed_panel,
+    shuffle_assignment,
+)
+from demand_forecast.synthetic.typed.draft import stream
+
+from .config import T1_BASE, SourceConfig, V5TrainConfig
+from .loop import load_model
+from .sampler import _postprocess, _supervised, plan_panel
+from .sources import TypedSource
+from .support import supported
+
+
+def _path(sets, *, both=None, arms=None, slices=(), required=(), present="inputs"):
+    arms = {"null": {"source": {"control": "shuffle"}}} if arms is None else arms
+    return {
+        "sets": sets,
+        "both": {} if both is None else both,
+        "arms": {"true": {}, **arms},
+        "comparisons": tuple(
+            ("true", arm, arm != "null_steps") for arm in arms if arm != "gates_one"
+        ),
+        "slices": slices,
+        "required": required,
+        "present": present,
+    }
+
+
+PATHS: dict[str, dict] = {
+    name: _path(((name,),)) for name in ("static_category", "multi_label", "static_number")
+}
+PATHS.update(
+    {
+        f"category_{effect}": _path(
+            ((f"dynamic_category_{effect}",),), slices=("rare", "late_first", "known", "past")
+        )
+        for effect in ("mean", "spread", "timing")
+    }
+)
+PATHS.update(
+    known_driver=_path((("known_driver",),)),
+    planned_event=_path((("planned_event",),), slices=("first_event",)),
+    past_driver=_path((("delayed_past_driver",),)),
+    calendar=_path(
+        (("calendar",),),
+        both={"source": {"freq": "D", "length": (64, 300)}, "sampler": {"contexts": (64, 128)}},
+        arms={"null": {"source": {"control": "no_dates"}}},
+        present="calendar",
+    ),
+    several_targets=_path(
+        (("multi_target",),),
+        both={"sampler": {"designate_target": True}},
+        arms={"null": {"sampler": {"drop_always": ("siblings",)}}},
+        present="siblings",
+    ),
+    missing_vs_zero=_path(
+        (("missing_vs_zero",),),
+        both={"sampler": {"origins": 1}},
+        arms={"null": {"source": {"control": "missing_as_zero"}}},
+        present="always",
+    ),
+    bank=_path(
+        (("seasonal_lag",), ("intermittent",), ("level_shift",)),
+        both={"sampler": {"contexts": (256,)}},
+        arms={
+            "null_all": {
+                "sampler": {
+                    "drop_always": ("rolling", "lags", "zeros"),
+                    "summary_off": SUMMARY_FEATURES,
+                }
+            },
+            "null_steps": {"sampler": {"drop_always": ("rolling", "lags", "zeros")}},
+        },
+        slices=("seasonal_lag", "intermittent", "level_shift"),
+        required=("seasonal_lag", "intermittent", "level_shift"),
+        present="bank",
+    ),
+    **{
+        name: _path(
+            ((name,),),
+            arms={"null": {"source": {"control": "shuffle", "control_inputs": "attribute"}}},
+        )
+        for name in ("event_response", "label_lag")
+    },
+    routing=_path(
+        (("static_category",), ("known_driver",), ("intermittent",)),
+        arms={"null_uniform": {"router": "uniform"}, "null_rolled": {"router": "rolled"}},
+    ),
+    selection=_path(
+        (("static_category", "static_number", "delayed_past_driver"),),
+        both={
+            "source": {
+                "n_nuisance": 3,
+                "nuisance_from": ("static_category", "static_number", "delayed_past_driver"),
+            }
+        },
+        arms={"null": {"source": {"control": "shuffle"}}, "gates_one": {"gates": "ones"}},
+    ),
+)
+
+
+def t1_config(path: str, arm: str, *, seed: int, base: V5TrainConfig = T1_BASE) -> V5TrainConfig:
+    """Apply only the registered source, sampler, router and gate overrides."""
+    if path not in PATHS or arm not in PATHS[path]["arms"]:
+        raise ValueError(f"unknown T1 path/arm: {path}/{arm}")
+    entry = PATHS[path]
+    source = SourceConfig("typed", 1, recipes=entry["sets"])
+    sampler = base.sampler
+    switches = {}
+    for overrides in (entry["both"], entry["arms"][arm]):
+        source = replace(source, **overrides.get("source", {}))
+        sampler = replace(sampler, **overrides.get("sampler", {}))
+        switches.update({k: overrides[k] for k in ("router", "gates") if k in overrides})
+    return replace(base, sources=(source,), sampler=sampler, seed=seed, **switches)
+
+
+_BANK = {
+    "seasonal_lag": ("lags", "acf_long"),
+    "intermittent": ("zeros", "adi"),
+    "level_shift": ("rolling", "trend_strength"),
+}
+
+
+def _present(path, generated, episode, mechanisms):
+    """Check the actual build, including flags rather than feature values."""
+    presence = PATHS[path]["present"]
+    if presence == "always":
+        return True
+    if presence == "calendar":
+        context = episode.cal_ids.reshape(-1, len(CALENDAR_SIZES))
+        horizon = episode.calh_ids.reshape(len(episode.origin_patches), -1, len(CALENDAR_SIZES))[
+            :, : episode.horizon
+        ]
+        return all(
+            bool(
+                (ids >= 0).any(axis=-1).all() and (ids >= -1).all() and (ids < CALENDAR_SIZES).all()
+            )
+            for ids in (context, horizon)
+        )
+    if presence == "siblings":
+        return bool((episode.row_role == ROLE_SIBLING).any())
+    for mechanism in mechanisms:
+        records = generated.inputs_of(mechanism)
+        if records:
+            if not all(
+                r.name in (episode.cand_names if r.where == "static" else episode.row_names)
+                for r in records
+            ):
+                return False
+        elif mechanism in _BANK:
+            family, summary = _BANK[mechanism]
+            span = STEP_FAMILIES[family]
+            rows = episode.forecast_rows[episode.keep]
+            flags = episode.x[rows, ..., CH_STEP_FLAG + span.start : CH_STEP_FLAG + span.stop]
+            if (
+                not flags.any()
+                or not episode.row_summary_flags[rows, SUMMARY_FEATURES.index(summary)].all()
+            ):
+                return False
+    return True
+
+
+def _build(generated, entry, config):
+    """Replay one frozen request; controls use the recipe seed, as TypedSource does."""
+    source = config.sources[0]
+    panel = generated.panel
+    if source.control == "shuffle":
+        controlled = generated
+        for record in generated.inputs:
+            mechanism = record.twin if record.mechanism == "nuisance" else record.mechanism
+            if mechanism not in generated.recipe.mechanisms or record.name in controlled.shuffled:
+                continue
+            if source.control_inputs == "attribute" and record.where != "static":
+                continue
+            if source.control_inputs == "column" and record.where != "dynamic":
+                continue
+            controlled = shuffle_assignment(controlled, record.name, seed=generated.recipe.seed)
+        panel = controlled.panel
+    elif source.control == "no_dates":
+        panel = replace(panel, epoch=None)
+    elif source.control == "missing_as_zero":
+        items = []
+        for item in panel.items:
+            targets = {name: values.copy() for name, values in item.targets.items()}
+            for values in targets.values():
+                prefix = values[: max(0, entry["origin"] - item.start)]
+                prefix[np.isnan(prefix)] = 0.0
+            items.append(replace(item, targets=targets))
+        panel = replace(panel, items=tuple(items))
+    index = next(i for i, item in enumerate(panel.items) if item.item_id == entry["item_id"])
+    request = EpisodeRequest(
+        index,
+        (entry["origin"],),
+        entry["horizon"],
+        entry["context"],
+        entry["target"],
+        entry["cutoff"],
+        frozenset(config.sampler.drop_always),
+    )
+    episode = EpisodeBuilder(panel).build(request)
+    _postprocess(episode, replace(config.sampler, designate_target=True))
+    return episode
+
+
+def _slices(path, generated, item_id, origin, horizon):
+    item = next(i for i in generated.complete.items if i.item_id == item_id)
+    left, right = max(0, origin - item.start), max(0, origin + horizon - item.start)
+    slices = []
+    for mechanism in generated.recipe.mechanisms:
+        if path == "bank":
+            slices.append(mechanism)
+        if mechanism.startswith("dynamic_category_"):
+            record = generated.inputs_of(mechanism)[0]
+            values = item.dynamic[record.name]
+            params = generated.params[mechanism]
+            slices.append(record.role)
+            for key, name in (("rare", "rare"), ("late", "late_first")):
+                label = params["values"][params["process"][key]]
+                positions = np.flatnonzero(values == label)
+                if key == "rare" and ((positions >= left) & (positions < right)).any():
+                    slices.append(name)
+                if key == "late" and len(positions) and left <= positions[0] < right:
+                    slices.append(name)
+        if mechanism == "planned_event":
+            record = generated.inputs_of(mechanism)[0]
+            positions = np.flatnonzero(item.dynamic[record.name] == 1)
+            if len(positions) and left <= positions[0] < right:
+                slices.append("first_event")
+    return tuple(slices)
+
+
+def eval_set(
+    path: str,
+    *,
+    episodes: int = 200,
+    max_panels: int = 1000,
+    seed: int = 10_000,
+    min_count: int = 30,
+) -> list[dict]:
+    """Plan on true held-out panels, retaining at most one episode per panel.
+
+    A scoring episode has one origin. Admission, cutoff fallback, target choice
+    and the nonconstant-prefix/observed-label checks belong to P3's planner.
+    """
+    if episodes < 1 or max_panels < 0 or min_count < 1:
+        raise ValueError("episodes/min_count must be positive and max_panels nonnegative")
+    config = t1_config(path, "true", seed=seed, base=T1_BASE)
+    source = replace(config.sources[0], heldout=True)
+    sampler = replace(
+        config.sampler,
+        episodes_per_batch=1,
+        episodes_per_panel=1,
+        origins=1,
+        path_share=1.0,
+        drop=(),
+        designate_target=True,
+    )
+    results, counts = [], Counter()
+    for i in range(max_panels):
+        if len(results) >= episodes and all(
+            counts[s] >= min_count for s in PATHS[path]["required"]
+        ):
+            break
+        panel, record = TypedSource(source).panel(stream(seed, f"eval:{path}:{i}"))
+        generated = record["generated"]
+        _, plans, _ = plan_panel(
+            panel, record, sampler, source, stream(seed, f"eval-plan:{path}:{i}")
+        )
+        if not plans or plans[0].mechanism is None:
+            continue
+        plan = plans[0]
+        request = plan.request
+        mechanisms = tuple(
+            m
+            for m in generated.recipe.mechanisms
+            if supported(
+                generated,
+                m,
+                plan.item_id,
+                request.origins[0],
+                context=request.context,
+                horizon=request.horizon,
+                cutoff=request.cutoff,
+            )
+        )
+        if path != "selection" and len(mechanisms) != len(generated.recipe.mechanisms):
+            continue
+        built = EpisodeBuilder(panel).build(request)
+        _postprocess(built, sampler)
+        if not _supervised(built) or not _present(path, generated, built, mechanisms):
+            continue
+        entry = {
+            "recipe": asdict(generated.recipe),
+            "item_id": plan.item_id,
+            "target": request.target,
+            "origin": request.origins[0],
+            "horizon": request.horizon,
+            "context": request.context,
+            "cutoff": request.cutoff,
+            "slices": _slices(path, generated, plan.item_id, request.origins[0], request.horizon),
+            "drivers": tuple(asdict(r) for r in generated.inputs if r.mechanism in mechanisms),
+            "nuisance": tuple(asdict(r) for r in generated.inputs if r.twin is not None),
+        }
+        results.append(entry)
+        counts.update(entry["slices"])
+    return results
+
+
+def eval_digest(episodes: list[dict]) -> str:
+    """Identify the complete ordered replay specification, independent of key order."""
+    return hashlib.sha256(
+        json.dumps(episodes, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    ).hexdigest()
+
+
+def _losses(output, arm, true, quantiles):
+    losses = []
+    q = output.quantiles.new_tensor(quantiles)
+    for b in range(arm.x.shape[0]):
+        ai = (arm.keep[b] & arm.forecast_mask[b]).nonzero().flatten().item()
+        ti = (true.keep[b] & true.forecast_mask[b]).nonzero().flatten().item()
+        horizon = int(true.horizon[b])
+        prediction = output.quantiles[b, :, ai, :horizon].double()
+        prediction = (
+            prediction * arm.scale[b, ai] + arm.loc[b, ai] - true.loc[b, ti]
+        ) / true.scale[b, ti]
+        error = true.labels[b, :, ti, :horizon, None].double() - prediction
+        pinball = torch.maximum(q * error, (q - 1) * error)
+        mask = true.label_mask[b, :, ti, :horizon] & true.origin_mask[b, :, None]
+        if not mask.any():
+            raise ValueError("frozen episode has no true label cells")
+        losses.append(float(pinball[mask].mean()))
+    return losses
+
+
+def _sizes(batch):
+    n, rows, patches = batch.x.shape[:3]
+    origins, forecasts, horizon = batch.labels.shape[1:]
+    cells = (
+        n * rows * patches * PATCH + n * origins * (forecasts + batch.known_rows.shape[1]) * horizon
+    )
+    return {
+        "rows": int(batch.row_mask.sum()),
+        "tokens": cells // PATCH + int(batch.attr_mask.sum() + batch.static_num_mask.sum()),
+        "cells": cells,
+    }
+
+
+@torch.inference_mode()
+def evaluate(
+    checkpoint: Path,
+    path: str,
+    arm: str,
+    episodes: list[dict],
+    *,
+    batch_episodes: int = 32,
+    forced: bool = False,
+) -> dict:
+    """Score exports in frozen order, using true labels and the true affine frame."""
+    if batch_episodes < 1:
+        raise ValueError("batch_episodes must be positive")
+    model, saved = load_model(checkpoint, weights="export")
+    model.eval()
+    # A null checkpoint already contains its training overrides. They cannot
+    # contaminate the reference build or a different evaluation arm.
+    base = replace(
+        saved,
+        sources=(),
+        router="learned",
+        gates="learned",
+        sampler=replace(
+            saved.sampler,
+            drop=(),
+            drop_always=(),
+            summary_off=(),
+            designate_target=True,
+            max_cells=None,
+            origins=1,
+        ),
+    )
+    config = t1_config(path, arm, seed=saved.seed, base=base)
+    true_config = t1_config(path, "true", seed=saved.seed, base=base)
+    mechanisms = sorted({r["mechanism"] for e in episodes for r in e["drivers"]})
+    result = {
+        "loss": [],
+        "gates": [],
+        "pruned": {"rows": 0, "tokens": 0, "cells": 0},
+        "without_candidate": 0,
+        "eval_digest": eval_digest(episodes),
+    }
+    if forced:
+        result["forced"] = {m: [] for m in mechanisms}
+    for start in range(0, len(episodes), batch_episodes):
+        entries = episodes[start : start + batch_episodes]
+        true_episodes, arm_episodes = [], []
+        for entry in entries:
+            generated = generate_typed_panel(PanelRecipe(**entry["recipe"]))
+            reference = _build(generated, entry, true_config)
+            built = _build(generated, entry, config)
+            own = {r["mechanism"] for r in entry["drivers"]} or set(generated.recipe.mechanisms)
+            result["without_candidate"] += not _present(path, generated, built, own)
+            true_episodes.append(reference)
+            arm_episodes.append(built)
+        true_batch, batch = collate(true_episodes), collate(arm_episodes)
+        gates = model.gates(batch, mode=config.gates)
+        output = model(batch, gates, router=config.router)
+        result["loss"].extend(_losses(output, batch, true_batch, model.config.quantiles))
+        for b in range(len(entries)):
+            named = {name: float(gates.cand[b, j]) for j, name in enumerate(batch.cand_names[b])}
+            named.update(
+                {name: float(gates.row[b, j]) for j, name in enumerate(batch.row_names[b])}
+            )
+            result["gates"].append(named)
+        smaller, _ = prune(batch, gates)
+        before, after = _sizes(batch), _sizes(smaller)
+        for key in before:
+            result["pruned"][key] += before[key] - after[key]
+        if forced:
+            for mechanism in mechanisms:
+                candidates, rows = (
+                    torch.zeros_like(batch.cand_mask),
+                    torch.zeros_like(batch.row_mask),
+                )
+                active = []
+                for b, entry in enumerate(entries):
+                    names = {r["name"] for r in entry["drivers"] if r["mechanism"] == mechanism}
+                    for j, name in enumerate(batch.cand_names[b]):
+                        candidates[b, j] = name in names
+                    for j, name in enumerate(batch.row_names[b]):
+                        rows[b, j] = name in names
+                    active.append(bool(candidates[b].any() or rows[b].any()))
+                forced_gates = model.gates(
+                    batch, mode=config.gates, zero_candidates=candidates, zero_rows=rows
+                )
+                losses = _losses(
+                    model(batch, forced_gates, router=config.router),
+                    batch,
+                    true_batch,
+                    model.config.quantiles,
+                )
+                result["forced"][mechanism].extend(
+                    loss if present else None for loss, present in zip(losses, active)
+                )
+    return result
+
+
+def _outcome(outcomes):
+    outcomes = tuple(outcomes)
+    return (
+        "fail"
+        if "fail" in outcomes
+        else "inconclusive"
+        if not outcomes or "inconclusive" in outcomes
+        else "pass"
+    )
+
+
+def _interval(numerator, denominator=None, *, resamples=10_000, seed=0, min_count=30):
+    """Paired percentile bootstrap; bounded allocation even for extended sets."""
+    numerator = np.asarray(numerator, dtype=np.float64)
+    n = len(numerator)
+    denominator = np.ones(n) if denominator is None else np.asarray(denominator, dtype=np.float64)
+    total = denominator.sum()
+    record = {
+        "gain": float(numerator.sum() / total) if total > 0 else None,
+        "low": None,
+        "high": None,
+        "n": n,
+    }
+    if n < min_count or total <= 0:
+        return record
+    rng, draws = stream(seed, "bootstrap"), []
+    for offset in range(0, resamples, 128):
+        indices = rng.integers(n, size=(min(128, resamples - offset), n))
+        bottom = denominator[indices].sum(axis=1)
+        if (bottom <= 0).any():
+            return record
+        draws.extend(numerator[indices].sum(axis=1) / bottom)
+    record["low"], record["high"] = (float(v) for v in np.quantile(draws, (0.05, 0.95)))
+    return record
+
+
+def _loss_arrays(true, null):
+    true, null = np.asarray(true, dtype=np.float64), np.asarray(null, dtype=np.float64)
+    if true.ndim != 1 or null.ndim != 1 or true.shape != null.shape:
+        raise ValueError("paired losses must have equal one-dimensional shapes")
+    if (
+        not np.isfinite(true).all()
+        or not np.isfinite(null).all()
+        or (true < 0).any()
+        or (null < 0).any()
+    ):
+        raise ValueError("losses must be finite and nonnegative")
+    return true, null
+
+
+def compare(
+    true: list[float],
+    null: list[float],
+    *,
+    episodes: list[dict] | None = None,
+    required: tuple[str, ...] = (),
+    resamples: int = 10_000,
+    seed: int = 0,
+    min_count: int = 30,
+) -> dict:
+    """Compare paired episode losses, with only explicitly required slices deciding."""
+    true, null = _loss_arrays(true, null)
+    if resamples < 1 or min_count < 1:
+        raise ValueError("resamples and min_count must be positive")
+    if episodes is not None and len(episodes) != len(true):
+        raise ValueError("episodes and losses must have equal lengths")
+    if required and episodes is None:
+        raise ValueError("required slices need episodes")
+
+    def decision(indices):
+        record = _interval(
+            null[indices] - true[indices],
+            null[indices],
+            resamples=resamples,
+            seed=seed,
+            min_count=min_count,
+        )
+        record["outcome"] = (
+            "inconclusive"
+            if record["low"] is None
+            else "pass"
+            if record["gain"] >= 0.05 and record["low"] > 0
+            else "fail"
+        )
+        return record
+
+    names = sorted(set(required) | {s for e in episodes or [] for s in e["slices"]})
+    slices = {
+        name: decision(
+            np.asarray([i for i, e in enumerate(episodes or []) if name in e["slices"]], dtype=int)
+        )
+        for name in names
+    }
+    overall = decision(np.arange(len(true)))
+    return {
+        "all": overall,
+        "slices": slices,
+        "outcome": _outcome([overall["outcome"], *(slices[s]["outcome"] for s in required)]),
+    }
+
+
+def selection_report(true: dict, null: dict, gates_one: dict, episodes: list[dict]) -> dict:
+    """R2 decisions, using only present candidates and live driver interventions."""
+    learned, shuffled = _loss_arrays(true["loss"], null["loss"])
+    _, ones = _loss_arrays(true["loss"], gates_one["loss"])
+    if len(episodes) != len(learned) or len(true["gates"]) != len(learned):
+        raise ValueError("selection episodes, losses and gates must be aligned")
+    pruning = {}
+    for kind, key, threshold in (("nuisance", "nuisance", 0.5), ("drivers", "drivers", 0.05)):
+        values, indices = [], set()
+        for i, (entry, gates) in enumerate(zip(episodes, true["gates"])):
+            for record in entry[key]:
+                if record["name"] in gates:
+                    values.append(gates[record["name"]] == 0)
+                    indices.add(i)
+        share = float(np.mean(values)) if values else None
+        passed = share is not None and (
+            share >= threshold if kind == "nuisance" else share <= threshold
+        )
+        pruning[kind] = {
+            "share_zero": share,
+            "inputs": len(values),
+            "n": len(indices),
+            "outcome": "inconclusive" if len(indices) < 30 else "pass" if passed else "fail",
+        }
+    pruning["outcome"] = _outcome(pruning[k]["outcome"] for k in ("nuisance", "drivers"))
+    forced = {}
+    mechanisms = sorted({r["mechanism"] for e in episodes for r in e["drivers"]})
+    for mechanism in mechanisms:
+        losses = true.get("forced", {}).get(mechanism, [None] * len(episodes))
+        if len(losses) != len(episodes):
+            raise ValueError("forced losses must be aligned with episodes")
+        differences = []
+        for i, entry in enumerate(episodes):
+            gates = true["gates"][i]
+            live = any(
+                r["mechanism"] == mechanism and gates.get(r["name"], 0) != 0
+                for r in entry["drivers"]
+            )
+            if live and losses[i] is not None:
+                if not np.isfinite(losses[i]):
+                    raise ValueError("forced losses must be finite")
+                differences.append(losses[i] - learned[i])
+        record = _interval(differences)
+        record["outcome"] = (
+            "inconclusive" if record["low"] is None else "pass" if record["low"] > 0 else "fail"
+        )
+        forced[mechanism] = record
+    forced["outcome"] = _outcome(r["outcome"] for r in forced.values())
+    advantage = _interval(learned - ones, ones)
+    advantage["outcome"] = (
+        "inconclusive"
+        if advantage["high"] is None
+        else "pass"
+        if advantage["high"] < 0.01
+        else "fail"
+    )
+    report = {
+        "pruning": pruning,
+        "forced": forced,
+        "shuffle": compare(learned, shuffled),
+        "gates_one": advantage,
+        "pruned": dict(true["pruned"]),
+    }
+    report["outcome"] = _outcome(
+        report[k]["outcome"] for k in ("pruning", "forced", "shuffle", "gates_one")
+    )
+    return report
