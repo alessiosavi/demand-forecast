@@ -462,6 +462,33 @@ def test_missing_as_zero_equals_prefilled_panel_and_preserves_true_units():
     assert np.isnan(p.items[0].targets["y0"][3])
 
 
+def test_missing_as_zero_fills_corpus_history(tmp_path):
+    """The control belongs to the sampler, so it reaches a corpus panel too."""
+    pytest.importorskip("pyarrow")
+    values = np.arange(64, dtype=np.float64)
+    values[3:5] = np.nan
+    write_rows(tmp_path / "univariate/a/train-000.parquet", [[values]])
+    source = SourceConfig("corpus", 1, root=str(tmp_path), control="missing_as_zero")
+    base = config(designate_target=True, origins=1, drop=(), cutoff_at_origin=1)
+    c = replace(base, sources=(source,))
+    p, record = SourceMix(c.sources).panel(np.random.default_rng(0))
+    target = record["target"]
+    assert np.isnan(p.items[0].targets[target][3:5]).all()
+    planned = api().plan_panel(p, record, c.sampler, source, np.random.default_rng(0))
+    exposed, plans = planned[0], planned[1]
+    assert plans
+    assert (exposed.items[0].targets[target][3:5] == 0.0).all()
+    assert np.isnan(p.items[0].targets[target][3:5]).all()  # The source's row is untouched.
+    true = replace(c, sources=(replace(source, control=None),))
+    uncontrolled = api().plan_panel(
+        p, record, true.sampler, true.sources[0], np.random.default_rng(0)
+    )
+    assert np.isnan(uncontrolled[0].items[0].targets[target][3:5]).all()
+    assert [plan.request for plan in plans] == [plan.request for plan in uncontrolled[1]]
+    _, report = api().make_batch(c, 0)
+    assert set(report["sources"]) == {"corpus"}
+
+
 def test_summary_off_changes_only_named_entries():
     c = config(designate_target=True, drop=())
     c = replace(c, sources=(replace(c.sources[0], recipes=(("static_category",),), max_items=12),))
