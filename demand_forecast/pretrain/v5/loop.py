@@ -299,7 +299,7 @@ def train(
     if saved is not None:
         optimizer.load_state_dict(saved["optimizer"])
         scheduler.load_state_dict(saved["scheduler"])
-        if scaler is not None:
+        if scaler is not None and saved["scaler"] is not None:
             scaler.load_state_dict(saved["scaler"])
         if ema is not None:
             ema.restore(saved["ema"], device)

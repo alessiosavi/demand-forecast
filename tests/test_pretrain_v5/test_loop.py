@@ -101,6 +101,27 @@ def test_resume_is_bitwise_equal_including_partial_history(tmp_path, monkeypatch
     ] == resumed.history
 
 
+def test_resume_without_saved_scaler_starts_fresh_scaler(tmp_path, monkeypatch):
+    loop = api()
+    c = config(steps=3)
+    # A CPU GradScaler exercises real scaling and rejects load_state_dict(None),
+    # without requiring a CUDA device or changing the training identity.
+    scaler = torch.amp.GradScaler("cpu", init_scale=8.0)
+    factories = iter((None, scaler))
+    monkeypatch.setattr(loop, "make_scaler", lambda enabled: next(factories))
+    first = loop.train(c, tmp_path, stop_after=1)
+    assert (first.batch, first.stop_reason, payload(first)["scaler"]) == (1, "interrupted", None)
+    resumed = loop.train(c, tmp_path)
+    assert (resumed.batch, resumed.updates, resumed.skipped, resumed.stop_reason) == (
+        3,
+        3,
+        0,
+        "max_steps",
+    )
+    assert payload(resumed)["scaler"]["scale"] == 8.0
+    assert payload(resumed)["scaler"]["_growth_tracker"] == 2
+
+
 def inject_faults(monkeypatch, faults):
     loop = api()
     real_loader, real_loss = loop.loader, loop.v5_loss
