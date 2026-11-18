@@ -175,7 +175,7 @@ def _t1_compare(args) -> int:
         except Exception as error:
             raise ValueError(f"{arm}: {error}") from error
 
-    episodes = t1.eval_set(args.path, episodes=args.episodes, max_panels=args.max_panels)
+    episodes = t1.eval_set(args.path, base=base, episodes=args.episodes, max_panels=args.max_panels)
     digest = t1.eval_digest(episodes)
     for arm, unit in units.items():
         if unit["eval_digest"] != digest:
@@ -214,10 +214,11 @@ def _t1_compare(args) -> int:
 
 
 def _run(args, unit: Path, training: Path) -> int:
-    config = V5TrainConfig.from_yaml(args.base if args.action == "t1" else args.config)
+    base = V5TrainConfig.from_yaml(args.base if args.action == "t1" else args.config)
     base_digest = file_digest(args.base) if args.action == "t1" else None
+    config = base
     if args.action == "t1":
-        config = t1.t1_config(args.path, args.arm, seed=args.seed, base=config)
+        config = t1.t1_config(args.path, args.arm, seed=args.seed, base=base)
     init = getattr(args, "init_file", None)
     init_digest = getattr(args, "init_sha256", None)
     if (init is None) != (init_digest is None):
@@ -309,7 +310,9 @@ def _run(args, unit: Path, training: Path) -> int:
             return 0
         files = ["checkpoint-final.pt", "train.json"]
         if args.action == "t1":
-            episodes = t1.eval_set(args.path, episodes=args.episodes, max_panels=args.max_panels)
+            episodes = t1.eval_set(
+                args.path, base=base, episodes=args.episodes, max_panels=args.max_panels
+            )
             evaluation = t1.evaluate(
                 training / "checkpoint-final.pt",
                 args.path,

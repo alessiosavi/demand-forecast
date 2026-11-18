@@ -14,6 +14,7 @@ import pytest
 
 from demand_forecast.pretrain.v5 import checkpoint, loop, measure, t1
 from demand_forecast.pretrain.v5.checkpoint import file_digest, latest_checkpoint, read_manifest
+from demand_forecast.pretrain.v5.config import V5TrainConfig
 from tests.helpers.v5_loop import config, training_equal
 
 CODE = "a" * 40
@@ -274,7 +275,16 @@ def test_t1_sigkill_resumes_from_published_training_or_slot(small_t1, tmp_path, 
     "path,arms",
     [("static_category", ("true", "null")), ("selection", ("true", "null", "gates_one"))],
 )
-def test_t1_all_arms_publish_paired_evaluations(job, small_t1, tmp_path, path, arms):
+def test_t1_all_arms_publish_paired_evaluations(job, small_t1, tmp_path, path, arms, monkeypatch):
+    base = V5TrainConfig.from_yaml(small_t1)
+    eval_set = t1.eval_set
+    observed = []
+
+    def observe(*args, **kwargs):
+        observed.append(kwargs.get("base"))
+        return eval_set(*args, **kwargs)
+
+    monkeypatch.setattr(t1, "eval_set", observe)
     digests = set()
     for arm in arms:
         assert job.main(t1_args(tmp_path, small_t1, arm=arm, path=path)) == 0
@@ -288,6 +298,7 @@ def test_t1_all_arms_publish_paired_evaluations(job, small_t1, tmp_path, path, a
         assert result["eval_digest"] == record["eval_digest"]
         digests.add(record["eval_digest"])
     assert len(digests) == 1
+    assert observed == [base] * len(arms)
 
 
 def test_qualify_publishes_real_measurements(job, settings, tmp_path, monkeypatch):

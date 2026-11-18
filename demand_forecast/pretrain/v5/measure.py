@@ -44,7 +44,7 @@ from demand_forecast.models.v5.model import prune
 from demand_forecast.synthetic.typed.draft import stream
 
 from . import loop
-from .checkpoint import _atomic_write, _read_checkpoint, save_checkpoint
+from .checkpoint import _atomic_write, read_payload, save_checkpoint
 from .config import T1_MODEL, V5TrainConfig
 from .corpus import CorpusIndex
 from .loop import load_model, train
@@ -356,7 +356,7 @@ def _corpus_measure(config, device):
 
 
 def _checkpoint_measure(path, directory, device):
-    saved = _read_checkpoint(path)
+    saved = read_payload(path)
     if not saved["optimizer"]["state"] or saved["ema"] is None:
         raise RuntimeError("checkpoint qualification requires populated optimiser and EMA state")
 

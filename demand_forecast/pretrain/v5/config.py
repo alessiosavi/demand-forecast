@@ -154,6 +154,9 @@ class SamplerConfig:
     designate_target: bool = False
     path_share: float = 0.5
     max_cells: int | None = 4_000_000
+    # Zero scores below this level. Within each budget's existing priorities,
+    # zero scores rank last and are cut first when the budget binds.
+    screen_no_evidence: float = 0.0
 
     def __post_init__(self) -> None:
         _flag(self, "designate_target")
@@ -171,6 +174,9 @@ class SamplerConfig:
         object.__setattr__(self, "horizon", _range(self.horizon, "horizon", maximum=MAX_HORIZON))
         for name in ("cutoff_at_origin", "path_share"):
             _normalize(self, name, minimum=0, maximum=1)
+        _normalize(self, "screen_no_evidence", minimum=0)
+        if self.screen_no_evidence >= 1:
+            raise ValueError("screen_no_evidence must be in [0, 1)")
         if self.max_cells is not None:
             _normalize(self, "max_cells", integer=True, minimum=1)
         drops = []
@@ -301,6 +307,8 @@ class V5TrainConfig:
         """Return detached semantics, independent of machine and corpus location."""
         data = _plain(asdict(self))
         del data["workers"], data["device"]
+        if self.sampler.screen_no_evidence == 0.0:
+            del data["sampler"]["screen_no_evidence"]
         for source in data["sources"]:
             del source["root"]
         return data

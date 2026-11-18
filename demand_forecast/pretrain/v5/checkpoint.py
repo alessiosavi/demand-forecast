@@ -155,7 +155,8 @@ class _CheckpointBody(io.RawIOBase):
         return self._stream.readinto(memoryview(buffer)[:size])
 
 
-def _read_checkpoint(path: Path) -> dict:
+def read_payload(path: Path) -> dict:
+    """Verify the SHA-256 footer and load the checkpoint on CPU with weights-only loading."""
     try:
         with path.open("rb") as stream:
             body_size = os.fstat(stream.fileno()).st_size - _FOOTER_BYTES
@@ -182,6 +183,9 @@ def _read_checkpoint(path: Path) -> dict:
         return payload
     except Exception as exc:
         raise CheckpointError(f"invalid checkpoint {path}: {exc}") from exc
+
+
+_read_checkpoint = read_payload
 
 
 def latest_checkpoint(directory: Path | str) -> tuple[Path, dict] | None:
