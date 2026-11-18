@@ -168,6 +168,23 @@ def test_inferred_kinds_match_the_records():
         assert infer_static_kind([i.static[record.name] for i in g.complete.items]) == record.kind
 
 
+def test_one_item_code_is_a_number_for_the_builder():
+    # With one item a whole-number code cannot repeat, so the builder's rule calls it a number
+    # while the record keeps the generating kind. Pinned so that the disagreement is known.
+    g = generate_typed_panel(
+        PanelRecipe(("whole_number_code",), n_items=1, length=(64, 120), seed=5)
+    )
+    (record,) = g.inputs
+    assert record.kind == "category"
+    assert infer_static_kind([i.static[record.name] for i in g.complete.items]) == "number"
+    for n_items in (2, 3, 40):
+        g = generate_typed_panel(
+            PanelRecipe(("whole_number_code",), n_items=n_items, length=(64, 120), seed=5)
+        )
+        values = [i.static[g.inputs[0].name] for i in g.complete.items]
+        assert infer_static_kind(values) == "category"
+
+
 @pytest.mark.parametrize("n_items", [1, 2, 3, 5, 8, 12, 96])
 def test_small_and_large_panels_are_feasible(n_items):
     for seed in range(10):
