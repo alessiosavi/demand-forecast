@@ -84,6 +84,8 @@ def _checkpoint(
     if fair_spread:
         config = replace(config, sampler=replace(config.sampler, screen_fair_spread=True))
     raw = V5Model(model).state_dict()
+    if model.horizon_seed:
+        raw["horizon_seed_projection.weight"].copy_(torch.eye(model.d_model))
     ema = None
     if weights == "ema":
         ema = {name: value.clone() for name, value in raw.items()}
@@ -146,6 +148,7 @@ def test_round_trip_of_the_whole_state_dict(tmp_path, monkeypatch, export_api, w
     # The stored model mapping leaves the default expert mode out, as it did before the mode existed.
     stored = json.loads(json.dumps(asdict(TINY)))
     assert stored.pop("expert_mode") == "routed"
+    assert stored.pop("horizon_seed") is False
     assert metadata["model"] == stored
     assert metadata["training"] == config.canonical()
     assert metadata["source"] == {
@@ -192,6 +195,65 @@ def test_dense_export_round_trips_with_parity(tmp_path, export_api):
     assert loaded.config.expert_mode == "dense"
     assert not any("router" in name for name, _ in loaded.named_parameters())
     export_api.require_parity(out)
+
+
+def test_a_seeded_export_passes_parity(tmp_path, export_api):
+    enabled = replace(TINY, horizon_seed=True)
+    checkpoint = _checkpoint(tmp_path, model=enabled)
+    assert export_api.read_payload(checkpoint)["config"]["model"]["horizon_seed"] is True
+    checkpoint_model, config = load_model(checkpoint)
+    assert config.model == enabled
+
+    out = tmp_path / "seeded-export"
+    export_api.write_export(checkpoint, out)
+    loaded, metadata = export_api.load_export(out)
+    assert loaded.config == enabled
+    assert metadata["model"]["horizon_seed"] is True
+    assert metadata["training"]["model"]["horizon_seed"] is True
+    torch.testing.assert_close(
+        loaded.horizon_seed_projection.weight,
+        checkpoint_model.horizon_seed_projection.weight,
+        rtol=0,
+        atol=0,
+    )
+    export_api.require_parity(out)
+
+
+def test_seed_option_is_omitted_from_default_checkpoint_and_export(tmp_path, export_api):
+    checkpoint = _checkpoint(tmp_path)
+    assert "horizon_seed" not in export_api.read_payload(checkpoint)["config"]["model"]
+    out = tmp_path / "unseeded-export"
+    metadata = export_api.write_export(checkpoint, out)
+    loaded, _ = export_api.load_export(out)
+    assert loaded.config.horizon_seed is False
+    assert "horizon_seed" not in metadata["model"]
+    assert "horizon_seed" not in metadata["training"]["model"]
+
+
+@pytest.mark.parametrize("horizon_seed", [False, True])
+def test_selftest_serializes_the_seed_option(tmp_path, export_api, monkeypatch, horizon_seed):
+    if horizon_seed:
+
+        def seeded_config(model, *args, **kwargs):
+            return V5TrainConfig(replace(model, horizon_seed=True), *args, **kwargs)
+
+        monkeypatch.setattr(export_api, "V5TrainConfig", seeded_config)
+    write_export = export_api.write_export
+
+    def check_checkpoint(checkpoint, out):
+        config = export_api.read_payload(checkpoint)["config"]["model"]
+        if horizon_seed:
+            assert config["horizon_seed"] is True
+        else:
+            assert "horizon_seed" not in config
+        return write_export(checkpoint, out)
+
+    monkeypatch.setattr(export_api, "write_export", check_checkpoint)
+    out = tmp_path / "selftest"
+    export_api._selftest(out)
+    model, metadata = export_api.load_export(out)
+    assert model.config.horizon_seed is horizon_seed
+    assert metadata["model"].get("horizon_seed") is (True if horizon_seed else None)
 
 
 def _read_archive(path):

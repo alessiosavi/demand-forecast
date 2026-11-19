@@ -340,6 +340,8 @@ class V5TrainConfig:
         data = _plain(asdict(self))
         if self.model.expert_mode == "routed":
             del data["model"]["expert_mode"]
+        if not self.model.horizon_seed:
+            del data["model"]["horizon_seed"]
         if not self.sampler.derive:
             del data["sampler"]["derive"]
         if not self.sampler.screen_fair_spread:
