@@ -265,7 +265,11 @@ def usable_workers(requested: int, *, naive_anchor: bool = False) -> tuple[int, 
     from demand_forecast.pretrain.v5 import sampler
 
     try:
-        sampler._ensure_worker_file_limit(requested, naive_anchor=naive_anchor)
+        # Without an anchor the call is the one made before the option existed.
+        if naive_anchor:
+            sampler._ensure_worker_file_limit(requested, naive_anchor=True)
+        else:
+            sampler._ensure_worker_file_limit(requested)
     except RuntimeError as error:
         return 0, str(error)
     return requested, None
