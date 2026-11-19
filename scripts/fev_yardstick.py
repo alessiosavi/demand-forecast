@@ -1,4 +1,4 @@
-"""Evaluate a pretrained reference model on fev YAML (run only on the benchmark host)."""
+"""Evaluate a pretrained model on fev YAML (run only on the benchmark host)."""
 
 from __future__ import annotations
 
@@ -10,12 +10,12 @@ from pathlib import Path
 def main(argv: list[str] | None = None) -> int:
     """Parse switches before importing optional benchmark or inference packages."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", choices=["chronos2", "timestral", "simons"], required=True)
+    parser.add_argument("--model", choices=["chronos2", "timestral", "simons", "v5"], required=True)
     parser.add_argument(
         "--weights",
         "--checkpoint",
         required=True,
-        help="Hugging Face model ID or local checkpoint directory (Simons: local export only)",
+        help="Hugging Face model ID or local checkpoint directory (Simons and v5: local export)",
     )
     parser.add_argument(
         "--revision", help="Hub commit or alias; resolved and recorded before inference"
@@ -24,10 +24,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--names", help="comma-separated task names or @file")
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--model-name", required=True)
-    parser.add_argument("--max-context", type=int)
+    parser.add_argument("--max-context", type=int, help="v5: encoder context in time steps")
     parser.add_argument(
-        "--processing", choices=["raw", "published"], help="required for Simons only"
+        "--processing", choices=["raw", "published"], help="required for Simons and v5 (raw)"
     )
+    parser.add_argument("--variant", help="v5 only: input or inference ablation (default: full)")
     parser.add_argument("--covariates", choices=["all", "none"], default="all")
     parser.add_argument(
         "--cross-series",
@@ -38,7 +39,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--batch-size",
         type=int,
-        help="Chronos variate budget (100); Timestral item limit (1024); Simons group limit (256)",
+        help="Chronos variates (100), Timestral items (1024), Simons groups (256), v5 episodes (64)",
     )
     parser.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
     parser.add_argument("--resume", action="store_true")
@@ -63,6 +64,7 @@ def main(argv: list[str] | None = None) -> int:
                     "batch_size",
                     "device",
                     "processing",
+                    "variant",
                 )
             }
         ).resolved()
