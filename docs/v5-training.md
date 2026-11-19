@@ -245,6 +245,11 @@ rows in `skips`, so the realised folder shares can differ from the proposal
 shares. Source weights apply to panel draws. A typed panel can supply several
 episodes, while corpus and upstream panels supply at most one.
 
+**Calendar effect of generated panels.** On daily typed panels with the calendar
+mechanism, each target's calendar effect adds day-of-week, day-of-month and month table entries. The generator
+draws day-of-month after the two existing tables, preserving their values for
+the same seed.
+
 For Q, use `--action qualify --config q.yaml --name q-typed`. Run a separate
 unit for typed 0.5 + corpus 0.5 with the corpus options. Both the generator and
 `job.py qualify` accept `--models full|t1|both`, `--workers N[,N...]`,
