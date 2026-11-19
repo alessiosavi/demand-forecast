@@ -95,6 +95,26 @@ def test_bash_determinism_embedded_configuration_and_digest(jobs, settings, tmp_
 
 
 @pytest.mark.parametrize(
+    ("action", "digest"),
+    [
+        ("train", "faf53dd3a54b6742189737131726140c91892e8a623d87ea6ae9f045666f95e2"),
+        ("qualify", "3bdc873d40a45fb9d3a92a077022aeb6ce24ff4d2ce2a5590783a47ebf8bf215"),
+        ("t1", "1f2190455b0f939ffd00116e6bcae0fccf2295e16259b0a228ce951b03ba1571"),
+    ],
+)
+def test_v5_job_byte_identical_to_ec6c5c4(jobs, tmp_path, action, digest):
+    config = tmp_path / "fixed.yaml"
+    config.write_bytes(b"sources: []\n")
+    options = {
+        "train": dict(config=str(config), leg="leg"),
+        "qualify": dict(config=str(config)),
+        "t1": dict(base=str(config), path="static_category", arm="true", seed=1),
+    }
+    script = jobs.generate(name="unit", action=action, repo_sha=SHA, **options[action])
+    assert hashlib.sha256(script.encode()).hexdigest() == digest
+
+
+@pytest.mark.parametrize(
     "changes",
     [
         {"repo_sha": "main"},
@@ -149,8 +169,11 @@ def machine(tmp_path):
                 print('zeta==2\\nalpha==1')
                 sys.exit(0)
             if a[:2] == ['-m', 'demand_forecast.pretrain.v5.job']:
-                config_flag = '--base' if '--base' in a else '--config'
-                assert pathlib.Path(a[a.index(config_flag) + 1]).exists()
+                if a[2] == 'export':
+                    assert pathlib.Path(a[a.index('--checkpoint-file') + 1]).read_bytes() == b'initial'
+                else:
+                    config_flag = '--base' if '--base' in a else '--config'
+                    assert pathlib.Path(a[a.index(config_flag) + 1]).exists()
                 assert a[a.index('--code') + 1] == 'a' * 40
                 assert a[a.index('--env-sha256') + 1] == hashlib.sha256(b'alpha==1\\nzeta==2\\n').hexdigest()
                 if os.environ.get('EXPECT_UPSTREAM'):
@@ -518,6 +541,72 @@ def test_cloud_actions_and_initial_checkpoint(jobs, settings, machine, action):
     )
     assert result.returncode == 0, result.stderr
     assert "--init-file" in events[-1]
+
+
+def export_arguments(**changes):
+    return {
+        "name": "model",
+        "action": "export",
+        "repo_sha": SHA,
+        "member_uri": "gs://offline/checkpoint-final.pt",
+        "member_sha256": hashlib.sha256(b"initial").hexdigest(),
+        **changes,
+    }
+
+
+@pytest.mark.parametrize(
+    ("options", "message"),
+    [
+        ({"config": "unused.yaml"}, "config"),
+        ({"corpus_uri": "gs://offline/corpus", "corpus_digest": DIGEST}, "corpus"),
+        ({"upstream": True}, "upstream"),
+        ({"init_uri": "gs://offline/initial.pt", "init_sha256": "a" * 64}, "init"),
+        ({"member_sha256": None}, "member_sha256"),
+        ({"member_sha256": "invalid"}, "member_sha256"),
+        ({"member_uri": None}, "member_uri"),
+        ({"member_uri": "https://offline/checkpoint.pt"}, "literal gs://"),
+        ({"member_uri": "gs://offline/../checkpoint.pt"}, "normalized gs://"),
+    ],
+)
+def test_export_generator_rejects_invalid_arguments(jobs, options, message):
+    with pytest.raises(ValueError, match=message):
+        jobs.generate(**export_arguments(**options))
+
+
+@pytest.mark.parametrize("matches", [True, False])
+def test_export_cloud_job_checks_member_before_environment(jobs, machine, tmp_path, matches):
+    _, execute = machine
+    options = export_arguments()
+    if not matches:
+        options["member_sha256"] = "0" * 64
+    output = tmp_path / "export.sh"
+    command = [sys.executable, jobs.__file__, "--output", str(output)]
+    for key, value in options.items():
+        command.extend(("--" + key.replace("_", "-"), value))
+    generated = subprocess.run(command, capture_output=True, text=True)
+    assert generated.returncode == 0, generated.stderr
+    assert subprocess.run(["bash", "-n", str(output)]).returncode == 0
+
+    result, events = execute(output.read_text())
+    fetch = next(i for i, event in enumerate(events) if event[0] == "gcloud")
+    assert events[fetch][:4] == ["gcloud", "storage", "cp", options["member_uri"]]
+    check = next(i for i, event in enumerate(events) if event[2:] == ["hash", events[fetch][-1]])
+    assert fetch < check
+    if matches:
+        assert result.returncode == 0, result.stderr
+        assert check < next(i for i, event in enumerate(events) if event[0] == "uv")
+        final = events[-1]
+        assert final[:4] == ["python", "-m", "demand_forecast.pretrain.v5.job", "export"]
+        assert final[final.index("--name") + 1] == "model"
+        assert final[final.index("--checkpoint-file") + 1] == events[fetch][-1]
+        assert final[final.index("--checkpoint-sha256") + 1] == options["member_sha256"]
+        assert "--config" not in final and "--base" not in final
+    else:
+        assert result.returncode == 2, result.stderr
+        assert "checkpoint SHA-256 mismatch" in result.stderr
+        assert not any(event[0] == "uv" for event in events)
+        assert not any(event[1:3] == ["-m", "pip"] for event in events)
+        assert not any("demand_forecast.pretrain.v5.job" in event for event in events)
 
 
 def test_generator_cli(jobs, settings, tmp_path):

@@ -1,9 +1,9 @@
 # Native v5 training jobs
 
 Every cloud run must be registered in the stage-2 plan before launch, with its
-code revision, configuration, state prefix, job URI and cost ceiling. Generating
-a script below is offline; launching it is the operator's work. Q and S1 publish
-experiment artifacts only, not a model release.
+code revision, configuration or checkpoint digest, state prefix, job URI and
+cost ceiling. Generate scripts offline and leave launches to the operator.
+Q and S1 publish experiment artifacts only.
 
 Generate a training job from a local YAML configuration:
 
@@ -14,8 +14,8 @@ python scripts/gcp/jobs/make_v5_job.py \
 ```
 
 The guest supplies absolute `RUN_DIR` and the bucket `STATE_URI`. It alone
-restores, copies and marks the job. Use one state prefix per train or qualify
-unit, and one prefix per T1 arm; allow only one writer per prefix. A fresh job
+restores, copies and marks the job. Use one state prefix per train, qualify or
+export unit, and one prefix per T1 arm. Allow only one writer per prefix. A fresh job
 name and job URI are required for every evaluation extension, because the guest
 refuses a job URI already recorded as DONE.
 
@@ -101,6 +101,42 @@ creates a seeded, untrained tiny export with `selftest` in the training
 environment and checks it in the scoring environment. If the gate fails on
 merged code, scoring work pauses while the environment choice is revisited.
 
+### Export as a resumable job
+
+Generate a job from a checkpoint's storage URI and SHA-256:
+
+```bash
+python scripts/gcp/jobs/make_v5_job.py \
+  --name scoring-export --action export --repo-sha <40-character-revision> \
+  --member-uri <checkpoint-gs-uri> --member-sha256 <checkpoint-hash> \
+  --output /tmp/scoring-export.sh
+```
+
+The generator requires both member flags. Export accepts no configuration,
+corpus, upstream, init, leg or T1 arguments. After the unit preflight and
+repository verification, the script downloads the checkpoint to scratch and
+compares its SHA-256 before creating the Python environment. A digest mismatch
+exits 2.
+
+Run the same export action with a local checkpoint:
+
+```bash
+python -m demand_forecast.pretrain.v5.job export \
+  --run-dir /absolute/run --code <revision> --job-sha256 <script-hash> \
+  --env-sha256 <freeze-hash> --name scoring-export \
+  --checkpoint-file checkpoint-final.pt --checkpoint-sha256 <checkpoint-hash>
+```
+
+The action checks the checkpoint digest before touching the run directory.
+It writes and checks the export under `staging/` with `load_export` and
+`require_parity`, then copies the three verified files into
+`state/export/NAME/` and publishes `unit.json` last. The unit identity hashes
+the canonical JSON of the action, name, code revision, environment hash and
+checkpoint hash. A matching valid unit is reused. An invalid manifest is
+removed before rebuilding.
+
+## Running a local training unit
+
 The module also runs directly under the guest contract:
 
 ```bash
@@ -111,10 +147,12 @@ python -m demand_forecast.pretrain.v5.job train \
 
 `--stop-after N` on train and T1 is available for small tests. Exit 0 means a
 validated `unit.json` has been published. Exit 75 means stopped unfinished,
-including training's TERM and stop-after outcomes. Exit 1 records the reason and the traceback in
-the unit's `failure.json` (the traceback is also printed to the job's log); nonfinite training is a failure. Script revision or
-corpus validation failures exit 2. A failure removes the attempted unit's old
-completion marker; it does not declare another configuration complete.
+including training's TERM and stop-after outcomes. Unit failures exit 1,
+remove the completion marker, and record the reason and traceback in
+`failure.json` and the job log. A local export input digest mismatch exits 1
+with a stderr diagnostic before publication begins. It leaves an existing valid unit
+untouched and writes no `failure.json`. Script revision or corpus
+validation failures exit 2.
 
 The guest (`scripts/gcp/guest-run.sh`) publishes these bucket outcomes after
 the job exits, assuming the final state copy and marker upload succeed:
@@ -168,10 +206,11 @@ RUN_DIR/
     train/LEG/{identity.json,checkpoint-slot-*.pt,history.jsonl,telemetry.jsonl,
                checkpoint-final.pt,train.json,unit.json}
     qualify/NAME/{identity.json,qualify.json,unit.json}
+    export/NAME/{config.json,model.safetensors,parity.npz,unit.json}
     t1/PATH-ARM-sSEED/
       train/{identity.json,checkpoint-slot-*.pt,checkpoint-final.pt,train.json,...}
       eval-N-M/{checkpoint-final.pt,train.json,result.json,unit.json}
-  staging/          temporary training checkpoint writes and qualification trials
+  staging/          temporary checkpoint writes, qualification trials and export artifacts
   v5-cache/         HOME, uv/Python/pip/Hugging Face caches, repository and venv
   corpus/           volatile corpus cache, rebuilt on every active invocation
   checkpoint-done   guest request acknowledgement
@@ -179,9 +218,10 @@ RUN_DIR/
 
 Everything needed to survive a machine is under `state/`. The corpus,
 repository, environment and configuration copies are disposable caches outside
-it. Training checkpoint temporary files and qualification trials use `staging/`;
-only the completed qualification report is copied into state. Each unit manifest is
-written last with atomic rename and fsync and records artifact sizes and SHA-256
+it. Training checkpoint temporary files, qualification trials and export verification
+use `staging/`. State receives the completed qualification report and verified
+export files. Each unit manifest is written last with atomic rename and fsync
+and records artifact sizes and SHA-256
 hashes. Evaluation directories include copies of their training checkpoint and
 manifest, so they remain valid when copied locally; this uses additional disk
 and bucket space per evaluation. There are no parent-relative paths or symlinks
