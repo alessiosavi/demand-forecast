@@ -7,6 +7,8 @@ import pandas as pd
 
 DAY_NS = pd.Timedelta(1, "D").value
 HOUR_NS = pd.Timedelta(1, "h").value
+_UNIT_NS = {"s": 1_000_000_000, "ms": 1_000_000, "us": 1_000, "ns": 1}
+_MONTH_END = (pd.offsets.MonthEnd, pd.offsets.QuarterEnd, pd.offsets.YearEnd)
 CANONICAL_CALENDAR_SCHEMA = tuple(
     f"{name}_{function}"
     for name in ("tod", "hour", "dow", "dom", "doy", "woy", "month", "quarter")
@@ -121,14 +123,82 @@ def validate_on_grid(
             ) from error
 
 
-def grid_range(
-    start: pd.Timestamp, periods: int, freq: str | pd.offsets.BaseOffset
+def _month_stride(offset: pd.offsets.BaseOffset) -> int:
+    if isinstance(offset, (pd.offsets.MonthBegin, pd.offsets.MonthEnd)):
+        return offset.n
+    if isinstance(offset, (pd.offsets.QuarterBegin, pd.offsets.QuarterEnd)):
+        return 3 * offset.n
+    if isinstance(offset, (pd.offsets.YearBegin, pd.offsets.YearEnd)):
+        return 12 * offset.n
+    return 0
+
+
+def _month_grid(
+    start: pd.Timestamp, months: np.ndarray, offset: pd.offsets.BaseOffset
 ) -> pd.DatetimeIndex:
-    """Generate grid timestamps using pandas' calendar and time-zone semantics."""
-    offset = to_offset(freq)
+    # pandas 2 offsets can use a surrogate year outside Python's datetime range.
+    # NumPy month ordinals retain the actual year, including year zero.
+    local = start.tz_localize(None).as_unit("us", round_ok=False).asm8
+    day = local.astype("datetime64[D]")
+    month = day.astype("datetime64[M]") + months
+    if isinstance(offset, _MONTH_END):
+        dates = (month + 1).astype("datetime64[D]") - np.timedelta64(1, "D")
+    else:
+        dates = month.astype("datetime64[D]")
+    return pd.DatetimeIndex(dates + (local - day)).tz_localize(start.tz)
+
+
+def shift_grid(start: pd.Timestamp, steps: int, offset: pd.offsets.BaseOffset) -> pd.Timestamp:
+    """Shift an on-grid timestamp by signed steps, using a wider unit if needed."""
+    if not 1 <= start.year <= 9999 and (stride := _month_stride(offset)):
+        return _month_grid(start, np.array([steps * stride]), offset)[0]
+    try:
+        return start + steps * offset
+    except (pd.errors.OutOfBoundsDatetime, pd.errors.OutOfBoundsTimedelta, OverflowError):
+        return start.as_unit("us", round_ok=False) + steps * offset
+
+
+def grid_range(
+    start: pd.Timestamp,
+    periods: int | None,
+    freq: str | pd.offsets.BaseOffset,
+    *,
+    end: pd.Timestamp | None = None,
+) -> pd.DatetimeIndex:
+    """Generate a positive-frequency grid from a start and a count or an end."""
+    # A parsed offset is used as given: the scoring path parses a window's frequency once.
+    offset = freq if isinstance(freq, pd.offsets.BaseOffset) else to_offset(freq)
     if offset.n <= 0:
         raise ValueError("Grid frequency must have a positive step")
-    return pd.date_range(start=start, periods=periods, freq=offset)
+    try:
+        return pd.date_range(start=start, end=end, periods=periods, freq=offset)
+    except (pd.errors.OutOfBoundsDatetime, pd.errors.OutOfBoundsTimedelta, OverflowError):
+        start = pd.Timestamp(start)
+        stride = _month_stride(offset)
+        if stride and periods is not None and periods >= 0:
+            last_year = start.year + (start.month - 1 + (periods - 1) * stride) // 12
+            if start.year < 1 or last_year >= 9999:
+                if not offset.is_on_offset(start):
+                    # Roll an off-anchor date in an equivalent 400-year Gregorian cycle.
+                    days = ((400 - start.year) // 400) * 146097
+                    cycle = pd.Timedelta(np.timedelta64(days * 86400, "s"))
+                    local = start.tz_localize(None).as_unit("us", round_ok=False)
+                    start = (offset.rollforward(local + cycle) - cycle).tz_localize(start.tz)
+                return _month_grid(start, np.arange(periods) * stride, offset)
+        return pd.date_range(start=start, end=end, periods=periods, freq=offset, unit="us")
+
+
+def _elapsed_steps(
+    a: pd.Timestamp, b: pd.Timestamp, step_ns: int
+) -> tuple[int, int | pd.Timedelta]:
+    try:
+        return divmod(b - a, pd.Timedelta(step_ns, unit="ns"))
+    except (pd.errors.OutOfBoundsDatetime, pd.errors.OutOfBoundsTimedelta, OverflowError):
+        # Python integers hold the difference at full precision even when a
+        # pandas Timedelta cannot represent the elapsed nanoseconds.
+        a_ns = int(a.asm8.view("i8")) * _UNIT_NS[a.unit]
+        b_ns = int(b.asm8.view("i8")) * _UNIT_NS[b.unit]
+        return divmod(b_ns - a_ns, step_ns)
 
 
 def steps_between(a: pd.Timestamp, b: pd.Timestamp, freq: str | pd.offsets.BaseOffset) -> int:
@@ -149,33 +219,16 @@ def steps_between(a: pd.Timestamp, b: pd.Timestamp, freq: str | pd.offsets.BaseO
         # Day is a Tick in pandas 2, but date_range still preserves local midnight
         # across DST. Handle it before Tick for consistent pandas 2/3 behavior.
         days = offset.n * (7 if isinstance(offset, pd.offsets.Week) else 1)
-        steps, remainder = divmod(
-            b.tz_localize(None) - a.tz_localize(None), pd.Timedelta(days, "D")
-        )
+        steps, remainder = _elapsed_steps(a.tz_localize(None), b.tz_localize(None), days * DAY_NS)
     elif isinstance(offset, pd.offsets.Tick):
-        steps, remainder = divmod(b - a, pd.Timedelta(offset.nanos, unit="ns"))
-    elif isinstance(
-        offset,
-        (
-            pd.offsets.MonthBegin,
-            pd.offsets.MonthEnd,
-            pd.offsets.QuarterBegin,
-            pd.offsets.QuarterEnd,
-            pd.offsets.YearBegin,
-            pd.offsets.YearEnd,
-        ),
-    ):
-        months = 1
-        if isinstance(offset, (pd.offsets.QuarterBegin, pd.offsets.QuarterEnd)):
-            months = 3
-        elif isinstance(offset, (pd.offsets.YearBegin, pd.offsets.YearEnd)):
-            months = 12
-        steps, remainder = divmod((b.year - a.year) * 12 + b.month - a.month, months * offset.n)
-        if remainder == 0 and a + steps * offset != b:
+        steps, remainder = _elapsed_steps(a, b, offset.nanos)
+    elif stride := _month_stride(offset):
+        steps, remainder = divmod((b.year - a.year) * 12 + b.month - a.month, stride)
+        if remainder == 0 and shift_grid(a, steps, offset) != b:
             remainder = 1
     else:
         start, end = (a, b) if a <= b else (b, a)
-        grid = pd.date_range(start=start, end=end, freq=offset)
+        grid = grid_range(start, None, offset, end=end)
         steps = (len(grid) - 1) * (1 if a <= b else -1)
         remainder = 0 if len(grid) and grid[-1] == end else 1
     if remainder:
