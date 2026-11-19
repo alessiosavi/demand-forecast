@@ -61,6 +61,14 @@ class InProcessLoader(DataLoader):
         return (self.dataset[i] for i in range(len(self.dataset)))
 
 
+def _assert_evidence_equal(actual, expected):
+    assert actual.requests == expected.requests
+    assert actual.candidates == expected.candidates
+    assert actual.rules == expected.rules
+    for field in ("status", "rule", "gate", "score"):
+        np.testing.assert_array_equal(getattr(actual, field), getattr(expected, field))
+
+
 @pytest.fixture
 def in_process_loader(monkeypatch):
     monkeypatch.setattr(batch_forecast, "sys", SimpleNamespace(platform="linux"), raising=False)
@@ -111,6 +119,7 @@ def test_workers_give_identical_forecasts(model, panel, monkeypatch, worker_time
         actual = v5.forecast_items(model, panel, jobs, HORIZON, workers=workers, **options)
         assert list(actual.values) == list(serial.values)
         assert actual.fallback == serial.fallback
+        _assert_evidence_equal(actual.evidence, serial.evidence)
         for key, value in actual.values.items():
             assert np.array_equal(value, serial.values[key]), key
             np.testing.assert_allclose((value - expected[key]) / scales[key], 0, atol=1e-5, rtol=0)
@@ -168,6 +177,7 @@ def test_joint_statistics_match_serial_without_statics(model, panel, in_process_
     actual = v5.forecast_items(model, panel, jobs, HORIZON, workers=2, **options)
 
     assert actual.stats_builds == serial.stats_builds == 1
+    _assert_evidence_equal(actual.evidence, serial.evidence)
 
 
 def test_workers_are_refused_off_linux(model, panel, monkeypatch):

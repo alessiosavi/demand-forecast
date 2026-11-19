@@ -519,6 +519,47 @@ def test_budgets_after_expansion():
     assert np.isin(e.row_role, [ROLE_PEER, ROLE_PANEL]).sum() <= 8
 
 
+def test_row_keys_follow_builder_rows_after_feature_budget(monkeypatch):
+    steps = np.arange(48, dtype=np.float64)
+    category = np.resize(np.array(["a", "b", "c"], dtype=object), len(steps))
+    items = tuple(
+        Item(
+            str(i),
+            0,
+            {"y": steps + i, "sibling": steps[::-1] + i},
+            {"number": steps**2, "category": category},
+            {"brand": "shared"},
+        )
+        for i in range(2)
+    )
+    panel = Panel("row keys", items, {"number": "known", "category": "past"}, None, None, True)
+    builder = EpisodeBuilder(panel)
+    request = EpisodeRequest(0, (40,), 3, context=32, target="y", drop=frozenset({"value_stats"}))
+    category_key = ("past", "category")
+    expected = [
+        ("y", None),
+        ("sibling", ("sibling", "sibling")),
+        ("number", ("known", "number")),
+        ("category=a", category_key),
+        ("category=b", category_key),
+        ("category=c", category_key),
+        ("category~effect", category_key),
+        ("brand=shared", None),
+        ("__panel__", None),
+    ]
+
+    full = builder.build(request)
+    assert len(full.row_keys) == len(full.x)
+    assert list(zip(full.row_names, full.row_keys, strict=True)) == expected
+    assert not hasattr(collate([full]), "row_keys")
+
+    monkeypatch.setattr(episode_builder, "MAX_FEATURE_ROWS", 2)
+    limited = builder.build(request)
+    assert len(limited.row_keys) == len(limited.x)
+    limited_rows = list(zip(limited.row_names, limited.row_keys, strict=True))
+    assert limited_rows == expected[:4] + expected[-2:]
+
+
 @pytest.mark.parametrize("drop", DROPPABLE)
 def test_drop_switches(drop):
     p = toy_panel(n_targets=2)

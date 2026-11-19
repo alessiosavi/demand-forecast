@@ -12,6 +12,7 @@ from dataclasses import fields, replace
 import pytest
 import torch
 
+from demand_forecast.data.episode import EpisodeBuilder, EpisodeRequest, collate
 from demand_forecast.models.v5 import V5Model, v5_loss
 from demand_forecast.pretrain.v5.config import (
     T1_MODEL,
@@ -21,6 +22,8 @@ from demand_forecast.pretrain.v5.config import (
     V5TrainConfig,
 )
 from demand_forecast.pretrain.v5.sampler import make_batch
+from tests.helpers.episodes import toy_panel
+from tests.helpers.v5_loop import config
 
 CONFIG = V5TrainConfig(
     model=T1_MODEL,
@@ -73,3 +76,21 @@ def test_training_step_under_accelerator_autocast(dtype, router, gates):
         loss, _ = v5_loss(output, batch, CONFIG.model)
     loss.backward()
     assert torch.isfinite(loss.detach().float())
+
+
+def test_evidence_mode_under_autocast():
+    panel = toy_panel(n_items=2, length=48)
+    batch = collate([EpisodeBuilder(panel).build(EpisodeRequest(0, (40,), 3, 32))])
+    model = V5Model(config().model).eval()
+
+    with torch.no_grad():
+        expected = model.gates(batch, mode="evidence")
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            actual = model.gates(batch, mode="evidence")
+            output = model(batch, actual)
+
+    for field in fields(expected):
+        torch.testing.assert_close(
+            getattr(actual, field.name), getattr(expected, field.name), atol=0, rtol=0
+        )
+    assert torch.isfinite(output.quantiles).all()

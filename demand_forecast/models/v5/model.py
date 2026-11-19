@@ -13,6 +13,7 @@ from demand_forecast.data.episode.schema import (
     N_SUMMARY,
     PATCH,
     ROLE_FORECAST,
+    ROLE_KNOWN,
     ROLE_PANEL,
     ROLE_PAST,
     ROLE_PEER,
@@ -113,6 +114,9 @@ class V5Model(nn.Module):
     ) -> Gates:
         """Choose cutoff-only gates, then force zeros without changing expected L0.
 
+        The ``"evidence"`` mode uses the sign of builder relevance scores and
+        keeps forecast, known-future and whole-panel rows open.
+
         ``zero_candidates`` zeros candidate gates and their inherited peer gates.
         ``zero_rows`` may force any real row except ``ROLE_FORECAST``, including
         siblings and known-future rows (overriding their gate floor).
@@ -120,8 +124,8 @@ class V5Model(nn.Module):
         forecast slot remains in the output until ``prune`` removes it. Callers
         scoring forecasts must select kept rows (``keep & forecast_mask``).
         """
-        if mode not in ("learned", "ones"):
-            raise ValueError("gate mode must be 'learned' or 'ones'")
+        if mode not in ("learned", "ones", "evidence"):
+            raise ValueError("gate mode must be 'learned', 'ones' or 'evidence'")
         for name, mask, shape in (
             ("zero_candidates", zero_candidates, batch.cand_mask.shape),
             ("zero_rows", zero_rows, batch.row_mask.shape),
@@ -133,9 +137,15 @@ class V5Model(nn.Module):
             and (zero_rows & batch.row_mask & (batch.row_role == ROLE_FORECAST)).any()
         ):
             raise ValueError("cannot force forecast rows to zero")
-        if mode == "ones":
-            row = torch.ones_like(batch.row_score)
-            cand = torch.ones_like(batch.cand_score)
+        if mode != "learned":
+            if mode == "evidence":
+                role = batch.row_role
+                always_open = (role == ROLE_FORECAST) | (role == ROLE_KNOWN) | (role == ROLE_PANEL)
+                row = ((batch.row_score > 0) | always_open).to(batch.row_score)
+                cand = (batch.cand_score > 0).to(batch.cand_score)
+            else:
+                row = torch.ones_like(batch.row_score)
+                cand = torch.ones_like(batch.cand_score)
             family = batch.x.new_ones((batch.x.shape[0], len(STEP_FAMILIES)))
             summary_mask = batch.x.new_ones(N_SUMMARY)
             expected_l0 = batch.x.new_zeros(())
@@ -180,7 +190,7 @@ class V5Model(nn.Module):
             cand = cand.masked_fill(zero_candidates, 0)
         peer_gate = _candidate_weights(cand, batch.row_cand, batch.row_mask)
         row = torch.where(batch.row_role == ROLE_PEER, peer_gate, row)
-        if mode == "learned":
+        if mode != "ones":
             row = row.masked_fill(~batch.row_mask, 0)
             cand = cand.masked_fill(~batch.cand_mask, 0)
         if zero_rows is not None:

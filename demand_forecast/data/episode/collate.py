@@ -79,7 +79,7 @@ def collate(episodes: list[Episode]) -> EpisodeBatch:
     lists = {"row_names", "cand_names", "attr_names", "context_target"}
     for field in fields(Episode):
         name = field.name
-        if name == "trace":
+        if name in ("trace", "row_keys"):
             continue
         values = [getattr(episode, name) for episode in episodes]
         if name in lists:
