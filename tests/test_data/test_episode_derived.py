@@ -148,6 +148,21 @@ def test_unrelated_series_with_gaps_rarely_build_a_row(name):
     assert admitted <= 12, f"{name}: {admitted}/400 admitted with gaps"
 
 
+@pytest.mark.parametrize("name", CASES[:5])
+def test_unrelated_series_with_a_fifth_removed_rarely_build_a_row(name):
+    """Every scan runs here: exactly 102 of 512 cells are removed from each series."""
+    season, length = 7, 512
+    admitted = 0
+    for seed in range(400):
+        rng = np.random.default_rng([seed, length, season, CASES.index(name), 102])
+        x, y, _ = case(name, rng, length, season)
+        x, y = x.copy(), y.copy()
+        x[rng.choice(length, 102, replace=False)] = np.nan
+        y[rng.choice(length, 102, replace=False)] = np.nan
+        admitted += _scan(x, y, season=season)[0] > 0
+    assert admitted <= 12, f"{name}: {admitted}/400 admitted with a fifth of the cells removed"
+
+
 def test_no_row_for_a_driver_whose_cycle_is_the_season():
     x = np.tile([-1.0, 2, -1, 0, 0, 0, 0], 70)
     y = np.roll(x, 3) + np.random.default_rng(50).normal(scale=0.2, size=len(x))

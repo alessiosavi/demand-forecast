@@ -94,7 +94,9 @@ def scan_delay(
     dof = pairs[delay] - 2 - phases
     if pairs[delay] < 32 or dof < 24:
         return 0, score, contemporaneous
-    threshold = max(0.2, 3.5 * np.sqrt(inflation / dof))
+    # The absolute floor was calibrated on complete windows: it rises as missing cells remove pairs.
+    floor = 0.2 * np.sqrt(common / pairs[delay])
+    threshold = max(floor, 3.5 * np.sqrt(inflation / dof))
     admitted = score >= threshold and score > contemporaneous and score > no_evidence
     return (delay if admitted else 0), score, contemporaneous
 
