@@ -6,7 +6,11 @@ import numpy as np
 import pytest
 from tsfresh.feature_extraction import feature_calculators as fc
 
-from demand_forecast.data.episode.bank import TSFRESH_PARITY, summary_vectors
+from demand_forecast.data.episode.bank import (
+    TSFRESH_PARITY,
+    _sample_shape_statistics,
+    summary_vectors,
+)
 from demand_forecast.data.episode.scale import fit_scale, to_scaled
 from demand_forecast.data.episode.schema import BANK_WINDOW, SUMMARY_FEATURES
 
@@ -84,6 +88,88 @@ def test_constant_short_and_empty_rows_are_finite():
     for name in ("skewness", "kurtosis", "acf_season", "acf_long", "spec_period"):
         assert not f[1, SUMMARY_FEATURES.index(name)], name
     assert np.all(v[~f] == 0) and np.all(np.abs(v) <= 10)
+
+
+@pytest.mark.parametrize(
+    ("row", "values", "flags"),
+    [
+        ([0.377191] * 5, [0, 0], [False, False]),
+        ([1, 1, 1, 1 + 1e-15, np.nan], [2, 4], [True, True]),
+        ([np.nan] * 5, [0, 0], [False, False]),
+        ([1, np.nan, np.nan, np.nan, np.nan], [0, 0], [False, False]),
+        ([1, 2, np.nan, np.nan, np.nan], [0, 0], [False, False]),
+        ([1, 2, 4, np.nan, np.nan], [0, 0], [False, False]),
+        ([1, 2, 3, 4, np.nan], [0, -1.2], [True, True]),
+        ([1, 2, np.inf, 3, 4], [0, -1.2], [True, True]),
+    ],
+    ids=["constant", "near-constant", "missing", "one", "two", "three", "four", "infinity"],
+)
+def test_summary_shape_statistics_for_degenerate_rows(row, values, flags):
+    history = np.array([row], dtype=np.float64)
+    actual, available = summary_vectors(history, history, season=1, long_lag=None, end=5)
+    columns = [SUMMARY_FEATURES.index(name) for name in ("skewness", "kurtosis")]
+    np.testing.assert_array_equal(actual[0, columns], np.array(values, dtype=np.float32))
+    np.testing.assert_array_equal(available[0, columns], flags)
+
+
+def test_sample_shape_statistics_match_pandas_with_missing_values():
+    pandas = pytest.importorskip("pandas")
+    rng = np.random.default_rng(27)
+    history = rng.lognormal(size=(64, 53))
+    observed = rng.random(history.shape) > 0.25
+    count = observed.sum(axis=1)
+    mean = np.where(observed, history, 0.0).sum(axis=1) / count
+    centered = np.where(observed, history - mean[:, None], 0.0)
+    skewness, kurtosis = _sample_shape_statistics(centered, (centered**2).sum(axis=1), count)
+    frame = pandas.DataFrame(np.where(observed, history, np.nan))
+    # pandas 3.x is the training reference. Older releases only agree on nondegenerate rows.
+    rtol = 1e-12 if pandas.__version__.startswith("3.") else 1e-9
+    np.testing.assert_allclose(skewness, frame.skew(axis=1), rtol=rtol, atol=0)
+    np.testing.assert_allclose(kurtosis, frame.kurt(axis=1), rtol=rtol, atol=0)
+
+
+@pytest.mark.parametrize("level", [1000.0, 0.1, 123456.789, 3e7, 1e-3])
+@pytest.mark.parametrize("length", [16, 40, 96])
+def test_shape_statistics_after_scaling_rounding_noise(level, length):
+    pandas = pytest.importorskip("pandas")
+    rng = np.random.default_rng(3)
+    raw = np.full((3, length), level)
+    raw[0, ::5] = level / 3 * 3
+    raw[1] = level * (1 + rng.integers(-2, 3, size=length) * 2.2e-16)
+    # Keep the shorter fitting prefix exactly constant in this variant.
+    raw[2, length // 2 :: 2] = level / 3 * 3
+    columns = [SUMMARY_FEATURES.index(name) for name in ("skewness", "kurtosis")]
+
+    for cutoff in (length, length // 2):
+        scaled = np.stack([to_scaled(row, fit_scale(row, cutoff, 7)) for row in raw])
+        values, flags = summary_vectors(scaled, raw, season=7, long_lag=None, end=length)
+        # pandas 2.x handles tiny moments and constant rows differently, so check only
+        # the expected flags and finiteness there.
+        expected_flags = np.ptp(scaled, axis=1) > 0
+        np.testing.assert_array_equal(
+            flags[:, columns], np.repeat(expected_flags[:, None], 2, axis=1)
+        )
+        assert np.isfinite(values[:, columns]).all()
+        if pandas.__version__.startswith("3."):
+            frame = pandas.DataFrame(scaled)
+            expected = np.column_stack((frame.skew(axis=1), frame.kurt(axis=1)))
+            valid = np.isfinite(expected)
+            np.testing.assert_array_equal(flags[:, columns], valid)
+            np.testing.assert_array_equal(
+                values[:, columns], np.where(valid, expected.clip(-10, 10), 0).astype(np.float32)
+            )
+
+
+def test_shape_statistics_pin_rounding_noise_at_a_large_offset():
+    pattern = np.array([0, 1, 2, -1, 0, 3, -2, 1, 0, -1])
+    row = 1000 * (1 + pattern * 1e-16)
+    values, flags = summary_vectors(row[None], row[None], season=7, long_lag=None, end=len(row))
+    columns = [SUMMARY_FEATURES.index(name) for name in ("skewness", "kurtosis")]
+    # These literals pin determinism across NumPy versions. pandas can differ on this row.
+    np.testing.assert_array_equal(flags[0, columns], [True, True])
+    np.testing.assert_array_equal(
+        values[0, columns], np.array([0.42952698, 0.17055394], dtype=np.float32)
+    )
 
 
 @pytest.mark.parametrize("level", [0.377191, 1.636365, -3.3, 1e6 / 3])
