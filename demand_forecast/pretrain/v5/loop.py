@@ -9,7 +9,7 @@ import signal
 import time
 import zlib
 from collections import deque
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -37,7 +37,6 @@ from .config import (
     SourceConfig,
     V5TrainConfig,
     _checked_mapping,
-    _plain,
     _record,
     identity,
 )
@@ -311,7 +310,7 @@ def train(
     def checkpoint_payload():
         return {
             "identity": requested,
-            "config": _plain(asdict(config)),
+            "config": config._serialized(),
             "model": model.state_dict(),
             "ema": None if ema is None else ema.shadow,
             "optimizer": optimizer.state_dict(),

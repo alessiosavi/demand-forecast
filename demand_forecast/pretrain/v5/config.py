@@ -309,12 +309,19 @@ class V5TrainConfig:
             data["sources"] = tuple(_record(SourceConfig, source) for source in data["sources"])
         return cls(**data)
 
+    def _serialized(self) -> dict:
+        """Preserve the stored model configuration of existing routed runs."""
+        data = _plain(asdict(self))
+        if self.model.expert_mode == "routed":
+            del data["model"]["expert_mode"]
+        return data
+
     def to_yaml(self, path: Path) -> None:
-        path.write_text(yaml.safe_dump(_plain(asdict(self)), sort_keys=False), encoding="utf-8")
+        path.write_text(yaml.safe_dump(self._serialized(), sort_keys=False), encoding="utf-8")
 
     def canonical(self) -> dict:
         """Return detached semantics, independent of machine and corpus location."""
-        data = _plain(asdict(self))
+        data = self._serialized()
         del data["workers"], data["device"]
         if self.sampler.screen_no_evidence == 0.0:
             del data["sampler"]["screen_no_evidence"]
