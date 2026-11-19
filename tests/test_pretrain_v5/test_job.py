@@ -3,6 +3,7 @@
 import copy
 import hashlib
 import importlib
+import inspect
 import json
 import signal
 import subprocess
@@ -17,7 +18,7 @@ import torch
 from demand_forecast.models.v5 import V5Model
 from demand_forecast.pretrain.v5 import checkpoint, loop, measure, t1
 from demand_forecast.pretrain.v5.checkpoint import file_digest, latest_checkpoint, read_manifest
-from demand_forecast.pretrain.v5.config import V5TrainConfig
+from demand_forecast.pretrain.v5.config import T1_BASE, SourceConfig, V5TrainConfig, identity
 from tests.helpers.v5_loop import config, training_equal
 
 CODE = "a" * 40
@@ -113,6 +114,30 @@ def test_export_rejects_wrong_digest_before_writing(job, export_checkpoint, tmp_
     assert job.main(export_args(run, export_checkpoint, "0" * 64)) == 1
     assert "checkpoint SHA-256 mismatch" in capsys.readouterr().err
     assert not run.exists()
+
+
+def test_export_rebuilds_same_name_for_another_checkpoint(
+    job, export_api, export_checkpoint, tmp_path
+):
+    run = tmp_path / "run"
+    first_digest = file_digest(export_checkpoint)
+    assert job.main(export_args(run, export_checkpoint, first_digest)) == 0
+    unit = run / "state/export/model"
+    before = read_manifest(unit / "unit.json")
+    assert before is not None
+
+    payload = checkpoint.read_payload(export_checkpoint)
+    second, _ = checkpoint.save_checkpoint(
+        tmp_path / "second", {**payload, "identity": "second-checkpoint"}, counter=1
+    )
+    second_digest = file_digest(second)
+    assert second_digest != first_digest
+    assert job.main(export_args(run, second, second_digest)) == 0
+    after = read_manifest(unit / "unit.json")
+    assert after is not None
+    assert before["identity"] != after["identity"]
+    _, metadata = export_api.load_export(unit)
+    assert metadata["source"]["sha256"] == second_digest
 
 
 def test_export_failure_during_promotion_publishes_no_unit(
@@ -431,6 +456,178 @@ def test_t1_all_arms_publish_paired_evaluations(job, small_t1, tmp_path, path, a
         digests.add(record["eval_digest"])
     assert len(digests) == 1
     assert observed == [base] * len(arms)
+
+
+@pytest.mark.parametrize(
+    "corpus,expected",
+    [
+        (None, "f8261cb26b1f807b80ead541b3c3e70985f1ea0450fd31a2fd0dfbc4ffa9cd10"),
+        ("d" * 64, "32810d2b80fd1c05bacfac63093a96f73ff135d3616dd1cc0063ccd2703ce9d5"),
+    ],
+)
+def test_qualification_keeps_base_training_config_identity(corpus, expected):
+    cfg = T1_BASE
+    if corpus:
+        cfg = replace(cfg, sources=(SourceConfig("typed", 0.5), SourceConfig("corpus", 0.5)))
+    inputs = dict(code=CODE, corpus=corpus, init=None, env=ENV)
+    assert identity(cfg, **inputs) == expected
+    assert identity(replace(cfg, seed=cfg.seed + 1), **inputs) != expected
+
+
+@pytest.mark.parametrize(
+    "explicit",
+    [
+        ["--models", "both"],
+        ["--updates", "200"],
+        ["--workers", "8,16,32,46"],
+        ["--models", "both", "--updates", "200", "--workers", "8,16,32,46"],
+    ],
+)
+def test_explicit_default_options_are_not_a_scope(job, settings, tmp_path, explicit):
+    base = args(tmp_path, "qualify", config=settings, name="unit")
+    parser = job._parser()
+    assert job._qualification_scope(parser.parse_args(base)) is None
+    assert job._qualification_scope(parser.parse_args([*base, *explicit])) is None
+    assert job._qualification_scope(parser.parse_args([*base, "--updates", "3"])) == {"updates": 3}
+    assert job._qualification_scope(parser.parse_args([*base, "--workers", "16"])) == {
+        "workers": [16]
+    }
+    signature = inspect.signature(measure.qualify).parameters
+    assert job._QUALIFY_DEFAULTS["updates"] == signature["updates"].default
+    assert job._QUALIFY_DEFAULTS["workers"] == list(signature["workers"].default)
+
+
+def test_qualify_options_restrict_what_runs(job, settings, tmp_path, monkeypatch):
+    architecture = config().model
+    t1_architecture = replace(architecture, d_model=24)
+    calls = []
+
+    def trial(cfg, directory, device):
+        calls.append((cfg.model, cfg.workers, cfg.optim.max_steps))
+        return {"updates": cfg.optim.max_steps}, directory / "unused.pt"
+
+    monkeypatch.setattr(measure, "T1_MODEL", t1_architecture)
+    monkeypatch.setattr(measure, "loader", lambda *a: iter([None]))
+    monkeypatch.setattr(measure, "_trial", trial)
+    monkeypatch.setattr(measure, "_checkpoint_measure", lambda *a: {})
+    monkeypatch.setattr(measure, "load_model", lambda _: (torch.nn.Identity(), None))
+    monkeypatch.setattr(measure, "_worst_measure", lambda *a: {})
+    monkeypatch.setattr(measure, "_inference_panel", lambda **kw: pytest.fail("inference ran"))
+    command = args(
+        tmp_path,
+        "qualify",
+        config=settings,
+        name="scoped",
+        workers="0,2",
+        updates=3,
+    )
+    command.append("--no-inference")
+    scoped = [*command, "--models", "t1"]
+    assert job.main(scoped) == 0
+    unit = tmp_path / "state/qualify/scoped"
+    manifest = read_manifest(unit / "unit.json")
+    assert calls == [(t1_architecture, 0, 3), (t1_architecture, 2, 3)]
+    report = json.loads((unit / "qualify.json").read_text())
+    assert report["models"].keys() == {"t1"}
+    assert "inference" not in report["models"]["t1"]
+    assert job.main(scoped) == 0
+    assert job.main([*scoped, "--inference-workers", "7"]) == 0
+    assert len(calls) == 2
+
+    assert job.main([*command, "--models", "full"]) == 0
+    assert calls[2:] == [(architecture, 0, 3), (architecture, 2, 3)]
+    assert json.loads((unit / "qualify.json").read_text())["models"].keys() == {"full"}
+    assert read_manifest(unit / "unit.json")["identity"] == manifest["identity"]
+
+
+@pytest.mark.parametrize("successful_origins", [1, 2], ids=["origin-trial", "worker-trial"])
+def test_qualify_retries_units_without_any_successful_training_trial(
+    job, settings, tmp_path, monkeypatch, successful_origins
+):
+    cfg = config()
+    replace(cfg, sampler=replace(cfg.sampler, origins=2)).to_yaml(settings)
+    t1_architecture = replace(cfg.model, d_model=24)
+    monkeypatch.setattr(measure, "T1_MODEL", t1_architecture)
+    monkeypatch.setattr(measure, "usable_workers", lambda _: (0, None))
+
+    def oom(part):
+        def fail(*args, **kwargs):
+            raise torch.OutOfMemoryError(f"{part} out of memory")
+
+        return fail
+
+    for probe in (
+        "_corpus_measure",
+        "_first_batch_seconds",
+        "_worst_measure",
+        "_checkpoint_measure",
+        "load_model",
+        "_inference_measure",
+    ):
+        monkeypatch.setattr(measure, probe, oom(probe))
+    calls = []
+    allow_success = False
+
+    def trial(c, directory, device):
+        calls.append((c.model, c.workers, c.sampler.origins))
+        if allow_success and calls[-1] == (t1_architecture, 2, successful_origins):
+            return {"updates": 1}, directory / "model.pt"
+        raise torch.OutOfMemoryError(f"training out of memory at {c.workers} workers")
+
+    monkeypatch.setattr(measure, "_trial", trial)
+    command = args(
+        tmp_path, "qualify", config=settings, name="retry", models="both", workers="2,0", updates=1
+    )
+    unit = tmp_path / "state/qualify/retry"
+    for run in (1, 2):
+        assert job.main(command) == 1
+        assert len(calls) == 6 * run
+        assert not (unit / "unit.json").exists()
+        assert not (unit / "qualify.json").exists()
+        failure = json.loads((unit / "failure.json").read_text())
+        assert "_corpus_measure out of memory" in failure["reason"]
+        assert "_first_batch_seconds out of memory" not in failure["reason"]
+
+    allow_success = True
+    assert job.main(command) == 0
+    assert len(calls) == 18
+    assert not (unit / "failure.json").exists()
+    assert read_manifest(unit / "unit.json") is not None
+    report = json.loads((unit / "qualify.json").read_text())
+    assert report["models"]["full"]["workers"]["2"]["status"] == "oom"
+    t1_report = report["models"]["t1"]
+    successful = t1_report["origins"]["1"] if successful_origins == 1 else t1_report["workers"]["2"]
+    assert successful["status"] == "ok"
+    assert t1_report["workers"]["0"]["status"] == t1_report["inference"]["status"] == "oom"
+
+
+@pytest.mark.parametrize("workers", ["16,16", "16,016"])
+def test_qualify_refuses_duplicate_workers(job, settings, tmp_path, monkeypatch, capsys, workers):
+    monkeypatch.setattr(job, "_run", lambda *a: pytest.fail("duplicate workers reached the action"))
+    command = args(tmp_path, "qualify", config=settings, name="duplicate", workers=workers)
+    with pytest.raises(SystemExit) as error:
+        job.main(command)
+    assert error.value.code == 2
+    message = capsys.readouterr().err
+    assert "--workers" in message and "duplicate" in message
+
+
+def test_qualify_inference_workers_option_reaches_measurement(job, settings, tmp_path, monkeypatch):
+    recorded = {}
+
+    def qualify(cfg, out, **options):
+        recorded.update(options)
+        report = {
+            "cold_start": {"status": "ok"},
+            "models": {"full": {"workers": {"0": {"status": "ok"}}, "origins": {}}},
+        }
+        (out / "qualify.json").write_text(json.dumps(report))
+        return report
+
+    monkeypatch.setattr(measure, "qualify", qualify)
+    command = args(tmp_path, "qualify", config=settings, name="inference", inference_workers=3)
+    assert job.main(command) == 0
+    assert recorded["inference_workers"] == 3
 
 
 def test_qualify_publishes_real_measurements(job, settings, tmp_path, monkeypatch):

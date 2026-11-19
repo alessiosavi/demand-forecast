@@ -15,7 +15,10 @@ import sys
 import threading
 import time
 from collections import Counter
+from collections.abc import Sequence
+from contextlib import contextmanager
 from dataclasses import replace
+from errno import ENOMEM
 from os import cpu_count
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -40,7 +43,7 @@ from demand_forecast.data.episode.schema import (
     MAX_FORECAST_ROWS,
     PATCH,
 )
-from demand_forecast.models.v5 import V5Config, V5Model, forecast_items, v5_loss
+from demand_forecast.models.v5 import V5Config, V5Model, forecast_items, usable_workers, v5_loss
 from demand_forecast.synthetic.typed.draft import stream
 
 from . import loop
@@ -176,44 +179,79 @@ def _peak_gpu(device):
     return torch.cuda.max_memory_allocated(device) if device.type == "cuda" else None
 
 
-def _host_rss(proc: Path = Path("/proc")) -> int | None:
-    """Sum RSS for this process and its descendants, including loader workers."""
-    if not (proc / str(os.getpid()) / "status").is_file():
-        return None
-    pending, visited, total = [os.getpid()], set(), 0
+def _proc_memory_bytes(path: Path, field: str) -> int | None:
+    try:
+        for line in path.read_text().splitlines():
+            if line.startswith(field + ":"):
+                return int(line.split()[1]) * 1024
+    except OSError:
+        # The file may be unsupported, inaccessible, or belong to an exiting worker.
+        pass
+    return None
+
+
+def _host_memory(proc: Path = Path("/proc")) -> tuple[int | None, int | None]:
+    """Sample total RSS and PSS for the same process tree, including loader workers."""
+    root = os.getpid()
+    pending, visited = [root], set()
+    rss, pss = 0, 0
     while pending:
         pid = pending.pop()
         if pid in visited:
             continue
         visited.add(pid)
-        try:
-            status = (proc / str(pid) / "status").read_text()
-            total += next(
-                int(line.split()[1]) * 1024
-                for line in status.splitlines()
-                if line.startswith("VmRSS:")
-            )
-            # A child may have been created by any thread of the process.
-            for task in (proc / str(pid) / "task").iterdir():
-                pending.extend(int(child) for child in (task / "children").read_text().split())
-        except (OSError, StopIteration):
-            # Exiting workers can disappear between the metadata reads.
-            continue
-    return total
+        process = proc / str(pid)
+        resident = _proc_memory_bytes(process / "status", "VmRSS")
+        if pid == root and resident is None:
+            return None, None
+        if resident is not None:
+            rss += resident
+            if pss is not None:
+                proportional = _proc_memory_bytes(process / "smaps_rollup", "Pss")
+                pss = None if proportional is None else pss + proportional
+        # A child may have been created by any thread of the process.
+        for children in (process / "task").glob("*/children"):
+            try:
+                pending.extend(int(child) for child in children.read_text().split())
+            except OSError:
+                continue
+    return rss, pss
+
+
+def _rss_bytes(ru_maxrss: int) -> int:
+    return ru_maxrss * 1024 if sys.platform == "linux" else ru_maxrss
+
+
+def _rusage_peak() -> int | None:
+    try:
+        import resource
+    except ImportError:
+        return None
+    # Resource usage gives lifetime high-water marks independent of procfs.
+    return _rss_bytes(
+        resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        + resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+    )
 
 
 class _HostPeak:
-    """Sample summed RSS every 10 ms and at every observed batch boundary."""
+    """Sample process-tree memory every 10 ms and at observed batch boundaries."""
 
     def __init__(self):
         self.peak = None
+        self.peak_pss = None
+        self.peak_rusage = None
+        self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = None
 
     def sample(self):
-        value = _host_rss()
-        if value is not None:
-            self.peak = value if self.peak is None else max(value, self.peak)
+        with self._lock:
+            rss, pss = _host_memory()
+            if rss is not None:
+                self.peak = max(rss, self.peak or 0)
+            if pss is not None:
+                self.peak_pss = max(pss, self.peak_pss or 0)
 
     def __enter__(self):
         self.sample()
@@ -228,10 +266,37 @@ class _HostPeak:
         return self
 
     def __exit__(self, *args):
-        self.sample()
         self._stop.set()
         if self._thread is not None:
             self._thread.join()
+        self.sample()
+        self.peak_rusage = _rusage_peak()
+
+
+@contextmanager
+def _record_part(part):
+    """Record recoverable probe failures while allowing interrupts to propagate."""
+    try:
+        yield
+    except Exception as error:
+        is_oom = (
+            isinstance(error, (torch.OutOfMemoryError, MemoryError))
+            or isinstance(error, OSError)
+            and error.errno == ENOMEM
+            or isinstance(error, RuntimeError)
+            and (
+                "out of memory" in str(error).lower()
+                or "can't allocate memory" in str(error).lower()
+            )
+        )
+        if part.get("status") not in ("failed", "oom"):
+            part["status"] = "oom" if is_oom else "failed"
+        message = str(error)
+        if "message" in part:
+            message = f"{part['message']}\n{message}"
+        part["message"] = message
+    else:
+        part.setdefault("status", "ok")
 
 
 def _sum_exposure(totals, exposure):
@@ -277,48 +342,72 @@ def _trial(config, directory, device):
         real_line(path, record)
 
     _reset_gpu(device)
-    with _HostPeak() as memory:
+    memory = _HostPeak()
+    metrics = {"supervised_cells_per_second": None, "peak_gpu_bytes": None}
+    with _record_part(metrics):
         with (
+            memory,
             patch.object(loop, "loader", observed_loader),
             patch.object(loop, "_json_line", observed_line),
         ):
             result, elapsed = _timed(device, lambda: train(config, directory))
-    if result.batch != config.optim.max_steps or result.stop_reason != "max_steps":
-        raise RuntimeError(f"qualification training stopped with {result.stop_reason}")
-    if not (len(reports) == len(durations) == len(result.history) == result.batch):
-        raise RuntimeError("qualification did not observe every training batch")
+        if result.stop_reason == "terminated":
+            raise KeyboardInterrupt
+        if result.batch != config.optim.max_steps or result.stop_reason != "max_steps":
+            raise RuntimeError(f"qualification training stopped with {result.stop_reason}")
+        if not (len(reports) == len(durations) == len(result.history) == result.batch):
+            raise RuntimeError("qualification did not observe every training batch")
+    exposure = {}
+    for report in reports:
+        _sum_exposure(exposure, report.get("exposure", {}))
+    metrics.update(
+        exposure=exposure,
+        host_memory_bytes=memory.peak,
+        host_memory_pss_bytes=memory.peak_pss,
+        host_memory_rusage_bytes=memory.peak_rusage,
+    )
+    with _record_part(metrics):
+        metrics["peak_gpu_bytes"] = _peak_gpu(device)
+    if metrics["status"] != "ok":
+        return metrics, None
+
     tail_start = len(durations) // 5
     tail = durations[tail_start:]
     updated = [entry["updates"] for entry in result.history]
     successful = [i for i in range(tail_start, len(durations)) if updated[i]]
     skips = Counter()
-    exposure = {}
     for report in reports:
         skips.update(report["skips"])
-        _sum_exposure(exposure, report.get("exposure", {}))
     if result.skipped:
         skips["nonfinite"] += result.skipped
-    metrics = {
-        "batches": result.batch,
-        "updates": result.updates,
-        "tail_batches": len(tail),
-        "batches_per_second": statistics.median(1 / seconds for seconds in tail),
-        "updates_per_second": sum(updated[tail_start:]) / sum(tail),
-        "supervised_cells_per_batch": statistics.mean(report["supervised"] for report in reports),
-        "padded_cells_per_batch": statistics.mean(report["cells"] for report in reports),
-        "supervised_cells_per_update": statistics.mean(reports[i]["supervised"] for i in successful)
-        if successful
-        else None,
-        "seconds_per_update": statistics.median(durations[i] for i in successful)
-        if successful
-        else None,
-        "skips": dict(skips),
-        "exposure": exposure,
-        "host_memory_bytes": memory.peak,
-        "peak_gpu_bytes": _peak_gpu(device),
-        "total_seconds": elapsed,
-    }
+    metrics.update(
+        {
+            "batches": result.batch,
+            "updates": result.updates,
+            "tail_batches": len(tail),
+            "batches_per_second": statistics.median(1 / seconds for seconds in tail),
+            "updates_per_second": sum(updated[tail_start:]) / sum(tail),
+            "supervised_cells_per_batch": statistics.mean(
+                report["supervised"] for report in reports
+            ),
+            "padded_cells_per_batch": statistics.mean(report["cells"] for report in reports),
+            "supervised_cells_per_update": statistics.mean(
+                reports[i]["supervised"] for i in successful
+            )
+            if successful
+            else None,
+            "seconds_per_update": statistics.median(durations[i] for i in successful)
+            if successful
+            else None,
+            "skips": dict(skips),
+            "total_seconds": elapsed,
+        }
+    )
     metrics["updates_per_hour"] = 3600 * metrics["updates_per_second"]
+    cells = metrics["supervised_cells_per_update"]
+    metrics["supervised_cells_per_second"] = (
+        None if cells is None else cells * metrics["updates_per_second"]
+    )
     return metrics, result.checkpoint
 
 
@@ -426,15 +515,87 @@ def _inference_panel(*, seed: int, items: int, length: int) -> Panel:
     )
 
 
+def _inference_measure(config, device, panel_items, panel_length, workers):
+    panel = _inference_panel(seed=config.seed, items=panel_items, length=panel_length)
+    origin = panel_length - 28
+    fallback_forecasts = 0
+    # Match EpisodeBuilder's fallback rule on each target's finite prefix.
+    for item in panel.items:
+        for values in item.targets.values():
+            observed = values[: max(0, origin - item.start)]
+            observed = observed[np.isfinite(observed)]
+            fallback_forecasts += int(not observed.size or np.all(observed == observed[0]))
+    model = V5Model(config.model).to(device)
+    _reset_gpu(device)
+    with _HostPeak() as memory:
+        forecasts, seconds = _timed(
+            device,
+            lambda: forecast_panel(
+                model, panel, origin, 28, context=512, gates="ones", pruned=False, workers=workers
+            ),
+        )
+        if len(forecasts) != panel_items or fallback_forecasts:
+            raise RuntimeError(
+                f"qualification inference requires {panel_items} forecasts and zero "
+                f"fallbacks; got {len(forecasts)} forecasts and {fallback_forecasts} fallbacks"
+            )
+        metrics = {
+            "seconds": seconds,
+            "peak_gpu_bytes": _peak_gpu(device),
+            "origin": origin,
+            "items": len(panel.items),
+            "forecasts": len(forecasts),
+            "fallback_forecasts": fallback_forecasts,
+        }
+    metrics["host_memory_bytes"] = memory.peak
+    metrics["host_memory_pss_bytes"] = memory.peak_pss
+    metrics["host_memory_rusage_bytes"] = memory.peak_rusage
+    return metrics
+
+
+def _measured_trial(config, scratch, device):
+    metrics = {
+        "supervised_cells_per_second": None,
+        "peak_gpu_bytes": None,
+        "host_memory_bytes": None,
+        "host_memory_pss_bytes": None,
+        "host_memory_rusage_bytes": None,
+        "exposure": {},
+    }
+    checkpoint = None
+    with _record_part(metrics):
+        values, checkpoint = _trial(config, scratch / "state", device)
+        metrics.update(values)
+    return metrics, checkpoint
+
+
+def _first_batch_seconds(config, device):
+    iterator = None
+
+    def read_first():
+        nonlocal iterator
+        iterator = loader(config, 0)
+        next(iterator)
+
+    try:
+        _, seconds = _timed(device, read_first)
+        return seconds
+    finally:
+        if iterator is not None:
+            loop._release(iterator)
+
+
 def qualify(
     config: V5TrainConfig,
     out: Path,
     *,
-    models: dict[str, V5Config] | None = None,
+    models: dict[str, V5Config] | str | None = None,
     updates: int = 200,
-    workers: tuple[int, ...] = (8, 16, 32, 46),
+    workers: Sequence[int] = (8, 16, 32, 46),
     panel_items: int = 30_490,
     panel_length: int = 1_941,
+    no_inference: bool = False,
+    inference_workers: int | None = None,
 ) -> dict:
     """Measure Q (a) through (g); retain only a finite/null JSON report.
 
@@ -442,13 +603,17 @@ def qualify(
     tail updates divided by total tail seconds, including skipped batches.
     seconds_per_update is the median over successful tail updates. Batch timings
     include loader, transfer, forward, backward, optimiser and history logging;
-    total_seconds also includes startup and checkpoint writes. CPU GPU-memory
-    fields and host-memory fields without /proc are null, never estimates.
+    total_seconds also includes startup and checkpoint writes. GPU memory is
+    null on CPU. PSS is null without smaps_rollup.
     """
     if type(updates) is not int or updates < 1:
         raise ValueError("updates must be a positive integer")
     if not workers or any(type(worker) is not int or worker < 0 for worker in workers):
         raise ValueError("workers requires nonnegative integer counts")
+    if inference_workers is not None and (
+        type(inference_workers) is not int or inference_workers < 0
+    ):
+        raise ValueError("inference_workers requires a nonnegative integer")
     if (
         type(panel_items) is not int
         or panel_items < 1
@@ -456,11 +621,21 @@ def qualify(
         or panel_length < 29
     ):
         raise ValueError("panel_items must be positive and panel_length must exceed 28")
-    models = {"full": config.model, "t1": T1_MODEL} if models is None else dict(models)
+    if models is None or isinstance(models, str):
+        available = {"full": config.model, "t1": T1_MODEL}
+        if models in (None, "both"):
+            models = available
+        elif models in available:
+            models = {models: available[models]}
+        else:
+            raise ValueError("models must be full, t1 or both")
+    else:
+        models = dict(models)
     if not models or any(not isinstance(name, str) or not name for name in models):
         raise ValueError("models requires nonempty string names")
     device = _device(config)
-    inference_workers = 16 if sys.platform == "linux" and (cpu_count() or 0) >= 18 else 0
+    if inference_workers is None and not no_inference:
+        inference_workers = 16 if sys.platform == "linux" and (cpu_count() or 0) >= 18 else 0
     # Q always measures the bank and all inputs, even if passed a T1 null arm.
     base = replace(
         config,
@@ -470,27 +645,25 @@ def qualify(
             config.optim, max_steps=updates, log_every=1, ema_decay=config.optim.ema_decay or 0.999
         ),
     )
-    index_seconds, excluded_share, unparsed_frequency_rows = _corpus_measure(base, device)
-    first_iterator = None
-
-    def first_batch():
-        nonlocal first_iterator
-        first_iterator = loader(replace(base, workers=workers[0]), 0)
-        next(first_iterator)
-
-    try:
-        _, first_seconds = _timed(device, first_batch)
-    finally:
-        if first_iterator is not None:
-            loop._release(first_iterator)
-        first_iterator = None
     cold = {
-        "corpus_index_seconds": index_seconds,
-        "first_batch_seconds": first_seconds,
+        "corpus_index_seconds": None,
+        "first_batch_seconds": None,
         "restore_seconds": {},
-        "excluded_row_share": excluded_share,
-        "unparsed_frequency_rows": unparsed_frequency_rows,
+        "excluded_row_share": None,
+        "unparsed_frequency_rows": None,
     }
+    with _record_part(cold):
+        (
+            cold["corpus_index_seconds"],
+            cold["excluded_row_share"],
+            cold["unparsed_frequency_rows"],
+        ) = _corpus_measure(base, device)
+    with _record_part(cold):
+        # Time the first read without including worker teardown.
+        cold["first_batch_seconds"] = _first_batch_seconds(
+            replace(base, workers=workers[0]), device
+        )
+
     report = {"cold_start": cold, "models": {}}
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
@@ -498,24 +671,35 @@ def qualify(
         scratch = Path(temporary)
         for name, architecture in models.items():
             model_config = replace(base, model=architecture)
-            measured = {"workers": {}}
+            measured = report["models"][name] = {"workers": {}, "checkpoint": {}}
+            checkpoint_report = measured["checkpoint"]
             for worker in workers:
                 trial_config = replace(model_config, workers=worker)
                 with TemporaryDirectory(dir=scratch) as trial:
-                    metrics, checkpoint = _trial(trial_config, Path(trial) / "state", device)
+                    metrics, checkpoint = _measured_trial(trial_config, Path(trial), device)
                     measured["workers"][str(worker)] = metrics
-                    if worker == workers[0]:
-                        measured["checkpoint"] = _checkpoint_measure(
-                            checkpoint, Path(trial) / "write", device
-                        )
+                    if metrics["status"] != "ok" or checkpoint is None:
+                        continue
+                    if checkpoint_report.get("status") != "ok":
+                        checkpoint_report.clear()
+                        with _record_part(checkpoint_report):
+                            checkpoint_report.update(
+                                _checkpoint_measure(checkpoint, Path(trial) / "write", device)
+                            )
+                    if name not in cold["restore_seconds"]:
 
                         def restore():
                             model, _ = load_model(checkpoint)
                             return model.to(device)
 
-                        restored, seconds = _timed(device, restore)
-                        cold["restore_seconds"][name] = seconds
-                        del restored
+                        with _record_part(cold):
+                            cold["restore_seconds"][name] = None
+                            restored, cold["restore_seconds"][name] = _timed(device, restore)
+                            del restored
+            if not checkpoint_report:
+                checkpoint_report.update(
+                    status="failed", message="no successful worker trial produced a checkpoint"
+                )
             configured_origins = str(model_config.sampler.origins)
             measured["origins"] = {configured_origins: measured["workers"][str(workers[0])].copy()}
             if configured_origins != "1":
@@ -525,53 +709,30 @@ def qualify(
                     sampler=replace(model_config.sampler, origins=1),
                 )
                 with TemporaryDirectory(dir=scratch) as trial:
-                    measured["origins"]["1"], _ = _trial(single, Path(trial) / "state", device)
-            measured["worst_batch"] = _worst_measure(model_config, device)
-            panel = _inference_panel(seed=config.seed, items=panel_items, length=panel_length)
-            origin = panel_length - 28
-            fallback_forecasts = 0
-            # Match EpisodeBuilder's fallback rule on each target's finite prefix.
-            for item in panel.items:
-                for values in item.targets.values():
-                    observed = values[: max(0, origin - item.start)]
-                    observed = observed[np.isfinite(observed)]
-                    fallback_forecasts += int(not observed.size or np.all(observed == observed[0]))
-            model = V5Model(architecture).to(device)
-            _reset_gpu(device)
-            with _HostPeak() as memory:
-                forecasts, seconds = _timed(
-                    device,
-                    lambda model=model, panel=panel: forecast_panel(
-                        model,
-                        panel,
-                        origin,
-                        28,
-                        context=512,
-                        gates="ones",
-                        pruned=False,
-                        workers=inference_workers,
-                    ),
-                )
-                if len(forecasts) != panel_items or fallback_forecasts:
-                    raise RuntimeError(
-                        f"qualification inference requires {panel_items} forecasts and zero "
-                        f"fallbacks; got {len(forecasts)} forecasts and {fallback_forecasts} fallbacks"
+                    measured["origins"]["1"], _ = _measured_trial(single, Path(trial), device)
+            worst = measured["worst_batch"] = {}
+            with _record_part(worst):
+                worst.update(_worst_measure(model_config, device))
+
+            parameters = measured["parameters"] = {}
+            with _record_part(parameters):
+                parts = Counter()
+                with torch.device("meta"):
+                    model = V5Model(architecture)
+                for parameter_name, parameter in model.named_parameters():
+                    parts[parameter_name.split(".", 1)[0]] += parameter.numel()
+                parameters.update(total=sum(parts.values()), by_part=dict(parts))
+            if parameters["status"] == "ok":
+                del parameters["status"]
+
+            if not no_inference:
+                inference = measured["inference"] = {}
+                with _record_part(inference):
+                    chosen, reason = usable_workers(inference_workers)
+                    inference.update(workers=chosen, worker_reason=reason)
+                    inference.update(
+                        _inference_measure(model_config, device, panel_items, panel_length, chosen)
                     )
-                measured["inference"] = {
-                    "seconds": seconds,
-                    "peak_gpu_bytes": _peak_gpu(device),
-                    "origin": origin,
-                    "items": len(panel.items),
-                    "forecasts": len(forecasts),
-                    "fallback_forecasts": fallback_forecasts,
-                }
-            measured["inference"]["host_memory_bytes"] = memory.peak
-            parts = Counter()
-            for parameter_name, parameter in model.named_parameters():
-                parts[parameter_name.split(".", 1)[0]] += parameter.numel()
-            measured["parameters"] = {"total": sum(parts.values()), "by_part": dict(parts)}
-            report["models"][name] = measured
-            del model, panel, forecasts
     encoded = json.dumps(report, allow_nan=False, sort_keys=True).encode()
     _atomic_write(out / "qualify.json", lambda output: output.write(encoded))
     return report

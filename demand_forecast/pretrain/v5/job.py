@@ -42,6 +42,44 @@ def _positive(value: str) -> int:
     return number
 
 
+def _nonnegative(value: str) -> int:
+    number = int(value)
+    if number < 0:
+        raise argparse.ArgumentTypeError("expected a nonnegative integer")
+    return number
+
+
+def _worker_counts(value: str) -> list[int]:
+    if not re.fullmatch(r"[0-9]+(?:,[0-9]+)*", value):
+        raise argparse.ArgumentTypeError("expected comma-separated nonnegative worker counts")
+    counts = [int(count) for count in value.split(",")]
+    if len(counts) != len(set(counts)):
+        raise argparse.ArgumentTypeError("duplicate worker counts")
+    return counts
+
+
+# The measurement's own defaults (a test pins them to ``measure.qualify``): an option given at its
+# default changes nothing in the report and is therefore no scope.
+_QUALIFY_DEFAULTS = {
+    "models": "both",
+    "workers": [8, 16, 32, 46],
+    "updates": 200,
+    "no_inference": False,
+}
+
+
+def _qualification_scope(args: argparse.Namespace) -> dict | None:
+    """Return the options that change the report."""
+    scope = {
+        key: value
+        for key in ("models", "workers", "updates", "no_inference", "inference_workers")
+        if (value := getattr(args, key)) is not None and value != _QUALIFY_DEFAULTS.get(key)
+    }
+    if args.no_inference:
+        scope.pop("inference_workers", None)
+    return scope or None
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     actions = parser.add_subparsers(dest="action", required=True)
@@ -71,6 +109,12 @@ def _parser() -> argparse.ArgumentParser:
         if action == "train":
             sub.add_argument("--init-file", type=Path)
             sub.add_argument("--init-sha256", type=lambda v: _hex(v, 64))
+        if action == "qualify":
+            sub.add_argument("--models", choices=("full", "t1", "both"))
+            sub.add_argument("--workers", type=_worker_counts, metavar="N[,N...]")
+            sub.add_argument("--updates", type=_positive, metavar="N")
+            sub.add_argument("--no-inference", action="store_true", default=None)
+            sub.add_argument("--inference-workers", type=_nonnegative, metavar="N")
     sub = actions.add_parser("t1-compare")
     sub.add_argument("--base", type=Path, required=True)
     sub.add_argument("--code", type=lambda v: _hex(v, 40), required=True)
@@ -289,6 +333,10 @@ def _run(args, unit: Path, training: Path) -> int:
             episodes=args.episodes,
             max_panels=args.max_panels,
         )
+    if args.action == "qualify":
+        # Scope affects report reuse, independently of the training configuration identity.
+        scope = _qualification_scope(args) or {}
+        expected["qualification"] = scope or None
 
     # Identity is checked even for complete units; stale completion must not
     # survive a failed attempt under another environment or configuration.
@@ -302,7 +350,10 @@ def _run(args, unit: Path, training: Path) -> int:
             _json(sidecar, {"identity": requested})
         if cached:
             return 0
-        # qualify has no corpus_root argument; roots are machine-local and do
+        if not scope:
+            # Preserve the shape of manifests published by unscoped jobs.
+            del expected["qualification"]
+        # measure.qualify has no corpus_root argument; roots are machine-local and do
         # not participate in canonical configuration identity.
         config = replace(
             config,
@@ -319,16 +370,23 @@ def _run(args, unit: Path, training: Path) -> int:
         # the guest's copied tree and publish only its completed report.
         with TemporaryDirectory(prefix="qualify-", dir=staging) as temporary:
             output = Path(temporary)
-            try:
-                measure.qualify(config, output)
-            except RuntimeError as error:
-                # P5 exposes an inner trainer's graceful TERM as this exception,
-                # rather than returning a TrainResult to its caller.
-                if str(error) == "qualification training stopped with terminated":
-                    return 75
-                raise
-            json.loads((output / "qualify.json").read_text())
-            _copy(output / "qualify.json", unit / "qualify.json", staging)
+            report = measure.qualify(config, output, **scope)
+            trials = [
+                trial
+                for model in report["models"].values()
+                for section in ("workers", "origins")
+                for trial in model[section].values()
+            ]
+            if not any(trial["status"] == "ok" for trial in trials):
+                first_error = report["cold_start"].get("message") or next(
+                    (trial["message"] for trial in trials if trial.get("message")),
+                    "no trial error was recorded",
+                )
+                first_line = first_error.split("\n", 1)[0]
+                raise RuntimeError(f"qualification had no successful training trial: {first_line}")
+            report_path = output / "qualify.json"
+            json.loads(report_path.read_text())
+            _copy(report_path, unit / "qualify.json", staging)
         files = ["qualify.json"]
     else:
         result = loop.train(

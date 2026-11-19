@@ -200,6 +200,11 @@ def generate(
     upstream: bool = False,
     member_uri: str | None = None,
     member_sha256: str | None = None,
+    models: str | None = None,
+    workers: str | None = None,
+    updates: int | None = None,
+    no_inference: bool = False,
+    inference_workers: int | None = None,
 ) -> str:
     """Return one deterministic shell script; config/base name local YAML files."""
     _name(name, "name")
@@ -208,6 +213,32 @@ def generate(
         raise ValueError("upstream must be a boolean")
     if action not in ("train", "qualify", "t1", "export"):
         raise ValueError("action must be train, qualify, t1 or export")
+    if type(no_inference) is not bool:
+        raise ValueError("no_inference must be a boolean")
+    qualification = {
+        "models": models,
+        "workers": workers,
+        "updates": updates,
+        "inference-workers": inference_workers,
+    }
+    if action != "qualify" and (
+        no_inference or any(value is not None for value in qualification.values())
+    ):
+        raise ValueError("qualification options apply only to qualify")
+    if models is not None and models not in ("full", "t1", "both"):
+        raise ValueError("models must be full, t1 or both")
+    if workers is not None:
+        if not isinstance(workers, str) or not re.fullmatch(r"[0-9]+(?:,[0-9]+)*", workers):
+            raise ValueError("--workers requires comma-separated nonnegative integers")
+        counts = [int(count) for count in workers.split(",")]
+        if len(counts) != len(set(counts)):
+            raise ValueError("--workers contains duplicate worker counts")
+    if updates is not None and (type(updates) is not int or updates < 1):
+        raise ValueError("updates requires a positive integer")
+    if inference_workers is not None and (
+        type(inference_workers) is not int or inference_workers < 0
+    ):
+        raise ValueError("inference_workers requires a nonnegative integer")
     if action == "export":
         if upstream or any(
             value is not None
@@ -288,6 +319,12 @@ def generate(
         unit_name = _name(leg or name, "leg") if action == "train" else name
         unit = f"state/{action}/{unit_name}"
         command += ["--name", unit_name]
+        if action == "qualify":
+            for option, value in qualification.items():
+                if value is not None:
+                    command += ["--" + option, str(value)]
+            if no_inference:
+                command.append("--no-inference")
         config_path, config_flag = config, "--config"
     member_step = config_step = ""
     if action == "export":
@@ -426,10 +463,13 @@ def main(argv: list[str] | None = None) -> int:
         "corpus-digest",
         "member-uri",
         "member-sha256",
+        "workers",
     ):
         parser.add_argument("--" + key)
-    for key in ("seed", "episodes", "max-panels"):
+    for key in ("seed", "episodes", "max-panels", "updates", "inference-workers"):
         parser.add_argument("--" + key, type=int)
+    parser.add_argument("--models", choices=("full", "t1", "both"))
+    parser.add_argument("--no-inference", action="store_true")
     parser.add_argument("--upstream", action="store_true", help="expose the pinned Simons source")
     parser.add_argument("--output", type=Path, required=True)
     args = vars(parser.parse_args(argv))
