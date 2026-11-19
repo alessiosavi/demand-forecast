@@ -91,6 +91,42 @@ def test_cap_is_omitted_when_none_and_round_trips(tmp_path):
     assert identity(base, **parts) != identity(enabled, **parts)
 
 
+def test_option_is_omitted_when_false_and_round_trips(tmp_path):
+    from demand_forecast.pretrain.v5.loop import _configuration
+
+    base = training_config()
+    assert base.model.horizon_seed is False
+    path = tmp_path / "train.yaml"
+    base.to_yaml(path)
+    original = path.read_bytes()
+    raw = yaml.safe_load(original)
+    assert "horizon_seed" not in raw["model"]
+    assert "horizon_seed" not in base.canonical()["model"]
+    assert "horizon_seed" not in base._serialized()["model"]
+    raw["model"]["horizon_seed"] = False
+    path.write_text(yaml.safe_dump(raw))
+    explicit = type(base).from_yaml(path)
+    assert _configuration(explicit._serialized()) == explicit == base
+    explicit.to_yaml(path)
+    assert path.read_bytes() == original
+
+    enabled = replace(base, model=replace(base.model, horizon_seed=True))
+    enabled.to_yaml(path)
+    assert type(base).from_yaml(path) == enabled
+    assert enabled.canonical()["model"]["horizon_seed"] is True
+    assert _configuration(enabled._serialized()) == enabled
+    identity = config_module().identity
+    parts = dict(code="0" * 40, corpus=None, init=None, env=None)
+    assert identity(base, **parts) == identity(explicit, **parts)
+    assert identity(base, **parts) != identity(enabled, **parts)
+
+
+@pytest.mark.parametrize("value", ["false", 0, None])
+def test_horizon_seed_requires_a_boolean(value):
+    with pytest.raises(ValueError, match="horizon_seed must be a boolean"):
+        V5Config(horizon_seed=value)
+
+
 def test_canonical_serialized_and_export_omit_an_empty_derive(tmp_path):
     from demand_forecast.pretrain.v5.loop import _configuration
 

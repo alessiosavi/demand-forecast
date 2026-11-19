@@ -130,6 +130,15 @@ The switch defaults to an empty list. The export records enabled names and
 the adapter uses them for scoring. Use the `no_derived` scoring variant to
 disable them on the same weights. `onset_rows` is reserved for a later presentation.
 
+**Optional horizon seed.** Set `model.horizon_seed: true` to add a projection
+of each forecast row's last encoder patch before each origin to every horizon
+token in that row. The seed is zero when that patch is unavailable or
+invalid, or when the forecast row or origin is padding. The projection's
+weights and bias start at zero, so the initial model gives the same forecasts
+in evaluation mode. At the default width of 384, the projection adds 147,840
+parameters. The option defaults to false and is omitted from saved
+configurations at that setting. Checkpoints and exports record it when enabled.
+
 ### Export as a resumable job
 
 Generate a job from a checkpoint's storage URI and SHA-256:

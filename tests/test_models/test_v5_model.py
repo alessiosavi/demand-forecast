@@ -76,6 +76,139 @@ def test_default_configuration_is_unchanged():
     assert model.config.expert_mode == "routed"
 
 
+@torch.no_grad()
+def test_seed_off_has_no_new_parameter_and_equal_outputs():
+    default = V5Model(TINY).eval()
+    model = V5Model(replace(TINY, horizon_seed=False)).eval()
+    assert not hasattr(model, "horizon_seed_projection")
+    assert model.state_dict().keys() == default.state_dict().keys()
+
+    model.load_state_dict(default.state_dict())
+    batch = toy_batch()
+    expected = default(batch).quantiles
+    actual = model(batch).quantiles
+    torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
+    # Median values from this batch at 2b098a1, before the seed option.
+    pinned = torch.tensor(
+        [[[0.150197, 0.053076, 0.039035, -0.095804], [0.059750, 0.261938, -0.013181, -0.044509]]]
+    )
+    torch.testing.assert_close(actual[:, :, 0, (0, 7, 16, 27), 4], pinned, rtol=0, atol=1e-5)
+
+
+@torch.no_grad()
+def test_seed_at_initialisation_equals_the_unseeded_model():
+    default = V5Model(TINY).eval()
+    model = V5Model(replace(TINY, horizon_seed=True)).eval()
+    projection = model.horizon_seed_projection
+    assert projection.weight.shape == (TINY.d_model, TINY.d_model)
+    assert projection.bias.shape == (TINY.d_model,)
+    missing, unexpected = model.load_state_dict(default.state_dict(), strict=False)
+    assert set(missing) == {"horizon_seed_projection.weight", "horizon_seed_projection.bias"}
+    assert not unexpected
+    assert projection.weight.count_nonzero() == projection.bias.count_nonzero() == 0
+    batch = toy_batch()
+    torch.testing.assert_close(
+        model(batch).quantiles, default(batch).quantiles, rtol=1e-6, atol=1e-6
+    )
+
+
+@torch.no_grad()
+def test_seed_reads_only_patches_before_each_origin(monkeypatch):
+    batch = toy_batch()
+    # Leave patches at or after both origins in the synthetic memory.
+    batch = replace(batch, origin_patches=batch.origin_patches - 1)
+    model = V5Model(replace(TINY, horizon_seed=True)).eval()
+    model.horizon_seed_projection.weight.copy_(torch.eye(TINY.d_model))
+    # Isolate the seed from the decoder's independent cross-attention memory path.
+    for block in model.decoder:
+        monkeypatch.setattr(
+            block.cross_attention, "forward", lambda query, *args, **kwargs: torch.zeros_like(query)
+        )
+    expected = model(batch).quantiles
+
+    def changed(start):
+        def perturb(_, _inputs, memory):
+            memory = memory.clone()
+            memory[0, batch.forecast_rows[0, 0], start:, 0] += 10
+            return memory
+
+        handle = model.encoder[-1].register_forward_hook(perturb)
+        try:
+            return model(batch).quantiles
+        finally:
+            handle.remove()
+
+    for i, origin in enumerate(batch.origin_patches[0].tolist()):
+        torch.testing.assert_close(changed(origin)[:, i], expected[:, i], rtol=1e-6, atol=1e-6)
+        assert not torch.allclose(changed(origin - 1)[:, i], expected[:, i], atol=1e-5)
+
+
+@pytest.mark.parametrize("field", ["origin_patches", "patch_valid", "forecast_mask", "origin_mask"])
+@torch.no_grad()
+def test_seed_with_no_patch_before_the_origin_is_zero(field):
+    batch = toy_batch()
+    if field == "patch_valid":
+        batch.patch_valid[0, batch.forecast_rows[0, 0], batch.origin_patches[0, 0] - 1] = False
+    else:
+        getattr(batch, field)[0, 0] = 0
+    model = V5Model(replace(TINY, horizon_seed=True)).eval()
+    seen = []
+    # Nonzero memory even at masked locations makes each pre-projection mask observable.
+    memory_hook = model.encoder[-1].register_forward_hook(
+        lambda _, _inputs, memory: torch.ones_like(memory)
+    )
+    seed_hook = model.horizon_seed_projection.register_forward_pre_hook(
+        lambda _, inputs: seen.append(inputs[0])
+    )
+    try:
+        model(batch)
+    finally:
+        seed_hook.remove()
+        memory_hook.remove()
+    (history,) = seen
+    assert history.shape == (1, 2, 1, TINY.d_model)
+    torch.testing.assert_close(history[0, 0, 0], torch.zeros(TINY.d_model), rtol=0, atol=0)
+    expected = torch.full((TINY.d_model,), float(field != "forecast_mask"))
+    torch.testing.assert_close(history[0, 1, 0], expected, rtol=0, atol=0)
+
+
+@torch.no_grad()
+def test_seed_bias_is_zero_for_invalid_patches_and_padding():
+    full = EpisodeBuilder(bare_panel(n_targets=2)).build(EpisodeRequest(0, (320, 336), 5, 64))
+    short = EpisodeBuilder(bare_panel()).build(EpisodeRequest(0, (320,), 5, 32))
+    batch = collate([full, short, short])
+    # Give the padded origin a valid patch index so its mask is tested independently.
+    batch.origin_patches[1, 1] = batch.origin_patches[1, 0]
+    batch.patch_valid[2, batch.forecast_rows[2, 0], batch.origin_patches[2, 0] - 1] = False
+
+    unseeded = V5Model(TINY).eval()
+    # With query and calendar zero and gates open, the forecast tokens equal the seeds.
+    unseeded.query.zero_()
+    unseeded.horizon_calendar[-1].weight.zero_()
+    unseeded.horizon_calendar[-1].bias.zero_()
+    model = V5Model(replace(TINY, horizon_seed=True)).eval()
+    model.load_state_dict(unseeded.state_dict(), strict=False)
+    model.horizon_seed_projection.weight.zero_()
+    model.horizon_seed_projection.bias.fill_(0.1)
+
+    seen = []
+    with model.scale_shift.register_forward_pre_hook(lambda _, args: seen.append(args[0])):
+        actual = model(batch, model.gates(batch, mode="ones")).quantiles
+    _, seeds = seen
+    expected_seeds = seeds.new_tensor(
+        [[[0.1, 0.1], [0.1, 0.1]], [[0.1, 0], [0, 0]], [[0, 0], [0, 0]]]
+    )
+    torch.testing.assert_close(
+        seeds, expected_seeds[..., None, None].expand_as(seeds), rtol=0, atol=0
+    )
+
+    expected = unseeded(batch, unseeded.gates(batch, mode="ones")).quantiles
+    assert torch.equal(actual[2, 0, 0], expected[2, 0, 0])  # invalid patch
+    assert torch.equal(actual[1, 0, 1], expected[1, 0, 1])  # padded forecast row
+    assert torch.equal(actual[1, 1, 0], expected[1, 1, 0])  # padded origin
+    assert not torch.allclose(actual[1, 0, 0], expected[1, 0, 0])
+
+
 @pytest.mark.parametrize(
     ("config", "extra_expected", "delta_expected"),
     [(V5Config(), 106, 2724), (T1_MODEL, 58, 1380)],
@@ -707,6 +840,43 @@ def test_prune_remaps():
     torch.testing.assert_close(
         before.quantiles[:, :, :1], after.quantiles[:, :, :1], atol=1e-5, rtol=0
     )
+
+
+@torch.no_grad()
+def test_pruned_and_unpruned_forward_agree_with_the_seed():
+    episode = EpisodeBuilder(toy_panel(n_targets=3)).build(
+        EpisodeRequest(0, (320, 336), 28, 128, target="y")
+    )
+    shorter = EpisodeBuilder(bare_panel()).build(EpisodeRequest(0, (320,), 5, 32))
+    batch = collate([episode, shorter])
+    model = V5Model(replace(TINY, horizon_seed=True)).eval()
+    projection = model.horizon_seed_projection
+    projection.weight.copy_(torch.eye(TINY.d_model))
+    gates = model.gates(batch, mode="ones")
+    gates.row[0, batch.forecast_rows[0, 1]] = 0
+    reduced, remapped_gates = prune(batch, gates)
+    assert reduced.forecast_rows[0].tolist() == [0, 1]
+    assert batch.forecast_rows[0].tolist() == [0, 1, 2]
+
+    def run_and_check_seeds(current, current_gates, kept_slots):
+        memories, projected = [], []
+        with (
+            model.encoder[-1].register_forward_hook(lambda _, _args, out: memories.append(out)),
+            projection.register_forward_hook(lambda _, _args, out: projected.append(out)),
+        ):
+            quantiles = model(current, current_gates).quantiles
+        (memory,) = memories
+        (seeds,) = projected
+        rows = current.forecast_rows[0, kept_slots].tolist()
+        patches = (current.origin_patches[0] - 1).tolist()
+        expected = projection(memory[0, rows][:, patches].transpose(0, 1))
+        assert (expected[:, 0] != expected[:, 1]).any(dim=-1).all()
+        torch.testing.assert_close(seeds[0, :, kept_slots], expected, rtol=0, atol=0)
+        return quantiles[:, :, kept_slots]
+
+    before = run_and_check_seeds(batch, gates, [0, 2])
+    after = run_and_check_seeds(reduced, remapped_gates, [0, 1])
+    torch.testing.assert_close(before, after, rtol=1e-5, atol=1e-5)
 
 
 @pytest.mark.parametrize(
