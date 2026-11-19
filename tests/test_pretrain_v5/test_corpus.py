@@ -147,20 +147,19 @@ def test_long_ids_never_decoded_or_charged_to_numeric_budget(tmp_path, monkeypat
     assert ("target",) in requested
 
 
-def test_excluded_group_with_unparsed_frequency_is_scanned_but_not_counted(tmp_path, monkeypatch):
+def test_excluded_group_with_unparsed_frequency_is_skipped(tmp_path, monkeypatch):
     write_rows(tmp_path / "univariate/a/train-bad.parquet", [[np.zeros(32)]], freqs=["nonsense"])
-    original = pq.ParquetFile.read_row_group
-    scanned = []
+    module = api()
+    admitted = module.CorpusIndex.build(tmp_path)
 
-    def read(reader, i, columns=None, **kwargs):
-        scanned.append((i, columns))
-        return original(reader, i, columns=columns, **kwargs)
+    def scan(parquet, group, unparsed_frequencies):
+        pytest.fail(f"scanned frequencies for excluded group {group}")
 
-    monkeypatch.setattr(pq.ParquetFile, "read_row_group", read)
-    index = api().CorpusIndex.build(tmp_path, max_group_bytes=1)
+    monkeypatch.setattr(module, "_frequencies", scan)
+    index = module.CorpusIndex.build(tmp_path, max_group_bytes=1)
     assert index.rows == 0
-    assert index.excluded[0][:2] == ("univariate/a/train-bad.parquet", 0)
-    assert scanned == [(0, ["freq"])]
+    assert [group[:2] for group in index.excluded] == [("univariate/a/train-bad.parquet", 0)]
+    assert index.digest == admitted.digest
     assert index.unparsed_frequencies == {}
 
 

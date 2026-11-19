@@ -1,6 +1,7 @@
 """Contracts for the v5 input schema, cutoff kinds and affine scale."""
 
 from dataclasses import FrozenInstanceError, replace
+from inspect import signature
 
 import numpy as np
 import pandas as pd
@@ -383,6 +384,32 @@ def test_panel_validation_rejects_invalid_grid_and_shapes():
         bad = replace(item, dynamic={**item.dynamic, "temp": column})
         with pytest.raises(ValueError, match=rf"{item.item_id}.*temp"):
             replace(panel, items=(bad,)).validate()
+
+
+def test_panel_validation_uses_the_declared_frequency():
+    panel = replace(toy_panel(n_items=1), freq="W-SUN", epoch=pd.Timestamp("2024-01-03"))
+    with pytest.raises(ValueError, match="epoch must lie on the freq grid"):
+        panel.validate()
+    assert tuple(signature(Panel.validate).parameters) == ("self",)
+
+
+def test_panel_validation_reuses_the_parsed_frequency(monkeypatch):
+    sc._validation_offset.cache_clear()
+    parse = sc._parse_validation_offset
+    parse_calls = []
+
+    def count_parse(freq):
+        parse_calls.append(freq)
+        return parse(freq)
+
+    monkeypatch.setattr(sc, "_parse_validation_offset", count_parse)
+    panel = toy_panel(n_items=1)
+    try:
+        for i in range(200):
+            replace(panel, name=f"panel-{i}").validate()
+    finally:
+        sc._validation_offset.cache_clear()
+    assert parse_calls == ["D"]
 
 
 def test_schema_constants_match_plan():

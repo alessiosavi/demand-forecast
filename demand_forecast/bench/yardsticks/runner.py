@@ -13,7 +13,7 @@ from importlib.metadata import PackageNotFoundError, distribution, version
 from importlib.util import find_spec
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 from urllib.parse import urlparse
 
 import numpy as np
@@ -22,6 +22,9 @@ import yaml
 
 from demand_forecast.bench.run import _save_failures, _save_summaries, score_predictions
 from demand_forecast.bench.specs import dataset_fingerprint
+
+if TYPE_CHECKING:
+    from demand_forecast.bench.v5_panels import ParsedFrequency, TimeAxis
 
 PROTOCOL_VERSION = 1
 FEV_SOURCE = "9cf943c388e5cfaf352175ea3c69e408b197d997"
@@ -89,6 +92,8 @@ class SeriesInput:
     target: np.ndarray
     past: dict[str, np.ndarray]
     future: dict[str, np.ndarray]
+    axis: TimeAxis | None = None
+    static: dict[str, object] | None = None
 
 
 @dataclass
@@ -98,6 +103,10 @@ class WindowInput:
     ids: list[str]
     targets: list[str]
     items: list[SeriesInput]
+    freq: str | None = None
+    declared: dict[str, str] | None = None
+    class_labels: dict[str, tuple[str, ...]] | None = None
+    parsed_frequency: ParsedFrequency | None = None
 
 
 class Adapter(Protocol):
@@ -302,8 +311,38 @@ def prepare_windows(task, options: Options) -> list[WindowInput]:
     """Apply history/role/group ablations before an adapter sees the input."""
     windows = []
     targets = list(task.target_columns)
+    is_v5 = options.model == "v5"
+    freq = declared = class_labels = None
+    if is_v5:
+        from datasets import ClassLabel
+
+        from demand_forecast.bench.v5_panels import _positive_offset, _prove_time_axis
+
     for window in task.iter_windows():
         past, future = window.get_input_data()
+        if is_v5 and declared is None:
+            try:
+                freq = task.freq
+            except ValueError:
+                freq = None
+            declared, class_labels = {}, {}
+            columns = task.past_dynamic_columns + task.known_dynamic_columns + task.static_columns
+            # fev reconstructs the split datasets and loses ClassLabel metadata.
+            for col in columns:
+                feature = window.full_dataset.features[col]
+                while hasattr(feature, "feature"):
+                    feature = feature.feature
+                dtype = getattr(feature, "dtype", "")
+                if isinstance(feature, ClassLabel):
+                    declared[col] = "class_label"
+                    class_labels[col] = tuple(feature.names)
+                elif dtype == "bool":
+                    declared[col] = "boolean"
+                elif dtype.startswith(("int", "uint", "float", "decimal")):
+                    declared[col] = "number"
+                elif dtype.startswith(("string", "large_string")):
+                    declared[col] = "string"
+        parsed_frequency = _positive_offset(freq) if is_v5 else None
         future_by_id = {str(row[task.id_column]): row for row in future}
         ids, items = [], []
         for i, row in enumerate(past):
@@ -312,7 +351,18 @@ def prepare_windows(task, options: Options) -> list[WindowInput]:
             target = np.stack([np.asarray(row[t], dtype=np.float64) for t in targets])
             # Default caps are checkpoint settings, enforced by each adapter. An
             # explicit ablation is applied here to every dynamic history column.
-            start = max(0, target.shape[-1] - options.max_context) if options.max_context else 0
+            start = 0
+            if not is_v5 and options.max_context:
+                start = max(0, target.shape[-1] - options.max_context)
+            axis = static = None
+            if parsed_frequency is not None:
+                axis = _prove_time_axis(
+                    np.asarray(row[task.timestamp_column]),
+                    parsed_frequency,
+                    future=np.asarray(future_by_id[key][task.timestamp_column]),
+                    horizon=task.horizon,
+                )
+                static = {col: row[col] for col in task.static_columns}
             history, known = {}, {}
             if options.covariates == "all":
                 history = {
@@ -324,16 +374,32 @@ def prepare_windows(task, options: Options) -> list[WindowInput]:
                 for j in range(len(targets)):
                     items.append(
                         SeriesInput(
-                            i, (j,), target[j : j + 1, start:], history.copy(), known.copy()
+                            i,
+                            (j,),
+                            target[j : j + 1, start:],
+                            history.copy(),
+                            known.copy(),
+                            axis,
+                            static,
                         )
                     )
             else:
                 items.append(
-                    SeriesInput(i, tuple(range(len(targets))), target[:, start:], history, known)
+                    SeriesInput(
+                        i,
+                        tuple(range(len(targets))),
+                        target[:, start:],
+                        history,
+                        known,
+                        axis,
+                        static,
+                    )
                 )
         if len(set(ids)) != len(ids):
             raise ValueError("duplicate fev item ids")
-        windows.append(WindowInput(ids, targets, items))
+        windows.append(
+            WindowInput(ids, targets, items, freq, declared, class_labels, parsed_frequency)
+        )
     return windows
 
 

@@ -16,6 +16,9 @@ def write_rows(
     item_id_size=8,
     compression="snappy",
     value_type=None,
+    domains=None,
+    subdomains=None,
+    covariate_names=None,
 ) -> Path:
     import pyarrow as pa
     import pyarrow.parquet as pq
@@ -34,6 +37,10 @@ def write_rows(
                 ("covariate_names", pa.list_(pa.string())),
             ]
         )
+    optional_labels = {"domain": domains, "subdomain": subdomains}
+    schema.extend(
+        (name, pa.string()) for name, labels in optional_labels.items() if labels is not None
+    )
     rows = []
     for i, target in enumerate(targets):
         row = {
@@ -44,7 +51,14 @@ def write_rows(
         }
         if kind == "covariates":
             row["covariates"] = covariates[i]
-            row["covariate_names"] = [f"driver_{j}" for j in range(len(covariates[i]))]
+            row["covariate_names"] = (
+                covariate_names[i]
+                if covariate_names is not None
+                else [f"driver_{j}" for j in range(len(covariates[i]))]
+            )
+        row.update(
+            (name, labels[i]) for name, labels in optional_labels.items() if labels is not None
+        )
         rows.append(row)
     path.parent.mkdir(parents=True, exist_ok=True)
     pq.write_table(
