@@ -286,6 +286,15 @@ manifest, so they remain valid when copied locally; this uses additional disk
 and bucket space per evaluation. There are no parent-relative paths or symlinks
 in a manifest. Checkpoint bytes also carry the training loop's SHA-256 footer.
 
+**Training loss.** The step projection, quantile head and training loss use
+float32 under mixed precision so small quantile gaps survive at large scaled
+levels. Set `optim.label_cap` to a finite positive value to exclude supervised
+cells whose absolute scaled labels exceed it. The pinball loss averages the
+remaining cells. When every cell is excluded, the sparsity and balance penalties
+still drive the update. With a cap set, each `history.jsonl` record reports the
+total `capped` cells across all batches in its logging window. Qualification
+applies the cap in its training trials and worst-batch measurement.
+
 **Corpus sampling.** The default `folder_power: null` draws uniformly across
 admitted rows. With a power in `[0, 1]`, the source draws a `<kind>/<dataset>`
 folder with weight `values ** folder_power`, using the number of numeric entries

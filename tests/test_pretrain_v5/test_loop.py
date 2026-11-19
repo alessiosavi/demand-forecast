@@ -103,6 +103,48 @@ def test_resume_is_bitwise_equal_including_partial_history(tmp_path, monkeypatch
     ] == resumed.history
 
 
+def test_history_and_resume_with_the_cap(tmp_path, monkeypatch):
+    loop = api()
+    base = config(steps=6, ema=0.9)
+    c = replace(base, optim=replace(base.optim, label_cap=1.0))
+    observed = []
+
+    def observe(output, batch, model, **kwargs):
+        batch.labels.fill_(2.0)
+        loss, parts = v5_loss(output, batch, model, **kwargs)
+        observed.append(parts["capped"])
+        if len(observed) == 2:
+            loss = loss * float("nan")
+        return loss, parts
+
+    monkeypatch.setattr(loop, "v5_loss", observe)
+    reference = loop.train(c, tmp_path / "full")
+    assert (reference.updates, reference.skipped) == (5, 1)
+    assert all(count > 0 for count in observed)
+    assert [entry["capped"] for entry in reference.history] == [
+        sum(observed[:3]),
+        sum(observed[3:]),
+    ]
+    assert all(
+        type(entry["capped"]) is int and "capped" not in entry["parts"]
+        for entry in reference.history
+    )
+    observed.clear()
+    state = tmp_path / "resume"
+    interrupted = loop.train(c, state, stop_after=2)
+    assert (interrupted.updates, interrupted.skipped, interrupted.stop_reason) == (
+        1,
+        1,
+        "interrupted",
+    )
+    resumed = loop.train(c, state)
+    training_equal(payload(reference), payload(resumed))
+    assert (state / "history.jsonl").read_bytes() == (
+        tmp_path / "full" / "history.jsonl"
+    ).read_bytes()
+    assert loop.load_model(resumed.checkpoint)[1] == c
+
+
 def test_resume_without_saved_scaler_starts_fresh_scaler(tmp_path, monkeypatch):
     loop = api()
     c = config(steps=3)

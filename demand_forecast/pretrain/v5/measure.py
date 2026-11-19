@@ -491,7 +491,7 @@ def _worst_measure(config, device):
     def forward_loss():
         with torch.autocast(device.type, dtype=dtype, enabled=amp):
             output = model(batch, model.gates(batch, mode="ones"), router=config.router)
-            return v5_loss(output, batch, config.model)[0]
+            return v5_loss(output, batch, config.model, label_cap=config.optim.label_cap)[0]
 
     loss, forward_seconds = _timed(device, forward_loss)
     _, backward_seconds = _timed(
