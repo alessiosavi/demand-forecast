@@ -13,6 +13,7 @@ from demand_forecast.data.episode import (
     Item,
     Panel,
     collate,
+    derived,
     panel_stats,
 )
 from demand_forecast.data.episode import builder as episode_builder
@@ -20,7 +21,7 @@ from demand_forecast.data.episode.bank import summary_vectors
 from demand_forecast.data.episode.builder import DROPPABLE
 from demand_forecast.data.episode.kinds import flag_codes
 from demand_forecast.data.episode.panel_stats import PanelStats
-from demand_forecast.data.episode.scale import fit_scale, to_scaled
+from demand_forecast.data.episode.scale import compress, fit_scale, to_scaled
 from demand_forecast.data.episode.schema import (
     CH_OBSERVED,
     CH_STEP,
@@ -30,6 +31,7 @@ from demand_forecast.data.episode.schema import (
     CH_VALUE_STATS,
     KIND_CATEGORY,
     KIND_FLAG,
+    KIND_NUMBER,
     MAX_FEATURE_ROWS,
     ROLE_KNOWN,
     ROLE_PANEL,
@@ -41,7 +43,8 @@ from demand_forecast.data.episode.schema import (
 )
 from demand_forecast.data.episode.screening import ScreeningConfig, relevance_number
 from demand_forecast.data.episode.value_stats import category_step_stats
-from tests.helpers.episodes import perturb_after, toy_panel
+from tests.helpers.episodes import lag_panel, perturb_after, toy_panel
+from tests.helpers.lag_scan_reference import scan_delay as reference_scan
 
 
 def _plain(panel):
@@ -78,7 +81,7 @@ def test_default_requests_are_unchanged():
     builder = EpisodeBuilder(panel)
     request = EpisodeRequest(1, (320, 336), 16, 64, "y", 304)
     baseline = builder.build(request)
-    for derive in (frozenset(), frozenset({"lag_rows", "onset_rows"})):
+    for derive in (frozenset(), frozenset({"onset_rows"})):
         actual = builder.build(replace(request, derive=derive))
         _equal_exact(baseline, actual)
 
@@ -987,3 +990,229 @@ def test_apply_summary_off_returns_the_transformed_episode():
     np.testing.assert_array_equal(result.row_summary, original)
     assert not result.cand_flags[..., i].any()
     assert not result.row_summary_flags[..., i].any()
+
+
+def test_scan_is_computed_once_per_item_column_target_cutoff(monkeypatch):
+    panel = lag_panel(length=730)
+    item = panel.items[0]
+    item = replace(
+        item,
+        targets={"z": item.targets["y"], "y": item.dynamic["driver"].copy()},
+        dynamic={**item.dynamic, "second": item.dynamic["driver"] + item.targets["y"] / 10},
+    )
+    panel = replace(
+        panel,
+        items=(item, replace(item, item_id="second")),
+        roles={"driver": "past", "second": "past"},
+    )
+    calls = []
+    real_scan = getattr(derived, "scan_delay", None)
+
+    def record(x, y, **kwargs):
+        calls.append((x.copy(), y.copy()))
+        return real_scan(x, y, **kwargs)
+
+    monkeypatch.setattr(derived, "scan_delay", record, raising=False)
+    builder = EpisodeBuilder(panel)
+    request = EpisodeRequest(0, (700,), 12, 128, target="z", cutoff=696)
+    builder.build(request)
+    assert calls == []
+
+    enabled = replace(request, derive=frozenset({"lag_rows"}))
+    (planned,) = builder.plan_requests(
+        0, enabled.origins, 12, context=128, cutoff=696, derive=enabled.derive
+    )
+    assert planned.target is None
+    assert (
+        "driver~lag" not in builder.build(planned).row_names
+    )  # Sorted first target is contemporaneous.
+    assert len(calls) == 2
+    assert "driver~lag" in builder.build(enabled).row_names
+    assert len(calls) == 4
+    assert {x.tobytes() for x, _ in calls[2:]} == {
+        values[184:696].tobytes() for values in item.dynamic.values()
+    }
+    for _, y in calls[2:]:
+        np.testing.assert_array_equal(y, item.targets["z"][184:696])
+    builder.build(enabled)
+    builder.build(replace(enabled, target="y"))
+    assert len(calls) == 4  # Hits include rejected scans and joint/designated requests for y.
+    strict = EpisodeBuilder(panel, ScreeningConfig(no_evidence=1.0), stats=builder.stats)
+    assert "driver~lag" not in strict.build(enabled).row_names
+    assert len(calls) == 4
+
+    builder.build(replace(enabled, item_index=1))
+    builder.build(replace(enabled, cutoff=700))
+    assert len(calls) == 8
+    builder.stats.release(696)
+    builder.build(replace(enabled, cutoff=700))
+    builder.build(enabled)
+    assert len(calls) == 10
+
+
+def test_lag_row_layout():
+    panel = lag_panel(start=19)
+    item = panel.items[0]
+    origin, cutoff, delay = 531, 523, 5
+    request = EpisodeRequest(0, (origin,), 12, 544, cutoff=cutoff, derive=frozenset({"lag_rows"}))
+    episode = EpisodeBuilder(panel).build(request)
+    index = episode.row_names.index("driver~lag")
+    assert episode.row_kind[index] == KIND_NUMBER
+    assert episode.row_role[index] == ROLE_KNOWN
+    assert episode.row_cand[index] == -1
+    assert episode.row_keys[index] == ("derived", "driver~lag")
+    end = cutoff - item.start
+    found, score, _ = reference_scan(item.dynamic["driver"][:end], item.targets["y"][:end], 1)
+    assert found == delay
+    assert episode.row_score[index] == pytest.approx(score)
+    assert episode.trace[-1] == episode_builder.Candidate(
+        "driver~lag", "derived", KIND_NUMBER, pytest.approx(score), None
+    )
+
+    shifted = np.full_like(item.dynamic["driver"], np.nan)
+    shifted[delay:] = item.dynamic["driver"][:-delay]
+    shifted_panel = replace(
+        panel, items=(replace(item, dynamic={"shifted": shifted}),), roles={"shifted": "known"}
+    )
+    ordinary = EpisodeBuilder(shifted_panel).build(replace(request, derive=frozenset()))
+    reference = ordinary.row_names.index("shifted")
+    for name in ("x", "row_summary", "row_summary_flags"):
+        np.testing.assert_allclose(
+            getattr(episode, name)[index], getattr(ordinary, name)[reference], atol=1e-6
+        )
+    context = episode.x[index].reshape(request.context, -1)
+    assert not context[: item.start + delay - (origin - request.context)].any()
+
+
+def test_horizon_cells_per_origin():
+    delay = 5
+    panel = lag_panel(start=19, delay=delay)
+    driver = panel.items[0].dynamic["driver"]
+    origins = (531, 547)
+    driver[origins[0] - 2 - panel.items[0].start] = np.nan
+    request = EpisodeRequest(0, origins, 12, 544, derive=frozenset({"lag_rows"}))
+    episode = EpisodeBuilder(panel).build(request)
+    index = episode.row_names.index("driver~lag")
+    (known,) = np.flatnonzero(episode.known_rows == index)
+    shifted = np.r_[np.full(delay, np.nan), driver]
+    scale = fit_scale(shifted, origins[0] - panel.items[0].start, 1)
+    for oi, origin in enumerate(origins):
+        local = origin - panel.items[0].start
+        actual = episode.xh[oi, known].reshape(-1, episode.xh.shape[-1])
+        expected = np.zeros_like(actual)
+        source = driver[local - delay : local]
+        observed = np.isfinite(source)
+        expected[:delay, CH_OBSERVED] = observed
+        expected[:delay, CH_VALUE] = np.where(observed, compress(to_scaled(source, scale)), 0)
+        np.testing.assert_allclose(actual, expected, atol=1e-6)
+
+
+def test_nothing_at_or_after_an_origin_is_read():
+    panel = lag_panel(start=19)
+    request = EpisodeRequest(0, (531, 547), 12, 544, derive=frozenset({"lag_rows"}))
+    original = EpisodeBuilder(panel).build(request)
+    altered = EpisodeBuilder(perturb_after(panel, request.origins[0])).build(request)
+    assert "driver~lag" in original.row_names
+    _equal_exact(original, altered, exclude=("x", "xh", "labels"))
+    prefix = original.origin_patches[0]
+    np.testing.assert_array_equal(original.x[:, :prefix], altered.x[:, :prefix])
+    np.testing.assert_array_equal(original.xh[0], altered.xh[0])
+    assert not np.array_equal(original.xh[1], altered.xh[1])
+
+
+def _fill_legacy_slots(panel, count):
+    item = panel.items[0]
+    columns = {f"known{i}": item.targets["y"] + i for i in range(count)}
+    return replace(
+        panel,
+        items=(replace(item, dynamic={**item.dynamic, **columns}),),
+        roles={**panel.roles, **dict.fromkeys(columns, "known")},
+    )
+
+
+def test_bases_first_under_the_cap():
+    panel = _fill_legacy_slots(lag_panel(), MAX_FEATURE_ROWS - 2)
+    builder = EpisodeBuilder(panel)
+    request = EpisodeRequest(0, (512,), 12, 128)
+    enabled = replace(request, derive=frozenset({"lag_rows"}))
+    legacy, actual = builder.build(request), builder.build(enabled)
+    assert len(actual.row_names) == len(legacy.row_names) + 1
+    assert set(actual.row_names) == {*legacy.row_names, "driver~lag"}
+    for i, name in enumerate(legacy.row_names):
+        np.testing.assert_array_equal(actual.x[actual.row_names.index(name)], legacy.x[i])
+    assert actual.trace[:-1] == legacy.trace
+    (planned,) = builder.plan_requests(0, (512,), 12, context=128, derive=enabled.derive)
+    _equal_exact(builder.build(planned), actual)
+    for restriction in (
+        {"drop": frozenset({"features"})},
+        {"keep_columns": frozenset({"known0"})},
+    ):
+        restricted = builder.build(replace(enabled, **restriction))
+        assert "driver" not in restricted.row_names
+        assert all(c.source != "derived" for c in restricted.trace)
+
+
+def test_name_collision_builds_nothing():
+    panel = lag_panel()
+    builder = EpisodeBuilder(panel)
+    request = EpisodeRequest(0, (512,), 12, 128, derive=frozenset({"lag_rows"}))
+    assert "driver~lag" in builder.build(request).row_names
+    item = panel.items[0]
+    collision = np.zeros_like(item.targets["y"])  # A screened-out column still reserves its name.
+    panel = replace(
+        panel,
+        items=(replace(item, dynamic={**item.dynamic, "driver~lag": collision}),),
+        roles={**panel.roles, "driver~lag": "past"},
+    )
+    actual = EpisodeBuilder(panel).build(request)
+    assert "driver~lag" not in actual.row_names
+    assert all(c.source != "derived" for c in actual.trace)
+
+
+def test_no_scan_without_a_free_slot(monkeypatch):
+    panel = _fill_legacy_slots(lag_panel(), MAX_FEATURE_ROWS - 1)
+    builder = EpisodeBuilder(panel)
+    request = EpisodeRequest(0, (512,), 12, 128)
+    calls = 0
+    real_scan = derived.scan_delay
+
+    def record(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return real_scan(*args, **kwargs)
+
+    monkeypatch.setattr(derived, "scan_delay", record)
+    legacy = builder.build(request)
+    assert "driver" in legacy.row_names and len(legacy.row_names) == MAX_FEATURE_ROWS + 1
+    actual = builder.build(replace(request, derive=frozenset({"lag_rows"})))
+    assert calls == 0
+    _equal_exact(legacy, actual)
+
+
+def test_overflow_is_traced_as_budget():
+    panel = _fill_legacy_slots(lag_panel(), MAX_FEATURE_ROWS - 3)
+    item = panel.items[0]
+    second = item.dynamic["driver"] + np.random.default_rng(829).normal(scale=0.3, size=560)
+    panel = replace(
+        panel,
+        items=(replace(item, dynamic={**item.dynamic, "a_second": second}),),
+        roles={**panel.roles, "a_second": "past"},
+    )
+    builder = EpisodeBuilder(panel)
+    request = EpisodeRequest(0, (512,), 12, 128, derive=frozenset({"lag_rows"}))
+    actual = builder.build(request)
+    assert "driver~lag" in actual.row_names
+    assert "a_second" in actual.row_names and "a_second~lag" not in actual.row_names
+    kept, budget = [c for c in actual.trace if c.source == "derived"]
+    assert kept.name == "driver~lag" and kept.removed is None
+    assert budget.name == "a_second~lag" and budget.removed == "budget"
+    assert kept.score > budget.score
+
+
+def test_a_delay_longer_than_the_horizon_covers_it():
+    panel = lag_panel(delay=11)
+    request = EpisodeRequest(0, (512,), 4, 128, derive=frozenset({"lag_rows"}))
+    actual = EpisodeBuilder(panel).build(request)
+    (i,) = np.flatnonzero(actual.known_rows == actual.row_names.index("driver~lag"))
+    np.testing.assert_array_equal(actual.xh[0, i, 0, :4, CH_OBSERVED], np.ones(4))
+    assert not actual.xh[0, i, 0, 4:].any()

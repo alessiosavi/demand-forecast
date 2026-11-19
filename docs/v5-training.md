@@ -118,10 +118,17 @@ level it estimates the noise spread. For AR(1) noise it estimates
 `sigma * sqrt(1 - rho)` at constant level, with half the squared baseline step
 added to the squared statistic when the level moves.
 
+Enable `lag_rows` to give a retained past-only numeric column a known row
+named `<column>~lag` when its recent history supports a delayed effect. The
+scan uses up to 512 cells before the statistics cutoff and considers delays
+up to 64 cells. A lag row takes a free feature slot and uses the known-row
+gate floor. At each origin its horizon shows shifted values only when their
+source cells are finite and strictly before that origin. Forecast evidence
+reports the lag row separately as `derived:<column>~lag`.
+
 The switch defaults to an empty list. The export records enabled names and
 the adapter uses them for scoring. Use the `no_derived` scoring variant to
-disable them on the same weights. `lag_rows` and `onset_rows` are accepted names
-reserved for later presentations.
+disable them on the same weights. `onset_rows` is reserved for a later presentation.
 
 ### Export as a resumable job
 

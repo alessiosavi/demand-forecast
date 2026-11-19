@@ -5,6 +5,7 @@ from dataclasses import dataclass, replace
 
 import numpy as np
 
+from . import derived
 from .bank import step_features, summary_vectors
 from .calendar import calendar_arrays
 from .kinds import flag_codes, labels_of, observed_mask
@@ -83,8 +84,8 @@ class Episode:
     ``row_keys`` has one entry per row in the final row order: the
     ``(source, name)`` of the screening candidate that produced a sibling or
     dynamic row (every label row and the effect row of an expanded category
-    carry the category's key), and ``None`` for forecast, peer and whole-panel
-    rows.
+    carry the category's key), ``("derived", name)`` for optional derived rows,
+    and ``None`` for forecast, peer and whole-panel rows.
     """
 
     x: np.ndarray
@@ -157,6 +158,7 @@ class _Row:
     cand: int = -1
     support: np.ndarray | None = None
     candidate_key: tuple[str, str] | None = None
+    lag_delay: int = 0
 
 
 def _array(values: object, dtype: type, *shape: int) -> np.ndarray:
@@ -472,6 +474,59 @@ class EpisodeBuilder:
         )
         return rows
 
+    def _lag_rows(
+        self, rows: list[_Row], stats: PanelStats, item_index: int, slots: int
+    ) -> tuple[list[_Row], list[Candidate]]:
+        item = self.panel.items[item_index]
+        end = max(0, stats.cutoff - item.start)
+        left = max(0, end - derived.LAG_SCAN_WINDOW)
+        names = {*item.dynamic, *item.targets, *item.static, *(row.name for row in rows)}
+        proposals = []
+        for base in rows:
+            name = f"{base.name}~lag"
+            if (
+                base.role != ROLE_PAST
+                or base.kind != KIND_NUMBER
+                or "=" in base.name
+                or "~" in base.name
+                or name in names
+            ):
+                continue
+            key = item_index, base.name
+            if key not in stats.lag_cache:
+                # The provider may be shared by builders with different no_evidence thresholds.
+                stats.lag_cache[key] = derived.scan_delay(
+                    _window(base.raw, left, end),
+                    _window(item.targets[stats.target], left, end),
+                    season=self.panel.season,
+                    no_evidence=0.0,
+                )
+            delay, score, _ = stats.lag_cache[key]
+            if delay and score > self.config.no_evidence:
+                proposals.append(
+                    (Candidate(name, "derived", KIND_NUMBER, score, None), base, delay)
+                )
+        proposals.sort(key=lambda proposal: (-proposal[0].score, proposal[0].name))
+
+        admitted, trace = [], []
+        for candidate, base, delay in proposals[:slots]:
+            shifted = np.pad(base.raw, (delay, 0), constant_values=np.nan)
+            row = self._row(
+                candidate.name,
+                shifted,
+                KIND_NUMBER,
+                ROLE_KNOWN,
+                candidate.score,
+                end,
+                cutoff=stats.cutoff,
+            )
+            row.candidate_key = candidate.source, candidate.name
+            row.lag_delay = delay
+            admitted.append(row)
+            trace.append(candidate)
+        trace.extend(replace(candidate, removed="budget") for candidate, _, _ in proposals[slots:])
+        return admitted, trace
+
     def build(self, request: EpisodeRequest) -> Episode:
         """Materialise one episode, keeping unavailable input cells identically zero."""
         cutoff = self._validate(request)
@@ -648,6 +703,11 @@ class EpisodeBuilder:
             ]
         )
         rows.extend(panel_rows)
+        if "lag_rows" in request.derive and len(features) < MAX_FEATURE_ROWS:
+            slots = MAX_FEATURE_ROWS - len(features)
+            lag_rows, lag_trace = self._lag_rows(rows, stats, request.item_index, slots)
+            rows.extend(lag_rows)
+            trace.extend(lag_trace)
         rows.sort(key=lambda row: (row.role, row.name))
 
         x, patch_valid = [], []
@@ -685,10 +745,13 @@ class EpisodeBuilder:
                 )
                 label_mask[oi, fi, : request.horizon] = valid
             for ki, ri in enumerate(known_rows):
-                xh[oi, ki, : request.horizon] = self._encode(
-                    rows[ri],
+                row = rows[ri]
+                # After the delay, the shifted source is at or after this origin.
+                visible = min(request.horizon, row.lag_delay or request.horizon)
+                xh[oi, ki, :visible] = self._encode(
+                    row,
                     local,
-                    local + request.horizon,
+                    local + visible,
                     target_scaled,
                     frozen_at=local,
                     horizon=True,

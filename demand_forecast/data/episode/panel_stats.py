@@ -30,6 +30,7 @@ class PanelStats:
         self.target = target
         self.cutoff = cutoff
         self.screen_cache: dict = {}
+        self.lag_cache: dict[tuple[int, str], tuple[int, float, float]] = {}
         self.scales: list[Scale] = []
         self._eligible = np.zeros(len(panel.items), dtype=bool)
         for i, item in enumerate(panel.items):
