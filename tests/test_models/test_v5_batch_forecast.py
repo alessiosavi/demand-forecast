@@ -117,6 +117,8 @@ def test_equals_single_episode_forecast(model):
 
 
 def test_float64_forecasts_match_float32_and_single_episode(model, monkeypatch):
+    if not torch.amp.autocast_mode.is_autocast_available("cpu"):
+        pytest.skip("CPU autocast is unavailable")
     panel = _panel(n_items=2, n_targets=2)
     jobs = [(0, 40), (1, 44)]
     double_model = deepcopy(model).double()
@@ -262,6 +264,30 @@ def test_per_item_origins_use_their_own_cutoff(model, monkeypatch):
     assert events == expected_events
 
 
+def test_explicit_layouts_hold_statistics_of_one_origin_at_a_time(model, monkeypatch):
+    panel = _panel(n_items=6, n_targets=2)
+    panel = replace(panel, items=tuple(replace(item, static={}) for item in panel.items))
+    jobs = [(index, 40 + index) for index in range(6)]
+    expected = v5.forecast_items(model, panel, jobs, 3, context=CONTEXT)
+    cached_cutoffs = []
+    real_get = PanelStatsProvider.get
+
+    def get(self, target, cutoff):
+        stats = real_get(self, target, cutoff)
+        cached_cutoffs.append({cached_cutoff for _, cached_cutoff in self._cache})
+        return stats
+
+    monkeypatch.setattr(PanelStatsProvider, "get", get)
+    actual = v5.forecast_items(model, panel, jobs, 3, context=CONTEXT, layouts=["joint"] * 6)
+
+    assert max(map(len, cached_cutoffs)) == 1
+    assert actual.stats_builds == expected.stats_builds
+    assert actual.fallback == expected.fallback
+    assert actual.values.keys() == expected.values.keys()
+    for key in expected.values:
+        np.testing.assert_array_equal(actual.values[key], expected.values[key])
+
+
 def test_later_observations_of_another_item_do_not_change_a_forecast(model, monkeypatch):
     panel = _panel()
     jobs = [(0, 48), (1, 40)]
@@ -340,22 +366,21 @@ def test_planned_layouts_match_forecasts_with_feature_drop(
 
 
 @pytest.mark.parametrize(
-    "jobs,layouts",
+    "jobs,layouts,earlier_origins",
     [
-        ([(0, 40)], ["joint"]),
-        ([(2, 44), (0, 40), (1, 36)], ["joint", "joint", "per_target"]),
+        ([(0, 40)], ["joint"], ()),
+        ([(2, 44), (0, 40), (1, 36)], ["joint", "joint", "per_target"], (36,)),
+        ([(1, 36), (0, 40)], ["per_target", "joint"], (36,)),
     ],
-    ids=["single-job", "unsorted-jobs"],
+    ids=["single-job", "unsorted-jobs", "later-origin"],
 )
-def test_incompatible_joint_layout_is_refused_before_forecasting(model, monkeypatch, jobs, layouts):
+def test_incompatible_joint_layout_is_refused_before_forecasting_its_origin(
+    model, monkeypatch, jobs, layouts, earlier_origins
+):
     panel = _panel_with_known_category()
     batches = _record_batches(model, monkeypatch)
-    mode_changes, built_at = [], []
-    real_train, real_get = model.train, PanelStatsProvider.get
-
-    def train(mode=True):
-        mode_changes.append(mode)
-        return real_train(mode)
+    built_at = []
+    real_get = PanelStatsProvider.get
 
     def get(self, target, cutoff):
         before = self.builds
@@ -364,16 +389,16 @@ def test_incompatible_joint_layout_is_refused_before_forecasting(model, monkeypa
             built_at.append(cutoff)
         return stats
 
-    monkeypatch.setattr(model, "train", train)
     monkeypatch.setattr(PanelStatsProvider, "get", get)
 
-    with pytest.raises(ValueError, match=r"item index 0.*origin 40.*must be forecast per target"):
+    with pytest.raises(
+        ValueError, match=r"^item index 0 at origin 40 must be forecast per target$"
+    ):
         v5.forecast_items(model, panel, jobs, 3, context=CONTEXT, layouts=layouts)
 
-    assert not mode_changes
     assert model.training
-    assert not batches
-    assert 44 not in built_at
+    assert [batch.context_target for batch, _ in batches] == [["y", "y1"] for _ in earlier_origins]
+    assert set(built_at) == {*earlier_origins, 40}
 
 
 def test_more_than_sixteen_targets_always_split(model):
@@ -441,6 +466,8 @@ def test_screening_no_evidence_reaches_the_model(model, monkeypatch):
 
 
 def test_gates_ones_and_uniform_router_reach_the_model(model, monkeypatch):
+    if not torch.amp.autocast_mode.is_autocast_available("cpu"):
+        pytest.skip("CPU autocast is unavailable")
     panel = _panel()
     with torch.no_grad():
         model.gate_net.net[-1].bias.fill_(-20)
