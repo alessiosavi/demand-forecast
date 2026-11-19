@@ -76,10 +76,79 @@ def in_process_loader(monkeypatch):
     monkeypatch.setattr(batch_forecast, "DataLoader", InProcessLoader, raising=False)
 
 
+def test_one_chunk_uses_the_calling_process(model, panel, monkeypatch, in_process_loader):
+    def fail_loader(*args, **kwargs):
+        pytest.fail("a single chunk should not create a DataLoader")
+
+    monkeypatch.setattr(batch_forecast, "DataLoader", fail_loader)
+    jobs = [(0, 40)]
+    options = {"context": CONTEXT, "batch_episodes": 2}
+    serial = v5.forecast_items(model, panel, jobs, HORIZON, workers=0, **options)
+    actual = v5.forecast_items(model, panel, jobs, HORIZON, workers=2, **options)
+
+    assert list(actual.values) == list(serial.values)
+    assert actual.fallback == serial.fallback
+    assert actual.stats_builds == serial.stats_builds
+    _assert_evidence_equal(actual.evidence, serial.evidence)
+    for key, value in actual.values.items():
+        np.testing.assert_array_equal(value, serial.values[key])
+
+
+@pytest.mark.parametrize("chunks,workers,expected_workers", [(3, 8, 3), (5, 2, 2)])
+def test_loader_worker_count_is_capped_by_chunks(
+    model, monkeypatch, in_process_loader, chunks, workers, expected_workers
+):
+    calls = []
+
+    def loader(dataset, **kwargs):
+        calls.append((len(dataset), kwargs["num_workers"]))
+        return InProcessLoader(dataset, **kwargs)
+
+    monkeypatch.setattr(batch_forecast, "DataLoader", loader)
+    panel = toy_panel(n_items=chunks, length=56, seed=37)
+    jobs = [(index, 40) for index in range(chunks)]
+    v5.forecast_items(
+        model, panel, jobs, HORIZON, context=CONTEXT, batch_episodes=1, workers=workers
+    )
+
+    assert calls == [(chunks, expected_workers)]
+
+
+@pytest.mark.parametrize(
+    "platform,requested,limit_error,expected",
+    [
+        ("linux", 0, None, (0, None)),
+        ("linux", 2, "injected file limit error", (0, "injected file limit error")),
+        ("darwin", 2, None, (0, "forecast workers are supported only on Linux")),
+        ("linux", 2, None, (2, None)),
+    ],
+    ids=["zero", "file-limit", "off-linux", "supported"],
+)
+def test_usable_workers(monkeypatch, platform, requested, limit_error, expected):
+    checked = []
+
+    def ensure_file_limit(workers):
+        checked.append(workers)
+        if limit_error is not None:
+            raise RuntimeError(limit_error)
+
+    monkeypatch.setattr(batch_forecast, "sys", SimpleNamespace(platform=platform))
+    monkeypatch.setattr(sampler, "_ensure_worker_file_limit", ensure_file_limit)
+
+    assert v5.usable_workers(requested) == expected
+    assert checked == ([requested] if requested and platform == "linux" else [])
+
+
+@pytest.mark.parametrize("requested", [-1, True, 1.5, "2"])
+def test_usable_workers_refuses_what_forecast_items_refuses(requested):
+    with pytest.raises(ValueError, match="nonnegative integer"):
+        v5.usable_workers(requested)
+
+
 @linux_workers
 def test_workers_give_identical_forecasts(model, panel, monkeypatch, worker_timeout):
     jobs = [(2, 40), (0, 40), (3, 40), (1, 36)]
-    options = {"context": CONTEXT, "batch_episodes": 3}
+    options = {"context": CONTEXT, "batch_episodes": 1}
     builder = EpisodeBuilder(panel)
     expected, scales = {}, {}
     for index, origin in jobs:
@@ -127,12 +196,12 @@ def test_workers_give_identical_forecasts(model, panel, monkeypatch, worker_time
 
 @linux_workers
 @pytest.mark.parametrize(
-    "origins,has_statics",
-    [((40, 40, 40, 40), True), ((40, 36, 40, 44), True), ((40, 40, 40, 40), False)],
+    "origins,has_statics,batch_episodes",
+    [((40, 40, 40, 40), True, 2), ((40, 36, 40, 44), True, 1), ((40, 40, 40, 40), False, 2)],
     ids=["one", "three", "joint-no-statics"],
 )
 def test_no_statistics_are_constructed_in_a_worker(
-    model, panel, monkeypatch, worker_timeout, origins, has_statics
+    model, panel, monkeypatch, worker_timeout, origins, has_statics, batch_episodes
 ):
     if not has_statics:
         panel = replace(panel, items=tuple(replace(item, static={}) for item in panel.items))
@@ -150,17 +219,29 @@ def test_no_statistics_are_constructed_in_a_worker(
         real_init(self, panel, target, cutoff)
 
     monkeypatch.setattr(PanelStats, "__init__", init)
+    episodes_in_workers = multiprocessing.get_context("fork").Value("i", 0)
+    real_build = EpisodeBuilder.build
+
+    def build(self, request):
+        if os.getpid() != parent:
+            with episodes_in_workers.get_lock():
+                episodes_in_workers.value += 1
+        return real_build(self, request)
+
+    monkeypatch.setattr(EpisodeBuilder, "build", build)
     result = v5.forecast_items(
         model,
         panel,
         list(enumerate(origins)),
         HORIZON,
         context=CONTEXT,
-        batch_episodes=2,
+        batch_episodes=batch_episodes,
         layouts=None if has_statics else ["joint"] * len(origins),
         workers=2,
     )
 
+    # A serial run would satisfy the statistics assertions trivially: workers must have built episodes.
+    assert episodes_in_workers.value > 0
     assert worker_builds.value == 0
     targets = ("y", "y1") if has_statics else ("y",)
     expected = {(target, origin): 1 for target in targets for origin in set(origins)}
@@ -253,7 +334,9 @@ def test_loader_release_failure_preserves_the_forecast_error(
 
     model.train()
     with pytest.raises(RuntimeError, match=f"injected {failure or 'release'} failure"):
-        v5.forecast_items(model, panel, [(0, 40)], HORIZON, context=CONTEXT, workers=2)
+        v5.forecast_items(
+            model, panel, [(0, 40)], HORIZON, context=CONTEXT, batch_episodes=1, workers=2
+        )
     assert len(released) == 1
     assert model.training
 
@@ -267,5 +350,7 @@ def test_worker_failure_surfaces_and_restores_the_model(model, panel, monkeypatc
     model.train()
     monkeypatch.setattr(EpisodeBuilder, "build", fail)
     with pytest.raises(RuntimeError, match="injected episode failure"):
-        v5.forecast_items(model, panel, [(0, 40)], HORIZON, context=CONTEXT, workers=1)
+        v5.forecast_items(
+            model, panel, [(0, 40)], HORIZON, context=CONTEXT, batch_episodes=1, workers=1
+        )
     assert model.training
