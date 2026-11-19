@@ -266,7 +266,11 @@ def _parity_cases(
 
 
 def _screening(training: dict) -> ScreeningConfig:
-    return ScreeningConfig(no_evidence=training["sampler"].get("screen_no_evidence", 0.0))
+    sampler = training["sampler"]
+    return ScreeningConfig(
+        no_evidence=sampler.get("screen_no_evidence", 0.0),
+        fair_static_spread=sampler.get("screen_fair_spread", False),
+    )
 
 
 def _batch_arrays(batch: EpisodeBatch) -> Iterator[tuple[str, np.ndarray]]:

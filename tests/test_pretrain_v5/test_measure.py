@@ -12,6 +12,7 @@ import pytest
 import torch
 
 from demand_forecast.data.episode import EpisodeBuilder, collate
+from demand_forecast.data.episode.screening import ScreeningConfig
 from demand_forecast.models.v5 import V5Model, forecast, v5_loss
 from demand_forecast.synthetic.typed import PanelRecipe, generate_typed_panel
 from tests.helpers.v5_loop import config, equal
@@ -425,6 +426,27 @@ def test_qualify_records_missing_or_fallback_inference(tmp_path, monkeypatch, fa
     assert "inference" in model["inference"]["message"]
     assert model["workers"]["0"]["status"] == "ok"
     assert model["parameters"]["total"] > 0
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_inference_probe_forwards_sampler_screening(monkeypatch, enabled):
+    measure = api()
+    c = config()
+    c = replace(
+        c,
+        sampler=replace(c.sampler, screen_no_evidence=0.2, screen_fair_spread=enabled),
+    )
+    forwarded = []
+    forecast_items = measure.forecast_items
+
+    def record(*args, **kwargs):
+        forwarded.append(kwargs.get("screening", ScreeningConfig()))
+        return forecast_items(*args, **kwargs)
+
+    monkeypatch.setattr(measure, "forecast_items", record)
+    result = measure._inference_measure(c, torch.device("cpu"), 12, 64, 0)
+    assert result["forecasts"] == 12
+    assert forwarded == [ScreeningConfig(no_evidence=0.2, fair_static_spread=enabled)]
 
 
 @pytest.fixture

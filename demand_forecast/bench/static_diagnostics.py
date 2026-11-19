@@ -54,7 +54,7 @@ ROUNDING_DIGITS = 9
 LEVEL_DIGITS = 2
 MAX_LEVEL = 0.99
 SUPPORT_SIZES = (2, 4, 8, 16, 32)
-SCREENING = ScreeningConfig()
+SCREENING = ScreeningConfig(fair_static_spread=True)
 KIND_NAMES = {KIND_CATEGORY: "category", KIND_FLAG: "flag", KIND_NUMBER: "number"}
 
 SUPPORT_COLUMNS = (
@@ -224,7 +224,11 @@ def _screen_statics(panel: Panel, cutoff: int, only: str | None = None) -> dict:
                 # No item can emit this candidate. Read the same fixed-rule
                 # trace that screen uses, including duplicate empty columns.
                 candidates[name] = next(
-                    c for c in _static_candidates(stats, SCREENING.min_items) if c.name == name
+                    c
+                    for c in _static_candidates(
+                        stats, SCREENING.min_items, fair_static_spread=SCREENING.fair_static_spread
+                    )
+                    if c.name == name
                 )
             else:
                 indices[first].add(name)

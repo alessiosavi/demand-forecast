@@ -35,6 +35,7 @@ from demand_forecast.data.episode import (
     EpisodeRequest,
     Item,
     Panel,
+    ScreeningConfig,
     collate,
 )
 from demand_forecast.data.episode.schema import (
@@ -67,6 +68,7 @@ def forecast_panel(
     device: str | None = None,
     workers: int = 0,
     prefetch: int = 2,
+    screening: ScreeningConfig = ScreeningConfig(),
 ) -> dict[tuple[str, str], np.ndarray]:
     """Forecast bounded batches on the model's device, without moving the model.
 
@@ -95,6 +97,7 @@ def forecast_panel(
         pruned=pruned,
         workers=workers,
         prefetch=prefetch,
+        screening=screening,
     )
     return {
         (panel.items[index].item_id, name): values
@@ -526,12 +529,24 @@ def _inference_measure(config, device, panel_items, panel_length, workers):
             observed = observed[np.isfinite(observed)]
             fallback_forecasts += int(not observed.size or np.all(observed == observed[0]))
     model = V5Model(config.model).to(device)
+    screening = ScreeningConfig(
+        no_evidence=config.sampler.screen_no_evidence,
+        fair_static_spread=config.sampler.screen_fair_spread,
+    )
     _reset_gpu(device)
     with _HostPeak() as memory:
         forecasts, seconds = _timed(
             device,
             lambda: forecast_panel(
-                model, panel, origin, 28, context=512, gates="ones", pruned=False, workers=workers
+                model,
+                panel,
+                origin,
+                28,
+                context=512,
+                gates="ones",
+                pruned=False,
+                workers=workers,
+                screening=screening,
             ),
         )
         if len(forecasts) != panel_items or fallback_forecasts:

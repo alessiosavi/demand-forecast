@@ -39,11 +39,13 @@ class ScreeningConfig:
 
     Scores below the threshold become zero. Within each budget's existing
     priorities, zero scores rank last and are cut first when the budget binds.
+    ``fair_static_spread`` calibrates static category relevance against permutations.
     """
 
     min_steps: int = 16
     min_items: int = 8
     no_evidence: float = 0.0
+    fair_static_spread: bool = False
 
 
 @dataclass(frozen=True)
@@ -139,6 +141,39 @@ def relevance_number(x: np.ndarray, y: np.ndarray, lags: tuple[int, ...], min_st
     return max((_correlation(*_lagged(x, y, lag), min_steps) for lag in lags), default=0.0)
 
 
+def _membership_reference(values: np.ndarray) -> tuple:
+    ordered = np.sort(values)
+    return values.sum(), np.sum(values**2), ordered, np.r_[0.0, ordered.cumsum()]
+
+
+def _membership_shares(
+    present_values: np.ndarray, codes: np.ndarray, n: int, k: int, reference: tuple
+) -> tuple[np.ndarray, np.ndarray]:
+    value_sum, sum_squares, ordered, prefix = reference
+    present = np.bincount(codes, minlength=k)
+    counts = np.column_stack([present, n - present])
+    sums = np.bincount(codes, weights=present_values, minlength=k)
+    sums = np.column_stack([sums, value_sum - sums])
+    means = sums / np.maximum(counts, 1)
+    squared_means = np.sum(sums**2 / np.maximum(counts, 1), axis=1)
+    mean_share = _adjusted(squared_means - value_sum**2 / n, sum_squares, n, 2)
+
+    # All-item absolute deviations at every absent-group mean, via sorted prefix sums.
+    positions = np.searchsorted(ordered, means[:, 1])
+    all_absent = means[:, 1] * (2 * positions - n) + prefix[-1] - 2 * prefix[positions]
+    present_abs = np.bincount(codes, weights=np.abs(present_values - means[codes, 0]), minlength=k)
+    absent_abs = all_absent - np.bincount(
+        codes, weights=np.abs(present_values - means[codes, 1]), minlength=k
+    )
+    deviations = np.column_stack([present_abs, absent_abs])
+    correction = deviations.sum(axis=1) ** 2 / n
+    between = np.sum(deviations**2 / np.maximum(counts, 1), axis=1) - correction
+    total = sum_squares - squared_means - correction
+    spread_share = _adjusted(between, total, n, 2)
+    supported = (counts > 0).all(axis=1)
+    return np.where(supported, mean_share, 0.0), np.where(supported, spread_share, 0.0)
+
+
 def _multilabel_score(labels: np.ndarray, values: np.ndarray) -> float:
     """Score each membership against absence without an items-by-labels matrix."""
     lengths = np.frompyfunc(len, 1, 1)(labels).astype(np.int64)
@@ -147,30 +182,10 @@ def _multilabel_score(labels: np.ndarray, values: np.ndarray) -> float:
     n, k = len(values), len(unique)
     if n <= 2 or not k:
         return 0.0
-    present = np.bincount(codes, minlength=k)
-    counts = np.column_stack([present, n - present])
-    sums = np.bincount(codes, weights=values[rows], minlength=k)
-    sums = np.column_stack([sums, values.sum() - sums])
-    means = sums / np.maximum(counts, 1)
-    squared_means = np.sum(sums**2 / np.maximum(counts, 1), axis=1)
-    mean_share = _adjusted(squared_means - values.sum() ** 2 / n, np.sum(values**2), n, 2)
-
-    # All-item absolute deviations at every absent-group mean, via sorted prefix sums.
-    ordered = np.sort(values)
-    prefix = np.r_[0.0, ordered.cumsum()]
-    positions = np.searchsorted(ordered, means[:, 1])
-    all_absent = means[:, 1] * (2 * positions - n) + prefix[-1] - 2 * prefix[positions]
-    present_abs = np.bincount(codes, weights=np.abs(values[rows] - means[codes, 0]), minlength=k)
-    absent_abs = all_absent - np.bincount(
-        codes, weights=np.abs(values[rows] - means[codes, 1]), minlength=k
+    mean_share, spread_share = _membership_shares(
+        values[rows], codes, n, k, _membership_reference(values)
     )
-    deviations = np.column_stack([present_abs, absent_abs])
-    correction = deviations.sum(axis=1) ** 2 / n
-    between = np.sum(deviations**2 / np.maximum(counts, 1), axis=1) - correction
-    total = np.sum(values**2) - squared_means - correction
-    spread_share = _adjusted(between, total, n, 2)
-    scores = np.where((counts > 0).all(axis=1), np.maximum(mean_share, spread_share), 0.0)
-    return float(scores.max(initial=0.0))
+    return float(np.maximum(mean_share, spread_share).max(initial=0.0))
 
 
 def _category_score(labels: np.ndarray, y: np.ndarray, minimum: int) -> float:
@@ -196,13 +211,139 @@ def relevance_category(
     return max((_category_score(*_lagged(labels, y, lag), min_steps) for lag in lags), default=0.0)
 
 
+def _singlelabel_components(values: np.ndarray, codes: np.ndarray, k: int) -> np.ndarray:
+    """Mean and spread shares with one row per label assignment."""
+    n = len(values)
+    if not 1 < k < n:
+        return np.zeros((len(codes), 2))
+
+    centered = np.broadcast_to(_center(values), codes.shape)
+    bins = (codes + k * np.arange(len(codes))[:, None]).ravel()
+
+    def group_sums(weights: np.ndarray) -> np.ndarray:
+        sums = np.bincount(bins, weights=weights.ravel(), minlength=len(codes) * k)
+        return sums.reshape(-1, k)
+
+    counts = np.bincount(codes[0], minlength=k)
+    mean_sums = group_sums(centered)
+    means_at_item = np.take_along_axis(mean_sums / counts, codes, axis=1)
+    deviations = np.abs(centered - means_at_item)
+
+    def share(weights: np.ndarray, sums: np.ndarray) -> np.ndarray:
+        total_sum = weights.sum(axis=1)
+        between = (sums**2 / counts).sum(axis=1) - total_sum**2 / n
+        residual = weights - (total_sum / n)[:, None]
+        return _adjusted(between, np.sum(residual**2, axis=1), n, k)
+
+    return np.column_stack([share(centered, mean_sums), share(deviations, group_sums(deviations))])
+
+
+def _multilabel_components(
+    values: np.ndarray, membership_rows: np.ndarray, membership_codes: np.ndarray, k: int
+) -> np.ndarray:
+    """Align shares by membership across assignments, with zero for missing groups."""
+    n = len(values)
+    components = np.zeros((len(membership_rows), 2 * k))
+    if n <= 2:
+        return components
+    centered = _center(values)
+    reference = _membership_reference(centered)
+    for i, rows in enumerate(membership_rows):
+        mean, spread = _membership_shares(centered[rows], membership_codes, n, k, reference)
+        components[i, :k] = mean
+        components[i, k:] = spread
+    return components
+
+
+def _rank_gap(value: np.ndarray, reference: np.ndarray) -> np.ndarray:
+    remaining = 1 - reference
+    return np.divide(
+        np.maximum(0, value - reference),
+        remaining,
+        out=np.zeros_like(value),
+        where=remaining > 1e-9,
+    )
+
+
+def _fair_static_category(
+    cells: np.ndarray, summaries: np.ndarray, flags: np.ndarray, min_items: int
+) -> float:
+    minimum = max(2, min_items)
+    valid = flags & np.isfinite(summaries)
+    entries = np.flatnonzero(valid.sum(axis=0) >= minimum)
+    if not len(entries):
+        return 0.0
+
+    # Raw summary values and their validity fix the order. Label cells break ties
+    # between items with identical valid summaries.
+    tie_order = np.array(sorted(range(len(cells)), key=cells.__getitem__))
+    keys = np.where(valid[:, entries], summaries[:, entries], np.inf)[tie_order]
+    order = tie_order[np.lexsort(keys.T[::-1])]
+    cells, summaries, valid = cells[order], summaries[order], valid[order]
+    n = len(cells)
+    lengths = np.fromiter(map(len, cells), dtype=np.intp, count=n)
+    codes, unique = pd.factorize(np.concatenate(cells), sort=False)
+    k = len(unique)
+    if k < 2:
+        return 0.0
+    labelled = lengths > 0
+    rng = np.random.default_rng([0xB03, n, k])
+    permutations = np.stack([np.arange(n), *(rng.permutation(n) for _ in range(32))])
+    multilabel = (lengths > 1).any()
+    if multilabel:
+        member_items = np.repeat(np.arange(n), lengths)
+        full_rows = permutations.argsort(axis=1)[:, member_items]
+    else:
+        item_codes = np.full(n, -1, dtype=np.intp)
+        item_codes[labelled] = codes
+        full_codes = item_codes[permutations]
+
+    maxima = np.zeros(len(permutations))
+    for j in entries:
+        mask = valid[:, j] & labelled
+        if mask.sum() < minimum:
+            continue
+        values = np.asarray(summaries[mask, j], dtype=np.float64)
+        full = mask.all()
+        if not full:
+            # Among valid items, sorting the shared permutation's entries maps each
+            # source cell to its destination. Invert it to index by destination.
+            destinations = permutations[:, mask].argsort(axis=1)
+        if multilabel:
+            if full:
+                rows, entry_codes = full_rows, codes
+            else:
+                local_items = np.repeat(np.arange(len(values)), lengths[mask])
+                rows, entry_codes = destinations[:, local_items], codes[mask[member_items]]
+            components = _multilabel_components(values, rows, entry_codes, k)
+        else:
+            if full:
+                assigned_codes, groups = full_codes, k
+            else:
+                entry_codes, unique = pd.factorize(item_codes[mask], sort=False)
+                assigned_codes, groups = entry_codes[destinations.argsort(axis=1)], len(unique)
+            components = _singlelabel_components(values, assigned_codes, groups)
+        # Compare each component with the largest value from another assignment.
+        second, top = np.partition(components, -2, axis=0)[-2:]
+        reference = np.where(components == top, second, top)
+        maxima = np.maximum(maxima, _rank_gap(components, reference).max(axis=1))
+    return float(_rank_gap(maxima[0], maxima[1:].max()))
+
+
 def relevance_static_category(
-    labels: list[tuple[str, ...]], summaries: np.ndarray, flags: np.ndarray, min_items: int
+    labels: list[tuple[str, ...]],
+    summaries: np.ndarray,
+    flags: np.ndarray,
+    min_items: int,
+    *,
+    fair_static_spread: bool = False,
 ) -> float:
     """Largest mean or spread share across valid per-item summary entries."""
     cells = np.empty(len(labels), dtype=object)
     cells[:] = labels
     cells = _label_sets(cells)
+    if fair_static_spread:
+        return _fair_static_category(cells, summaries, flags, min_items)
     return max(
         (
             _category_score(cells, np.where(flags[:, j], summaries[:, j], np.nan), min_items)
@@ -238,8 +379,10 @@ def _standalone_provider(stats: PanelStats) -> PanelStatsProvider:
     return stats.screen_cache[key]
 
 
-def _static_candidates(stats: PanelStats, min_items: int) -> tuple[Candidate, ...]:
-    cache_key = "static", min_items
+def _static_candidates(
+    stats: PanelStats, min_items: int, *, fair_static_spread: bool = False
+) -> tuple[Candidate, ...]:
+    cache_key = "static", min_items, fair_static_spread
     if cache_key in stats.screen_cache:
         return stats.screen_cache[cache_key]
     candidates = []
@@ -265,7 +408,11 @@ def _static_candidates(stats: PanelStats, min_items: int) -> tuple[Candidate, ..
             elif not (counts >= 2).any():
                 removed = "unshared"
             score = relevance_static_category(
-                labels, stats.summaries, stats.summary_flags, min_items
+                labels,
+                stats.summaries,
+                stats.summary_flags,
+                min_items,
+                fair_static_spread=fair_static_spread,
             )
         key = kind, signature
         if key in seen:
@@ -348,7 +495,9 @@ def screen(
                 if provider is None:
                     provider = _standalone_provider(stats)
                 current = provider.get(target, cutoff)
-            for candidate in _static_candidates(current, config.min_items):
+            for candidate in _static_candidates(
+                current, config.min_items, fair_static_spread=config.fair_static_spread
+            ):
                 previous = static.get(candidate.name)
                 if previous is None or candidate.score > previous.score:
                     size = (

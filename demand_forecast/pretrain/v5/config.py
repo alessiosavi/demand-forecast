@@ -172,10 +172,12 @@ class SamplerConfig:
     cold_share: float = 0.0
     cold_steps: tuple[int, int] = (3, 4)
     first_event_only: bool = False
+    screen_fair_spread: bool = False
 
     def __post_init__(self) -> None:
         _flag(self, "designate_target")
         _flag(self, "first_event_only")
+        _flag(self, "screen_fair_spread")
         for name in ("episodes_per_batch", "episodes_per_panel", "origins", "origin_stride"):
             _normalize(self, name, integer=True, minimum=1)
         if not self.contexts:
@@ -328,6 +330,8 @@ class V5TrainConfig:
         data = _plain(asdict(self))
         if self.model.expert_mode == "routed":
             del data["model"]["expert_mode"]
+        if not self.sampler.screen_fair_spread:
+            del data["sampler"]["screen_fair_spread"]
         for source in data["sources"]:
             if source["folder_power"] is None:
                 del source["folder_power"]

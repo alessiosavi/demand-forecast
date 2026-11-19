@@ -280,6 +280,9 @@ def test_fast_paths_do_not_fall_back_to_the_scalar_rules(monkeypatch):
 
     monkeypatch.setattr(kinds, "is_missing", no_scalar_missing)
     monkeypatch.setattr(kinds, "label_of", counted_label)
+    # The screening module binds its own names: its scalar branch must be closed off as well.
+    monkeypatch.setattr(screening, "is_missing", no_scalar_missing)
+    monkeypatch.setattr(screening, "label_of", counted_label)
     numbers = np.tile(np.array([0.0, -0.0, 1.5, np.nan, 7.0]), 200)
     mixed = np.tile(np.array(["a", "", None, 2.5, float("nan"), "b"], dtype=object), 200)
     words = np.tile(np.array(["a", "", "b"], dtype=object), 200)
