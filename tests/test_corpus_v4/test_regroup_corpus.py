@@ -418,6 +418,28 @@ def test_shard_without_footer_metadata_keeps_it_absent(regroup, tmp_path):
     assert pq.read_metadata(target).metadata is None
 
 
+def test_regroup_preserves_dictionary_type_and_hashes_values(regroup, tmp_path):
+    parent, out = tmp_path / "parent", tmp_path / "out"
+    source, target = parent / UNI, out / UNI
+    source.parent.mkdir(parents=True)
+    indices = pa.array([0, 1, 0, None], type=pa.int32())
+    labels = pa.DictionaryArray.from_arrays(indices, pa.array(["daily", "hourly"]))
+    table = pa.table({"target": [[[1.0]], [[2.0]], [[3.0]], [[4.0]]], "label": labels})
+    pq.write_table(table, source)
+
+    record = regroup.regroup_tree(parent, out, threshold_bytes=0, group_bytes=420, group_rows=2)
+    assert record["shards"][UNI]["output_groups"] == 2
+    before, after = pq.read_table(source), pq.read_table(target)
+    assert before.schema.field("label").type == after.schema.field("label").type == labels.type
+    assert before.to_pylist() == after.to_pylist() == table.to_pylist()
+    regroup.verify_tree(parent, out, record)
+
+    changed = pa.DictionaryArray.from_arrays(indices, pa.array(["weekly", "hourly"]))
+    pq.write_table(table.set_column(1, "label", changed), target, row_group_size=2)
+    with pytest.raises(ValueError, match=rf"{UNI}.*rows_sha256 mismatch"):
+        regroup.verify_tree(parent, out, record)
+
+
 def test_two_runs_are_byte_identical(regroup, tmp_path):
     parent = _tree(tmp_path / "parent")
     first, second = tmp_path / "first", tmp_path / "second"
