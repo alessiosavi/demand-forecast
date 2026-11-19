@@ -77,6 +77,7 @@ pywavelets==1.10.0
 pyyaml==6.0.3
 requests==2.34.2
 rich==15.0.0
+safetensors==0.6.2
 scikit-learn==1.9.1
 scipy==1.18.1
 setuptools==84.2.1

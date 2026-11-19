@@ -11,6 +11,7 @@ from demand_forecast.data.episode import EpisodeBuilder, EpisodeRequest, collate
 from demand_forecast.data.episode.schema import (
     CH_STEP,
     CH_STEP_FLAG,
+    CH_VALUE_STATS,
     KIND_NUMBER,
     N_SUMMARY,
     ROLE_FORECAST,
@@ -733,9 +734,15 @@ def test_family_gates_mask_values_and_flags():
     gates = model.gates(batch, mode="ones")
     gates.family[:] = 0
     changed = replace(batch, x=batch.x.clone())
-    numeric = batch.row_kind == KIND_NUMBER
-    changed.x[numeric, ..., CH_STEP:CH_STEP_FLAG] = 200
-    changed.x[numeric, ..., CH_STEP_FLAG:33] = 1
+    numeric = (batch.row_kind == KIND_NUMBER)[..., None, None, None]
+    step_values = changed.x[..., CH_STEP:CH_STEP_FLAG]
+    step_flags = changed.x[..., CH_STEP_FLAG:CH_VALUE_STATS]
+    step_values.copy_(torch.where(numeric, 200, step_values))
+    step_flags.copy_(torch.where(numeric, 1, step_flags))
+    channels = torch.arange(batch.x.shape[-1], device=batch.x.device)
+    allowed = numeric & (channels >= CH_STEP) & (channels < CH_VALUE_STATS)
+    different = changed.x != batch.x
+    assert different.any() and not (different & ~allowed).any()
     torch.testing.assert_close(
         model(batch, gates).quantiles, model(changed, gates).quantiles, rtol=0, atol=0
     )
