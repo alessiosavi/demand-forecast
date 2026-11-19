@@ -234,6 +234,53 @@ the canonical JSON of the action, name, code revision, environment hash and
 checkpoint hash. A matching valid unit is reused. An invalid manifest is
 removed before rebuilding.
 
+## Absolute forecast probe
+
+`train` and `t1` publish `probe.json` beside `train.json` using the checkpoint's
+export-selected weights. The file contains the report and gate verdict, and
+the unit manifest lists it. On a retry through `job.py`, a manifest that omits
+the probe triggers validation and reuse of completed training and publication
+of the missing report.
+
+Run the same CPU probe locally from either source.
+
+```bash
+python -m demand_forecast.pretrain.v5.job probe --export scoring-export/
+python -m demand_forecast.pretrain.v5.job probe --checkpoint checkpoint-final.pt
+```
+
+The command prints a JSON object with `report` and `gate`. Exit 0 means the
+probe ran successfully. Use `gate.passed` to decide whether to promote the
+training. Each failing family reports its first failing criterion.
+
+The probe scores 24 items per family from a fixed origin with a 512-cell
+context and a 96-cell horizon. The families cover hourly seasonality,
+hourly seasonality with a weekly component, daily seasonality, a trend,
+seasonality with a trend, noise, intermittent demand, and a level shift.
+The report includes the model's median-path MASE, centred correlation and
+spread ratio, MASE for seasonal naive, the family reference and the history
+median, and tie-aware coverage at the model's knots. It also records the
+smallest mean gap between neighbouring quantiles. MASE scales each item's
+horizon error by the mean absolute seasonal difference before the origin.
+The spread ratio compares the median path's standard deviation with the
+truth's.
+
+The reference uses a four-season average by phase for `seasonal_h` and
+`seasonal_d`, a repeat of the last 168 cells for `seasonal_h2`, and
+`y~drift` for both trend families. It uses a 28-cell trailing mean for
+`level_shift` and the history median for noise and intermittent demand.
+
+When `naive_rows` is enabled, `zeroed_naive_rows` repeats the figures with
+those rows' horizon values and flags zeroed in the same batch layout. The
+gate uses the main forecast.
+
+The five shape families require MASE at most seasonal naive's and
+correlation of at least 0.5. Noise allows MASE up to 1.05 times the history
+median's. Intermittent demand and level shift allow up to 1.05 times the
+better of seasonal naive and the history median. Every knot must satisfy
+the 0.15 tolerance around its tie-aware coverage interval. Each mean
+neighbouring quantile gap must be positive for the continuous families.
+
 ## Running a local training unit
 
 The module also runs directly under the guest contract:
@@ -303,12 +350,12 @@ State layout:
 RUN_DIR/
   state/
     train/LEG/{identity.json,checkpoint-slot-*.pt,history.jsonl,telemetry.jsonl,
-               checkpoint-final.pt,train.json,unit.json}
+               checkpoint-final.pt,train.json,probe.json,unit.json}
     qualify/NAME/{identity.json,qualify.json,unit.json}
     export/NAME/{config.json,model.safetensors,parity.npz,unit.json}
     t1/PATH-ARM-sSEED/
       train/{identity.json,checkpoint-slot-*.pt,checkpoint-final.pt,train.json,...}
-      eval-N-M/{checkpoint-final.pt,train.json,result.json,unit.json}
+      eval-N-M/{checkpoint-final.pt,train.json,result.json,probe.json,unit.json}
   staging/          temporary checkpoint writes, qualification trials and export artifacts
   v5-cache/         HOME, uv/Python/pip/Hugging Face caches, repository and venv
   corpus/           volatile corpus cache, rebuilt on every active invocation

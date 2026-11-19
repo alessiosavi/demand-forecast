@@ -8,12 +8,14 @@ import pytest
 import torch
 
 from demand_forecast.data.episode import (
+    EpisodeBatch,
     EpisodeBuilder,
     EpisodeRequest,
     PanelStatsProvider,
     ScreeningConfig,
     collate,
 )
+from demand_forecast.data.episode.collate import EpisodeBatchWithRowKeys
 from demand_forecast.data.episode.schema import (
     MAX_FEATURE_ROWS,
     MAX_FORECAST_ROWS,
@@ -24,7 +26,7 @@ from demand_forecast.data.episode.schema import (
     SUMMARY_FEATURES,
 )
 from demand_forecast.models import v5
-from demand_forecast.models.v5 import predict
+from demand_forecast.models.v5 import batch_forecast, predict
 from tests.helpers.episodes import lag_panel, perturb_after, toy_panel
 from tests.helpers.v5_loop import config, equal
 
@@ -160,6 +162,56 @@ def _record_batches(model, monkeypatch):
 
     monkeypatch.setattr(model, "gates", gates)
     return batches
+
+
+def test_batch_hook_replaces_each_collated_batch_before_model_gates(model, monkeypatch):
+    panel = _panel()
+    batches = _record_batches(model, monkeypatch)
+    replacements = []
+
+    def hook(batch):
+        assert torch.count_nonzero(batch.xh)
+        changed = replace(batch, xh=torch.zeros_like(batch.xh))
+        replacements.append(changed)
+        return changed
+
+    v5.forecast_items(
+        model,
+        panel,
+        [(i, 40) for i in range(4)],
+        8,
+        context=CONTEXT,
+        batch_episodes=2,
+        batch_hook=hook,
+    )
+    assert len(batches) == len(replacements) == 2
+    for (batch, _), replacement in zip(batches, replacements, strict=True):
+        torch.testing.assert_close(batch.xh, replacement.xh)
+        assert batch.row_names == replacement.row_names
+
+
+def test_forecast_items_only_collates_row_keys_with_a_hook(model, monkeypatch):
+    panel = _panel()
+    jobs = [(i, 40) for i in range(len(panel.items))]
+    batches = []
+    real_collate = batch_forecast.collate
+
+    def record_collate(episodes, **kwargs):
+        batch = real_collate(episodes, **kwargs)
+        batches.append(batch)
+        return batch
+
+    monkeypatch.setattr(batch_forecast, "collate", record_collate)
+    kwargs = dict(context=CONTEXT, batch_episodes=2)
+
+    v5.forecast_items(model, panel, jobs, 8, **kwargs)
+    assert len(batches) == 2
+    assert all(type(batch) is EpisodeBatch for batch in batches)
+
+    batches.clear()
+    v5.forecast_items(model, panel, jobs, 8, batch_hook=lambda batch: batch, **kwargs)
+    assert len(batches) == 2
+    assert all(type(batch) is EpisodeBatchWithRowKeys for batch in batches)
 
 
 def test_equals_single_episode_forecast(model):

@@ -202,11 +202,12 @@ def test_train_stop_resume_does_not_repeat_batches(job, settings, tmp_path):
     assert job.main([*command, "--stop-after", "4"]) == 75
     assert not (unit / "unit.json").exists()
     assert not (unit / "train.json").exists()
+    assert not (unit / "probe.json").exists()
     assert latest_checkpoint(unit)[1]["counters"]["batch"] == 4
     assert job.main(command) == 0
     manifest = read_manifest(unit / "unit.json")
     assert manifest is not None
-    assert set(manifest["files"]) == {"checkpoint-final.pt", "train.json"}
+    assert set(manifest["files"]) == {"checkpoint-final.pt", "train.json", "probe.json"}
     assert manifest["code"] == CODE
     assert manifest["job_sha256"] == JOB
     assert manifest["env_sha256"] == ENV
@@ -287,6 +288,64 @@ def t1_args(tmp_path, base, arm="true", path="static_category", episodes=2):
     return args(
         tmp_path, "t1", base=base, path=path, arm=arm, seed=7, episodes=episodes, max_panels=40
     )
+
+
+@pytest.fixture(params=["train", "t1"])
+def probe_unit(request, job, settings, small_t1, tmp_path):
+    if request.param == "train":
+        unit = tmp_path / "state/train/leg"
+        command = args(tmp_path, config=settings, name="leg")
+    else:
+        unit = tmp_path / "state/t1/static_category-true-s7/eval-2-40"
+        command = t1_args(tmp_path, small_t1)
+    assert job.main(command) == 0
+    return command, unit
+
+
+def test_train_and_t1_units_publish_probe_json(job, probe_unit, capsys):
+    _, unit = probe_unit
+    manifest = read_manifest(unit / "unit.json")
+    assert "probe.json" in manifest["files"]
+    published = json.loads((unit / "probe.json").read_text())
+    assert set(published) == {"report", "gate"}
+    assert type(published["gate"]["passed"]) is bool
+    assert job.main(["probe", "--checkpoint", str(unit / "checkpoint-final.pt")]) == 0
+    assert json.loads(capsys.readouterr().out) == published
+
+
+def test_a_unit_without_probe_json_is_incomplete(job, probe_unit):
+    command, unit = probe_unit
+    unit_path = unit / "unit.json"
+    manifest = read_manifest(unit_path)
+    manifest["files"].pop("probe.json", None)
+    checkpoint.write_manifest(unit_path, manifest)
+    assert read_manifest(unit_path) is not None
+    existing_weights = file_digest(unit / "checkpoint-final.pt")
+    assert job.main(command) == 0
+    assert "probe.json" in read_manifest(unit_path)["files"]
+    assert file_digest(unit / "checkpoint-final.pt") == existing_weights
+
+
+def test_probe_cli_agrees_for_checkpoint_and_export(
+    job, export_api, export_checkpoint, tmp_path, capsys
+):
+    payload = checkpoint.read_payload(export_checkpoint)
+    payload["config"]["sampler"].update(
+        derive=["naive_rows"], screen_no_evidence=0.125, screen_fair_spread=True
+    )
+    payload["ema"] = {name: value.clone() for name, value in payload["model"].items()}
+    for value in payload["model"].values():
+        if value.is_floating_point():
+            value.zero_()
+    payload["export"] = "ema"
+    selected, _ = checkpoint.save_checkpoint(tmp_path / "selected", payload, counter=1)
+    directory = tmp_path / "export"
+    export_api.write_export(selected, directory)
+    assert job.main(["probe", "--checkpoint", str(selected)]) == 0
+    saved = json.loads(capsys.readouterr().out)
+    assert job.main(["probe", "--export", str(directory)]) == 0
+    assert saved == json.loads(capsys.readouterr().out)
+    assert all("zeroed_naive_rows" in family for family in saved["report"]["families"].values())
 
 
 def test_t1_interrupt_after_training_resumes_evaluation_only(job, small_t1, tmp_path, monkeypatch):
@@ -458,7 +517,7 @@ def test_t1_all_arms_publish_paired_evaluations(job, small_t1, tmp_path, path, a
         unit = tmp_path / f"state/t1/{path}-{arm}-s7/eval-{episode_count}-40"
         record = read_manifest(unit / "unit.json")
         assert record is not None
-        files = {"checkpoint-final.pt", "train.json", "result.json"}
+        files = {"checkpoint-final.pt", "train.json", "result.json", "probe.json"}
         off = unit / "result-derive-off.json"
         publishes_removal = path == "past_driver" and arm == "true"
         assert off.is_file() == publishes_removal

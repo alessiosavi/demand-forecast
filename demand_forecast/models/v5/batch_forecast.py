@@ -2,7 +2,7 @@
 
 import sys
 from collections import defaultdict
-from collections.abc import Generator, Iterator, Sequence
+from collections.abc import Callable, Generator, Iterator, Sequence
 from contextlib import closing
 from dataclasses import dataclass, fields, replace
 from itertools import groupby, islice, tee
@@ -271,11 +271,17 @@ def usable_workers(requested: int) -> tuple[int, str | None]:
 
 
 def _collate_chunk(
-    builder: EpisodeBuilder, group: list[EpisodeRequest], summary_off: tuple[str, ...]
+    builder: EpisodeBuilder,
+    group: list[EpisodeRequest],
+    summary_off: tuple[str, ...],
+    *,
+    include_row_keys: bool,
 ) -> _ForecastChunk:
     episodes = [apply_summary_off(builder.build(req), summary_off) for req in group]
     evidence = [_evidence_inputs(episode) for episode in episodes]
-    return _ForecastChunk(collate(episodes), evidence)
+    # Without a hook the call is the one made before row keys existed.
+    batch = collate(episodes, include_row_keys=True) if include_row_keys else collate(episodes)
+    return _ForecastChunk(batch, evidence)
 
 
 class _EpisodeChunks(Dataset[_ForecastChunk]):
@@ -284,16 +290,24 @@ class _EpisodeChunks(Dataset[_ForecastChunk]):
         builder: EpisodeBuilder,
         groups: list[list[EpisodeRequest]],
         summary_off: tuple[str, ...],
+        *,
+        include_row_keys: bool,
     ) -> None:
         self.builder = builder
         self.groups = groups
         self.summary_off = summary_off
+        self.include_row_keys = include_row_keys
 
     def __len__(self) -> int:
         return len(self.groups)
 
     def __getitem__(self, index: int) -> _ForecastChunk:
-        return _collate_chunk(self.builder, self.groups[index], self.summary_off)
+        return _collate_chunk(
+            self.builder,
+            self.groups[index],
+            self.summary_off,
+            include_row_keys=self.include_row_keys,
+        )
 
 
 def _forecast_batches(
@@ -304,10 +318,15 @@ def _forecast_batches(
     summary_off: tuple[str, ...],
     workers: int,
     prefetch: int,
+    *,
+    include_row_keys: bool,
 ) -> Generator[tuple[list[EpisodeRequest], _ForecastChunk], None, None]:
     if not workers:
         while group := list(islice(requests, batch_episodes)):
-            yield group, _collate_chunk(builder, group, summary_off)
+            yield (
+                group,
+                _collate_chunk(builder, group, summary_off, include_row_keys=include_row_keys),
+            )
         return
 
     groups = []
@@ -329,14 +348,17 @@ def _forecast_batches(
 
     if len(groups) <= 1:
         for group in groups:
-            yield group, _collate_chunk(builder, group, summary_off)
+            yield (
+                group,
+                _collate_chunk(builder, group, summary_off, include_row_keys=include_row_keys),
+            )
         return
 
     from demand_forecast.pretrain.v5 import loop
 
     iterator = iter(
         DataLoader(
-            _EpisodeChunks(builder, groups, summary_off),
+            _EpisodeChunks(builder, groups, summary_off, include_row_keys=include_row_keys),
             num_workers=min(workers, len(groups)),
             multiprocessing_context="fork",
             batch_size=None,
@@ -411,6 +433,7 @@ def forecast_items(
     batch_episodes: int = 64,
     workers: int = 0,
     prefetch: int = 2,
+    batch_hook: Callable[[EpisodeBatch], EpisodeBatch] | None = None,
 ) -> ItemForecasts:
     """Forecast one origin per item in the model's floating-point dtype and device.
 
@@ -419,7 +442,9 @@ def forecast_items(
     Joint layout compatibility is checked before forecasting each origin.
     On Linux, workers can build and collate chunks for origins with multiple
     chunks, with prefetch chunks queued per worker. Statistics construction
-    and model inference run in the caller.
+    and model inference run in the caller. The optional hook transforms each
+    collated batch with row keys before device transfer and model gating,
+    preserving its layout.
     """
     _validate_workers(workers, prefetch)
     if workers:
@@ -488,10 +513,14 @@ def forecast_items(
                             summary_off,
                             workers,
                             prefetch,
+                            include_row_keys=batch_hook is not None,
                         )
                     ) as batches:
                         for group, chunk in batches:
-                            batch = _batch_to_model(chunk.batch, device, dtype)
+                            batch = chunk.batch
+                            if batch_hook is not None:
+                                batch = batch_hook(batch)
+                            batch = _batch_to_model(batch, device, dtype)
                             selected = model.gates(batch, mode=gates)
                             evidence_requests.extend((req.item_index, req.target) for req in group)
                             evidence_rows.extend(_evidence_rows(chunk.evidence, selected, pruned))

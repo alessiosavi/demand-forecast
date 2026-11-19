@@ -15,13 +15,14 @@ from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from . import loop, measure, t1
+from . import loop, measure, probe, t1
 from .checkpoint import _atomic_write, file_digest, read_manifest, write_manifest
 from .config import V5TrainConfig, identity
 from .sources import SourceMix
 
 T1_EVAL_DEFAULTS = (200, 1000)
 _DERIVE_OFF_RESULT = "result-derive-off.json"
+_PROBE_RESULT = "probe.json"
 
 
 def _name(value: str) -> str:
@@ -125,6 +126,10 @@ def _parser() -> argparse.ArgumentParser:
     sub.add_argument("--max-panels", type=_positive, required=True)
     sub.add_argument("--arm", action="append", default=[])
     sub.add_argument("--out", type=Path, required=True)
+    sub = actions.add_parser("probe")
+    source = sub.add_mutually_exclusive_group(required=True)
+    source.add_argument("--export", type=Path, metavar="DIR")
+    source.add_argument("--checkpoint", type=Path, metavar="FILE")
     return parser
 
 
@@ -157,6 +162,28 @@ def _publish_unit(unit: Path, expected: dict, files: list[str]) -> None:
     write_manifest(unit / "unit.json", {**expected, "files": files})
     if read_manifest(unit / "unit.json") is None:
         raise RuntimeError("unit publication does not validate")
+
+
+def _probe_result(model, training: dict) -> dict:
+    report = probe.run_probe(model, probe.ProbeSettings.from_training(training))
+    return {"report": report, "gate": probe.gate(report)}
+
+
+def _probe_checkpoint(checkpoint: Path) -> dict:
+    model, config = loop.load_model(checkpoint, weights="export")
+    return _probe_result(model, config.canonical())
+
+
+def _run_probe(args: argparse.Namespace) -> int:
+    if args.export is None:
+        result = _probe_checkpoint(args.checkpoint)
+    else:
+        from demand_forecast.models.v5.export import load_export
+
+        model, metadata = load_export(args.export)
+        result = _probe_result(model, metadata["training"])
+    print(json.dumps(result, sort_keys=True, allow_nan=False))
+    return 0
 
 
 def _run_export(args: argparse.Namespace, unit: Path) -> int:
@@ -370,7 +397,10 @@ def _run(args, unit: Path, training: Path) -> int:
 
     # Identity is checked even for complete units; stale completion must not
     # survive a failed attempt under another environment or configuration.
-    cached = _complete(unit, expected, required_files=(_DERIVE_OFF_RESULT,) if derive_off else ())
+    required_files = () if args.action == "qualify" else (_PROBE_RESULT,)
+    if derive_off:
+        required_files += (_DERIVE_OFF_RESULT,)
+    cached = _complete(unit, expected, required_files=required_files)
     if args.action == "qualify":
         sidecar = unit / "identity.json"
         if sidecar.exists():
@@ -444,11 +474,11 @@ def _run(args, unit: Path, training: Path) -> int:
         if cached:
             return 0
         files = ["checkpoint-final.pt", "train.json"]
+        checkpoint = training / "checkpoint-final.pt"
         if args.action == "t1":
             episodes = t1.eval_set(
                 args.path, base=base, episodes=args.episodes, max_panels=args.max_panels
             )
-            checkpoint = training / "checkpoint-final.pt"
             evaluation = t1.evaluate(
                 checkpoint,
                 args.path,
@@ -474,17 +504,19 @@ def _run(args, unit: Path, training: Path) -> int:
             files.append("result.json")
             if derive_off:
                 files.append(_DERIVE_OFF_RESULT)
+        _json(unit / _PROBE_RESULT, _probe_checkpoint(checkpoint))
+        files.append(_PROBE_RESULT)
     _publish_unit(unit, expected, files)
     return 0
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    if args.action == "t1-compare":
+    if args.action in ("t1-compare", "probe"):
         try:
-            return _t1_compare(args)
+            return _run_probe(args) if args.action == "probe" else _t1_compare(args)
         except Exception as error:
-            print(f"t1-compare: {error}", file=sys.stderr)
+            print(f"{args.action}: {error}", file=sys.stderr)
             return 1
     if not args.run_dir.is_absolute():
         raise SystemExit("run-dir must be absolute")

@@ -9,7 +9,8 @@ import numpy as np
 import pytest
 import torch
 
-from demand_forecast.data.episode import EpisodeBuilder, EpisodeRequest, collate
+from demand_forecast.data.episode import EpisodeBatch, EpisodeBuilder, EpisodeRequest, collate
+from demand_forecast.data.episode.collate import EpisodeBatchWithRowKeys
 from demand_forecast.data.episode.schema import (
     CH_STEP,
     CH_STEP_FLAG,
@@ -840,6 +841,38 @@ def test_prune_remaps():
     torch.testing.assert_close(
         before.quantiles[:, :, :1], after.quantiles[:, :, :1], atol=1e-5, rtol=0
     )
+
+
+def test_prune_keeps_row_keys_aligned_in_padded_batch():
+    request = EpisodeRequest(0, (320,), 5, 32, derive=frozenset({"naive_rows"}))
+    episodes = [
+        EpisodeBuilder(panel).build(request) for panel in (bare_panel(), toy_panel(n_items=1))
+    ]
+    batch = collate(episodes, include_row_keys=True)
+    assert not batch.row_mask[0, -1]
+    assert batch.row_mask[1, -1]
+
+    gates = V5Model(TINY).eval().gates(batch, mode="ones")
+    keys_by_name = [
+        dict(zip(names, keys, strict=True))
+        for names, keys in zip(batch.row_names, batch.row_keys, strict=True)
+    ]
+    expected_names = []
+    for i, dropped in enumerate(("y~drift", "promo")):
+        names = batch.row_names[i]
+        gates.row[i, names.index(dropped)] = 0
+        expected_names.append([name for name in names if name != dropped])
+
+    reduced, _ = prune(batch, gates)
+    assert type(reduced) is EpisodeBatchWithRowKeys
+    assert reduced.row_names == expected_names
+    for i, names in enumerate(reduced.row_names):
+        assert reduced.row_keys[i] == [keys_by_name[i][name] for name in names]
+
+    plain, _ = prune(collate(episodes), gates)
+    assert type(plain) is EpisodeBatch
+    assert not hasattr(plain, "row_keys")
+    assert plain.row_names == expected_names
 
 
 @torch.no_grad()
