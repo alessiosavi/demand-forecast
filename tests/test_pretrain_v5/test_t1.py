@@ -1,7 +1,9 @@
 """P6: paired inputs, common scoring frames, and evidence-based T1 verdicts."""
 
 import copy
+import hashlib
 import importlib
+import json
 from dataclasses import asdict, replace
 from pathlib import Path
 
@@ -45,6 +47,82 @@ PATH_NAMES = (
     "routing",
     "selection",
 )
+
+
+# Sorted-key JSON of asdict(t1_config(path, arm, seed=7)) at 508a326.
+_BASE_ARM_DIGESTS = {
+    "static_category": {
+        "true": "f561623c6dd25fad0820668654278f466c5e071f7712100d73ca02e3acd51a97",
+        "null": "bf6efd7cb34170b5623f0699844b9854c2ebd22632e213abb6985f367076ed31",
+    },
+    "multi_label": {
+        "true": "8e12f6e6ce922e32c01f150bd68239b1b28e435b01c258caf7a186f7ff127335",
+        "null": "13e3dbf0eb3257f003c87a5d1b7def07d4ef32ddce052822c31952dc268de4fc",
+    },
+    "static_number": {
+        "true": "1a61af08ba02b603811af48b929ca2fe72d30223987cbe0344ebc1b1b1499266",
+        "null": "e13d7baf7665725a13f58b8101d69b15ae0bebcfd349c46c9e892f7c0ae2121f",
+    },
+    "category_mean": {
+        "true": "5842660a02acc6086a5f91cc70bd38815da179af028e8405bb95ddd0aa1168bd",
+        "null": "ccc25d80b7b08203d2a3551d4594635232037a30f771f325883b9a2d1f0335d2",
+    },
+    "category_spread": {
+        "true": "206a8547c738231a320b82e3937787c33827c58992f535a057a4e6c61c6fe4cd",
+        "null": "5b58cbb75ea44aaa5ad45f51ccf74f73898e173e775ee030aca2319c502899c8",
+    },
+    "category_timing": {
+        "true": "33d433ec7a31783f63e3683591468e7c802e81511647a3f00ffb43038916d425",
+        "null": "46e16340a9150bf026e4e416a2919c7b4c14326134c1cb7d00eb785a3b636a15",
+    },
+    "known_driver": {
+        "true": "53dae316e7a1c2545bbe4a48c9d1224fe5bf2088e5385edaee589f1c09f0b9ca",
+        "null": "f9ee53d2138a1169fcb7fb422ddb7565f815d7418ba90a7a8926a0445e6f1518",
+    },
+    "planned_event": {
+        "true": "4cc696c52af3df04064a4e7a0558f58a1ccb5e7375acdb7154208741ea04f921",
+        "null": "7889e148e02ccd4804cba41b980e339e5ae15843c76787491258046e001ce24e",
+    },
+    "past_driver": {
+        "true": "ca6382298b3a66d074f15ccbcc2610feb9f108404c98d0c1d6b5a3a3f86ef345",
+        "null": "c020d8361c7713a499ecacd8e6ff3f9d538a87bae8e0c508faf3292e530f44f9",
+    },
+    "calendar": {
+        "true": "520f2e2d21df94d8a668afa2c3d1aef49f7cbda55451ddb475f96c3dd4ade529",
+        "null": "1fdde34cb417d3cbaedd223bbe59d4bba7d413a61d49b10532362ab4b09072d2",
+    },
+    "several_targets": {
+        "true": "bcd64f663b60e80d97d7af254d8fc91bf8008529b9ad8d0c2a133754de684b6c",
+        "null": "fd6f9a32312e6648b3ed06a80af2e5cc640007a50ab8ce98fccb88129097211e",
+    },
+    "missing_vs_zero": {
+        "true": "0a96024632a5bd9b465b7e96e33edf9d425f0a925107302dd015e3cb17121028",
+        "null": "507c66fb8e437548b0a4bdf1dbd1c9b14cc9ff6b3a8c338ef928551de2019d71",
+    },
+    "bank": {
+        "true": "42e34cf9ef447eb1af5a20dad7c6e9c8d3737547ab95e59ec13fc4f2199beac4",
+        "null_all": "065af3780130ed39bf4e1b88f856da1a21e906a5654fcf7bce8d60155df77417",
+        "null_steps": "1775de6877d35b4d7670c094843d22e1d374212153a1a44dce70b2e1b10d6d67",
+    },
+    "event_response": {
+        "true": "b5ad467c7750f413045163b4b60a463c542b6751c48300d350d4ec956871ef04",
+        "null": "f9c334dee9cc3d59bb70581d0bf7987aaa4f35e5f4b61ea0e40ca4f4a4b77753",
+    },
+    "label_lag": {
+        "true": "426ece1189329a276113a8dc5cb97737770852ee3995af26154a9ca2c66d6696",
+        "null": "9d821c4e7dc8d36fed072d98518b4d4221c54a47534eb49b8944bbafe4b3116c",
+    },
+    "routing": {
+        "true": "5bca35a7a37d7593269718e1955dd9d40973e525b2e53de391806e579e6383ac",
+        "null_uniform": "e3ce2326bf69c846dd2be0778f0413bdd1611d177e4f6a2565e459d33ffbccbf",
+        "null_rolled": "8b767ae6a0e5a9f78a94214f042ff935ad167605d77f2d58f8f379f08f339b93",
+    },
+    "selection": {
+        "true": "c87f3b0c28577508f950c0e21da7c75e558a68cf3bb46ea2af96f27eb5e6e107",
+        "null": "22b59755d837d84dd27b37d1a1610b482c3694a146615b95dc497a52726c521b",
+        "gates_one": "fcd5d8870e21e5cff4a12030fef43d1860933bd3a325ba8d07e6d0e17e5dd29c",
+    },
+}
 
 
 def api():
@@ -126,6 +204,59 @@ def test_paths_recipes_37_valid_arms_and_exact_overrides():
         module.t1_config("bank", "typo", seed=0)
 
 
+def test_only_the_three_repaired_paths_change():
+    module = api()
+    assert module.PATHS.keys() == _BASE_ARM_DIGESTS.keys()
+    for path, entry in module.PATHS.items():
+        assert entry["arms"].keys() == _BASE_ARM_DIGESTS[path].keys()
+        for arm in entry["arms"]:
+            cfg = asdict(module.t1_config(path, arm, seed=7))
+            sampler = cfg["sampler"]
+            cold_share = sampler.pop("cold_share")
+            assert sampler.pop("cold_steps") == (3, 4)
+            if path in ("static_category", "multi_label"):
+                assert cold_share == 1.0 and sampler["episodes_per_panel"] == 1
+                sampler["episodes_per_panel"] = 8  # Restore the base field before hashing.
+            else:
+                assert cold_share == 0.0
+            if path == "several_targets":
+                # The draw truncates a log-uniform sample: the upper bound is exclusive.
+                assert sampler["horizon"] == (1, 5)
+                if arm == "null":
+                    assert sampler["drop_always"] == ("siblings",)
+                sampler["horizon"] = (16, 288)  # Restore the base field before hashing.
+            digest = hashlib.sha256(json.dumps(cfg, sort_keys=True).encode()).hexdigest()
+            assert digest == _BASE_ARM_DIGESTS[path][arm], (path, arm)
+
+
+@pytest.mark.parametrize("path", ["static_category", "multi_label"])
+def test_eval_set_of_a_static_path_is_cold_and_full(path):
+    entries = api().eval_set(path, episodes=30, max_panels=400)
+    assert len(entries) == 30
+    for entry in entries:
+        generated = generate_typed_panel(PanelRecipe(**entry["recipe"]))
+        item = next(item for item in generated.panel.items if item.item_id == entry["item_id"])
+        steps = entry["origin"] - item.start
+        assert steps in (3, 4) and entry["cutoff"] == entry["origin"]
+        assert np.isfinite(item.targets[entry["target"]][:steps]).any()
+
+
+def test_eval_set_of_several_targets_uses_short_horizons():
+    module = api()
+    entries = module.eval_set("several_targets", episodes=30, max_panels=400)
+    assert len(entries) == 30
+    cfg = module.t1_config("several_targets", "true", seed=10_000)
+    for entry in entries:
+        horizon = entry["horizon"]
+        assert 1 <= horizon <= 4
+        generated = generate_typed_panel(PanelRecipe(**entry["recipe"]))
+        episode = module._build(generated, entry, cfg)
+        assert episode.label_mask[:, episode.keep & ~episode.fallback, :horizon].any()
+    # Requested horizons are 1 to 4 steps, and the longest one does occur.
+    assert {entry["horizon"] for entry in entries} <= {1, 2, 3, 4}
+    assert max(entry["horizon"] for entry in entries) == 4
+
+
 @pytest.mark.parametrize("path", PATH_NAMES)
 def test_eval_set_supported_present_labelled_deterministic(small, path):
     episodes = small.eval_set(path, episodes=2, max_panels=60, min_count=1)
@@ -154,8 +285,12 @@ def test_eval_set_supported_present_labelled_deterministic(small, path):
         assert not built.label_mask[:, ~built.keep].any()
 
 
-def test_default_eval_set_reproduces_the_base_revision_digest():
+def test_default_eval_set_reproduces_the_base_revision_digest(monkeypatch):
     module = api()
+    # Replay the original static_category path with its pre-cold defaults.
+    monkeypatch.setitem(
+        module.PATHS, "static_category", {**module.PATHS["static_category"], "both": {}}
+    )
     options = {"episodes": 5, "max_panels": 50}
     entries = module.eval_set("static_category", **options)
     assert len(entries) == 5
