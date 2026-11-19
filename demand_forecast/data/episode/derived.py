@@ -26,8 +26,9 @@ class NaiveHistory:
         pairs_needed = (self.width + 1) // 2
         self.slope = np.full(1, np.nan)
         if size - season >= pairs_needed:
+            drift_width = season * ((64 + season - 1) // season)
             # Beyond the item's end, the rolling window loses older pairs without adding any.
-            padding = min(self.width, max(0, end - size))
+            padding = min(drift_width, max(0, end - size))
             differences = np.full(size + padding, np.nan)
             paired = self.finite[1 + season :] & self.finite[1:-season]
             with np.errstate(over="ignore"):
@@ -35,7 +36,7 @@ class NaiveHistory:
                     scaled[season:], scaled[:-season], out=differences[season:size], where=paired
                 )
             differences /= season
-            means = pd.Series(differences).rolling(self.width, min_periods=pairs_needed).mean()
+            means = pd.Series(differences).rolling(drift_width, min_periods=pairs_needed).mean()
             self.slope = np.r_[np.nan, means.to_numpy()]
 
     def _same_phase(

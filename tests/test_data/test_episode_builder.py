@@ -1641,9 +1641,14 @@ def test_new_history_before_an_origin_is_used():
 def test_naive_rows_recover_planted_values(freq, name, season, slope):
     steps = np.arange(420, dtype=np.float64)
     raw = 50 + np.sin(2 * np.pi * (steps % season) / season) + slope * steps
+    origin = 192
+    if name == "drift":
+        drift_width = season * ((64 + season - 1) // season)
+        # A level shift outside both endpoints of the slope window cannot enter the fit.
+        raw[: origin - drift_width - season] += 20
     panel = _naive_panel(freq, target=raw)
     item = panel.items[0]
-    request = EpisodeRequest(0, (item.start + 192,), 45, 16, derive=_NAIVE)
+    request = EpisodeRequest(0, (item.start + origin,), 45, 16, derive=_NAIVE)
     episode = EpisodeBuilder(panel).build(request)
     horizon = _naive_horizon(episode, f"y~{name}")
     assert horizon[:, CH_OBSERVED].all()
@@ -1654,6 +1659,20 @@ def test_naive_rows_recover_planted_values(freq, name, season, slope):
         assert set(episode.row_names[1:]) == {"y~last", "y~drift"}
     if freq == "D":
         assert set(episode.row_names[1:]) == {"y~last", "y~season", "y~drift"}
+
+
+def test_drift_row_survives_a_short_history():
+    origin = 14  # Seven daily seasonal pairs, the minimum in the 70-cell window.
+    panel = _naive_panel("D", target=np.arange(30, dtype=np.float64))
+    item = panel.items[0]
+    request = EpisodeRequest(0, (item.start + origin,), 8, 16, derive=_NAIVE)
+    episode = EpisodeBuilder(panel).build(request)
+    horizon = _naive_horizon(episode, "y~drift")
+
+    assert horizon[:, CH_OBSERVED].all()
+    np.testing.assert_allclose(
+        np.sinh(horizon[:, CH_VALUE]), episode.labels[0, 0, : request.horizon], atol=1e-6, rtol=1e-6
+    )
 
 
 def test_naive_row_layout_uses_the_first_origin_even_with_missing_history():
