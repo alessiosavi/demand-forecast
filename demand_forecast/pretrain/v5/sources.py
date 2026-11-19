@@ -114,7 +114,8 @@ class CorpusSource:
         self.cache = RowCache()
 
     def panel(self, rng: np.random.Generator) -> tuple[Panel, dict]:
-        values = read_values(self.index, int(rng.integers(self.index.rows)), self.cache)
+        row = self.index.pick(rng, self.config.folder_power)
+        values = read_values(self.index, row, self.cache)
         targets, covariates = values["targets"], values["covariates"]
         designated = int(rng.integers(len(targets)))
         others = np.delete(np.arange(len(targets)), designated)
@@ -131,6 +132,7 @@ class CorpusSource:
         panel = Panel("corpus", (item,), roles, values["freq"], None, False)
         return panel, {
             "source": "corpus",
+            "folder": values["file"].rsplit("/", 1)[0],
             "file": values["file"],
             "row": values["row"],
             "target": f"target_{designated:03d}",
@@ -138,11 +140,10 @@ class CorpusSource:
 
 
 class UpstreamSource:
-    """One undated series with upstream numeric covariate effects per panel.
+    """One undated upstream series per panel, optionally without covariates.
 
     Only one seed is drawn from the caller. Both upstream generators use local
     CPU streams; importing sources or constructing a mix never imports Simons.
-    Generator options in SourceConfig remain exclusive to typed sources.
     """
 
     def __init__(self, config: SourceConfig):
@@ -168,9 +169,13 @@ class UpstreamSource:
         # Effects normalize the history: upstream padding can otherwise hide
         # all of it while leaving observations only in the future segment.
         base = generate(1, MAX_CONTEXT + MAX_HORIZON, generator, "cpu", pad=0.0).numpy()
-        target, covariates = synthetic(
-            SimpleNamespace(uni=[(base[0], None)]), local, MAX_CONTEXT, MAX_HORIZON
-        )
+        share = self.config.plain_share
+        if share > 0 and local.random() < share:
+            target, covariates = base[0], []
+        else:
+            target, covariates = synthetic(
+                SimpleNamespace(uni=[(base[0], None)]), local, MAX_CONTEXT, MAX_HORIZON
+            )
         dynamic = {f"cov_{i:03d}": values.astype(np.float64) for i, values in enumerate(covariates)}
         roles = {name: str(local.choice(("known", "past"))) for name in dynamic}
         item = Item(
