@@ -158,6 +158,43 @@ def test_screen_no_evidence_yaml_round_trip_and_identity(tmp_path):
     assert type(cfg).from_yaml(path) == base
 
 
+@pytest.mark.parametrize("value", [0, 1, "false", None])
+def test_screen_fair_spread_requires_a_bool(value):
+    with pytest.raises(ValueError, match="screen_fair_spread"):
+        config_module().SamplerConfig(screen_fair_spread=value)
+
+
+def test_canonical_and_serializers_omit_the_default(tmp_path):
+    from demand_forecast.pretrain.v5.loop import _configuration
+
+    config = training_config()
+    assert config.sampler.screen_fair_spread is False
+    path = tmp_path / "train.yaml"
+    config.to_yaml(path)
+    stored = yaml.safe_load(path.read_text())
+    checkpoint_config = config._serialized()
+    for mapping in (stored, checkpoint_config, config.canonical()):
+        assert "screen_fair_spread" not in mapping["sampler"]
+    assert type(config).from_yaml(path) == _configuration(checkpoint_config) == config
+
+
+def test_enabled_fair_spread_round_trips_through_yaml_and_checkpoint_config(tmp_path):
+    from demand_forecast.pretrain.v5 import read_payload, save_checkpoint
+    from demand_forecast.pretrain.v5.loop import _configuration
+
+    base = training_config()
+    config = replace(base, sampler=replace(base.sampler, screen_fair_spread=True))
+    path = tmp_path / "train.yaml"
+    config.to_yaml(path)
+    payload = {"config": config._serialized(), "counters": {"batch": 0, "saves": 1}}
+    checkpoint, _ = save_checkpoint(tmp_path, payload, counter=1)
+    stored = read_payload(checkpoint)["config"]
+    assert stored["sampler"]["screen_fair_spread"] is True
+    assert yaml.safe_load(path.read_text())["sampler"]["screen_fair_spread"] is True
+    assert config.canonical()["sampler"]["screen_fair_spread"] is True
+    assert type(config).from_yaml(path) == _configuration(stored) == config
+
+
 @pytest.mark.parametrize(
     "with_corpus,expected",
     [
