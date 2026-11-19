@@ -4,7 +4,6 @@ from dataclasses import fields
 
 import numpy as np
 import pandas as pd
-import pytest
 
 from demand_forecast.data.episode import (
     EpisodeBuilder,
@@ -210,11 +209,7 @@ def test_calendar_cache_returns_equal_arrays_and_cannot_be_corrupted(monkeypatch
             assert cached.dtype == uncached.dtype
             np.testing.assert_array_equal(cached, uncached)
     for array in first:
-        try:
-            array[0, 0] = 42
-        except ValueError:
-            with pytest.raises(ValueError):
-                array.setflags(write=True)
+        array[0, 0] = 42  # results are copies: a caller's write must not reach the memo
     for cached, uncached in zip(
         episode_builder._calendar_arrays(start, length), expected, strict=True
     ):
@@ -270,3 +265,28 @@ def test_episodes_are_byte_equal_before_and_after(monkeypatch):
                 assert left.tobytes() == right.tobytes(), field.name
             else:
                 assert left == right, field.name
+
+
+def test_fast_paths_do_not_fall_back_to_the_scalar_rules(monkeypatch):
+    """Equal values alone would also pass if every array took the scalar path."""
+    calls = []
+
+    def no_scalar_missing(value):
+        raise AssertionError("is_missing was called on a fast-path array")
+
+    def counted_label(value):
+        calls.append(value)
+        return str(value)
+
+    monkeypatch.setattr(kinds, "is_missing", no_scalar_missing)
+    monkeypatch.setattr(kinds, "label_of", counted_label)
+    numbers = np.tile(np.array([0.0, -0.0, 1.5, np.nan, 7.0]), 200)
+    mixed = np.tile(np.array(["a", "", None, 2.5, float("nan"), "b"], dtype=object), 200)
+    words = np.tile(np.array(["a", "", "b"], dtype=object), 200)
+    assert kinds.observed_mask(numbers).sum() == 800
+    assert kinds.observed_mask(mixed).sum() == 600
+    assert kinds.labels_of(numbers).shape == numbers.shape
+    assert kinds.labels_of(mixed)[3] == "2.5"
+    assert len(calls) <= 7  # one call per distinct float, never one per cell
+    sets = screening._label_sets(words)
+    assert sets[0] == ("a",) and sets[1] == () and len(calls) <= 7
