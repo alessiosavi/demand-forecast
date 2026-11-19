@@ -22,7 +22,7 @@ from demand_forecast.data.episode.schema import (
 )
 from demand_forecast.models.heads import MonotoneQuantileHead
 
-from .blocks import DecoderBlock, EncoderBlock, _rows
+from .blocks import DecoderBlock, EncoderBlock, _expert_parameter_match, _rows
 from .config import V5Config
 from .context import ExpertRouter, ScaleShift, StaticContext
 from .gates import GateNet, GlobalMask, HardConcreteGate
@@ -45,12 +45,13 @@ class V5Output:
     """Scaled quantiles, applied gates, per-row expert weights and penalties.
 
     ``router`` holds the expert weights applied in the forward pass, including
-    the null weights under ``"uniform"`` and ``"rolled"`` routing.
+    the null weights under ``"uniform"`` and ``"rolled"`` routing. It is ``None``
+    in dense expert mode.
     """
 
     quantiles: Tensor
     gates: Gates
-    router: Tensor
+    router: Tensor | None
     aux: dict[str, Tensor]
 
 
@@ -85,7 +86,7 @@ class V5Model(nn.Module):
         self.calendar = CalendarEmbedding(config)
         self.patch_encoder = PatchEncoder(config)
         self.scale_shift = ScaleShift(config)
-        self.router = ExpertRouter(config)
+        self.router = ExpertRouter(config) if config.expert_mode == "routed" else None
         self.encoder = nn.ModuleList(
             EncoderBlock(config, expert=i >= config.enc_layers - config.expert_enc_layers)
             for i in range(config.enc_layers)
@@ -103,6 +104,19 @@ class V5Model(nn.Module):
         )
         self.step_projection = nn.Linear(config.d_model, PATCH * config.d_out)
         self.head = MonotoneQuantileHead(config.d_out, config.quantiles, config.width_factor)
+
+    def parameter_report(self) -> dict[str, int | None]:
+        """Return both parameter totals and the extra width of each dense expert block.
+
+        Dense size and extra width are unavailable when there are no expert blocks.
+        """
+        total = sum(parameter.numel() for parameter in self.parameters())
+        config = self.config
+        if config.expert_enc_layers == config.expert_dec_layers == 0:
+            return {"routed": total, "dense": None, "extra": None}
+        extra, delta = _expert_parameter_match(config)
+        routed = total if config.expert_mode == "routed" else total - delta
+        return {"routed": routed, "dense": routed + delta, "extra": extra}
 
     def gates(
         self,
@@ -202,8 +216,11 @@ class V5Model(nn.Module):
     ) -> V5Output:
         """Encode and decode with learned, uniform or deterministically rolled routing.
 
-        Rolled routing requires at least two episodes in the batch.
+        Rolled routing requires at least two episodes in the batch. Dense expert
+        mode accepts the default ``router="learned"`` argument.
         """
+        if self.router is None and router != "learned":
+            raise ValueError("dense expert mode only accepts router='learned'")
         if router not in ("learned", "uniform", "rolled"):
             raise ValueError("router must be 'learned', 'uniform' or 'rolled'")
         if router == "rolled" and batch.x.shape[0] == 1:
@@ -242,11 +259,14 @@ class V5Model(nn.Module):
             ref_flags,
             batch.freq_class,
         )
-        weights, balance = self.router(context, summary, flags, batch.row_mask)
-        if router == "uniform":
-            weights = torch.full_like(weights, 1 / self.config.n_experts)
-        elif router == "rolled":
-            weights = weights.roll(max(1, weights.shape[0] // 2), dims=0)
+        if self.router is None:
+            weights, balance = None, context.new_zeros(())
+        else:
+            weights, balance = self.router(context, summary, flags, batch.row_mask)
+            if router == "uniform":
+                weights = torch.full_like(weights, 1 / self.config.n_experts)
+            elif router == "rolled":
+                weights = weights.roll(max(1, weights.shape[0] // 2), dims=0)
         cal = self.calendar(batch.cal_phases, batch.cal_ids)[:, None]
         tokens = self.patch_encoder(
             x,
@@ -281,7 +301,7 @@ class V5Model(nn.Module):
         dec_gate = _rows(gates.row, dec_rows)
         horizon_tokens = torch.cat((forecast_tokens, known_tokens), dim=2)
         h = self.scale_shift(horizon_tokens * dec_gate[:, None, :, None, None], context)
-        dec_weights = _rows(weights, dec_rows)
+        dec_weights = _rows(weights, dec_rows) if weights is not None else None
         for block in self.decoder:
             h = block(
                 h,

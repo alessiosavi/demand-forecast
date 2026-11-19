@@ -287,6 +287,8 @@ class V5TrainConfig:
             raise ValueError("router must be learned, uniform or rolled")
         if self.gates not in ("learned", "ones"):
             raise ValueError("gates must be learned or ones")
+        if self.model.expert_mode == "dense" and self.router != "learned":
+            raise ValueError("the dense expert mode requires router=learned")
         if self.router == "rolled":
             if self.sampler.episodes_per_batch < 2:
                 raise ValueError(
@@ -321,18 +323,20 @@ class V5TrainConfig:
             data["sources"] = tuple(_record(SourceConfig, source) for source in data["sources"])
         return cls(**data)
 
-    def to_yaml(self, path: Path) -> None:
-        path.write_text(yaml.safe_dump(self._serialized(), sort_keys=False), encoding="utf-8")
-
     def _serialized(self) -> dict:
-        """Keep portable settings and omit source options at their defaults."""
+        """Omit options at their defaults so that existing runs keep their stored configuration."""
         data = _plain(asdict(self))
+        if self.model.expert_mode == "routed":
+            del data["model"]["expert_mode"]
         for source in data["sources"]:
             if source["folder_power"] is None:
                 del source["folder_power"]
             if source["plain_share"] == 0.0:
                 del source["plain_share"]
         return data
+
+    def to_yaml(self, path: Path) -> None:
+        path.write_text(yaml.safe_dump(self._serialized(), sort_keys=False), encoding="utf-8")
 
     def canonical(self) -> dict:
         """Return detached semantics, independent of machine and corpus location."""
