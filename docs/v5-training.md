@@ -123,6 +123,18 @@ the adapter uses them for scoring. Use the `no_derived` scoring variant to
 disable them on the same weights. `lag_rows` and `onset_rows` are accepted names
 reserved for later presentations.
 
+**Calibrated score for static categories.** Set `sampler.screen_fair_spread` to
+`true` to score a static category attribute against 32 seeded permutations of
+its labels. The default score is the share of spread between label groups, which
+is biased upward when a label has two or three items, so an unrelated attribute
+can pass the screening level. With the option, the attribute scores above zero
+only when its largest component exceeds the same component under every
+permutation. Permutations act within the items that are valid for each summary
+entry, and a multi-label attribute is scored by membership. The option defaults
+to `false`. The export records it and the adapter uses it for scoring; an export
+written without the key replays with the default score. The static diagnostics
+always use the calibrated score.
+
 ### Export as a resumable job
 
 Generate a job from a checkpoint's storage URI and SHA-256:
