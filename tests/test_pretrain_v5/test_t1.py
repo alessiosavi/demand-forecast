@@ -214,6 +214,8 @@ def test_only_the_four_repaired_paths_change():
             sampler = cfg["sampler"]
             # The model field added after the base revision; every T1 arm keeps the routed experts.
             assert cfg["model"].pop("expert_mode") == "routed"
+            # The optimiser field added after the base revision; no T1 arm sets a label cap.
+            assert cfg["optim"].pop("label_cap") is None
             for source in cfg["sources"]:
                 # Source fields added after the base revision; every T1 arm leaves them at their defaults.
                 assert source.pop("folder_power") is None

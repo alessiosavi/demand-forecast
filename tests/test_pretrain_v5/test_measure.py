@@ -240,6 +240,33 @@ def test_worst_batch_origins_fit_context():
     assert batch.origin_patches.tolist() == [[2]]
 
 
+def test_qualification_runs_with_the_cap(tmp_path, monkeypatch):
+    measure = api()
+    base = config()
+    c = replace(base, optim=replace(base.optim, label_cap=1.0))
+    observed = []
+
+    def observer(phase):
+        def observe(output, batch, model, **kwargs):
+            batch.labels.fill_(2.0)
+            loss, parts = v5_loss(output, batch, model, **kwargs)
+            observed.append((phase, kwargs.get("label_cap"), parts.get("capped")))
+            return loss, parts
+
+        return observe
+
+    monkeypatch.setattr(measure, "v5_loss", observer("worst"))
+    monkeypatch.setattr(measure.loop, "v5_loss", observer("trial"))
+    report = measure.qualify(
+        c, tmp_path, models={"tiny": c.model}, updates=1, workers=(0,), no_inference=True
+    )
+    model = report["models"]["tiny"]
+    assert model["workers"]["0"]["status"] == model["worst_batch"]["status"] == "ok"
+    assert model["workers"]["0"]["updates"] == 1
+    assert [phase for phase, _, _ in observed] == ["trial", "worst"]
+    assert all(cap == 1 and count > 0 for _, cap, count in observed)
+
+
 @pytest.mark.parametrize("entry", ["worst_batch", "inference"])
 def test_derive_reaches_every_request(monkeypatch, entry):
     measure = api()

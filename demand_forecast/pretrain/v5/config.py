@@ -226,6 +226,7 @@ class OptimConfig:
     ema_decay: float | None = 0.999
     checkpoint_minutes: float = 10.0
     log_every: int = 50
+    label_cap: float | None = None
 
     def __post_init__(self) -> None:
         _flag(self, "amp")
@@ -239,6 +240,10 @@ class OptimConfig:
             _normalize(self, "ema_decay", minimum=0, maximum=1)
             if self.ema_decay in (0, 1):
                 raise ValueError("ema_decay must be None or in (0, 1)")
+        if self.label_cap is not None:
+            _normalize(self, "label_cap", minimum=0)
+            if self.label_cap == 0:
+                raise ValueError("label_cap must be positive")
 
 
 def _plain(value):
@@ -335,6 +340,8 @@ class V5TrainConfig:
             del data["model"]["expert_mode"]
         if not self.sampler.derive:
             del data["sampler"]["derive"]
+        if self.optim.label_cap is None:
+            del data["optim"]["label_cap"]
         for source in data["sources"]:
             if source["folder_power"] is None:
                 del source["folder_power"]

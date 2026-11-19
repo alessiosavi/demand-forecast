@@ -54,6 +54,43 @@ def test_yaml_round_trip_is_plain_and_restores_tuples(tmp_path):
     assert isinstance(restored.model.quantiles, tuple)
 
 
+@pytest.mark.parametrize("value", [0, -1, float("nan"), float("inf"), -float("inf"), True, "1"])
+def test_cap_must_be_finite_and_positive(value):
+    with pytest.raises(ValueError, match="label_cap"):
+        config_module().OptimConfig(max_steps=1, label_cap=value)
+
+
+def test_cap_is_omitted_when_none_and_round_trips(tmp_path):
+    from demand_forecast.pretrain.v5.loop import _configuration
+
+    base = training_config()
+    assert base.optim.label_cap is None
+    path = tmp_path / "train.yaml"
+    base.to_yaml(path)
+    original = path.read_bytes()
+    raw = yaml.safe_load(original)
+    assert "label_cap" not in raw["optim"]
+    assert "label_cap" not in base._serialized()["optim"]
+    assert "label_cap" not in base.canonical()["optim"]
+    raw["optim"]["label_cap"] = None
+    path.write_text(yaml.safe_dump(raw))
+    explicit = type(base).from_yaml(path)
+    explicit.to_yaml(path)
+    assert path.read_bytes() == original
+    assert _configuration(base._serialized()) == explicit
+
+    enabled = replace(base, optim=replace(base.optim, label_cap=1000))
+    enabled.to_yaml(path)
+    assert type(base).from_yaml(path) == enabled
+    assert _configuration(enabled._serialized()) == enabled
+    assert enabled.canonical()["optim"]["label_cap"] == pytest.approx(1000.0)
+    assert type(enabled.optim.label_cap) is float
+    identity = config_module().identity
+    parts = dict(code="0" * 40, corpus=None, init=None, env=None)
+    assert identity(base, **parts) == identity(explicit, **parts)
+    assert identity(base, **parts) != identity(enabled, **parts)
+
+
 def test_canonical_serialized_and_export_omit_an_empty_derive(tmp_path):
     from demand_forecast.pretrain.v5.loop import _configuration
 

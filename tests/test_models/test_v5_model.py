@@ -16,6 +16,7 @@ from demand_forecast.data.episode.schema import (
     CH_VALUE_STATS,
     KIND_NUMBER,
     N_SUMMARY,
+    PATCH,
     ROLE_FORECAST,
     ROLE_KNOWN,
     ROLE_PANEL,
@@ -179,6 +180,216 @@ def test_shapes_and_monotone_quantiles():
     out = V5Model(TINY).eval()(batch)
     assert out.quantiles.shape == (1, 2, 1, 32, 9)
     assert (out.quantiles.diff(dim=-1) >= 0).all()
+
+
+def test_head_and_loss_are_float32_under_autocast(monkeypatch):
+    batch = toy_batch()
+    model = V5Model(TINY).eval()
+    observed = []
+    projected = []
+
+    def observe_pinball(*args, **kwargs):
+        observed.append((torch.is_autocast_enabled("cpu"), [tensor.dtype for tensor in args[:2]]))
+        return pinball_loss(*args, **kwargs)
+
+    monkeypatch.setattr("demand_forecast.models.v5.predict.pinball_loss", observe_pinball)
+    median = TINY.quantiles.index(0.5)
+    with torch.no_grad():
+        model.head.projection.weight.zero_()
+        gaps = torch.tensor(TINY.quantiles).diff()
+        widths = TINY.width_factor * torch.cat((gaps[:median], torch.ones(1), gaps[median:]))
+        model.head.projection.bias.copy_(torch.log(torch.expm1(0.01 / widths)))
+        model.head.projection.bias[median] = 30
+        hook = model.step_projection.register_forward_hook(
+            lambda _module, _inputs, steps: projected.append(steps.dtype)
+        )
+        try:
+            with torch.autocast("cpu", dtype=torch.bfloat16):
+                output = model(batch)
+                loss, _ = v5_loss(output, batch, TINY)
+        finally:
+            hook.remove()
+    assert output.quantiles.dtype == loss.dtype == torch.float32
+    assert projected == [torch.float32]
+    assert observed == [(False, [torch.float32, torch.float32])]
+    q = output.quantiles[0, 0, 0, 0]
+    torch.testing.assert_close(q[median], torch.tensor(30.0))
+    torch.testing.assert_close(q.diff(), torch.full_like(q[:-1], 0.01), rtol=0, atol=3e-6)
+
+
+def legacy_toy_loss(output, batch):
+    # The toy batch has one eligible row and no observed labels in the padded steps.
+    pinball = pinball_loss(
+        output.quantiles.flatten(0, 2),
+        batch.labels.flatten(0, 2),
+        batch.label_mask.flatten(0, 2),
+        batch.origin_mask.flatten(),
+        output.quantiles.new_tensor(TINY.quantiles),
+    )[0]
+    return (
+        pinball
+        + TINY.sparsity_weight * output.gates.expected_l0
+        + TINY.balance_weight * output.aux["balance"]
+    )
+
+
+def test_amp_off_is_bitwise_today():
+    batch = toy_batch()
+    model = V5Model(TINY).eval()
+    reference = []
+
+    def legacy_head(_, _inputs, decoded):
+        steps = model.step_projection(decoded[:, :, : batch.forecast_rows.shape[1]])
+        reference.append(model.head(steps.unflatten(-1, (PATCH, TINY.d_out)).flatten(3, 4)))
+
+    hook = model.decoder[-1].register_forward_hook(legacy_head)
+    with torch.no_grad():
+        try:
+            output = model(batch)
+        finally:
+            hook.remove()
+        (expected,) = reference
+        torch.testing.assert_close(output.quantiles, expected, rtol=0, atol=0)
+        legacy_loss = legacy_toy_loss(replace(output, quantiles=expected), batch)
+        torch.testing.assert_close(v5_loss(output, batch, TINY)[0], legacy_loss, rtol=0, atol=0)
+
+
+def test_float64_predictions_and_labels_are_not_downcast():
+    batch = toy_batch()
+    batch.label_mask[:] = True
+    labels = batch.labels.double()
+    labels[0, 0, 0, 0] = 1.0 + 2.0**-40  # Not representable in float32.
+    batch = replace(batch, labels=labels)
+    gates = V5Model(TINY).gates(batch, mode="ones")
+    predictions = torch.zeros((*labels.shape, len(TINY.quantiles)), dtype=torch.float64)
+    predictions.requires_grad_()
+    output = V5Output(predictions, gates, None, {"balance": torch.tensor(0.0)})
+
+    loss, _ = v5_loss(output, batch, TINY)
+    capped, _ = v5_loss(output, batch, TINY, label_cap=1000.0)
+
+    assert loss.dtype == capped.dtype == torch.float64
+    exact = v5_loss(output, replace(batch, labels=labels.float().double()), TINY)[0]
+    assert loss.item() != exact.item()
+
+
+def _capped_count(labels, cap):
+    batch = toy_batch()
+    batch.label_mask[:] = True
+    batch = replace(batch, labels=labels.expand_as(batch.labels).clone())
+    gates = V5Model(TINY).gates(batch, mode="ones")
+    predictions = torch.zeros((*batch.labels.shape, len(TINY.quantiles)), dtype=labels.dtype)
+    output = V5Output(predictions, gates, None, {"balance": torch.tensor(0.0)})
+    return v5_loss(output, batch, TINY, label_cap=cap)[1]
+
+
+@pytest.mark.parametrize(
+    ("value", "cap"),
+    [(0.0999999999, 0.1), (1e39, 1e100), (-1e39, 1e100)],
+)
+def test_cap_compares_float64_labels_exactly(value, cap, recwarn):
+    parts = _capped_count(torch.tensor(value, dtype=torch.float64), cap)
+
+    assert parts["capped"] == 0 and parts["n_labels"] > 0
+    assert not [w for w in recwarn if issubclass(w.category, RuntimeWarning)]
+
+
+def test_half_precision_predictions_and_labels_are_promoted():
+    batch = toy_batch()
+    batch.label_mask[:] = True
+    gates = V5Model(TINY).gates(batch, mode="ones")
+    predictions = torch.zeros((*batch.labels.shape, len(TINY.quantiles)), dtype=torch.bfloat16)
+    output = V5Output(predictions, gates, None, {"balance": torch.tensor(0.0)})
+
+    loss, _ = v5_loss(output, replace(batch, labels=batch.labels.bfloat16()), TINY)
+
+    assert loss.dtype == torch.float32 and torch.isfinite(loss)
+
+
+def test_label_cap_none_is_bitwise_today():
+    batch = toy_batch()
+    model = V5Model(TINY).eval()
+    output = model(batch)
+    default, default_parts = v5_loss(output, batch, TINY)
+    legacy = legacy_toy_loss(output, batch)
+    explicit, parts = v5_loss(output, batch, TINY, label_cap=None)
+    assert "capped" not in parts
+    assert parts == default_parts
+    torch.testing.assert_close(explicit, default, rtol=0, atol=0)
+    torch.testing.assert_close(explicit, legacy, rtol=0, atol=0)
+    parameters = tuple(model.parameters())
+    expected = torch.autograd.grad(legacy, parameters, allow_unused=True, retain_graph=True)
+    actual = torch.autograd.grad(explicit, parameters, allow_unused=True)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    ("label_cap", "kept", "removed"),
+    [
+        (2.0, 2.0, (3.0, -4.0)),
+        (1.0 - 2**-30, 0.5, (1.0, -1.0)),
+        (1e100, 2.0, (float("inf"), -float("inf"))),
+    ],
+    ids=["strict-boundary", "rounds-up", "beyond-float32"],
+)
+def test_capped_cells_leave_sum_and_count(label_cap, kept, removed):
+    batch = toy_batch()
+    batch.horizon[:] = 5
+    batch.origin_mask[:, 1] = False
+    batch.label_mask[:] = True
+    batch.label_mask[..., 4] = False
+    batch.labels.fill_(100.0)
+    batch.labels[0, 0, 0, :5] = torch.tensor([kept, -kept, *removed, 100.0])
+    gates = V5Model(TINY).gates(batch, mode="ones")
+    predictions = torch.full((*batch.labels.shape, len(TINY.quantiles)), float("nan"))
+    predictions[0, 0, 0, :2] = 0.0
+    predictions.requires_grad_()
+    output = V5Output(predictions, gates, None, {"balance": torch.tensor(0.0)})
+
+    loss, parts = v5_loss(output, batch, TINY, label_cap=label_cap)
+
+    assert parts["pinball"] == pytest.approx(kept)
+    assert parts["n_labels"] == parts["capped"] == 2
+    loss.backward()
+    assert torch.isfinite(predictions.grad).all()
+    assert predictions.grad[0, 0, 0, :2].count_nonzero() == 2 * len(TINY.quantiles)
+    assert predictions.grad.count_nonzero() == 2 * len(TINY.quantiles)
+
+
+def test_all_capped_batch_steps_on_the_auxiliary_terms():
+    batch = toy_batch()
+    batch.labels.fill_(2.0)
+    model = V5Model(TINY).train()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    output = model(batch)
+    aux = (
+        TINY.sparsity_weight * output.gates.expected_l0
+        + TINY.balance_weight * output.aux["balance"]
+    )
+    parameters = tuple(model.parameters())
+    expected = torch.autograd.grad(aux, parameters, allow_unused=True, retain_graph=True)
+    # A NaN at the prediction boundary must never enter the empty pinball reduction.
+    invalid = replace(output, quantiles=output.quantiles + float("nan"))
+    loss, parts = v5_loss(invalid, batch, TINY, label_cap=1.0)
+    assert parts["pinball"] == parts["n_labels"] == 0
+    assert parts["capped"] == batch.label_mask.sum().item()
+    torch.testing.assert_close(loss, aux, rtol=0, atol=0)
+
+    before = [parameter.detach().clone() for parameter in parameters]
+    loss.backward()
+    assert model.head.projection.weight.grad is not None
+    for parameter, reference in zip(parameters, expected, strict=True):
+        if parameter.grad is not None:
+            assert torch.isfinite(parameter.grad).all()
+            reference = torch.zeros_like(parameter.grad) if reference is None else reference
+            torch.testing.assert_close(parameter.grad, reference, rtol=0, atol=0)
+        else:
+            assert reference is None
+    optimizer.step()
+    assert any(
+        not torch.equal(parameter, initial)
+        for parameter, initial in zip(parameters, before, strict=True)
+    )
 
 
 def test_overfits_one_batch():
