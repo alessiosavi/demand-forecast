@@ -25,7 +25,7 @@ from demand_forecast.data.episode.schema import (
 )
 from demand_forecast.models import v5
 from demand_forecast.models.v5 import predict
-from tests.helpers.episodes import perturb_after, toy_panel
+from tests.helpers.episodes import lag_panel, perturb_after, toy_panel
 from tests.helpers.v5_loop import config, equal
 
 CONTEXT = 32
@@ -880,3 +880,27 @@ def test_training_mode_is_restored_after_an_error(model, monkeypatch, training, 
     with error:
         v5.forecast_items(model, panel, [(0, 40)], 4, context=CONTEXT)
     assert model.training is training
+
+
+def test_base_evidence_ignores_its_derived_row(model):
+    panel = lag_panel(start=19)
+    origins = (531, 547)
+    derive = frozenset({"lag_rows"})
+    with torch.no_grad():
+        model.gate_net.net[-1].weight.zero_()
+        model.gate_net.net[-1].bias.fill_(-20)
+    evidence = v5.forecast_items(
+        model, panel, [(0, origins[0])], 12, context=CONTEXT, derive=derive, pruned=True
+    ).evidence
+    base = evidence.candidates.index("dynamic:driver")
+    lag = evidence.candidates.index("derived:driver~lag")
+    np.testing.assert_array_equal(evidence.status[0, [base, lag]], [5, 1])
+    assert evidence.gate[0, base] == 0
+    assert evidence.gate[0, lag] == pytest.approx(model.gate_net.known_gate_floor)
+    assert evidence.score[0, lag] > evidence.score[0, base]
+
+    request = EpisodeRequest(0, origins, 12, CONTEXT, derive=derive)
+    original = v5.forecast(model, panel, request)
+    modified = v5.forecast(model, perturb_after(panel, origins[0]), request)
+    assert original.gates == modified.gates
+    np.testing.assert_array_equal(original.quantiles[0], modified.quantiles[0])

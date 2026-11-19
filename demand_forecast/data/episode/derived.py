@@ -5,6 +5,99 @@ import pandas as pd
 
 from .kinds import is_missing, label_of
 
+LAG_SCAN_WINDOW = 512
+
+
+def _adjust(values: np.ndarray, observed: np.ndarray, phases: int) -> np.ndarray:
+    """Remove a linear trend, then phase means, fitting only observed cells."""
+    time = np.arange(len(values)) - (len(values) - 1) / 2
+    time -= time[observed].mean()
+    centered = values - values[observed].mean()
+    fitted_time = time[observed]
+    residual = centered - time * (fitted_time @ centered[observed]) / (fitted_time @ fitted_time)
+    if phases:
+        phase = np.arange(len(values)) % phases
+        count = np.bincount(phase[observed], minlength=phases)
+        total = np.bincount(phase[observed], residual[observed], minlength=phases)
+        residual -= (total / np.maximum(count, 1))[phase]
+    return residual
+
+
+def _acf(values: np.ndarray, observed: np.ndarray, lags: int) -> np.ndarray:
+    centered = values - values[observed].mean()
+    if observed.all():
+        # Preserve the frozen calibration on complete series.
+        energy = centered @ centered
+        if energy == 0:
+            return np.zeros(lags)
+        return np.array([(centered[k:] @ centered[:-k]) / energy for k in range(1, lags + 1)])
+
+    acf = np.zeros(lags)
+    for lag in range(1, lags + 1):
+        paired = observed[lag:] & observed[:-lag]
+        left, right = centered[:-lag][paired], centered[lag:][paired]
+        norm = np.linalg.norm(left) * np.linalg.norm(right)
+        if norm:
+            acf[lag - 1] = (right @ left) / norm
+    return acf
+
+
+def _pearson(x: np.ndarray, y: np.ndarray, has_missing: bool) -> tuple[float, int]:
+    """Absolute correlation and the number of complete pairs it rests on."""
+    if has_missing:
+        paired = np.isfinite(x) & np.isfinite(y)
+        if paired.sum() < 2:
+            return 0.0, int(paired.sum())
+        x, y = x[paired], y[paired]
+    score = float(abs(np.corrcoef(x, y)[0, 1]))
+    return (0.0 if has_missing and np.isnan(score) else score), len(x)
+
+
+def scan_delay(
+    x: np.ndarray, y: np.ndarray, *, season: int, no_evidence: float
+) -> tuple[int, float, float]:
+    """Return the admitted delay (or zero), best positive-lag score and lag-zero score."""
+    x = np.asarray(x[-LAG_SCAN_WINDOW:], dtype=np.float64)
+    y = np.asarray(y[-LAG_SCAN_WINDOW:], dtype=np.float64)
+    width = len(x)
+    max_delay = min(64, width // 3)
+    common = width - max_delay
+    phases = season if season > 1 and width >= 8 * season else 0
+    dof = common - 2 - phases
+    if max_delay < 8 or common < 32 or dof < 24:
+        return 0, 0.0, 0.0
+
+    x_observed, y_observed = np.isfinite(x), np.isfinite(y)
+    observed = min(x_observed.sum(), y_observed.sum())
+    if 5 * observed < 4 * width:
+        return 0, 0.0, 0.0
+    has_missing = observed < width
+    with np.errstate(invalid="ignore", divide="ignore"):
+        x = _adjust(x, x_observed, phases)
+        y = _adjust(y, y_observed, phases)
+        scores, pairs = zip(
+            *(
+                _pearson(x[max_delay - delay : width - delay], y[max_delay:], has_missing)
+                for delay in range(max_delay + 1)
+            ),
+            strict=True,
+        )
+        acf_lags = min(max_delay, common // 4)
+        inflation = max(
+            1.0, 1 + 2 * float(_acf(x, x_observed, acf_lags) @ _acf(y, y_observed, acf_lags))
+        )
+
+    # argmax returns the first of any exact ties.
+    delay = int(np.argmax(scores[1:])) + 1
+    score, contemporaneous = scores[delay], scores[0]
+    # Missing cells shorten the evidence: the threshold counts the chosen delay's complete pairs.
+    dof = pairs[delay] - 2 - phases
+    if pairs[delay] < 32 or dof < 24:
+        return 0, score, contemporaneous
+    threshold = max(0.2, 3.5 * np.sqrt(inflation / dof))
+    admitted = score >= threshold and score > contemporaneous and score > no_evidence
+    return (delay if admitted else 0), score, contemporaneous
+
 
 def increment_spread(
     labels: np.ndarray,

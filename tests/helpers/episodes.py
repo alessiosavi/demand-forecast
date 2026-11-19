@@ -93,3 +93,13 @@ def perturb_after(
                     values[np.arange(len(values)) + item.start >= index] = value
         items.append(replace(item, targets=targets, dynamic=dynamic, static=deepcopy(item.static)))
     return replace(panel, items=tuple(items), roles=panel.roles.copy())
+
+
+def lag_panel(*, delay: int = 5, length: int = 560, start: int = 0) -> Panel:
+    """One past continuous driver with a delayed target effect."""
+    rng = np.random.default_rng(827)
+    driver = rng.normal(size=length)
+    target = rng.normal(scale=0.08, size=length)
+    target[delay:] += driver[:-delay]
+    item = Item("item", start, {"y": target}, {"driver": driver}, {})
+    return Panel("delay", (item,), {"driver": "past"}, None, None, True)
