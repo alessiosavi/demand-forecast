@@ -33,6 +33,89 @@ def test_index_order_counts_and_footer_identity(tmp_path):
     assert len(paths) == 3
 
 
+@pytest.fixture
+def folder_index(tmp_path):
+    paths = write_corpus(tmp_path)
+    for name, targets in (
+        ("univariate/alpha/train-001.parquet", [[np.arange(40)], [np.arange(1000)]]),
+        ("univariate/excluded/train-000.parquet", [[np.arange(1000)]]),
+    ):
+        paths += (write_rows(tmp_path / name, targets, row_group_size=1),)
+    objects = manifest(tmp_path, paths)
+    return api().CorpusIndex.build(tmp_path, max_group_bytes=23_000), objects
+
+
+def test_folders_cover_admitted_rows_and_values_without_affecting_digest(folder_index):
+    index, objects = folder_index
+    assert [(f.name, f.first_row, f.rows, f.values) for f in index.folders] == [
+        ("covariates/drivers", 0, 3, 360),
+        ("univariate/alpha", 3, 5, 200),
+        ("univariate/beta", 8, 3, 880),
+    ]
+    assert sum(f.rows for f in index.folders) == index.rows == 11
+    assert [group[:2] for group in index.excluded] == [
+        ("univariate/alpha/train-001.parquet", 1),
+        ("univariate/excluded/train-000.parquet", 0),
+    ]
+    assert index.digest == api().listing_digest(objects)
+    assert index.digest == api().CorpusIndex.build(index.root).digest
+
+
+def test_pick_none_matches_200_base_revision_row_draws(folder_index):
+    index, _ = folder_index
+    rng = np.random.default_rng(7)
+    # The base draws were int(rng.integers(index.rows)), with 11 admitted rows.
+    rows = """
+    10 6 7 9 6 8 9 2 0 3 3 9 10 0 5 9 1 8 1 5 8 3 3 3 7 2 10 4 5 5 6 6 5 10 8 8 7 6 3 10
+    5 2 9 1 9 6 1 0 4 0 1 5 10 5 8 10 9 6 4 5 2 5 4 2 10 0 1 2 10 7 9 2 7 4 5 0 6 9 7 1
+    5 2 10 9 2 5 10 9 7 7 0 8 5 1 2 5 7 5 6 9 7 3 7 6 1 0 7 4 6 3 2 1 4 8 4 4 6 10 4 6
+    4 6 4 7 6 7 10 1 6 4 3 2 0 4 9 1 4 10 10 2 0 7 0 3 5 9 1 7 5 1 9 9 5 10 6 9 10 6 3 1
+    6 2 8 10 2 6 0 1 4 9 10 7 6 6 0 4 10 4 2 2 7 0 10 9 6 5 8 6 5 3 4 8 0 0 7 4 8 0 9 1
+    """
+    assert [index.pick(rng, None) for _ in range(200)] == list(map(int, rows.split()))
+
+
+@pytest.mark.parametrize("power,weights", [(0, [1, 1, 1]), (1, [360, 200, 880])])
+def test_pick_proposes_a_folder_then_a_uniform_row(folder_index, power, weights):
+    index, _ = folder_index
+    expected = np.array(weights) / sum(weights)
+    calls = []
+
+    class FixedDraws:
+        def choice(self, n, *, p):
+            calls.append("choice")
+            assert n == 3
+            np.testing.assert_allclose(p, expected, rtol=0, atol=1e-12)
+            return 1
+
+        def integers(self, low, high):
+            calls.append("integers")
+            assert (low, high) == (3, 8)
+            return 7
+
+    assert index.pick(FixedDraws(), power) == 7
+    assert calls == ["choice", "integers"]
+
+    rng = np.random.default_rng(42)
+    counts = np.bincount([index.pick(rng, power) for _ in range(10_000)], minlength=index.rows)
+    sizes = [3, 5, 3]
+    folder_counts = np.add.reduceat(counts, [0, 3, 8])
+    predicted = expected * 10_000
+    assert np.sum((folder_counts - predicted) ** 2 / predicted) < 16
+    by_row = np.repeat(predicted / sizes, sizes)
+    assert np.sum((counts - by_row) ** 2 / by_row) < 32
+    if power == 1:
+        swapped = predicted[[2, 1, 0]]
+        assert np.sum((folder_counts - swapped) ** 2 / swapped) > 16
+
+
+@pytest.mark.parametrize("power", [0, 0.5, 1])
+def test_pick_with_one_folder_and_one_row(tmp_path, power):
+    write_rows(tmp_path / "univariate/only/train-000.parquet", [[np.arange(32)]])
+    index = api().CorpusIndex.build(tmp_path)
+    assert index.pick(np.random.default_rng(0), power) == 0
+
+
 def test_equal_sized_changed_footer_changes_metadata_identity(tmp_path):
     path = tmp_path / "univariate/a/train-000.parquet"
     write_rows(path, [[np.zeros(32)]], compression=None)
