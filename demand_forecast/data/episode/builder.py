@@ -1,12 +1,13 @@
 """Build cutoff-bounded, typed numpy episodes on an absolute panel grid."""
 
+from collections import OrderedDict
 from dataclasses import dataclass, replace
 
 import numpy as np
 
 from .bank import step_features, summary_vectors
 from .calendar import calendar_arrays
-from .kinds import flag_codes, is_missing, label_of
+from .kinds import flag_codes, labels_of, observed_mask
 from .panel_stats import PanelStats, PanelStatsProvider
 from .scale import Scale, compress, fit_scale, to_scaled
 from .schema import (
@@ -177,6 +178,8 @@ def _window(values: np.ndarray, left: int, right: int) -> np.ndarray:
 class EpisodeBuilder:
     """Reuse cutoff statistics across planning, screening and episode assembly."""
 
+    _CALENDAR_CACHE_SIZE = 32
+
     def __init__(
         self,
         panel: Panel,
@@ -190,6 +193,20 @@ class EpisodeBuilder:
         self.panel = panel
         self.config = config
         self.stats = PanelStatsProvider(panel) if stats is None else stats
+        self._calendar_cache: OrderedDict[tuple[int, int], tuple[np.ndarray, np.ndarray] | None] = (
+            OrderedDict()
+        )
+
+    def _calendar_arrays(self, start: int, length: int) -> tuple[np.ndarray, np.ndarray] | None:
+        key = start, length
+        if key not in self._calendar_cache:
+            self._calendar_cache[key] = calendar_arrays(self.panel, start, length)
+            if len(self._calendar_cache) > self._CALENDAR_CACHE_SIZE:
+                self._calendar_cache.popitem(last=False)
+        self._calendar_cache.move_to_end(key)
+        arrays = self._calendar_cache[key]
+        # A caller can edit its arrays without affecting later episodes.
+        return None if arrays is None else (arrays[0].copy(), arrays[1].copy())
 
     def _stats(self, target: str, cutoff: int) -> PanelStats:
         return self.stats.get(target, cutoff)
@@ -370,9 +387,7 @@ class EpisodeBuilder:
             )
             observed = np.zeros(right - left, dtype=bool)
             if start < stop:
-                observed[start - left : stop - left] = ~np.frompyfunc(is_missing, 1, 1)(
-                    row.raw[start:stop]
-                ).astype(bool)
+                observed[start - left : stop - left] = observed_mask(row.raw[start:stop])
             result[:, CH_OBSERVED] = observed
             if row.mode == "category":
                 result[:, CH_VALUE_STATS:] = stats
@@ -389,7 +404,7 @@ class EpisodeBuilder:
             scaled, raw = row.scaled, row.raw
             if row.mode == "effect":
                 effects, _ = category_step_stats(row.raw, target, left=0, right=stop)
-                present = ~np.frompyfunc(is_missing, 1, 1)(row.raw[:stop]).astype(bool)
+                present = observed_mask(row.raw[:stop])
                 # Effects already inhabit the target's scaled frame.
                 scaled = raw = np.where(present, effects[:, 0], np.nan).astype(np.float64)
             values, flags = step_features(
@@ -410,12 +425,12 @@ class EpisodeBuilder:
         self, row: _Row, end: int, target: np.ndarray, *, cutoff: int, include_effect: bool
     ) -> list[_Row]:
         prefix = row.raw[: max(0, end)]
-        observed = ~np.frompyfunc(is_missing, 1, 1)(prefix).astype(bool)
-        names = np.frompyfunc(label_of, 1, 1)(prefix[observed])
+        observed = observed_mask(prefix)
+        names = labels_of(prefix[observed])
         unique, first, counts = np.unique(names, return_index=True, return_counts=True)
         order = np.lexsort((first, -counts))[:4]
-        present = ~np.frompyfunc(is_missing, 1, 1)(row.raw).astype(bool)
-        labels = np.frompyfunc(label_of, 1, 1)(row.raw)
+        present = observed_mask(row.raw)
+        labels = labels_of(row.raw)
         rows = []
         for label in unique[order]:
             codes = np.where(present, (labels == label).astype(np.float64), np.nan)
@@ -685,9 +700,9 @@ class EpisodeBuilder:
         calh_phases = np.zeros((len(request.origins), nh * PATCH, N_PHASES), np.float32)
         calh_ids = np.full((len(request.origins), nh * PATCH, 6), -1, np.int16)
         if panel.epoch is not None and "calendar" not in request.drop:
-            cal_phases[:], cal_ids[:] = calendar_arrays(panel, left, request.context)
+            cal_phases[:], cal_ids[:] = self._calendar_arrays(left, request.context)
             for oi, origin in enumerate(request.origins):
-                phases, ids = calendar_arrays(panel, origin, request.horizon)
+                phases, ids = self._calendar_arrays(origin, request.horizon)
                 calh_phases[oi, : request.horizon] = phases
                 calh_ids[oi, : request.horizon] = ids
         fallback = []

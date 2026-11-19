@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 
 from .derived import increment_spread
-from .kinds import is_missing, label_of
+from .kinds import labels_of, observed_mask
 from .schema import VALUE_STATS
 
 
@@ -35,9 +35,9 @@ def category_step_stats(
     if not len(steps):
         return values, flags
 
-    missing = np.frompyfunc(is_missing, 1, 1)(labels).astype(bool)
-    names = np.frompyfunc(label_of, 1, 1)(labels)
-    names[missing] = None
+    observed = observed_mask(labels)
+    names = labels_of(labels)
+    names[~observed] = None
     codes, unique = pd.factorize(names, sort=False)
     # Stable grouping retains chronological accumulation within every label.
     order = np.argsort(codes, kind="stable")

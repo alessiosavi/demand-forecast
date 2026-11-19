@@ -3,7 +3,7 @@
 import numpy as np
 import pandas as pd
 
-from .kinds import is_missing, label_of
+from .kinds import labels_of, observed_mask
 
 
 def increment_spread(
@@ -29,8 +29,8 @@ def increment_spread(
         return values
 
     labels = labels[:stop]
-    names = np.frompyfunc(label_of, 1, 1)(labels)
-    names[np.frompyfunc(is_missing, 1, 1)(labels).astype(bool)] = None
+    names = labels_of(labels)
+    names[~observed_mask(labels)] = None
     codes, unique = pd.factorize(names, sort=False)
     # Group by label while keeping each group's original time order.
     order = np.argsort(codes, kind="stable")

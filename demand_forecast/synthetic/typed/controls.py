@@ -6,6 +6,7 @@ from dataclasses import replace
 import numpy as np
 
 from demand_forecast.data.episode import Item, is_missing
+from demand_forecast.data.episode.kinds import observed_mask
 from demand_forecast.synthetic.typed.draft import INPUT_MECHANISMS, stream
 from demand_forecast.synthetic.typed.recipe import GeneratedPanel, InputRecord
 
@@ -66,7 +67,7 @@ def shuffle_assignment(generated: GeneratedPanel, name: str, seed: int) -> Gener
                 values = column[(np.arange(_length(items[i])) + offset) % len(column)]
                 complete.items[i].dynamic[moved.name] = values
                 original = generated.panel.items[i].dynamic[moved.name]
-                missing = np.frompyfunc(is_missing, 1, 1)(original).astype(bool)
+                missing = ~observed_mask(original)
                 masked = values.copy()
                 masked[missing] = original[missing]
                 panel.items[i].dynamic[moved.name] = masked
