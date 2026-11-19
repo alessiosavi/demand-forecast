@@ -15,7 +15,6 @@ import threading
 import time
 from collections import Counter
 from dataclasses import replace
-from itertools import islice
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -39,8 +38,7 @@ from demand_forecast.data.episode.schema import (
     MAX_FORECAST_ROWS,
     PATCH,
 )
-from demand_forecast.models.v5 import V5Config, V5Model, v5_loss
-from demand_forecast.models.v5.model import prune
+from demand_forecast.models.v5 import V5Config, V5Model, forecast_items, v5_loss
 from demand_forecast.synthetic.typed.draft import stream
 
 from . import loop
@@ -51,7 +49,6 @@ from .loop import load_model, train
 from .sampler import loader
 
 
-@torch.no_grad()
 def forecast_panel(
     model: V5Model,
     panel: Panel,
@@ -80,45 +77,20 @@ def forecast_panel(
             raise ValueError(
                 f"requested device {requested} differs from model device {model_device}"
             )
-    builder = EpisodeBuilder(panel)
-
-    def requests():
-        for index, item in enumerate(panel.items):
-            for request in builder.plan_requests(
-                index, (origin,), horizon, context=context, cutoff=origin
-            ):
-                yield item.item_id, request
-
-    training = model.training
-    try:
-        model.eval()
-        planned = requests()
-        result = {}
-        while group := list(islice(planned, batch_episodes)):
-            # The comprehension releases every Episode before forwarding. Never
-            # retain a previous group while building the next one's episodes.
-            batch = collate([builder.build(request) for _, request in group]).to(model_device)
-            selected = model.gates(batch, mode=gates)
-            if pruned:
-                batch, selected = prune(batch, selected)
-            quantiles = model(batch, selected).quantiles[:, 0]
-            quantiles = batch.loc[..., None, None] + batch.scale[..., None, None] * quantiles
-            quantiles = torch.where(
-                batch.fallback[..., None, None], batch.loc[..., None, None], quantiles
-            )
-            quantiles = quantiles[:, :, :horizon].cpu().numpy()
-            for b, (item_id, _) in enumerate(group):
-                kept = (batch.keep[b] & batch.forecast_mask[b]).nonzero().flatten().tolist()
-                for row in kept:
-                    name = batch.row_names[b][int(batch.forecast_rows[b, row])]
-                    values = quantiles[b, row].copy()
-                    if not np.isfinite(values).all():
-                        raise ValueError(f"nonfinite forecast for {item_id!r}, {name!r}")
-                    result[item_id, name] = values
-            del batch, selected, quantiles
-        return result
-    finally:
-        model.train(training)
+    forecasts = forecast_items(
+        model,
+        panel,
+        [(index, origin) for index in range(len(panel.items))],
+        horizon,
+        context=context,
+        batch_episodes=batch_episodes,
+        gates=gates,
+        pruned=pruned,
+    )
+    return {
+        (panel.items[index].item_id, name): values
+        for (index, name), values in forecasts.values.items()
+    }
 
 
 def worst_batch(config: V5TrainConfig) -> EpisodeBatch:
