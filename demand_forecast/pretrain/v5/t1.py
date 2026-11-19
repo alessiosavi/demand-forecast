@@ -226,7 +226,10 @@ def _build(generated, entry, config):
         frozenset(config.sampler.drop_always),
         derive=frozenset(config.sampler.derive),
     )
-    screening = ScreeningConfig(no_evidence=config.sampler.screen_no_evidence)
+    screening = ScreeningConfig(
+        no_evidence=config.sampler.screen_no_evidence,
+        fair_static_spread=config.sampler.screen_fair_spread,
+    )
     episode = EpisodeBuilder(panel, screening).build(request)
     _postprocess(episode, replace(config.sampler, designate_target=True))
     return episode
@@ -289,8 +292,12 @@ def eval_set(
         drop=(),
         designate_target=True,
         screen_no_evidence=base.sampler.screen_no_evidence,
+        screen_fair_spread=base.sampler.screen_fair_spread,
     )
-    screening = ScreeningConfig(no_evidence=sampler.screen_no_evidence)
+    screening = ScreeningConfig(
+        no_evidence=sampler.screen_no_evidence,
+        fair_static_spread=sampler.screen_fair_spread,
+    )
     results, counts = [], Counter()
     for i in range(max_panels):
         if len(results) >= episodes and all(
