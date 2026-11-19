@@ -10,7 +10,15 @@ import numpy as np
 import pandas as pd
 from scipy.stats import rankdata
 
-from .kinds import flag_codes, infer_kind, is_missing, label_of
+from .kinds import (
+    _simple_object_types,
+    flag_codes,
+    infer_kind,
+    is_missing,
+    label_of,
+    labels_of,
+    observed_mask,
+)
 from .panel_stats import PanelStats, PanelStatsProvider
 from .scale import fit_scale, to_scaled
 from .schema import (
@@ -59,7 +67,18 @@ def _cell_labels(value: object) -> tuple[str, ...]:
 
 
 def _label_sets(values: np.ndarray) -> np.ndarray:
-    return np.frompyfunc(_cell_labels, 1, 1)(values)
+    kind = values.dtype.kind
+    if values.ndim == 0 or (
+        kind not in "biufUS" and (kind != "O" or _simple_object_types(values) is None)
+    ):
+        return np.frompyfunc(_cell_labels, 1, 1)(values)
+    observed = observed_mask(values)
+    names = labels_of(values[observed])
+    singletons = np.fromiter(zip(names), dtype=object, count=len(names))
+    cells = np.empty(values.shape, dtype=object)
+    cells.fill(())
+    cells[observed] = singletons
+    return cells
 
 
 def _center(values: np.ndarray) -> np.ndarray:
@@ -91,10 +110,10 @@ def adjusted_share(values: np.ndarray, groups: np.ndarray) -> float:
     """Adjusted between-label variance share, excluding unobserved pairs."""
     values = np.asarray(values, dtype=np.float64)
     groups = np.asarray(groups, dtype=object)
-    observed = np.isfinite(values) & ~np.frompyfunc(is_missing, 1, 1)(groups).astype(bool)
+    observed = np.isfinite(values) & observed_mask(groups)
     if not observed.any():
         return 0.0
-    codes, labels = pd.factorize(np.frompyfunc(label_of, 1, 1)(groups[observed]), sort=False)
+    codes, labels = pd.factorize(labels_of(groups[observed]), sort=False)
     return _share(_center(values[observed]), codes, len(labels))
 
 
