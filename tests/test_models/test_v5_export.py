@@ -12,7 +12,14 @@ import pytest
 import torch
 from safetensors.torch import load_file, save_file
 
-from demand_forecast.data.episode import CH_VALUE_STATS, EpisodeBatch, EpisodeRequest, Item, Panel
+from demand_forecast.data.episode import (
+    CH_VALUE_STATS,
+    EpisodeBatch,
+    EpisodeRequest,
+    Item,
+    Panel,
+    screening,
+)
 from demand_forecast.data.episode import builder as episode_builder
 from demand_forecast.models.v5 import V5Config, V5Model, forecast
 from demand_forecast.pretrain.v5 import (
@@ -27,6 +34,8 @@ from demand_forecast.pretrain.v5 import (
     sources,
 )
 from demand_forecast.synthetic import typed
+from tests.helpers.v5_sampler import paired_static_panel
+from tests.test_data.test_static_category_spread import _base_static_category
 
 TINY = V5Config(
     d_model=16,
@@ -47,7 +56,7 @@ def export_api():
     return importlib.import_module("demand_forecast.models.v5.export")
 
 
-def _checkpoint(directory, weights="model", model=None, *, sampler_options=None):
+def _checkpoint(directory, weights="model", model=None, *, fair_spread=False, sampler_options=None):
     model = TINY if model is None else model
     config = V5TrainConfig(
         model,
@@ -57,6 +66,8 @@ def _checkpoint(directory, weights="model", model=None, *, sampler_options=None)
         device="cpu",
         workers=1,
     )
+    if fair_spread:
+        config = replace(config, sampler=replace(config.sampler, screen_fair_spread=True))
     raw = V5Model(model).state_dict()
     ema = None
     if weights == "ema":
@@ -392,6 +403,58 @@ def test_parity_needs_no_generator_and_no_pickle(export_api, artifact, monkeypat
 
     monkeypatch.setattr(np, "load", no_pickle)
     export_api.require_parity(artifact)
+
+
+@pytest.fixture
+def paired_parity_case(export_api, monkeypatch):
+    original = export_api._parity_cases
+
+    def cases(config, derive):
+        other_cases = iter(original(config, derive))
+        next(other_cases)
+        yield paired_static_panel(), [EpisodeRequest(0, (48,), 8, context=48, derive=derive)]
+        yield from other_cases
+
+    monkeypatch.setattr(export_api, "_parity_cases", cases)
+
+
+def test_an_export_trained_with_the_option_replays(tmp_path, export_api, paired_parity_case):
+    out = tmp_path / "export"
+    checkpoint = _checkpoint(tmp_path, fair_spread=True)
+    export_api.write_export(checkpoint, out)
+    _, metadata = export_api.load_export(out, device="cpu")
+    assert metadata["training"]["sampler"]["screen_fair_spread"] is True
+    score = _read_archive(out / "parity.npz")["case_1/batch/cand_score"][0, 0]
+    assert 0 <= score < 1.0
+    export_api.require_parity(out, device="cpu")
+
+
+def test_an_export_without_the_key_replays_with_the_legacy_score(
+    tmp_path, export_api, paired_parity_case, monkeypatch
+):
+    out = tmp_path / "export"
+    with monkeypatch.context() as legacy:
+        legacy.setattr(
+            screening, "relevance_static_category", lambda *args, **kw: _base_static_category(*args)
+        )
+        export_api.write_export(_checkpoint(tmp_path), out)
+    _, metadata = export_api.load_export(out, device="cpu")
+    assert "screen_fair_spread" not in metadata["training"]["sampler"]
+    score = _read_archive(out / "parity.npz")["case_1/batch/cand_score"][0, 0]
+    assert score == pytest.approx(1.0)
+    export_api.require_parity(out, device="cpu")
+
+
+def test_fair_spread_reaches_every_screening_site(export_api):
+    panel = paired_static_panel()
+    request = EpisodeRequest(0, (48,), 8, context=48)
+
+    def score(enabled):
+        config = export_api._screening({"sampler": {"screen_fair_spread": enabled}})
+        episode = episode_builder.EpisodeBuilder(panel, config).build(request)
+        return episode.cand_score[episode.cand_names.index("pair")]
+
+    assert score(True) < score(False) == pytest.approx(1.0)
 
 
 def test_export_is_one_unit(tmp_path, export_api, monkeypatch):

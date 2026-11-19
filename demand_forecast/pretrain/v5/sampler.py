@@ -211,7 +211,11 @@ def _plan_panel(panel, record, config, source, rng, *, path_quota=None, ordinary
         else:
             if builder is None:
                 builder = EpisodeBuilder(
-                    original, ScreeningConfig(no_evidence=config.screen_no_evidence)
+                    original,
+                    ScreeningConfig(
+                        no_evidence=config.screen_no_evidence,
+                        fair_static_spread=config.screen_fair_spread,
+                    ),
                 )
             requests = builder.plan_requests(
                 index, origins, horizon, context=context, cutoff=cutoff, derive=derive
@@ -346,7 +350,11 @@ def _make_batch(config, k, sources):
                 continue
             if builder is None or builder.panel is not panel:
                 builder = EpisodeBuilder(
-                    panel, ScreeningConfig(no_evidence=config.sampler.screen_no_evidence)
+                    panel,
+                    ScreeningConfig(
+                        no_evidence=config.sampler.screen_no_evidence,
+                        fair_static_spread=config.sampler.screen_fair_spread,
+                    ),
                 )
         except SamplerSkip as error:
             skips[_skip_reason(error)] += 1
