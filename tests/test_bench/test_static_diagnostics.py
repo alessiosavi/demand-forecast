@@ -19,7 +19,8 @@ from demand_forecast.bench.v5_panels import Part, WindowPanels, describe, window
 from demand_forecast.bench.yardsticks.runner import Options, prepare_windows  # noqa: E402
 from demand_forecast.data.episode.panel_stats import PanelStatsProvider  # noqa: E402
 from demand_forecast.data.episode.schema import Item, Panel  # noqa: E402
-from demand_forecast.data.episode.screening import screen  # noqa: E402
+from demand_forecast.data.episode.screening import ScreeningConfig, screen  # noqa: E402
+from tests.helpers.v5_sampler import paired_static_panel  # noqa: E402
 
 
 @pytest.fixture
@@ -203,11 +204,27 @@ def test_shuffled_scores_are_seeded_and_leave_other_inputs(diagnostics):
     stats = PanelStatsProvider(panel).get("target", 24)
     index = next(i for i, item in enumerate(items) if item.static["informative"] is not None)
     expected = next(
-        c.score for c in screen(panel, stats, index, ("target",), 24) if c.name == "informative"
+        c.score
+        for c in screen(
+            panel, stats, index, ("target",), 24, ScreeningConfig(fair_static_spread=True)
+        )
+        if c.name == "informative"
     )
     assert info["shuffled_scores"][0] == pytest.approx(expected)
     assert part.panel.items[0].static["informative"] is None
     np.testing.assert_array_equal(part.panel.items[0].dynamic["plan"], np.r_[np.arange(24), np.nan])
+
+
+def test_diagnostics_calibrate_observed_and_shuffled_paired_categories(diagnostics):
+    panel = replace(paired_static_panel(), freq="D", epoch=pd.Timestamp("2024-01-01"))
+    part = Part(panel, tuple(range(len(panel.items))), (48,) * len(panel.items), False)
+    stats = PanelStatsProvider(panel).get("y0", 48)
+    legacy = next(c.score for c in screen(panel, stats, 0, ("y0",), 48) if c.name == "pair")
+    (row,) = diagnostics.attribute_scores(part, name="pairs", shuffles=4)
+    assert legacy == pytest.approx(1.0)
+    assert row["score"] < legacy
+    assert len(row["shuffled_scores"]) == 4
+    assert max(row["shuffled_scores"]) < legacy
 
 
 def test_static_score_uses_largest_of_first_sixteen_sorted_targets(diagnostics):

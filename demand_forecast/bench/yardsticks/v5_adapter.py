@@ -137,7 +137,10 @@ class V5Adapter:
             if self.options.max_context is None
             else min(MAX_CONTEXT, self.options.max_context // PATCH * PATCH)
         )
-        self.screening = ScreeningConfig(no_evidence=sampler.get("screen_no_evidence", 0.0))
+        self.screening = ScreeningConfig(
+            no_evidence=sampler.get("screen_no_evidence", 0.0),
+            fair_static_spread=sampler.get("screen_fair_spread", False),
+        )
         self.variant = VARIANTS[self.options.variant or "full"]
         self._training_drop = frozenset(sampler["drop_always"])
         self._drop = self._training_drop | self.variant.drop

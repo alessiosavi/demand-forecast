@@ -30,7 +30,14 @@ from demand_forecast.synthetic.typed import PanelRecipe, generate_typed_panel
 from tests.helpers.batch_fingerprint import assert_fingerprint
 from tests.helpers.corpus_v4_fixture import write_rows
 from tests.helpers.v5_loop import config as tiny_train_config
-from tests.helpers.v5_sampler import FixedSource, config, equal_batches, fixed_mix, panel
+from tests.helpers.v5_sampler import (
+    FixedSource,
+    config,
+    equal_batches,
+    fixed_mix,
+    paired_static_panel,
+    panel,
+)
 from tests.test_pretrain_v5.test_upstream_source import install_fake_simons
 
 
@@ -873,6 +880,26 @@ def test_level_zeroes_scores_and_keeps_every_candidate_within_budget(designate_t
     assert screened.cand_names == reference.cand_names
     assert screened.cand_score[0, candidate_index] == 0
     assert screened.row_score[0, screened.row_names[0].index(row)] == 0
+
+
+@pytest.mark.parametrize("designate_target", [False, True], ids=["planner", "batch-builder"])
+def test_fair_spread_reaches_every_screening_site(designate_target):
+    base = config(
+        designate_target=designate_target,
+        drop=(),
+        cutoff_at_origin=1,
+        origins=1,
+        episodes_per_batch=1,
+        episodes_per_panel=1,
+    )
+    sources = fixed_mix(base, FixedSource(paired_static_panel()))
+
+    def score(enabled):
+        cfg = replace(base, sampler=replace(base.sampler, screen_fair_spread=enabled))
+        batch, _ = api().make_batch(cfg, 3, sources=sources)
+        return batch.cand_score[0, batch.cand_names[0].index("pair")].item()
+
+    assert score(True) < score(False) == pytest.approx(1.0)
 
 
 def test_level_puts_candidates_without_evidence_last_when_the_budget_binds(monkeypatch):
