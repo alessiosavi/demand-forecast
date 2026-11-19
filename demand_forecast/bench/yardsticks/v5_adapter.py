@@ -140,6 +140,7 @@ class V5Adapter:
         self.screening = ScreeningConfig(
             no_evidence=sampler.get("screen_no_evidence", 0.0),
             fair_static_spread=sampler.get("screen_fair_spread", False),
+            scale_floor=sampler.get("scale_floor"),
         )
         self.variant = VARIANTS[self.options.variant or "full"]
         self._training_drop = frozenset(sampler["drop_always"])

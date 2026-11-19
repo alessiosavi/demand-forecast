@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 from dataclasses import asdict, fields, replace
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -241,11 +242,12 @@ def test_selftest_serializes_the_seed_option(tmp_path, export_api, monkeypatch, 
     write_export = export_api.write_export
 
     def check_checkpoint(checkpoint, out):
-        config = export_api.read_payload(checkpoint)["config"]["model"]
+        config = export_api.read_payload(checkpoint)["config"]
+        assert "scale_floor" not in config["sampler"]
         if horizon_seed:
-            assert config["horizon_seed"] is True
+            assert config["model"]["horizon_seed"] is True
         else:
-            assert "horizon_seed" not in config
+            assert "horizon_seed" not in config["model"]
         return write_export(checkpoint, out)
 
     monkeypatch.setattr(export_api, "write_export", check_checkpoint)
@@ -606,6 +608,44 @@ def test_fair_spread_reaches_every_screening_site(export_api):
         return episode.cand_score[episode.cand_names.index("pair")]
 
     assert score(True) < score(False) == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize("scale_floor", [None, 0.01], ids=["legacy", "floored"])
+def test_export_replays_with_the_saved_scale_floor(tmp_path, export_api, monkeypatch, scale_floor):
+    prefix = 1000 + 1e-9 * np.random.default_rng(19).normal(size=400)
+    item = Item("near-constant", 0, {"y": np.r_[prefix, 1100.0]}, {}, {})
+    panel = Panel("scale-floor", (item,), {}, "D", None, True)
+    original = export_api._parity_cases
+
+    def cases(config, derive):
+        remaining = iter(original(config, derive))
+        next(remaining)
+        yield panel, [EpisodeRequest(0, (400,), 1, context=32, derive=derive)]
+        yield from remaining
+
+    monkeypatch.setattr(export_api, "_parity_cases", cases)
+    options = {} if scale_floor is None else {"scale_floor": scale_floor}
+    out = tmp_path / "export"
+    metadata = export_api.write_export(_checkpoint(tmp_path, sampler_options=options), out)
+    stored = metadata["training"]["sampler"]
+    archive = _read_archive(out / "parity.npz")
+    scale = archive["case_1/batch/scale"].item()
+    if scale_floor is None:
+        assert "scale_floor" not in stored
+        assert 0 < scale < 1e-8
+    else:
+        assert stored["scale_floor"] == scale_floor
+        assert scale == pytest.approx(scale_floor * np.abs(prefix).mean(), rel=1e-12)
+    assert export_api._screening(metadata["training"]).scale_floor == scale_floor
+    export_api.require_parity(out, device="cpu")
+
+
+def test_legacy_export_replays_without_a_scale_floor(export_api):
+    directory = Path(__file__).parents[1] / "fixtures" / "v5_legacy_export"
+    _, metadata = export_api.load_export(directory)
+    assert "scale_floor" not in metadata["training"]["sampler"]
+    assert export_api._screening(metadata["training"]).scale_floor is None
+    export_api.require_parity(directory, device="cpu")
 
 
 def test_export_is_one_unit(tmp_path, export_api, monkeypatch):

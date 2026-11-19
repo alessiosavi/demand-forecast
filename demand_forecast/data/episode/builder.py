@@ -191,11 +191,16 @@ class EpisodeBuilder:
         stats: PanelStatsProvider | None = None,
     ) -> None:
         panel.validate()
-        if stats is not None and stats.panel is not panel:
-            raise ValueError("statistics provider must use the builder's panel")
+        if stats is not None:
+            if stats.panel is not panel:
+                raise ValueError("statistics provider must use the builder's panel")
+            if stats.scale_floor != config.scale_floor:
+                raise ValueError("statistics provider must use the builder's scale_floor")
         self.panel = panel
         self.config = config
-        self.stats = PanelStatsProvider(panel) if stats is None else stats
+        self.stats = (
+            PanelStatsProvider(panel, scale_floor=config.scale_floor) if stats is None else stats
+        )
         self._calendar_cache: OrderedDict[tuple[int, int], tuple[np.ndarray, np.ndarray] | None] = (
             OrderedDict()
         )
@@ -346,8 +351,12 @@ class EpisodeBuilder:
                 np.zeros(N_SUMMARY, bool),
                 "category",
             )
+        floor = self.config.scale_floor
+        scale_options = {} if floor is None else {"floor": floor}
         scale = (
-            fit_scale(raw, max(0, end), self.panel.season) if kind == KIND_NUMBER else Scale(0, 1)
+            fit_scale(raw, max(0, end), self.panel.season, **scale_options)
+            if kind == KIND_NUMBER
+            else Scale(0, 1)
         )
         scaled = to_scaled(raw, scale) if kind == KIND_NUMBER else flag_codes(raw, end)
         summary, flags = self._summary(

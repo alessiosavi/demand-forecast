@@ -902,6 +902,50 @@ def test_fair_spread_reaches_every_screening_site(designate_target):
     assert score(True) < score(False) == pytest.approx(1.0)
 
 
+@pytest.mark.parametrize("designate_target", [False, True], ids=["planner", "batch-builder"])
+def test_scale_floor_only_changes_the_floored_episode(designate_target):
+    base = replace(
+        config(
+            designate_target=designate_target,
+            drop=(),
+            cutoff_at_origin=1,
+            origins=1,
+            episodes_per_batch=2,
+            episodes_per_panel=2,
+        ),
+        workers=0,
+    )
+    original = panel(length=401, count=2)
+    quiet, ordinary = original.items
+    prefix = 1000 + 1e-9 * np.random.default_rng(19).normal(size=400)
+    quiet = replace(quiet, targets={"y0": np.r_[prefix, 1100.0]})
+    data = replace(original, items=(quiet, ordinary), aligned=False)
+    sources = fixed_mix(base, FixedSource(data))
+    enabled = replace(base, sampler=replace(base.sampler, scale_floor=0.01))
+    before, reference_report = api().make_batch(base, 3, sources=sources)
+    after, report = api().make_batch(enabled, 3, sources=sources)
+
+    assert report == reference_report
+    floored = (before.scale[:, 0] < 1e-8).nonzero().flatten().tolist()
+    assert len(floored) == 1
+    assert after.scale[floored[0], 0].item() == pytest.approx(10, rel=1e-12)
+    ordinary_index = 1 - floored[0]
+    changed = set()
+    for field in fields(before):
+        old, new = (getattr(batch, field.name) for batch in (before, after))
+        if isinstance(old, torch.Tensor):
+            assert torch.equal(old[ordinary_index], new[ordinary_index]), field.name
+            if not torch.equal(old, new):
+                changed.add(field.name)
+        else:
+            assert old == new, field.name
+    assert (
+        {"x", "labels", "scale"}
+        <= changed
+        <= {"x", "labels", "scale", "row_summary", "row_summary_flags"}
+    )
+
+
 def test_level_puts_candidates_without_evidence_last_when_the_budget_binds(monkeypatch):
     rng = np.random.default_rng(0)
     length = 160

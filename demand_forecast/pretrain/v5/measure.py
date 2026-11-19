@@ -542,6 +542,7 @@ def _inference_measure(config, device, panel_items, panel_length, workers):
     screening = ScreeningConfig(
         no_evidence=config.sampler.screen_no_evidence,
         fair_static_spread=config.sampler.screen_fair_spread,
+        scale_floor=config.sampler.scale_floor,
     )
     _reset_gpu(device)
     with _HostPeak() as memory:

@@ -232,6 +232,54 @@ def test_enabled_fair_spread_round_trips_through_yaml_and_checkpoint_config(tmp_
 
 
 @pytest.mark.parametrize(
+    "value", [0, -1.0, float("nan"), float("inf"), -float("inf"), True, False, "0.01"]
+)
+def test_scale_floor_must_be_finite_and_positive(value):
+    with pytest.raises(ValueError, match="scale_floor"):
+        config_module().SamplerConfig(scale_floor=value)
+
+
+def test_scale_floor_is_omitted_when_none_and_round_trips(tmp_path):
+    from demand_forecast.pretrain.v5 import read_payload, save_checkpoint
+    from demand_forecast.pretrain.v5.loop import _configuration
+
+    base = training_config()
+    assert base.sampler.scale_floor is None
+    path = tmp_path / "train.yaml"
+    base.to_yaml(path)
+    original = path.read_bytes()
+    raw = yaml.safe_load(original)
+    for mapping in (raw, base._serialized(), base.canonical()):
+        assert "scale_floor" not in mapping["sampler"]
+    assert type(base).from_yaml(path) == base
+
+    raw["sampler"]["scale_floor"] = None
+    path.write_text(yaml.safe_dump(raw))
+    explicit = type(base).from_yaml(path)
+    explicit.to_yaml(path)
+    assert path.read_bytes() == original
+
+    enabled = replace(base, sampler=replace(base.sampler, scale_floor=0.01))
+    enabled.to_yaml(path)
+    assert type(base).from_yaml(path) == enabled
+    assert enabled.canonical()["sampler"]["scale_floor"] == pytest.approx(0.01)
+    for counter, config in enumerate((base, enabled), start=1):
+        payload = {"config": config._serialized(), "counters": {"batch": 0, "saves": counter}}
+        checkpoint, _ = save_checkpoint(tmp_path, payload, counter=counter)
+        stored = read_payload(checkpoint)["config"]
+        if config is base:
+            assert "scale_floor" not in stored["sampler"]
+        else:
+            assert stored["sampler"]["scale_floor"] == pytest.approx(0.01)
+        assert _configuration(stored) == config
+
+    identity = config_module().identity
+    parts = dict(code="0" * 40, corpus=None, init=None, env=None)
+    assert identity(base, **parts) == identity(explicit, **parts)
+    assert identity(base, **parts) != identity(enabled, **parts)
+
+
+@pytest.mark.parametrize(
     "with_corpus,expected",
     [
         (False, "5864f0742ee6db2d2e4f82229c7265f1d99f880767d2336f5686caf8c3e9213c"),

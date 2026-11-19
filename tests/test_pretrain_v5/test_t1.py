@@ -255,6 +255,7 @@ def test_only_the_four_aligned_paths_change_config_digests():
             assert sampler.pop("first_event_only") is (path == "event_response")
             derive = sampler.pop("derive")
             assert sampler.pop("screen_fair_spread") is False
+            assert sampler.pop("scale_floor") is None
             cold_share = sampler.pop("cold_share")
             assert sampler.pop("cold_steps") == (3, 4)
             if path in ("static_category", "multi_label"):
@@ -652,6 +653,35 @@ def test_fair_spread_reaches_every_screening_site(site, monkeypatch):
         return scores[0]
 
     assert score(True) < score(False) == pytest.approx(1.0)
+
+
+def test_scale_floor_reaches_eval_set_and_replay(monkeypatch):
+    module = api()
+    base = replace(module.T1_BASE, sampler=replace(module.T1_BASE.sampler, scale_floor=0.01))
+    seen = []
+
+    def observe(panel, screening):
+        seen.append(screening.scale_floor)
+        return EpisodeBuilder(panel, screening)
+
+    monkeypatch.setattr(module, "EpisodeBuilder", observe)
+    assert module.eval_set("static_category", episodes=1, min_count=1, max_panels=30, base=base)
+    assert seen and set(seen) == {0.01}
+
+    seen.clear()
+    panel = paired_static_panel()
+    config = module.t1_config("static_category", "true", seed=0, base=base)
+    entry = {
+        "item_id": panel.items[0].item_id,
+        "origin": 48,
+        "horizon": 8,
+        "context": 48,
+        "target": "y0",
+        "cutoff": 48,
+    }
+    module._build(SimpleNamespace(panel=panel), entry, config)
+    assert config.sampler.scale_floor == 0.01
+    assert seen == [0.01]
 
 
 def test_absent_screened_candidate_is_counted_and_still_scored(small, monkeypatch):

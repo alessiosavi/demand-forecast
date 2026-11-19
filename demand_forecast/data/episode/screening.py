@@ -46,6 +46,7 @@ class ScreeningConfig:
     min_items: int = 8
     no_evidence: float = 0.0
     fair_static_spread: bool = False
+    scale_floor: float | None = None
 
 
 @dataclass(frozen=True)
@@ -375,7 +376,9 @@ def _standalone_provider(stats: PanelStats) -> PanelStatsProvider:
     # Direct screen callers can supply just one PanelStats and reuse it across items.
     key = ("provider",)
     if key not in stats.screen_cache:
-        stats.screen_cache[key] = PanelStatsProvider(stats.panel, limit=None)
+        stats.screen_cache[key] = PanelStatsProvider(
+            stats.panel, limit=None, scale_floor=stats.scale_floor
+        )
     return stats.screen_cache[key]
 
 
@@ -440,15 +443,19 @@ def screen(
         raise IndexError("item index outside the panel")
     if cutoff != stats.cutoff:
         raise ValueError("cutoff must match stats.cutoff")
+    if stats.scale_floor != config.scale_floor:
+        raise ValueError("statistics must use the screening config's scale_floor")
     item = panel.items[item_index]
     end = max(0, cutoff - item.start)
     histories = []
+    floor = config.scale_floor
+    scale_options = {} if floor is None else {"floor": floor}
     for target in sorted(targets):
         raw = item.targets[target][:end]
         scale = (
             stats.scales[item_index]
             if target == stats.target
-            else fit_scale(raw, len(raw), panel.season)
+            else fit_scale(raw, len(raw), panel.season, **scale_options)
         )
         histories.append(to_scaled(raw, scale))
     lags = tuple(dict.fromkeys((0, 1, panel.season)))
