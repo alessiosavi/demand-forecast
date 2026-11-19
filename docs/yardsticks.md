@@ -214,6 +214,58 @@ models, never between two runs of the same model. Runs of the same model must
 share the full evaluation configuration and per-task evaluation identity,
 including the inference implementation. The mean uses fixed, equal weights by default.
 
+## Stage D static-attribute diagnostics
+
+Run `python -m demand_forecast.bench.static_diagnostics --tasks TASKS.yaml --names @names.txt --out DIR`
+for a subset, or omit `--names` for the entire YAML. The diagnostic reads fev's
+past split for all measured values. For dated fev windows the date denotes the
+last allowed observation. The builder origin is the first step after the split.
+Diagnostics use scoring's `task.freq` and prove each item's time axis with the
+same history timestamps, horizon timestamps, and task horizon as v5 scoring.
+Only the timestamp column is read from fev's future split. The one-step
+synthetic horizon is filled with missing targets and covariates.
+The diagnostic therefore cannot see a future covariate cell that scoring would
+refuse, such as a class code outside its declared labels.
+
+Each `<task>.json` contains window summaries, static support, equal-static and
+equal-target groups, dynamic-column relevance, and the static screening trace.
+Numeric label support uses the builder's bins. For multilabel cells, support at
+a given size means at least one label has that many members. Dependencies use
+pairs of observed cells. Target equality compares ordered history values by
+target name. `new_items` counts first appearances after the initial window.
+`on_grid` includes items that fall back when the origin budget is exceeded.
+
+`tasks.csv` has these columns in order.
+
+```text
+task,window,items,targets_per_item,history_min,history_median,history_max,short_items,on_grid,off_grid,items_alone,items_without_time_axis,grid_reasons,distinct_origins,over_origin_budget,new_items
+```
+
+`attributes.csv` has these columns in order. Support describes the full window.
+`window_items` counts all items in the window. `panel_items` counts the items in the
+dated part used to compute the score. `screen_kind`, removals and scores come from
+that dated part at the given cutoff.
+Cutoffs are integer offsets on that panel's grid. Lists and maps in CSV cells use JSON.
+
+```text
+task,window,cutoff,attribute,window_items,panel_items,kind,missing_share,labels,label_size_min,label_size_median,label_size_max,share_at_least_2,share_at_least_4,share_at_least_8,share_at_least_16,share_at_least_32,constant,identifier,unshared,determined_by,copied_from,screen_kind,removed,score,shuffled_scores
+```
+
+The diagnostic scores the three most frequent dated origins, favoring later
+ones in ties, and takes the maximum relevance over the first 16 sorted targets.
+`level.json` pools 20 permutations per kept attribute and cutoff in the first
+and last windows when both `window_items` and `panel_items` are at least eight.
+It uses the linear 95th percentile, rounds to nine decimals before taking the
+ceiling to two decimals, and caps the level at 0.99. Fewer than 200 pooled scores
+give 0.0. The report counts distinct tasks, task-windows and task-attributes in
+the pool, and records the share of their real score rows strictly above the
+level.
+
+`scripts/gcp/jobs/make_diagnose_job.py` generates the CPU guest script offline.
+The guest verifies the task YAML and optional names file by SHA-256 and publishes
+the reports under `state/diagnose/<name>/`. It publishes `completed.json` last
+and checks all recorded hashes on a retry.
+
 ## Averaging completed yardstick runs
 
 `scripts/fev_ensemble.py` averages saved forecasts with fixed member weights (equal by default),
