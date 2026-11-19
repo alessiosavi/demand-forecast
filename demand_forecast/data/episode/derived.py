@@ -9,6 +9,89 @@ LAG_SCAN_WINDOW = 512
 _ONSET_AGES = 32
 
 
+class NaiveHistory:
+    """Index the kept target's scaled history once for context and all origins."""
+
+    def __init__(self, scaled: np.ndarray, *, season: int, long_lag: int | None, end: int) -> None:
+        self.season = season
+        self.long_lag = long_lag if long_lag is not None and long_lag > season else None
+        self.width = season * ((8 + season - 1) // season)
+        # Position zero denotes a missing source; position j + 1 stores cell j.
+        scaled = scaled[: max(0, end)]
+        self.values = np.r_[np.nan, scaled]
+        self.finite = np.isfinite(self.values)
+        self.previous = np.maximum.accumulate(np.where(self.finite, np.arange(len(self.values)), 0))
+        size = len(scaled)
+        self.context_end = min(max(0, end), size + 4 * max(self.width, self.long_lag or 0))
+        pairs_needed = (self.width + 1) // 2
+        self.slope = np.full(1, np.nan)
+        if size - season >= pairs_needed:
+            # Beyond the item's end, the rolling window loses older pairs without adding any.
+            padding = min(self.width, max(0, end - size))
+            differences = np.full(size + padding, np.nan)
+            paired = self.finite[1 + season :] & self.finite[1:-season]
+            with np.errstate(over="ignore"):
+                np.subtract(
+                    scaled[season:], scaled[:-season], out=differences[season:size], where=paired
+                )
+            differences /= season
+            means = pd.Series(differences).rolling(self.width, min_periods=pairs_needed).mean()
+            self.slope = np.r_[np.nan, means.to_numpy()]
+
+    def _same_phase(
+        self, cells: np.ndarray, bounds: np.ndarray, upper: np.ndarray, lag: int
+    ) -> np.ndarray:
+        latest = upper - (upper - 1 - cells) % lag
+        positions = np.maximum(latest[:, None] - lag * np.arange(4), 0)
+        previous = np.where(self.finite[positions], positions, 0).max(axis=1)
+        return np.where(previous > bounds - 4 * lag, previous, 0)
+
+    def series(
+        self, *, left: int, right: int, origin: int | None
+    ) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+        cells = np.arange(left, right)
+        bounds = cells if origin is None else np.minimum(cells, origin)
+        upper = np.clip(bounds, 0, len(self.values) - 1)
+        previous = self.previous[upper]
+        last = np.where(previous > bounds - 4 * self.width, previous, 0)
+        base = last
+        rows = {"last": self.values[last]}
+        if self.season > 1:
+            base = self._same_phase(cells, bounds, upper, self.season)
+            rows["season"] = self.values[base]
+        if self.long_lag is not None:
+            source = self._same_phase(cells, bounds, upper, self.long_lag)
+            rows["season2"] = self.values[source]
+
+        slope_index = np.where((bounds > 0) & (bounds < len(self.slope)), bounds, 0)
+        with np.errstate(over="ignore", invalid="ignore"):
+            rows["drift"] = self.values[base] + self.slope[slope_index] * (cells - base + 1)
+        result = {}
+        for name, values in rows.items():
+            observed = np.isfinite(values)
+            result[name] = np.where(observed, values, 0.0), observed
+        return result
+
+
+def naive_series(
+    scaled: np.ndarray,
+    *,
+    season: int,
+    long_lag: int | None,
+    left: int,
+    right: int,
+    origin: int | None,
+) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    """Return naive values and observed flags for item-local cells in [left, right).
+
+    A cell uses its own bound up to the origin, and the origin's bound thereafter.
+    Pass a long lag only when the request has enough history at its first origin.
+    """
+    end = right - 1 if origin is None else min(right - 1, origin)
+    history = NaiveHistory(scaled, season=season, long_lag=long_lag, end=end)
+    return history.series(left=left, right=right, origin=origin)
+
+
 def _adjust(values: np.ndarray, observed: np.ndarray, phases: int) -> np.ndarray:
     """Remove a linear trend, then phase means, fitting only observed cells."""
     time = np.arange(len(values)) - (len(values) - 1) / 2

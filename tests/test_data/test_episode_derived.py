@@ -292,3 +292,71 @@ def test_missing_cells_are_left_out_and_a_fifth_missing_stops_the_scan():
     x[100] = np.nan
     assert _scan(x, y) == (0, 0.0, 0.0)
     assert _scan(y, x) == (0, 0.0, 0.0)
+
+
+def _naive_reference(scaled, *, season, long_lag, left, right, origin):
+    width = season * ((8 + season - 1) // season)
+    periods = {"last": 1}
+    if season > 1:
+        periods["season"] = season
+    if long_lag is not None and long_lag > season:
+        periods["season2"] = long_lag
+    result = {name: (np.zeros(right - left), np.zeros(right - left, bool)) for name in periods}
+    result["drift"] = (np.zeros(right - left), np.zeros(right - left, bool))
+    for index, cell in enumerate(range(left, right)):
+        bound = cell if origin is None else min(cell, origin)
+        for name, period in periods.items():
+            limit = width if name == "last" else period
+            for j in range(min(bound, len(scaled)) - 1, max(0, bound - 4 * limit) - 1, -1):
+                if (cell - j) % period == 0 and np.isfinite(scaled[j]):
+                    result[name][0][index] = scaled[j]
+                    result[name][1][index] = True
+                    if name == ("season" if season > 1 else "last"):
+                        differences = [
+                            (scaled[i] - scaled[i - season]) / season
+                            for i in range(max(season, bound - width), min(bound, len(scaled)))
+                            if np.isfinite(scaled[i]) and np.isfinite(scaled[i - season])
+                        ]
+                        if 2 * len(differences) >= width:
+                            result["drift"][0][index] = scaled[j] + np.mean(differences) * (
+                                cell - j
+                            )
+                            result["drift"][1][index] = True
+                    break
+    return result
+
+
+@pytest.mark.parametrize("season", [1, 7, 24, 400])
+@pytest.mark.parametrize("long_lag", [None, 168, 364])
+def test_naive_series_equals_a_loop_reference(season, long_lag):
+    naive_series = import_module("demand_forecast.data.episode.derived").naive_series
+    rng = np.random.default_rng(719)
+    for trial in range(25):
+        size = 0 if trial == 0 else int(rng.integers(1, 1000))
+        scaled = rng.normal(size=size)
+        scaled[rng.random(size) < 0.23] = np.nan
+        scaled[rng.random(size) < 0.03] = np.inf
+        left = int(rng.integers(-40, size + 50))
+        right = left + int(rng.integers(0, 78))
+        origin = None if trial % 3 == 0 else int(rng.integers(left - 8, right + 8))
+        bounds = dict(season=season, long_lag=long_lag, left=left, right=right, origin=origin)
+        actual = naive_series(scaled, **bounds)
+        expected = _naive_reference(scaled, **bounds)
+        assert actual.keys() == expected.keys()
+        for name, (values, observed) in actual.items():
+            expected_values, expected_observed = expected[name]
+            assert observed.dtype == np.bool_
+            np.testing.assert_array_equal(observed, expected_observed)
+            np.testing.assert_allclose(values, expected_values, atol=1e-12, rtol=1e-12)
+
+
+@pytest.mark.parametrize(("gap", "origin", "expected"), [(1, 40, 38), (31, 40, 8), (32, 40, None)])
+def test_gap_before_the_origin(gap, origin, expected):
+    naive_series = import_module("demand_forecast.data.episode.derived").naive_series
+    scaled = np.arange(60, dtype=np.float64)
+    scaled[origin - gap : origin] = np.nan
+    values, observed = naive_series(
+        scaled, season=1, long_lag=None, left=origin, right=origin + 3, origin=origin
+    )["last"]
+    np.testing.assert_array_equal(observed, np.full(3, expected is not None))
+    np.testing.assert_allclose(values, np.full(3, expected or 0))

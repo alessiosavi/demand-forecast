@@ -12,9 +12,17 @@ import pytest
 import torch
 from safetensors.torch import load_file, save_file
 
-from demand_forecast.data.episode import CH_VALUE_STATS, EpisodeBatch, EpisodeRequest, Item, Panel
+from demand_forecast.data.episode import (
+    CH_OBSERVED,
+    CH_VALUE,
+    CH_VALUE_STATS,
+    EpisodeBatch,
+    EpisodeRequest,
+    Item,
+    Panel,
+)
 from demand_forecast.data.episode import builder as episode_builder
-from demand_forecast.models.v5 import V5Config, V5Model, forecast
+from demand_forecast.models.v5 import V5Config, V5Model, forecast, forecast_items
 from demand_forecast.pretrain.v5 import (
     OptimConfig,
     SamplerConfig,
@@ -190,8 +198,9 @@ def test_canonical_serialized_and_export_omit_an_empty_derive(export_api, refere
     [
         ("increment_spread",),
         ("lag_rows",),
+        ("naive_rows",),
         ("onset_rows",),
-        ("onset_rows", "increment_spread", "lag_rows"),
+        ("onset_rows", "naive_rows", "increment_spread", "lag_rows"),
     ],
 )
 def test_enabled_names_round_trip_sorted(tmp_path, export_api, derive):
@@ -245,6 +254,68 @@ def test_an_enabled_export_passes_parity(tmp_path, export_api, reference_export)
         np.testing.assert_array_equal(before[..., :spread], after[..., :spread])
         np.testing.assert_array_equal(before[..., spread + 1 :], after[..., spread + 1 :])
         assert np.any(before[..., spread] != after[..., spread])
+
+
+def test_enabled_export_holds_the_rows(tmp_path, export_api):
+    out = tmp_path / "export"
+    checkpoint = _checkpoint(tmp_path, sampler_options={"derive": ("naive_rows",)})
+    export_api.write_export(checkpoint, out)
+    model, metadata = export_api.load_export(out)
+    export_api.require_parity(out)
+
+    arrays = _read_archive(out / "parity.npz")
+    assert sum(key.endswith("/panel") for key in arrays) == 9
+    prefix = "case_9"
+    panel = export_api._read_panel(arrays, prefix)
+    (request,) = export_api._read_requests(arrays[f"{prefix}/requests"])
+    assert panel.season == 24 and panel.long_lag == 168
+    item = panel.items[request.item_index]
+    (target,) = item.targets
+    origin = request.origins[0]
+    local = origin - item.start
+    cells = np.arange(local, local + request.horizon)
+    scaled = (item.targets[target] - arrays[f"{prefix}/batch/loc"][0, 0]) / arrays[
+        f"{prefix}/batch/scale"
+    ][0, 0]
+    assert len(scaled) >= local >= 168
+    previous_season = local - 1 - (local - 1 - cells) % 24
+    previous_week = local - 1 - (local - 1 - cells) % 168
+    drift = (scaled[local - 24 : local] - scaled[local - 48 : local - 24]).mean() / 24
+    expected = {
+        "last": np.full(request.horizon, scaled[local - 1]),
+        "season": scaled[previous_season],
+        "season2": scaled[previous_week],
+        "drift": scaled[previous_season] + drift * (cells - previous_season),
+    }
+    with torch.no_grad():
+        model.gate_net.net[-1].weight.zero_()
+        model.gate_net.net[-1].bias.fill_(-1000)
+    evidence = forecast_items(
+        model,
+        panel,
+        [(request.item_index, origin)],
+        request.horizon,
+        context=request.context,
+        screening=export_api._screening(metadata["training"]),
+        derive=request.derive,
+        pruned=True,
+    ).evidence
+    (names,) = json.loads(arrays[f"{prefix}/batch/row_names"].item())
+    known = arrays[f"{prefix}/batch/known_rows"][0].tolist()
+    horizon = arrays[f"{prefix}/batch/xh"][0, 0]
+    assert set(names) == {target, *(f"{target}~{suffix}" for suffix in expected)}
+    for suffix, values in expected.items():
+        name = f"{target}~{suffix}"
+        row = horizon[known.index(names.index(name))].reshape(-1, horizon.shape[-1])
+        np.testing.assert_allclose(
+            row[: request.horizon, CH_VALUE], np.arcsinh(values), atol=1e-6, rtol=1e-6
+        )
+        assert row[: request.horizon, CH_OBSERVED].all()
+        assert not row[request.horizon :].any()
+        index = evidence.candidates.index(f"derived:{name}")
+        assert evidence.status[0, index] == 1
+        assert evidence.gate[0, index] == pytest.approx(model.gate_net.known_gate_floor)
+        assert evidence.score[0, index] == pytest.approx(1.0)
 
 
 def _rehash(out, filename):
