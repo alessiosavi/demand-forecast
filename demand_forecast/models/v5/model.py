@@ -394,11 +394,10 @@ def prune(batch: EpisodeBatch, gates: Gates) -> tuple[EpisodeBatch, Gates]:
                     else value
                 )
             example[name] = value
-        for name, selected in (
-            ("row_names", rows),
-            ("cand_names", candidates),
-            ("attr_names", attrs),
-        ):
+        metadata_masks = {"row_names": rows, "cand_names": candidates, "attr_names": attrs}
+        if "row_keys" in example:
+            metadata_masks["row_keys"] = rows
+        for name, selected in metadata_masks.items():
             example[name] = [
                 value for i, value in enumerate(getattr(batch, name)[b]) if selected[i]
             ]

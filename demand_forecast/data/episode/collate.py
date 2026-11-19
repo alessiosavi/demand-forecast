@@ -71,7 +71,14 @@ class EpisodeBatch:
         )
 
 
-def collate(episodes: list[Episode]) -> EpisodeBatch:
+@dataclass
+class EpisodeBatchWithRowKeys(EpisodeBatch):
+    """An episode batch with candidate provenance for the unpadded rows."""
+
+    row_keys: list[list[tuple[str, str] | None]]
+
+
+def collate(episodes: list[Episode], *, include_row_keys: bool = False) -> EpisodeBatch:
     """Pad each independent axis and shift origins by their context's left padding."""
     if not episodes:
         raise ValueError("cannot collate an empty list of episodes")
@@ -123,4 +130,8 @@ def collate(episodes: list[Episode]) -> EpisodeBatch:
         ("horizon_mask", [e.calh_phases.shape[1] for e in episodes]),
     ):
         result[name] = torch.arange(max(lengths))[None, :] < torch.tensor(lengths)[:, None]
+    if include_row_keys:
+        return EpisodeBatchWithRowKeys(
+            **result, row_keys=[list(episode.row_keys) for episode in episodes]
+        )
     return EpisodeBatch(**result)

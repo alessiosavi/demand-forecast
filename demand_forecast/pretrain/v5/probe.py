@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 
 from demand_forecast.data.episode import EpisodeBatch, Item, Panel, ScreeningConfig
+from demand_forecast.data.episode.collate import EpisodeBatchWithRowKeys
 from demand_forecast.data.episode.derived import naive_series
 from demand_forecast.models.v5 import V5Model, forecast_items
 from demand_forecast.models.v5.export import _screening
@@ -16,6 +17,8 @@ _ORIGIN = 2208
 _HORIZON = 96
 _CONTEXT = 512
 _LENGTH = 2400
+_ITEMS = 24
+_BATCH_EPISODES = 16
 _SHAPE = ("seasonal_h", "seasonal_h2", "seasonal_d", "trend", "seasonal_trend")
 _FAMILIES = (*_SHAPE, "noise", "intermittent", "level_shift")
 _NAIVE_SUFFIXES = ("~last", "~season", "~season2", "~drift")
@@ -43,7 +46,7 @@ def probe_panels() -> dict[str, Panel]:
         hourly = name in ("seasonal_h", "seasonal_h2")
         season = 24 if hourly else 7
         items = []
-        for phase in range(6):
+        for phase in range(_ITEMS):
             if name == "intermittent":
                 values = np.where(
                     rng.random(_LENGTH) < 0.7, 0.0, 1.0 + rng.exponential(4.0, _LENGTH)
@@ -120,7 +123,9 @@ def reference(panel: Panel, levels: Sequence[float]) -> np.ndarray:
         origin = _ORIGIN - _HORIZON * k
         past = history[:, :origin]
         truth = history[:, origin : origin + _HORIZON]
-        errors.append((truth - _reference_path(panel, past)) / _mase_scale(past, panel.season)[:, None])
+        errors.append(
+            (truth - _reference_path(panel, past)) / _mase_scale(past, panel.season)[:, None]
+        )
     offsets = np.quantile(np.concatenate(errors, axis=0), levels, axis=0).T
     return path[..., None] + _mase_scale(history, panel.season)[:, None, None] * offsets
 
@@ -133,10 +138,7 @@ def _mase(truth: np.ndarray, path: np.ndarray, scale: np.ndarray) -> float | Non
     return _finite((np.abs(truth - path).mean(axis=1) / scale).mean())
 
 
-def _forecast_figures(
-    truth: np.ndarray, scale: np.ndarray, quantiles: np.ndarray, levels: Sequence[float]
-) -> dict:
-    path = quantiles[..., list(levels).index(0.5)]
+def _point_figures(truth: np.ndarray, scale: np.ndarray, path: np.ndarray) -> dict:
     centred_truth = truth - truth.mean(axis=1, keepdims=True)
     centred_path = path - path.mean(axis=1, keepdims=True)
     truth_sd, path_sd = truth.std(axis=1), path.std(axis=1)
@@ -150,18 +152,30 @@ def _forecast_figures(
     correlation[np.ptp(path, axis=1) == 0] = 0
     with np.errstate(divide="ignore", invalid="ignore"):
         spread = (path_sd / truth_sd).mean()
-    coverage = []
-    for knot in np.moveaxis(quantiles, -1, 0):
-        if np.isfinite(knot).all() and np.isfinite(truth).all():
-            coverage.append({"lt": float((truth < knot).mean()), "le": float((truth <= knot).mean())})
-        else:
-            coverage.append({"lt": None, "le": None})
-    figures = {
+    return {
         "mase": _mase(truth, path, scale),
         "correlation": _finite(correlation.mean()),
         "spread_ratio": _finite(spread),
-        "coverage": coverage,
     }
+
+
+def _forecast_figures(
+    truth: np.ndarray, scale: np.ndarray, quantiles: np.ndarray, levels: Sequence[float]
+) -> dict:
+    levels = list(levels)
+    if 0.5 in levels:
+        figures = _point_figures(truth, scale, quantiles[..., levels.index(0.5)])
+    else:
+        figures = {"mase": None, "correlation": None, "spread_ratio": None}
+    coverage = []
+    for knot in np.moveaxis(quantiles, -1, 0):
+        if np.isfinite(knot).all() and np.isfinite(truth).all():
+            coverage.append(
+                {"lt": float((truth < knot).mean()), "le": float((truth <= knot).mean())}
+            )
+        else:
+            coverage.append({"lt": None, "le": None})
+    figures["coverage"] = coverage
     if len(levels) > 1:
         figures["min_mean_gap"] = _finite(np.diff(quantiles, axis=-1).mean(axis=(0, 1)).min())
     return figures
@@ -179,6 +193,67 @@ def score_panel(panel: Panel, quantiles: np.ndarray, levels: Sequence[float]) ->
         "reference_mase": _mase(truth, _reference_path(panel, history), scale),
         "level_mase": _mase(truth, np.median(history, axis=1, keepdims=True), scale),
     }
+
+
+def zero_naive_rows(batch: EpisodeBatch) -> EpisodeBatch:
+    """Zero known naive horizon values and flags while retaining their rows."""
+    if not isinstance(batch, EpisodeBatchWithRowKeys):
+        # A silent pass-through would report the ablated figures as equal to the model's own.
+        raise TypeError("zero_naive_rows needs a batch with row keys (a forecast_items hook)")
+    xh = batch.xh.clone()
+    for i, (names, keys, rows, valid) in enumerate(
+        zip(
+            batch.row_names,
+            batch.row_keys,
+            batch.known_rows.tolist(),
+            batch.known_mask.tolist(),
+            strict=True,
+        )
+    ):
+        slots = [
+            slot
+            for slot, (row, known) in enumerate(zip(rows, valid, strict=True))
+            if known
+            and keys[row] == ("derived", names[row])
+            and names[row].endswith(_NAIVE_SUFFIXES)
+        ]
+        xh[i, :, slots] = 0
+    return replace(batch, xh=xh)
+
+
+def _score_model(
+    model: V5Model, panel: Panel, settings: ProbeSettings, *, zero: bool = False
+) -> dict:
+    jobs = [(i, _ORIGIN) for i in range(len(panel.items))]
+    forecasts = forecast_items(
+        model,
+        panel,
+        jobs,
+        _HORIZON,
+        context=_CONTEXT,
+        screening=settings.screening,
+        derive=settings.derive,
+        batch_episodes=_BATCH_EPISODES,
+        batch_hook=zero_naive_rows if zero else None,
+    )
+    quantiles = np.stack([forecasts.values[i, "y"] for i, _ in jobs])
+    return score_panel(panel, quantiles, model.config.quantiles)
+
+
+def run_probe(model: V5Model, settings: ProbeSettings, *, device: str = "cpu") -> dict:
+    """Measure the probe in eval mode through the ordinary batch scoring path."""
+    original_device = next(model.parameters()).device
+    families = {}
+    try:
+        model.to(device)
+        for name, panel in probe_panels().items():
+            figures = _score_model(model, panel, settings)
+            if "naive_rows" in settings.derive:
+                figures["zeroed_naive_rows"] = _score_model(model, panel, settings, zero=True)
+            families[name] = figures
+    finally:
+        model.to(original_device)
+    return {"levels": list(model.config.quantiles), "families": families}
 
 
 def _defined(value: float | None) -> bool:
