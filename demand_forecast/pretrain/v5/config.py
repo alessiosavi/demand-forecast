@@ -15,6 +15,8 @@ import yaml
 from demand_forecast.data.episode.builder import DROPPABLE
 from demand_forecast.data.episode.schema import MAX_CONTEXT, MAX_HORIZON, PATCH, SUMMARY_FEATURES
 from demand_forecast.models.v5.config import V5Config
+from demand_forecast.synthetic.typed.draft import INPUT_MECHANISMS
+from demand_forecast.synthetic.typed.recipe import MECHANISMS
 
 
 def _flag(self, name: str) -> None:
@@ -102,6 +104,28 @@ class SourceConfig:
             raise ValueError("control must be None, shuffle, no_dates or missing_as_zero")
         if self.control_inputs not in ("all", "attribute", "column"):
             raise ValueError("control_inputs must be all, attribute or column")
+        if not self.recipes:
+            if self.nuisance_from is not None:
+                raise ValueError(
+                    "nuisance_from requires recipes and is ignored by the sampled recipe mix"
+                )
+            if self.n_nuisance > 0:
+                raise ValueError(
+                    "n_nuisance requires recipes and is ignored by the sampled recipe mix"
+                )
+            return
+        for recipe in self.recipes:
+            for mechanism in recipe:
+                if mechanism not in MECHANISMS:
+                    raise ValueError(f"recipes contains unknown mechanism {mechanism!r}")
+        for mechanism in self.nuisance_from or ():
+            if mechanism not in INPUT_MECHANISMS:
+                raise ValueError(f"nuisance_from contains unsupported mechanism {mechanism!r}")
+            for recipe in self.recipes:
+                if mechanism not in recipe:
+                    raise ValueError(
+                        f"nuisance_from mechanism {mechanism!r} is missing from recipe {recipe!r}"
+                    )
 
 
 @dataclass(frozen=True)
@@ -251,6 +275,13 @@ class V5TrainConfig:
             raise ValueError("router must be learned, uniform or rolled")
         if self.gates not in ("learned", "ones"):
             raise ValueError("gates must be learned or ones")
+        if self.router == "rolled":
+            if self.sampler.episodes_per_batch < 2:
+                raise ValueError(
+                    "the rolled router requires sampler.episodes_per_batch of at least two"
+                )
+            if self.sampler.max_cells is not None:
+                raise ValueError("the rolled router requires sampler.max_cells=None")
         if any(source.control == "missing_as_zero" for source in self.sources):
             if self.sampler.cold_share > 0:
                 raise ValueError("missing_as_zero requires sampler.cold_share == 0")
