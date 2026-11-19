@@ -1554,3 +1554,237 @@ def test_onset_name_collision_builds_nothing():
     actual = EpisodeBuilder(panel).build(request)
     assert "event~onset" not in actual.row_names
     assert all(c.source != "derived" for c in actual.trace)
+
+
+_NAIVE = frozenset({"naive_rows"})
+_NAIVE_HOURLY_NAMES = {"y~last", "y~season", "y~season2", "y~drift"}
+
+
+def _naive_panel(freq="h", *, start=71, target=None):
+    steps = np.arange(420, dtype=np.float64)
+    if target is None:
+        target = steps / 23 + np.sin(steps / 5)
+    return Panel("naive", (Item("one", start, {"y": target}, {}, {}),), {}, freq, None, False)
+
+
+def _naive_horizon(episode, name, origin=0):
+    known = episode.known_rows.tolist().index(episode.row_names.index(name))
+    return episode.xh[origin, known].reshape(-1, N_CHANNELS)[: episode.horizon]
+
+
+@pytest.mark.parametrize("origin_index", [0, 1])
+@pytest.mark.parametrize("replacement", [1e6, np.nan])
+def test_naive_horizon_reads_nothing_at_or_after_its_origin(origin_index, replacement):
+    panel = _naive_panel()
+    item = panel.items[0]
+    origins = tuple(item.start + local for local in (192, 224))
+    request = EpisodeRequest(0, origins, 45, 64, cutoff=origins[0] - 16, derive=_NAIVE)
+    changed = item.targets["y"].copy()
+    changed[origins[origin_index] - item.start :] = replacement
+    hidden = replace(panel, items=(replace(item, targets={"y": changed}),))
+    original = EpisodeBuilder(panel).build(request)
+    altered = EpisodeBuilder(hidden).build(request)
+
+    assert set(original.row_names[1:]) == _NAIVE_HOURLY_NAMES
+    _equal_exact(original, altered, exclude=("x", "xh", "labels", "label_mask"))
+    prefix = original.origin_patches[origin_index]
+    np.testing.assert_array_equal(original.x[:, :prefix], altered.x[:, :prefix])
+    np.testing.assert_array_equal(original.xh[origin_index], altered.xh[origin_index])
+    assert not np.array_equal(original.labels[origin_index], altered.labels[origin_index])
+    if np.isnan(replacement):
+        assert not altered.label_mask[origin_index].any()
+
+    model = v5.V5Model(config().model)
+    before = v5.forecast(model, panel, request)
+    after = v5.forecast(model, hidden, request)
+    assert before.names == after.names
+    assert before.gates == pytest.approx(after.gates, abs=1e-6)
+    np.testing.assert_allclose(
+        before.quantiles[origin_index], after.quantiles[origin_index], atol=1e-6, rtol=1e-6
+    )
+
+
+def test_new_history_before_an_origin_is_used():
+    panel = _naive_panel()
+    item = panel.items[0]
+    request = EpisodeRequest(0, (263, 295), 45, 64, cutoff=247, derive=_NAIVE)
+    values = item.targets["y"].copy()
+    values[request.origins[0] - item.start : request.origins[1] - item.start] += 20
+    changed = replace(panel, items=(replace(item, targets={"y": values}),))
+    original = EpisodeBuilder(panel).build(request)
+    altered = EpisodeBuilder(changed).build(request)
+    _equal_exact(original, altered, exclude=("x", "xh", "labels"))
+    np.testing.assert_array_equal(original.xh[0], altered.xh[0])
+    patch = original.origin_patches[0]
+    row = original.row_names.index("y~last")
+    # The changed target at the grid cell can first serve the following context cell.
+    np.testing.assert_array_equal(original.x[row, patch, 0], altered.x[row, patch, 0])
+    assert original.x[row, patch, 1, CH_VALUE] != altered.x[row, patch, 1, CH_VALUE]
+    for name in ("y~last", "y~season", "y~drift"):
+        assert not np.allclose(
+            _naive_horizon(original, name, 1)[:, CH_VALUE],
+            _naive_horizon(altered, name, 1)[:, CH_VALUE],
+        )
+
+
+@pytest.mark.parametrize(
+    ("freq", "name", "season", "slope"),
+    [
+        ("D", "season", 7, 0),
+        ("h", "season", 24, 0),
+        (None, "drift", 1, 0.2),
+        ("D", "drift", 7, 0.2),
+        ("h", "drift", 24, 0.2),
+        ("h", "season2", 168, 0),
+    ],
+)
+def test_naive_rows_recover_planted_values(freq, name, season, slope):
+    steps = np.arange(420, dtype=np.float64)
+    raw = 50 + np.sin(2 * np.pi * (steps % season) / season) + slope * steps
+    origin = 192
+    if name == "drift":
+        drift_width = season * ((64 + season - 1) // season)
+        # A level shift outside both endpoints of the slope window cannot enter the fit.
+        raw[: origin - drift_width - season] += 20
+    panel = _naive_panel(freq, target=raw)
+    item = panel.items[0]
+    request = EpisodeRequest(0, (item.start + origin,), 45, 16, derive=_NAIVE)
+    episode = EpisodeBuilder(panel).build(request)
+    horizon = _naive_horizon(episode, f"y~{name}")
+    assert horizon[:, CH_OBSERVED].all()
+    np.testing.assert_allclose(
+        np.sinh(horizon[:, CH_VALUE]), episode.labels[0, 0, : request.horizon], atol=1e-6, rtol=1e-6
+    )
+    if freq is None:
+        assert set(episode.row_names[1:]) == {"y~last", "y~drift"}
+    if freq == "D":
+        assert set(episode.row_names[1:]) == {"y~last", "y~season", "y~drift"}
+
+
+def test_drift_row_survives_a_short_history():
+    origin = 14  # Seven daily seasonal pairs, the minimum in the 70-cell window.
+    panel = _naive_panel("D", target=np.arange(30, dtype=np.float64))
+    item = panel.items[0]
+    request = EpisodeRequest(0, (item.start + origin,), 8, 16, derive=_NAIVE)
+    episode = EpisodeBuilder(panel).build(request)
+    horizon = _naive_horizon(episode, "y~drift")
+
+    assert horizon[:, CH_OBSERVED].all()
+    np.testing.assert_allclose(
+        np.sinh(horizon[:, CH_VALUE]), episode.labels[0, 0, : request.horizon], atol=1e-6, rtol=1e-6
+    )
+
+
+def test_naive_row_layout_uses_the_first_origin_even_with_missing_history():
+    panel = _naive_panel(target=np.full(420, np.nan))
+    item = panel.items[0]
+    early = EpisodeRequest(0, (item.start + 167, item.start + 183), 17, 192, derive=_NAIVE)
+    builder = EpisodeBuilder(panel)
+    actual = builder.build(early)
+    assert set(actual.row_names[1:]) == _NAIVE_HOURLY_NAMES - {"y~season2"}
+    assert not actual.x[1:].any()
+    assert not actual.xh.any()
+    enough = builder.build(replace(early, origins=(item.start + 168,)))
+    assert set(enough.row_names[1:]) == _NAIVE_HOURLY_NAMES
+    assert not enough.xh.any()
+
+
+def test_naive_rows_are_reserved_under_the_cap():
+    panel = _fill_legacy_slots(_naive_panel(), 20)
+    item = panel.items[0]
+    roles = {name: "past" if int(name[5:]) % 3 == 0 else "known" for name in panel.roles}
+    builder = EpisodeBuilder(replace(panel, roles=roles))
+    request = EpisodeRequest(0, (item.start + 192,), 21, 64)
+    baseline = builder.build(request)
+    enabled = builder.build(replace(request, derive=_NAIVE | {"lag_rows", "onset_rows"}))
+
+    by_rank = sorted(
+        (c for c in baseline.trace if c.removed is None),
+        key=lambda c: (roles[c.name] != "known", -c.score, c.name),
+    )
+    assert len(by_rank) == MAX_FEATURE_ROWS
+    preserved, displaced = by_rank[:-4], by_rank[-4:]
+    assert enabled.row_names == [
+        "y",
+        *sorted(_NAIVE_HOURLY_NAMES | {c.name for c in preserved if roles[c.name] == "known"}),
+        *sorted(c.name for c in preserved if roles[c.name] == "past"),
+    ]
+    trace = {(c.source, c.name): c for c in enabled.trace}
+    for candidate in preserved:
+        assert trace[candidate.source, candidate.name] == candidate
+        np.testing.assert_array_equal(
+            enabled.x[enabled.row_names.index(candidate.name)],
+            baseline.x[baseline.row_names.index(candidate.name)],
+        )
+    for candidate in displaced:
+        assert trace[candidate.source, candidate.name] == replace(candidate, removed="budget")
+    for name in _NAIVE_HOURLY_NAMES:
+        c = trace["derived", name]
+        assert (c.kind, c.score, c.removed) == (KIND_NUMBER, 1.0, None)
+        row = enabled.row_names.index(name)
+        assert enabled.row_keys[row] == ("derived", name)
+        assert (enabled.row_kind[row], enabled.row_role[row], enabled.row_score[row]) == (
+            KIND_NUMBER,
+            ROLE_KNOWN,
+            1.0,
+        )
+    _equal_exact(baseline, builder.build(replace(request, derive=frozenset())))
+
+
+def test_naive_rows_leave_free_slots_for_existing_derived_rows(monkeypatch):
+    panel = _onset_panel()
+    item = panel.items[0]
+    driver = lag_panel(length=len(item.targets["y"])).items[0].dynamic["driver"]
+    panel = replace(
+        panel,
+        items=(replace(item, dynamic={**item.dynamic, "driver": driver}),),
+        roles={**panel.roles, "driver": "past"},
+    )
+    panel = _fill_legacy_slots(panel, MAX_FEATURE_ROWS - 6)
+    request = EpisodeRequest(0, (115,), 12, 64, derive=_NAIVE | {"onset_rows", "lag_rows"})
+    monkeypatch.setattr(derived, "scan_delay", lambda *a, **k: (5, 1.0, 0.0))
+    episode = EpisodeBuilder(panel).build(request)
+    expected = {
+        "y~last": None,
+        "y~season": None,
+        "y~drift": None,
+        "driver~lag": None,
+        "event~onset": "budget",
+    }
+    assert {c.name: c.removed for c in episode.trace if c.source == "derived"} == expected
+    assert {name for name in episode.row_names if "~" in name} == {
+        name for name, reason in expected.items() if reason is None
+    }
+
+
+def test_naive_row_name_collision_does_not_reserve_a_slot():
+    panel = _fill_legacy_slots(_naive_panel(), 20)
+    item = panel.items[0]
+    panel = replace(
+        panel,
+        items=(replace(item, dynamic={**item.dynamic, "y~last": np.full(420, np.nan)}),),
+        roles={**panel.roles, "y~last": "past"},
+    )
+    actual = EpisodeBuilder(panel).build(EpisodeRequest(0, (263,), 12, 64, derive=_NAIVE))
+    assert "y~last" not in actual.row_names
+    assert len(actual.row_names) == MAX_FEATURE_ROWS + 1
+    assert sum(c.removed is None and c.source == "known" for c in actual.trace) == 13
+
+
+def test_naive_rows_use_only_the_kept_forecast_target():
+    panel = _naive_panel()
+    item = panel.items[0]
+    targets = {**item.targets, "actual": item.targets["y"] ** 2}
+    builder = EpisodeBuilder(replace(panel, items=(replace(item, targets=targets),)))
+    (joint,) = builder.plan_requests(0, (263,), 21, context=64, derive=_NAIVE)
+    assert joint.target is None
+    _equal_exact(builder.build(joint), builder.build(replace(joint, derive=frozenset())))
+    episode = builder.build(replace(joint, target="actual"))
+    assert episode.keep.sum() == 1
+    assert {name for name in episode.row_names if "~" in name} == {
+        name.replace("y~", "actual~") for name in _NAIVE_HOURLY_NAMES
+    }
+    scaled = to_scaled(targets["actual"], fit_scale(targets["actual"], 192, panel.season))
+    np.testing.assert_allclose(
+        _naive_horizon(episode, "actual~last")[:, CH_VALUE], np.arcsinh(scaled[191]), atol=1e-6
+    )

@@ -522,6 +522,32 @@ def test_a_legacy_export_replays_and_scores_unchanged(make_adapter):
         np.testing.assert_allclose(actual, expected, **TOL)
 
 
+def test_naive_rows_keep_adapter_layouts(make_adapter, monkeypatch, tmp_path):
+    exported = _export(tmp_path, sampler_options={"derive": ("naive_rows",)})
+    episodes = _capture_episodes(monkeypatch)
+    for count in (1, 5, 6, 17):
+        window = _window(targets=count)
+        outputs = {}
+        for variant in ("full", "no_derived"):
+            adapter = make_adapter(checkpoint=exported, variant=variant)
+            episodes.clear()
+            ((output,),) = adapter.predict([window], HORIZON, [0.5])
+            assert output.shape == (count, HORIZON, 1)
+            assert np.isfinite(output).all()
+            outputs[variant] = output
+            layout = set(window.targets) if count == 17 else {None}
+            assert {target for _, target in episodes} == layout
+            for (_, target), episode in episodes.items():
+                assert episode.keep.sum() == (1 if count == 17 else count)
+                expected = set()
+                if variant == "full" and count in (1, 17):
+                    kept = window.targets[0] if count == 1 else target
+                    expected = {f"{kept}~{name}" for name in ("last", "season", "drift")}
+                assert {c.name for c in episode.trace if c.source == "derived"} == expected
+        if count in (5, 6):
+            np.testing.assert_allclose(outputs["full"], outputs["no_derived"], **TOL)
+
+
 def test_derive_reaches_every_request(make_adapter, monkeypatch, tmp_path):
     from demand_forecast.bench.yardsticks import v5_adapter as api
 
