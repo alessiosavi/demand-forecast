@@ -12,7 +12,7 @@ from pathlib import Path
 
 import yaml
 
-from demand_forecast.data.episode.builder import DROPPABLE
+from demand_forecast.data.episode.builder import DERIVABLE, DROPPABLE
 from demand_forecast.data.episode.schema import MAX_CONTEXT, MAX_HORIZON, PATCH, SUMMARY_FEATURES
 from demand_forecast.models.v5.config import V5Config
 from demand_forecast.synthetic.typed.draft import INPUT_MECHANISMS
@@ -172,6 +172,7 @@ class SamplerConfig:
     cold_share: float = 0.0
     cold_steps: tuple[int, int] = (3, 4)
     first_event_only: bool = False
+    derive: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         _flag(self, "designate_target")
@@ -208,6 +209,10 @@ class SamplerConfig:
             if any(name not in allowed for name in getattr(self, field)):
                 raise ValueError(f"{field} requires known names")
             object.__setattr__(self, field, tuple(getattr(self, field)))
+        derive = tuple(self.derive)
+        if any(name not in DERIVABLE for name in derive):
+            raise ValueError("derive requires known names")
+        object.__setattr__(self, "derive", tuple(sorted(set(derive))))
 
 
 @dataclass(frozen=True)
@@ -328,6 +333,8 @@ class V5TrainConfig:
         data = _plain(asdict(self))
         if self.model.expert_mode == "routed":
             del data["model"]["expert_mode"]
+        if not self.sampler.derive:
+            del data["sampler"]["derive"]
         for source in data["sources"]:
             if source["folder_power"] is None:
                 del source["folder_power"]

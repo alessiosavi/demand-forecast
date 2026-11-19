@@ -194,6 +194,7 @@ def _plan_panel(panel, record, config, source, rng, *, path_quota=None, ordinary
     selected.extend((index, None) for index in remaining[:room])
     plans = []
     builder = None
+    derive = frozenset(config.derive)
     for index, path in selected:
         item = original.items[index]
         cold = index == lead and lead_cold
@@ -204,14 +205,16 @@ def _plan_panel(panel, record, config, source, rng, *, path_quota=None, ordinary
             target = record.get("target")
             if target is None:
                 target = str(rng.choice(sorted(item.targets)))
-            request = EpisodeRequest(index, origins, horizon, context, target, cutoff)
+            request = EpisodeRequest(
+                index, origins, horizon, context, target, cutoff, derive=derive
+            )
         else:
             if builder is None:
                 builder = EpisodeBuilder(
                     original, ScreeningConfig(no_evidence=config.screen_no_evidence)
                 )
             requests = builder.plan_requests(
-                index, origins, horizon, context=context, cutoff=cutoff
+                index, origins, horizon, context=context, cutoff=cutoff, derive=derive
             )
             request = requests[int(rng.integers(len(requests)))]
         drawn = {name for name, probability in config.drop if rng.random() < probability}

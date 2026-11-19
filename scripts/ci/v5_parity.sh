@@ -100,6 +100,9 @@ make_env scoring requirements-yardsticks.txt
 require_distinct_versions "$work/training-installed.txt" "$work/scoring-installed.txt"
 "$work/training/bin/python" -m demand_forecast.models.v5.export selftest "$work/export"
 "$work/scoring/bin/python" -m demand_forecast.models.v5.export check "$work/export"
+"$work/training/bin/python" -m demand_forecast.models.v5.export \
+    selftest "$work/export-derived" --derive increment_spread
+"$work/scoring/bin/python" -m demand_forecast.models.v5.export check "$work/export-derived"
 "$work/training/bin/python" -m demand_forecast.bench.yardsticks.v5_adapter \
     selftest "$work/export" "$work/adapter"
 "$work/scoring/bin/python" -m demand_forecast.bench.yardsticks.v5_adapter \

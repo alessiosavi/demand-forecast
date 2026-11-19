@@ -219,6 +219,7 @@ def test_only_the_four_repaired_paths_change():
                 assert source.pop("folder_power") is None
                 assert source.pop("plain_share") == 0.0
             assert sampler.pop("first_event_only") is (path == "event_response")
+            assert sampler.pop("derive") == ()
             cold_share = sampler.pop("cold_share")
             assert sampler.pop("cold_steps") == (3, 4)
             if path in ("static_category", "multi_label"):
@@ -440,6 +441,31 @@ def test_eval_set_passes_the_base_screening_config_to_admission(monkeypatch):
     episodes = module.eval_set("static_category", episodes=1, max_panels=30, base=base)
     assert len(episodes) == 1
     assert observed and all(screening == ScreeningConfig(no_evidence=0.9) for screening in observed)
+
+
+def test_derive_reaches_every_request(small, monkeypatch):
+    base = tiny()
+    derive = frozenset({"increment_spread", "onset_rows"})
+    base = replace(base, sampler=replace(base.sampler, derive=tuple(derive)))
+    built = []
+    build = small.EpisodeBuilder.build
+
+    def observe(builder, request):
+        built.append(request.derive)
+        return build(builder, request)
+
+    monkeypatch.setattr(small.EpisodeBuilder, "build", observe)
+    episodes = small.eval_set("category_mean", base=base, episodes=1, min_count=1, max_panels=60)
+    assert len(episodes) == 1 and built and set(built) == {derive}
+    saved = small.t1_config("category_mean", "true", seed=17, base=base)
+    model = V5Model(saved.model)
+    monkeypatch.setattr(small, "load_model", lambda *a, **kw: (model, saved))
+    built.clear()
+    small.evaluate(Path("unused"), "category_mean", "true", episodes)
+    assert built == [derive, derive]
+    built.clear()
+    small.evaluate(Path("unused"), "category_mean", "true", episodes, derive_override=frozenset())
+    assert built == [derive, frozenset()]
 
 
 def test_t1_evaluation_uses_the_configured_level(monkeypatch, tmp_path):

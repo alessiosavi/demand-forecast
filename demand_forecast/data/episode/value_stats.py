@@ -3,6 +3,7 @@
 import numpy as np
 import pandas as pd
 
+from .derived import increment_spread
 from .kinds import labels_of, observed_mask
 from .schema import VALUE_STATS
 
@@ -14,6 +15,7 @@ def category_step_stats(
     left: int,
     right: int,
     frozen_at: int | None = None,
+    use_increment_spread: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Encode completed earlier responses, freezing history over a known horizon.
 
@@ -67,8 +69,9 @@ def category_step_stats(
                 means[:, offset] = np.where(n > 0, anchor + mean, 0.0)
                 if offset == 0:
                     support = n
-                    squares = np.r_[0.0, (shifted**2).cumsum()][n]
-                    spread = np.sqrt(np.maximum(0.0, squares / np.maximum(n, 1) - mean**2))
+                    if not use_increment_spread:
+                        squares = np.r_[0.0, (shifted**2).cumsum()][n]
+                        spread = np.sqrt(np.maximum(0.0, squares / np.maximum(n, 1) - mean**2))
         valid = support > 0
         shrink = support / (support + 4)
         with np.errstate(over="ignore", invalid="ignore"):
@@ -78,5 +81,7 @@ def category_step_stats(
         values[rows, 5] = np.log1p(support)
         values[rows[~valid]] = 0
         flags[rows] = valid
+    if use_increment_spread:
+        values[:, 1] = increment_spread(labels, target, left=left, right=right, frozen_at=frozen_at)
     np.nan_to_num(values, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
     return values, flags

@@ -1,0 +1,174 @@
+{
+  "files": {
+    "model.safetensors": "ad29f775660eb5c4eb17906acc2314de39002e1f0e89a57d5817e6e89ea47459",
+    "parity.npz": "7f57872f56164fa0ff35d65e636833f9d64a8c5a4171ff251df2811542451130"
+  },
+  "format": "v5-export-1",
+  "model": {
+    "balance_weight": 0.01,
+    "d_calendar": 4,
+    "d_model": 16,
+    "d_out": 4,
+    "d_step": 4,
+    "dec_layers": 1,
+    "dim_feedforward": 16,
+    "dropout": 0.1,
+    "enc_layers": 1,
+    "expert_dec_layers": 1,
+    "expert_enc_layers": 1,
+    "gate_init": 3.0,
+    "known_gate_floor": 0.05,
+    "n_experts": 4,
+    "nhead": 2,
+    "quantiles": [
+      0.1,
+      0.2,
+      0.3,
+      0.4,
+      0.5,
+      0.6,
+      0.7,
+      0.8,
+      0.9
+    ],
+    "sparsity_weight": 0.001,
+    "top_k": 2,
+    "width_factor": 2.0
+  },
+  "source": {
+    "identity": "975325f266cedf4dd231355e0e5b39c00b3bf8b2011294555b1e0615655f7942",
+    "sha256": "a343ab430f4067084bab52e8ced321b9fe5868ef1559321f8769fa44790fb590",
+    "updates": 4,
+    "weights": "raw"
+  },
+  "training": {
+    "gates": "learned",
+    "model": {
+      "balance_weight": 0.01,
+      "d_calendar": 4,
+      "d_model": 16,
+      "d_out": 4,
+      "d_step": 4,
+      "dec_layers": 1,
+      "dim_feedforward": 16,
+      "dropout": 0.1,
+      "enc_layers": 1,
+      "expert_dec_layers": 1,
+      "expert_enc_layers": 1,
+      "gate_init": 3.0,
+      "known_gate_floor": 0.05,
+      "n_experts": 4,
+      "nhead": 2,
+      "quantiles": [
+        0.1,
+        0.2,
+        0.3,
+        0.4,
+        0.5,
+        0.6,
+        0.7,
+        0.8,
+        0.9
+      ],
+      "sparsity_weight": 0.001,
+      "top_k": 2,
+      "width_factor": 2.0
+    },
+    "optim": {
+      "amp": true,
+      "checkpoint_minutes": 10.0,
+      "ema_decay": null,
+      "grad_clip": 1.0,
+      "learning_rate": 0.0005,
+      "log_every": 50,
+      "max_steps": 1,
+      "warmup_steps": 0,
+      "weight_decay": 0.01
+    },
+    "router": "learned",
+    "sampler": {
+      "contexts": [
+        256,
+        512,
+        1024
+      ],
+      "cutoff_at_origin": 0.5,
+      "designate_target": false,
+      "drop": [
+        [
+          "features",
+          0.1
+        ],
+        [
+          "peers",
+          0.15
+        ],
+        [
+          "attributes",
+          0.15
+        ],
+        [
+          "static_numbers",
+          0.1
+        ],
+        [
+          "panel_row",
+          0.2
+        ],
+        [
+          "siblings",
+          0.1
+        ],
+        [
+          "calendar",
+          0.1
+        ],
+        [
+          "rolling",
+          0.1
+        ],
+        [
+          "lags",
+          0.1
+        ],
+        [
+          "zeros",
+          0.1
+        ]
+      ],
+      "drop_always": [],
+      "episodes_per_batch": 32,
+      "episodes_per_panel": 8,
+      "horizon": [
+        16,
+        288
+      ],
+      "max_cells": 4000000,
+      "origin_stride": 2,
+      "origins": 4,
+      "path_share": 0.5,
+      "screen_no_evidence": 0.2,
+      "summary_off": []
+    },
+    "seed": 0,
+    "sources": [
+      {
+        "control": null,
+        "control_inputs": "all",
+        "freq": null,
+        "heldout": false,
+        "kind": "corpus",
+        "length": [
+          64,
+          2048
+        ],
+        "max_items": 48,
+        "n_nuisance": 0,
+        "nuisance_from": null,
+        "recipes": [],
+        "singleton_share": 0.0,
+        "weight": 1.0
+      }
+    ]
+  }
+}
