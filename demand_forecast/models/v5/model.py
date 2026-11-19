@@ -314,8 +314,12 @@ class V5Model(nn.Module):
                 dec_gate,
                 dec_weights,
             )
-        steps_out = self.step_projection(h[:, :, :nf]).unflatten(-1, (PATCH, self.config.d_out))
-        quantiles = self.head(steps_out.flatten(3, 4))
+        # Low precision can round the gaps between adjacent quantiles to zero.
+        with torch.autocast(h.device.type, enabled=False):
+            # Match the float32 weights in training and honor an explicit forecast dtype.
+            states = h[:, :, :nf].to(self.step_projection.weight.dtype)
+            steps_out = self.step_projection(states).unflatten(-1, (PATCH, self.config.d_out))
+            quantiles = self.head(steps_out.flatten(3, 4))
         real = batch.origin_mask[:, :, None, None] & batch.forecast_mask[:, None, :, None]
         quantiles = quantiles.masked_fill(~real[..., None], 0)
         return V5Output(

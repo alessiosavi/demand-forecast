@@ -58,13 +58,26 @@ def export_api():
     return importlib.import_module("demand_forecast.models.v5.export")
 
 
-def _checkpoint(directory, weights="model", model=None, *, fair_spread=False, sampler_options=None):
+def _checkpoint(
+    directory,
+    weights="model",
+    model=None,
+    *,
+    fair_spread=False,
+    sampler_options=None,
+    optim_options=None,
+):
     model = TINY if model is None else model
     config = V5TrainConfig(
         model,
         (SourceConfig("corpus", 1.0, root="/unused/local/corpus"),),
         SamplerConfig(screen_no_evidence=0.2, **(sampler_options or {})),
-        OptimConfig(max_steps=1, warmup_steps=0, ema_decay=0.999 if weights == "ema" else None),
+        OptimConfig(
+            max_steps=1,
+            warmup_steps=0,
+            ema_decay=0.999 if weights == "ema" else None,
+            **(optim_options or {}),
+        ),
         device="cpu",
         workers=1,
     )
@@ -184,6 +197,17 @@ def test_dense_export_round_trips_with_parity(tmp_path, export_api):
 def _read_archive(path):
     with np.load(path, allow_pickle=False) as archive:
         return dict(archive)
+
+
+def test_label_cap_metadata_and_export_parity(tmp_path, export_api, reference_export):
+    _, metadata = export_api.load_export(reference_export)
+    assert "label_cap" not in metadata["training"]["optim"]
+    checkpoint = _checkpoint(tmp_path, optim_options={"label_cap": 1000.0})
+    out = tmp_path / "capped-export"
+    export_api.write_export(checkpoint, out)
+    _, metadata = export_api.load_export(out)
+    assert metadata["training"]["optim"]["label_cap"] == pytest.approx(1000.0)
+    export_api.require_parity(out)
 
 
 def test_canonical_serialized_and_export_omit_an_empty_derive(export_api, reference_export):

@@ -293,6 +293,8 @@ def train(
     )
     amp, dtype, use_scaler = resolve_amp(config.optim.amp, device)
     scaler = make_scaler(use_scaler)
+    label_cap = config.optim.label_cap
+    loss_options = {} if label_cap is None else {"label_cap": label_cap}
     ema = None if config.optim.ema_decay is None else _PretrainEMA(model, config.optim.ema_decay)
     counters = {"batch": 0, "updates": 0, "skipped": 0, "consecutive_nonfinite": 0, "saves": 0}
     history, pending = [], _pending()
@@ -396,7 +398,9 @@ def train(
             with torch.autocast(device.type, dtype=dtype, enabled=amp):
                 gates = model.gates(batch, mode=config.gates)
                 output = model(batch, gates, router=config.router)
-                loss, parts = v5_loss(output, batch, config.model)
+                loss, parts = v5_loss(output, batch, config.model, **loss_options)
+            if label_cap is not None:
+                pending["capped"] = pending.get("capped", 0) + parts.pop("capped")
             value = float(loss.detach())
             updated = False
             if math.isfinite(value):
@@ -449,6 +453,8 @@ def train(
                     "skipped": pending["skipped"],
                     "zero_gates": _zero_gates(model, batch, config.gates),
                 }
+                if label_cap is not None:
+                    entry["capped"] = pending["capped"]
                 history.append(entry)
                 _json_line(state_dir / "history.jsonl", entry)
                 pending = _pending()
