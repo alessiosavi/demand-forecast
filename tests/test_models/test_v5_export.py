@@ -142,7 +142,11 @@ def test_round_trip_of_the_whole_state_dict(tmp_path, monkeypatch, export_api, w
     request = EpisodeRequest(0, (32,), 4, context=32)
     expected_forecast = forecast(oracle, panel, request)
     actual_forecast = forecast(loaded, panel, request)
-    np.testing.assert_array_equal(actual_forecast.quantiles, expected_forecast.quantiles)
+    # Equal weights give equal forecasts only up to float32 kernel noise: on x86-64 two models at
+    # different addresses differed by 2e-8 (the weights above are compared exactly).
+    np.testing.assert_allclose(
+        actual_forecast.quantiles, expected_forecast.quantiles, rtol=1e-6, atol=1e-6
+    )
     assert actual_forecast.names == expected_forecast.names
     assert actual_forecast.gates == expected_forecast.gates
 
