@@ -394,6 +394,17 @@ of the training seed, and all arms share the same frozen evaluation digest.
 The unit records path, arm, training seed, base-file hash, requested episodes and
 max panels, and the actual replay digest in addition to its training identity.
 
+Both arms of `past_driver` and `label_lag` enable `lag_rows`, both arms of
+`category_timing` enable `onset_rows`, and both arms of `category_spread`
+enable `increment_spread`. When a path configures presentations, `result.json`
+records their sorted names under `derive` and the sorted names of derived
+rows built in each episode under `derived`. The `true` arm also publishes
+`result-derive-off.json` in its evaluation manifest. This replay uses the
+same checkpoint and evaluation digest with presentations disabled, so
+`derive` and each episode's derived-name list are empty. The
+`increment_spread` presentation changes the spread channel of existing
+category rows, so both replays have empty per-episode derived-name lists.
+
 **Cold-start episodes.** `sampler.cold_share` is the probability per attempt in
 the support loop of trying a cold frame for a `static_category` or `multi_label`
 path lead. It defaults to zero. The support rule rejects cold frames more often
@@ -431,7 +442,18 @@ the arms**, code, path, seed and evaluation parameters and one `--arm NAME=DIR`
 per required arm. The base file's SHA-256 is compared, so even changes only to
 `workers`, `device` or YAML formatting are refused, although `workers` and
 `device` are excluded from the training identity. Each arm must name an existing
-real directory, not a symlink. For `selection`, the top-level `compare.json`
+real directory, not a symlink. For `category_timing` and `category_spread`,
+only the `known` cohort decides the verdict. It is inconclusive below 30
+episodes, and the all-episode figure appears under `overall`. When the true
+unit includes `result-derive-off.json`, `compare.json` reports `removal` on the
+same decision cohort, or on all episodes for paths without a cohort.
+`t1-compare` checks the configured presentations against each arm's `derive`
+and requires an empty `derive` in the off replay. For `lag_rows` and
+`onset_rows`, it also checks that each episode in the off replay has an empty
+derived-name list. The removal figure uses a
+paired 90% bootstrap interval for the summed loss reduction with presentations
+enabled, relative to the summed loss with them disabled. The verdict depends
+on the arm comparison. For `selection`, the top-level `compare.json`
 outcome combines the deciding comparison and `selection_report.outcome`: either
 failure means fail; otherwise either inconclusive means inconclusive; only two
 passes mean pass. This job generator does not perform that local comparison.

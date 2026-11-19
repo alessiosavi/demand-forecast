@@ -146,6 +146,7 @@ def rejected(command, arms, out, capsys, arm, reason):
     assert reason.lower() in error
     assert not out.exists()
     assert snapshot(arms) == before
+    return error
 
 
 @pytest.mark.parametrize("path", ["static_category", "category_mean"])
@@ -169,6 +170,7 @@ def test_copied_units_publish_figures_slices_hashes_and_deterministic_bytes(
     report = json.loads(payload)
     assert report["path"] == path
     assert report["outcome"] == "inconclusive"
+    assert "removal" not in report
     assert report["units"] == {a: file_digest(d / "unit.json") for a, d in arms.items()}
     assert len(report["comparisons"]) == 1
     comparison = report["comparisons"][0]
@@ -409,6 +411,67 @@ def test_reported_slice_failure_does_not_decide(copied, monkeypatch):
     report = json.loads((out / "compare.json").read_text())
     assert report["outcome"] == "pass"
     assert report["comparisons"][0]["slices"]["rare"]["outcome"] == "fail"
+
+
+@pytest.mark.parametrize("damage", [None, "eval_digest", "loss", "derived"])
+def test_category_comparison_and_removal_use_known_cohort(copied, monkeypatch, capsys, damage):
+    _, arms, out, command = copied("category_timing")
+    episodes = [{"slices": ("known",)}] * 30 + [{"slices": ("past",)}] * 30
+    controlled_episodes(
+        monkeypatch,
+        arms,
+        episodes,
+        {"true": [0.8] * 30 + [1.2] * 30, "null": [1.0] * 60},
+    )
+    true = arms["true"]
+    off = true / "result-derive-off.json"
+    result = {
+        "eval_digest": t1.eval_digest(episodes),
+        "loss": [0.7] * 30 + [2.4] * 30,
+        "derive": [],
+        "derived": [[] for _ in episodes],
+    }
+    if damage == "eval_digest":
+        result["eval_digest"] = "d" * 64
+    if damage == "loss":
+        result["loss"].pop()
+        result["derived"].pop()
+    if damage == "derived":
+        result["derived"][0] = ["category~onset"]
+    manifest = read_manifest(true / "unit.json")
+    off.write_text(json.dumps(result))
+    manifest["files"][off.name] = {}
+    write_manifest(true / "unit.json", manifest)
+    if damage:
+        assert damage in rejected(command, arms, out, capsys, "true", off.name)
+        return
+
+    assert invoke(command, arms) == 0
+    report = json.loads((out / "compare.json").read_text())
+    assert report["comparisons"][0]["overall"]["outcome"] == "fail"
+    assert report["comparisons"][0]["slices"]["known"]["n"] == 30
+    assert report["outcome"] == "pass"
+    assert report["removal"]["n"] == 30
+    for key in ("gain", "low", "high"):
+        assert report["removal"][key] == pytest.approx((0.7 - 0.8) / 0.7)
+
+
+@pytest.mark.parametrize("damage", [None, "copy", "true", "null"])
+def test_category_spread_requires_matching_presentations(copied, capsys, damage):
+    _, arms, out, command = copied("category_spread")
+    true = arms["true"]
+    off = true / "result-derive-off.json"
+    if damage == "copy":
+        manifest = read_manifest(true / "unit.json")
+        shutil.copyfile(true / "result.json", off)
+        write_manifest(true / "unit.json", manifest)
+        assert "derive must be empty" in rejected(command, arms, out, capsys, "true", off.name)
+    elif damage:
+        rewrite_result(arms[damage], derive=[])
+        assert "derive" in rejected(command, arms, out, capsys, damage, "result.json")
+    else:
+        assert invoke(command, arms) == 0
+        assert json.loads((out / "compare.json").read_text())["removal"]["n"] > 0
 
 
 def test_selection_publishes_all_r2_decisions(copied):

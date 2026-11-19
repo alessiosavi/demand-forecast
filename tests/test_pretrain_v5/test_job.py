@@ -430,10 +430,15 @@ def test_t1_sigkill_resumes_from_published_training_or_slot(small_t1, tmp_path, 
 
 @pytest.mark.parametrize(
     "path,arms",
-    [("static_category", ("true", "null")), ("selection", ("true", "null", "gates_one"))],
+    [
+        ("static_category", ("true", "null")),
+        ("selection", ("true", "null", "gates_one")),
+        ("past_driver", ("true", "null")),
+    ],
 )
 def test_t1_all_arms_publish_paired_evaluations(job, small_t1, tmp_path, path, arms, monkeypatch):
     base = V5TrainConfig.from_yaml(small_t1)
+    episode_count = 6 if path == "past_driver" else 2
     eval_set = t1.eval_set
     observed = []
 
@@ -443,19 +448,85 @@ def test_t1_all_arms_publish_paired_evaluations(job, small_t1, tmp_path, path, a
 
     monkeypatch.setattr(t1, "eval_set", observe)
     digests = set()
+    directories = {}
+    results = {}
+    removal = None
     for arm in arms:
-        assert job.main(t1_args(tmp_path, small_t1, arm=arm, path=path)) == 0
-        unit = tmp_path / f"state/t1/{path}-{arm}-s7/eval-2-40"
+        assert (
+            job.main(t1_args(tmp_path, small_t1, arm=arm, path=path, episodes=episode_count)) == 0
+        )
+        unit = tmp_path / f"state/t1/{path}-{arm}-s7/eval-{episode_count}-40"
         record = read_manifest(unit / "unit.json")
         assert record is not None
-        assert set(record["files"]) == {"checkpoint-final.pt", "train.json", "result.json"}
+        files = {"checkpoint-final.pt", "train.json", "result.json"}
+        off = unit / "result-derive-off.json"
+        publishes_removal = path == "past_driver" and arm == "true"
+        assert off.is_file() == publishes_removal
+        if publishes_removal:
+            files.add(off.name)
+            removal = json.loads(off.read_text())
+            assert removal["eval_digest"] == record["eval_digest"]
+            assert removal["derived"] == [[] for _ in range(episode_count)]
+            assert removal["derive"] == []
+        assert set(record["files"]) == files
         result = json.loads((unit / "result.json").read_text())
-        assert len(result["loss"]) == 2
+        assert len(result["loss"]) == episode_count
+        if publishes_removal:
+            assert sum(map(bool, result["derived"])) >= 2
         assert ("forced" in result) == (path == "selection" and arm == "true")
         assert result["eval_digest"] == record["eval_digest"]
         digests.add(record["eval_digest"])
+        directories[arm] = unit
+        results[arm] = result
     assert len(digests) == 1
     assert observed == [base] * len(arms)
+    if removal is not None:
+        out = tmp_path / "compare"
+        command = [
+            "t1-compare",
+            "--base",
+            str(small_t1),
+            "--code",
+            CODE,
+            "--path",
+            path,
+            "--seed",
+            "7",
+            "--episodes",
+            str(episode_count),
+            "--max-panels",
+            "40",
+            "--out",
+            str(out),
+            *(
+                value
+                for arm, directory in directories.items()
+                for value in ("--arm", f"{arm}={directory}")
+            ),
+        ]
+        assert job.main(command) == 0
+        report = json.loads((out / "compare.json").read_text())
+        off_loss, on_loss = sum(removal["loss"]), sum(results["true"]["loss"])
+        assert report["removal"] == {
+            "n": episode_count,
+            "low": None,
+            "high": None,
+            "gain": pytest.approx((off_loss - on_loss) / off_loss),
+        }
+
+        true_dir = directories["true"]
+        manifest = read_manifest(true_dir / "unit.json")
+        del manifest["files"]["result-derive-off.json"]
+        (true_dir / "result-derive-off.json").unlink()
+        checkpoint.write_manifest(true_dir / "unit.json", manifest)
+        assert job.main(command) == 0
+        without = json.loads((out / "compare.json").read_text())
+        assert "removal" not in without
+        assert report["comparisons"] == without["comparisons"]
+        assert report["outcome"] == without["outcome"]
+
+        assert job.main(t1_args(tmp_path, small_t1, path=path, episodes=episode_count)) == 0
+        assert "result-derive-off.json" in read_manifest(true_dir / "unit.json")["files"]
 
 
 @pytest.mark.parametrize(
