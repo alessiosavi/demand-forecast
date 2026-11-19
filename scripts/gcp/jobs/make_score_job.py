@@ -5,6 +5,7 @@ import argparse
 import base64
 import gzip
 import hashlib
+import importlib.util
 import json
 import re
 import shlex
@@ -366,18 +367,17 @@ if __name__ == "__main__":
 """
 
 
-def _guest(model):
-    # Preserve the registered Simons payload byte-for-byte. References specialize
-    # only the inference package check and CLI; all state/evidence logic is shared.
-    if model == "simons":
-        return GUEST
-    replacements = [
-        (
-            "Simons package check",
-            """    upstream = json.loads(metadata.distribution("simons").read_text("direct_url.json"))
+_SIMONS_PACKAGE_CHECK = """    upstream = json.loads(metadata.distribution("simons").read_text("direct_url.json"))
     if upstream["vcs_info"]["commit_id"] != config["upstream_pin"]:
-        raise ValueError("installed Simons commit does not match upstream pin")""",
-            """    package = config["model_package"]
+        raise ValueError("installed Simons commit does not match upstream pin")"""
+_SIMONS_CHILD_ARGUMENTS = """"--model", "simons",
+                   "--checkpoint", str(checkpoint), "--processing", mode,"""
+
+_REFERENCE_REPLACEMENTS = (
+    (
+        "Simons package check",
+        _SIMONS_PACKAGE_CHECK,
+        """    package = config["model_package"]
     if config["model"] == "chronos2":
         if metadata.version("chronos-forecasting") != package.split("==")[1]:
             raise ValueError("installed Chronos package does not match pin")
@@ -385,25 +385,134 @@ def _guest(model):
         upstream = json.loads(metadata.distribution("timestral").read_text("direct_url.json"))
         if upstream["vcs_info"]["commit_id"] != package.rsplit("@", 1)[1]:
             raise ValueError("installed Timestral commit does not match pin")""",
-        ),
-        (
-            "Simons child command",
-            """"--model", "simons",
-                   "--checkpoint", str(checkpoint), "--processing", mode,""",
-            """"--model", config["model"],
+    ),
+    (
+        "Simons child command",
+        _SIMONS_CHILD_ARGUMENTS,
+        """"--model", config["model"],
                    "--weights", config["hub_weights"], "--revision", config["hub_revision"],""",
-        ),
-    ]
+    ),
+)
+
+_CHILD_TASK_ARGUMENTS = """
+                   "--tasks", str(root / "tasks.yaml"), "--model-name", config["name"] + "-" + mode,
+                   "--out-dir", str(directory), "--resume", "--keep-going"]
+        if selection:
+            command += ["--names", selection]
+        if config["max_context"] is not None:
+            command += ["--max-context", str(config["max_context"])]"""
+
+_V5_REPLACEMENTS = (
+    ("Simons package check", _SIMONS_PACKAGE_CHECK, ""),
+    (
+        "Simons child command",
+        _SIMONS_CHILD_ARGUMENTS
+        + _CHILD_TASK_ARGUMENTS
+        + """
+        if config.get("covariates", "all") == "none":
+            command += ["--covariates", "none"]""",
+        """"--model", "v5",
+                   "--checkpoint", str(checkpoint), "--processing", "raw","""
+        + _CHILD_TASK_ARGUMENTS
+        + """
+        if config["variant"] is not None:
+            command += ["--variant", config["variant"]]""",
+    ),
+    (
+        "checkpoint fetch files",
+        """    download.mkdir()
+    for filename in ("config.json", "model.safetensors"):""",
+        """    download.mkdir()
+    files = ("config.json", "model.safetensors", "parity.npz")
+    for filename in files:""",
+    ),
+    (
+        "checkpoint hash files",
+        ' for name in ("config.json", "model.safetensors")',
+        " for name in files",
+    ),
+    (
+        "checkpoint hash keys",
+        'set(value) == {"config.json", "model.safetensors"}',
+        'set(value) == {"config.json", "model.safetensors", "parity.npz"}',
+    ),
+    (
+        "export digest check",
+        '}\n    prior = root / "checkpoint-sha256.json"',
+        '''}
+    # demand_forecast/models/v5/export.py: export_digest is the SHA-256 of
+    # config.json's bytes, which in turn records the other two file digests.
+    if hashes["config.json"] != config["export_digest"]:
+        raise ValueError("v5 export sha256 mismatch: config.json")
+    export_files = read_object(download / "config.json").get("files")
+    if not isinstance(export_files, dict):
+        raise ValueError("v5 config.json is missing export file digests")
+    for name in ("model.safetensors", "parity.npz"):
+        if hashes[name] != export_files.get(name):
+            raise ValueError("v5 export sha256 mismatch: " + name)
+    prior = root / "checkpoint-sha256.json"''',
+    ),
+    (
+        # "v5-report.json" and "evidence_window_<i>.npz" are the names run_yardstick writes for a v5 task
+        # (demand_forecast/bench/yardsticks/runner.py).
+        "task evidence scan",
+        """            windows = record["window_sha256"]
+            valid = (name in rows and record.get("summary") is not None
+                     and rows[name].get("run_identity") == record["run_identity"]
+                     and bool(windows)
+                     and all(digest(safe_child(task, p)) == h for p, h in windows.items()))""",
+        """            windows = record["window_sha256"]
+            evidence_hashes = record["evidence_sha256"]
+            expected_evidence = {"v5-report.json"} | {
+                f"evidence_window_{i}.npz" for i in range(len(windows))
+            }
+            valid = (name in rows and record.get("summary") is not None
+                     and rows[name].get("run_identity") == record["run_identity"]
+                     and math.isfinite(float(rows[name]["test_error"]))
+                     and bool(windows)
+                     and all(digest(safe_child(task, p)) == h for p, h in windows.items())
+                     and evidence_hashes.keys() == expected_evidence
+                     and all(digest(safe_child(task, p)) == h for p, h in evidence_hashes.items()))""",
+    ),
+    (
+        "completion artifacts",
+        """                required.update(mode + "/" + name + "/" + p for p in record["window_sha256"])""",
+        """                required.update(mode + "/" + name + "/" + p for p in record["window_sha256"])
+                required.update(mode + "/" + name + "/" + p for p in record["evidence_sha256"])""",
+    ),
+)
+
+
+def _guest(model):
+    # Preserve the registered Simons payload byte-for-byte.
+    if model == "simons":
+        return GUEST
+    replacements = _V5_REPLACEMENTS if model == "v5" else _REFERENCE_REPLACEMENTS
     for target, old, _ in replacements:
         count = GUEST.count(old)
         if count != 1:
             raise RuntimeError(f"expected exactly one {target} target, found {count}")
     guest = GUEST
-    for _, old, new in replacements:
+    for target, old, new in replacements:
+        # Count again on the running text: an earlier replacement must neither create nor remove a later target.
+        count = guest.count(old)
+        if count != 1:
+            raise RuntimeError(
+                f"expected exactly one {target} target while replacing, found {count}"
+            )
         guest = guest.replace(old, new)
     if '"--model", "simons"' in guest:
-        raise RuntimeError("reference guest still contains Simons child arguments")
+        raise RuntimeError("specialized guest still contains Simons child arguments")
     return guest
+
+
+def _v5_variants():
+    # Read from this checkout, as third_party/simons/PINNED is: generate jobs from a checkout at --repo-sha.
+    path = ROOT / "demand_forecast/bench/yardsticks/v5_variants.py"
+    spec = importlib.util.spec_from_file_location("v5_variants", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.VARIANT_NAMES
 
 
 def _sha(value, length, label):
@@ -436,11 +545,31 @@ def generate(
     max_context=None,
     covariates="all",
     model="simons",
+    export_digest=None,
+    variant=None,
 ):
     """Validate inputs and return a shell job, without fetching code, data or cloud state."""
-    if model not in ("simons", "timestral", "chronos2"):
-        raise ValueError("model must be simons, timestral or chronos2")
-    if model != "simons":
+    if model not in ("simons", "timestral", "chronos2", "v5"):
+        raise ValueError("model must be simons, timestral, chronos2 or v5")
+    if model == "v5":
+        if hub_weights is not None or hub_revision is not None:
+            raise ValueError("v5 does not accept Hub weights or revision")
+        if not checkpoint_uri:
+            raise ValueError("v5 requires an export checkpoint URI")
+        _sha(export_digest, 64, "export digest")
+        if processing not in ("raw", "both"):
+            raise ValueError("v5 requires raw processing")
+        processing = "raw"
+        if variant is not None and variant not in _v5_variants():
+            raise ValueError(f"unknown v5 variant {variant!r}")
+        if covariates != "all":
+            raise ValueError("v5 requires covariates all")
+        # 16 is PATCH (demand_forecast/data/episode/schema.py), the floor Options.resolved() enforces for v5.
+        if max_context is not None and (type(max_context) is not int or max_context < 16):
+            raise ValueError("v5 max-context must be an integer of at least 16")
+    elif variant is not None or export_digest is not None:
+        raise ValueError("variant and export digest are supported only for v5")
+    if model in MODEL_PACKAGES:
         if checkpoint_uri or not hub_weights or not hub_revision:
             raise ValueError(
                 "reference models require Hub weights and revision; checkpoint URI is unsupported"
@@ -503,10 +632,15 @@ def generate(
     )
     package = "simons @ git+https://github.com/Abel-ai-lab/Simons.git@" + upstream_pin
     label = "Simons"
-    if model != "simons":
+    if model == "v5":
+        package = None
+        config.update(model=model, export_digest=export_digest, variant=variant)
+        label = model
+    elif model in MODEL_PACKAGES:
         package = MODEL_PACKAGES[model]
         config.update(model=model, model_package=package, modes=["raw"])
         label = model
+    model_requirement = " \\\n    " + shlex.quote(package) if package else ""
     encoded_config = base64.b64encode(json.dumps(config, sort_keys=True).encode()).decode()
     encoded_guest = base64.b64encode(payload).decode()
     return f'''#!/usr/bin/env bash
@@ -572,8 +706,7 @@ git -C "$repo" checkout --detach FETCH_HEAD
 [[ $(git -C "$repo" rev-parse HEAD) == {shlex.quote(repo_sha)} ]] || {{ echo 'repository SHA mismatch' >&2; exit 2; }}
 "$python" -m pip install --upgrade pip
 "$python" -m pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu128
-"$python" -m pip install -r "$repo/requirements-yardsticks.txt" --editable "$repo[bench]" \\
-    {shlex.quote(package)}
+"$python" -m pip install -r "$repo/requirements-yardsticks.txt" --editable "$repo[bench]"{model_requirement}
 "$python" -m pip check
 guest "$python" environment
 guest "$python" score
@@ -583,13 +716,15 @@ guest "$python" score
 def main():
     """Write one executable job; generation never contacts an external service."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", choices=["simons", "timestral", "chronos2"], default="simons")
+    parser.add_argument(
+        "--model", choices=["simons", "timestral", "chronos2", "v5"], default="simons"
+    )
     for key in ("name", "repo-sha", "upstream-pin", "tasks-uri", "tasks-sha256"):
         parser.add_argument("--" + key, required=True)
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--checkpoint-uri")
     source.add_argument("--hub-weights")
-    for key in ("hub-revision", "names-uri", "names-sha256"):
+    for key in ("hub-revision", "names-uri", "names-sha256", "export-digest", "variant"):
         parser.add_argument("--" + key)
     parser.add_argument("--processing", choices=["raw", "published", "both"], default="both")
     parser.add_argument("--max-context", type=int)

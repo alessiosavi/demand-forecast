@@ -280,11 +280,22 @@ python scripts/gcp/jobs/make_score_job.py --model chronos2 --name chronos2 \
   --tasks-uri gs://bucket/tasks.yaml --tasks-sha256 "$TASKS_SHA256" \
   --hub-weights amazon/chronos-2 --hub-revision 29ec3766d36d6f73f0696f85560a422f50e8498c \
   --output /tmp/score-chronos2.sh
+python scripts/gcp/jobs/make_score_job.py --model v5 --name v5-full \
+  --repo-sha "$REPO_SHA" --upstream-pin "$(cat third_party/simons/PINNED)" \
+  --tasks-uri gs://bucket/tasks.yaml --tasks-sha256 "$TASKS_SHA256" \
+  --checkpoint-uri gs://bucket/state/export/model --export-digest "$EXPORT_DIGEST" \
+  --output /tmp/score-v5.sh
 ```
+
+A v5 job scores an export unit: `--checkpoint-uri` is the prefix that holds `config.json`,
+`model.safetensors` and `parity.npz`, and `--export-digest` is the SHA-256 of that `config.json`. The guest
+checks the three fetched files against the digest before it keeps or reuses them. `--variant NAME` selects one
+of the scoring variants; the only processing is `raw`.
 
 Reference jobs require Hub weights at a full commit SHA, refuse checkpoint URIs
 and nondefault `--processing`, and save their native output in `raw` only.
-`--covariates all|none` and `--max-context` apply to every model. To average these
+`--covariates all|none` and `--max-context` apply to the reference models and Simons; v5 refuses
+`--covariates none` and a `--max-context` below 16, its patch length. To average these
 runs with Simons, select `--processing raw|published|both`; references contribute
 `raw` native forecasts in every mode, while Simons contributes that mode. Member tasks, covariates, context limits and scoring runtime must match. Model-specific
 packages, native batching and Simons's dropped-covariate report may differ across
