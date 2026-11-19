@@ -477,12 +477,15 @@ def test_qualify_records_missing_or_fallback_inference(tmp_path, monkeypatch, fa
 
 
 @pytest.mark.parametrize("enabled", [False, True])
-def test_inference_probe_forwards_sampler_screening(monkeypatch, enabled):
+@pytest.mark.parametrize("scale_floor", [None, 0.01])
+def test_inference_probe_forwards_sampler_screening(monkeypatch, enabled, scale_floor):
     measure = api()
     c = config()
     c = replace(
         c,
-        sampler=replace(c.sampler, screen_no_evidence=0.2, screen_fair_spread=enabled),
+        sampler=replace(
+            c.sampler, screen_no_evidence=0.2, screen_fair_spread=enabled, scale_floor=scale_floor
+        ),
     )
     forwarded = []
     forecast_items = measure.forecast_items
@@ -494,7 +497,9 @@ def test_inference_probe_forwards_sampler_screening(monkeypatch, enabled):
     monkeypatch.setattr(measure, "forecast_items", record)
     result = measure._inference_measure(c, torch.device("cpu"), 12, 64, 0)
     assert result["forecasts"] == 12
-    assert forwarded == [ScreeningConfig(no_evidence=0.2, fair_static_spread=enabled)]
+    assert forwarded == [
+        ScreeningConfig(no_evidence=0.2, fair_static_spread=enabled, scale_floor=scale_floor)
+    ]
 
 
 @pytest.fixture

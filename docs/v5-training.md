@@ -183,6 +183,14 @@ to `false`. The export records it and the adapter uses it for scoring; an export
 written without the key replays with the default score. The static diagnostics
 always use the calibrated score.
 
+**Optional episode scale floor.** Set `sampler.scale_floor` to a positive, finite fraction `f`
+to keep nearly constant histories from producing extreme scaled labels after a level shift.
+For targets and numeric covariates, the scale is the larger of the usual scale and `f` times the
+mean absolute level of the finite values before the statistics cutoff. The location and the
+fallback for an empty finite prefix stay the same. The floor defaults to off. Exports record it
+when enabled, and the training value will be chosen later from the corpus distribution of
+scale relative to mean absolute level.
+
 **Optional horizon seed.** Set `model.horizon_seed: true` to add a projection
 of each forecast row's last encoder patch before each origin to every horizon
 token in that row. The seed is zero when that patch is unavailable or

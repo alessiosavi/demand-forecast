@@ -174,6 +174,7 @@ class SamplerConfig:
     first_event_only: bool = False
     derive: tuple[str, ...] = ()
     screen_fair_spread: bool = False
+    scale_floor: float | None = None
 
     def __post_init__(self) -> None:
         _flag(self, "designate_target")
@@ -199,6 +200,10 @@ class SamplerConfig:
         _normalize(self, "screen_no_evidence", minimum=0)
         if self.screen_no_evidence >= 1:
             raise ValueError("screen_no_evidence must be in [0, 1)")
+        if self.scale_floor is not None:
+            _normalize(self, "scale_floor", minimum=0)
+            if self.scale_floor == 0:
+                raise ValueError("scale_floor must be positive")
         if self.max_cells is not None:
             _normalize(self, "max_cells", integer=True, minimum=1)
         drops = []
@@ -346,6 +351,8 @@ class V5TrainConfig:
             del data["sampler"]["derive"]
         if not self.sampler.screen_fair_spread:
             del data["sampler"]["screen_fair_spread"]
+        if self.sampler.scale_floor is None:
+            del data["sampler"]["scale_floor"]
         if self.optim.label_cap is None:
             del data["optim"]["label_cap"]
         for source in data["sources"]:
