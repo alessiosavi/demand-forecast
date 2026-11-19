@@ -2,10 +2,12 @@
 
 import importlib
 from copy import deepcopy
+from dataclasses import replace
 
 import numpy as np
 import pytest
 
+from demand_forecast.data.episode import Item, Panel
 from demand_forecast.synthetic.typed import PanelRecipe, generate_typed_panel, necessary_items
 from demand_forecast.synthetic.typed.recipe import MECHANISMS
 
@@ -29,6 +31,17 @@ def test_supported_table_against_generated_columns(mechanism):
     )
     records = generated.inputs_of(mechanism)
     ids = set(necessary_items(generated, mechanism)) if records else None
+
+    def check(panel, item_id, origin):
+        args = (panel, mechanism, item_id, origin)
+        frame = dict(context=64, horizon=32, cutoff=origin)
+        supported = api().supported
+        ordinary = supported(*args, **frame)
+        assert supported(*args, **frame, first_event_only=False) == ordinary
+        if mechanism != "event_response":
+            assert supported(*args, **frame, first_event_only=True) == ordinary
+        return ordinary
+
     found = None
     for item in generated.panel.items:
         if ids is not None and item.item_id not in ids:
@@ -36,9 +49,7 @@ def test_supported_table_against_generated_columns(mechanism):
         length = len(next(iter(item.targets.values())))
         for local in range(16, length):
             origin = item.start + local
-            if api().supported(
-                generated, mechanism, item.item_id, origin, context=64, horizon=32, cutoff=origin
-            ):
+            if check(generated, item.item_id, origin):
                 found = item, origin
                 break
         if found:
@@ -48,9 +59,7 @@ def test_supported_table_against_generated_columns(mechanism):
         assert found is None
         item = generated.panel.items[0]
         origin = item.start + generated.panel.long_lag + 16
-        assert api().supported(
-            generated, mechanism, item.item_id, origin, context=64, horizon=32, cutoff=origin
-        )
+        assert check(generated, item.item_id, origin)
         return
     assert found is not None, mechanism
     item, origin = found
@@ -74,9 +83,7 @@ def test_supported_table_against_generated_columns(mechanism):
                 exposed.static[record.name] = None
             else:
                 exposed.dynamic[record.name][:] = None if record.kind == "category" else np.nan
-        assert not api().supported(
-            hidden, mechanism, item.item_id, origin, context=64, horizon=32, cutoff=origin
-        )
+        assert not check(hidden, item.item_id, origin)
 
 
 def test_only_peer_must_have_sixteen_observations():
@@ -149,6 +156,30 @@ def test_events_require_true_one_and_exposed_availability():
     assert not api().supported(
         g, "planned_event", item.item_id, origin, context=64, horizon=16, cutoff=origin
     )
+
+
+@pytest.mark.parametrize("earlier_event", [None, 33, 63])
+def test_event_response_first_event_only_uses_the_full_own_grid(earlier_event):
+    template = generate_typed_panel(PanelRecipe(("event_response",), n_items=2, seed=2))
+    attribute, flag = (record.name for record in template.inputs_of("event_response"))
+    origin = 64
+    events = np.zeros(96)
+    events[[24, origin]] = 1  # The peer saw the panel-wide event at 24 before the lead started.
+    if earlier_event is not None:
+        events[earlier_event] = 1
+    lead = Item("lead", 32, {"y": np.arange(64.0)}, {flag: events[32:].copy()}, {attribute: "a"})
+    peer = Item("peer", 0, {"y": np.arange(96.0)}, {flag: events}, {attribute: "a"})
+    complete = Panel("event_response", (lead, peer), {flag: "known"}, None, None, True)
+    exposed = deepcopy(complete)
+    if earlier_event is not None:
+        local = earlier_event - lead.start
+        exposed.items[0].targets["y"][local] = np.nan
+        exposed.items[0].dynamic[flag][local] = np.nan
+    generated = replace(template, panel=exposed, complete=complete, short_items=(lead.item_id,))
+    args = (generated, "event_response", lead.item_id, origin)
+    frame = dict(context=16, horizon=16, cutoff=52)
+    assert api().supported(*args, **frame, first_event_only=False)
+    assert api().supported(*args, **frame, first_event_only=True) == (earlier_event is None)
 
 
 def test_past_category_change_must_be_adjacent_and_before_origin():
