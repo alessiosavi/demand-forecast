@@ -4,7 +4,7 @@ import sys
 from collections.abc import Generator, Iterator, Sequence
 from contextlib import closing
 from dataclasses import dataclass, fields, replace
-from itertools import groupby, islice
+from itertools import groupby, islice, tee
 from operator import itemgetter
 
 import numpy as np
@@ -71,28 +71,23 @@ def planned_layouts(
 
 def _validate_joint_layouts(
     builder: EpisodeBuilder,
-    jobs: Sequence[tuple[int, int]],
+    jobs: Iterator[tuple[int, int, int]],
     layouts: Sequence[str],
     horizon: int,
     context: int,
     drop: frozenset[str],
 ) -> None:
-    for origin, same_origin in _jobs_by_origin(jobs):
-        for _, position, index in same_origin:
-            if layouts[position] != "joint":
-                continue
-            if not 0 <= index < len(builder.panel.items):
-                raise ValueError("item index outside the panel")
-            # Single targets are already designated, and wide items always split.
-            if not 1 < len(builder.panel.items[index].targets) <= MAX_FORECAST_ROWS:
-                continue
-            requests = builder.plan_requests(
-                index, (origin,), horizon, context=context, cutoff=origin, drop=drop
-            )
-            if requests[0].target is not None:
-                raise ValueError(
-                    f"item index {index} at origin {origin} must be forecast per target"
-                )
+    for origin, position, index in jobs:
+        if layouts[position] != "joint":
+            continue
+        # Single targets are already designated, and wide items always split.
+        if not 1 < len(builder.panel.items[index].targets) <= MAX_FORECAST_ROWS:
+            continue
+        requests = builder.plan_requests(
+            index, (origin,), horizon, context=context, cutoff=origin, drop=drop
+        )
+        if requests[0].target is not None:
+            raise ValueError(f"item index {index} at origin {origin} must be forecast per target")
 
 
 def _requests_for_job(
@@ -108,8 +103,6 @@ def _requests_for_job(
         return builder.plan_requests(
             index, (origin,), horizon, context=context, cutoff=origin, drop=drop
         )
-    if not 0 <= index < len(builder.panel.items):
-        raise ValueError("item index outside the panel")
     targets = builder.panel.items[index].targets
     if not targets:
         raise ValueError("a forecast target must exist")
@@ -269,6 +262,7 @@ def forecast_items(
 
     The cutoff is exclusive for observed inputs. Explicit layouts follow the
     input job order and can preserve the full panel's layout through ablations.
+    Joint layout compatibility is checked before forecasting each origin.
     On Linux, workers can build and collate chunks, with prefetch chunks queued
     per worker. Statistics construction and model inference run in the caller.
     """
@@ -289,6 +283,8 @@ def forecast_items(
         raise ValueError("layouts must give 'joint' or 'per_target' for every job")
     if len({index for index, _ in jobs}) != len(jobs):
         raise ValueError("forecast jobs must specify one origin per item")
+    if any(not 0 <= index < len(panel.items) for index, _ in jobs):
+        raise ValueError("item index outside the panel")
     parameter = next(model.parameters())
     dtypes = {p.dtype for p in model.parameters()}
     if len(dtypes) != 1 or not parameter.is_floating_point():
@@ -299,9 +295,6 @@ def forecast_items(
     device, dtype = parameter.device, parameter.dtype
     stats = PanelStatsProvider(panel, limit=None)
     builder = EpisodeBuilder(panel, screening, stats=stats)
-    if layouts is not None:
-        # Reuse statistics from validation until forecasting at their cutoff is done.
-        _validate_joint_layouts(builder, jobs, layouts, horizon, context, drop)
     values, fallback = {}, set()
     training = model.training
     try:
@@ -309,6 +302,12 @@ def forecast_items(
         with torch.autocast(device.type, enabled=False):
             for origin, same_origin in _jobs_by_origin(jobs):
                 try:
+                    if layouts is not None:
+                        # Reuse this origin's validation statistics until its forecasts finish.
+                        validation_jobs, same_origin = tee(same_origin)
+                        _validate_joint_layouts(
+                            builder, validation_jobs, layouts, horizon, context, drop
+                        )
                     requests = (
                         request
                         for _, position, index in same_origin
