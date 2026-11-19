@@ -277,6 +277,51 @@ def test_summary_mask_is_carried_once_and_ones_bypasses_it():
     torch.testing.assert_close(first.router, model(changed, gates).router, rtol=0, atol=0)
 
 
+def test_evidence_gates_by_role():
+    panel = toy_panel(n_items=9, length=48, n_targets=2)
+    rich = EpisodeBuilder(panel).build(EpisodeRequest(0, (40,), 3, 32, "y"))
+    bare = EpisodeBuilder(bare_panel()).build(EpisodeRequest(0, (40,), 3, 32))
+    batch = collate([rich, bare])
+    roles = batch.row_role
+    peers = roles == ROLE_PEER
+    open_candidate = batch.row_cand[peers][0]
+    open_peers = peers & (batch.row_cand == open_candidate)
+    assert (peers & ~open_peers).any()
+    for role in (ROLE_KNOWN, ROLE_PAST, ROLE_PANEL, ROLE_SIBLING):
+        assert (roles == role).any()
+
+    batch.row_score[:] = 0
+    batch.row_score[(roles == ROLE_SIBLING) | peers | ~batch.row_mask] = 0.25
+    batch.cand_score[:] = 0
+    batch.cand_score[0, open_candidate] = 0.25
+    batch.cand_score[~batch.cand_mask] = 0.25
+    expected_row = (
+        batch.row_mask
+        & (
+            (roles == ROLE_FORECAST)
+            | (roles == ROLE_KNOWN)
+            | (roles == ROLE_PANEL)
+            | (roles == ROLE_SIBLING)
+            | open_peers
+        )
+    ).float()
+    expected_cand = torch.zeros_like(batch.cand_score)
+    expected_cand[0, open_candidate] = 1
+    model = V5Model(TINY).eval()
+
+    for extreme in (-20, 20):
+        with torch.no_grad():
+            for module in (model.gate_net, model.family_logits, model.global_mask):
+                for parameter in module.parameters():
+                    parameter.fill_(extreme)
+        gates = model.gates(batch, mode="evidence")
+        assert torch.equal(gates.row, expected_row)
+        assert torch.equal(gates.cand, expected_cand)
+        assert torch.equal(gates.family, torch.ones(2, len(STEP_FAMILIES)))
+        assert torch.equal(gates.summary_mask, torch.ones(N_SUMMARY))
+        assert torch.equal(gates.expected_l0, torch.zeros(()))
+
+
 def test_training_summary_mask_is_sampled_once():
     from demand_forecast.models.v5.gates import GlobalMask
 

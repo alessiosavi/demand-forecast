@@ -1,6 +1,7 @@
 """Forecast panel items in bounded batches using each item's own origin."""
 
 import sys
+from collections import defaultdict
 from collections.abc import Generator, Iterator, Sequence
 from contextlib import closing
 from dataclasses import dataclass, fields, replace
@@ -12,6 +13,7 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 from demand_forecast.data.episode import (
+    Episode,
     EpisodeBatch,
     EpisodeBuilder,
     EpisodeRequest,
@@ -21,9 +23,32 @@ from demand_forecast.data.episode import (
     apply_summary_off,
     collate,
 )
-from demand_forecast.data.episode.schema import MAX_FORECAST_ROWS
+from demand_forecast.data.episode.schema import MAX_FORECAST_ROWS, STEP_FAMILIES
+from demand_forecast.data.episode.screening import Candidate
 
-from .model import V5Model, prune
+from .model import Gates, V5Model, prune
+
+
+@dataclass
+class Evidence:
+    """Screening and applied gates per request, with sorted candidate columns.
+
+    Status codes are 0 absent, 1 kept, 2 fixed rule, 3 budget, 4 zero and
+    retained, and 5 zero and pruned. Rule indices are -1 except for status 2.
+    A candidate with multiple rows reports their maximum applied gate and
+    has status 4 or 5 only when all those gates are zero.
+    A kept candidate without rows or tokens has a NaN gate. Absent and
+    removed candidates also have NaN gates. Scores come from the screening
+    trace and are NaN for absent candidates and step families.
+    """
+
+    requests: list[tuple[int, str | None]]
+    candidates: list[str]
+    status: np.ndarray
+    rules: tuple[str, ...]
+    rule: np.ndarray
+    gate: np.ndarray
+    score: np.ndarray
 
 
 @dataclass
@@ -33,6 +58,97 @@ class ItemForecasts:
     values: dict[tuple[int, str], np.ndarray]
     fallback: frozenset[tuple[int, str]]
     stats_builds: int
+    evidence: Evidence
+
+
+@dataclass
+class _EvidenceInputs:
+    trace: tuple[Candidate, ...]
+    rows: dict[tuple[str, str], list[int]]
+    attributes: dict[str, int]
+
+
+@dataclass
+class _ForecastChunk:
+    batch: EpisodeBatch
+    evidence: list[_EvidenceInputs]
+
+
+def _evidence_inputs(episode: Episode) -> _EvidenceInputs:
+    key_count, row_count = len(episode.row_keys), len(episode.x)
+    if key_count != row_count:
+        raise ValueError(f"Episode.row_keys has length {key_count} for {row_count} rows")
+    rows: dict[tuple[str, str], list[int]] = defaultdict(list)
+    for i, key in enumerate(episode.row_keys):
+        if key is not None:
+            rows[key].append(i)
+
+    represented = set(episode.row_cand) | set(episode.attr_cand) | set(episode.static_num_cand)
+    attributes = {name: i for i, name in enumerate(episode.cand_names) if i in represented}
+    return _EvidenceInputs(episode.trace, dict(rows), attributes)
+
+
+# Each entry contains the status, fixed rule (if any), applied gate and score.
+_EvidenceRow = dict[str, tuple[int, str | None, float, float]]
+
+
+def _evidence_rows(inputs: list[_EvidenceInputs], gates: Gates, pruned: bool) -> list[_EvidenceRow]:
+    rows, attributes, families = (
+        tensor.cpu().tolist() for tensor in (gates.row, gates.cand, gates.family)
+    )
+    evidence = []
+    for data, row_gates, attr_gates, family_gates in zip(
+        inputs, rows, attributes, families, strict=True
+    ):
+        entries: _EvidenceRow = {
+            f"family:{name}": (4 if gate == 0 else 1, None, gate, np.nan)
+            for name, gate in zip(STEP_FAMILIES, family_gates, strict=True)
+        }
+        for candidate in data.trace:
+            source, name = candidate.source, candidate.name
+            gate = np.nan
+            rule = None
+            if candidate.removed == "budget":
+                status = 3
+            elif candidate.removed is not None:
+                status, rule = 2, candidate.removed
+            else:
+                if source == "static":
+                    if name in data.attributes:
+                        gate = attr_gates[data.attributes[name]]
+                else:
+                    # An expanded category is removed only if all its rows are.
+                    gate = max(
+                        (row_gates[i] for i in data.rows.get((source, name), ())), default=np.nan
+                    )
+                status = (5 if pruned else 4) if gate == 0 else 1
+            prefix = "dynamic" if source in ("known", "past") else source
+            entries[f"{prefix}:{name}"] = status, rule, gate, candidate.score
+        evidence.append(entries)
+    return evidence
+
+
+def _pack_evidence(requests: list[tuple[int, str | None]], rows: list[_EvidenceRow]) -> Evidence:
+    candidates = sorted({name for row in rows for name in row})
+    rules = tuple(
+        sorted({rule for row in rows for _, rule, _, _ in row.values() if rule is not None})
+    )
+    columns = {name: i for i, name in enumerate(candidates)}
+    rule_indices = {name: i for i, name in enumerate(rules)}
+    shape = (len(requests), len(candidates))
+    status = np.zeros(shape, dtype=np.int8)
+    rule = np.full(shape, -1, dtype=np.int8)
+    gate = np.full(shape, np.nan, dtype=np.float32)
+    score = np.full(shape, np.nan, dtype=np.float32)
+    for i, row in enumerate(rows):
+        for name, (disposition, fixed_rule, weight, relevance) in row.items():
+            j = columns[name]
+            status[i, j] = disposition
+            if fixed_rule is not None:
+                rule[i, j] = rule_indices[fixed_rule]
+            gate[i, j] = weight
+            score[i, j] = relevance
+    return Evidence(requests, candidates, status, rules, rule, gate, score)
 
 
 def _jobs_by_origin(
@@ -126,11 +242,13 @@ def _validate_workers(workers: int, prefetch: int) -> None:
 
 def _collate_chunk(
     builder: EpisodeBuilder, group: list[EpisodeRequest], summary_off: tuple[str, ...]
-) -> EpisodeBatch:
-    return collate([apply_summary_off(builder.build(req), summary_off) for req in group])
+) -> _ForecastChunk:
+    episodes = [apply_summary_off(builder.build(req), summary_off) for req in group]
+    evidence = [_evidence_inputs(episode) for episode in episodes]
+    return _ForecastChunk(collate(episodes), evidence)
 
 
-class _EpisodeChunks(Dataset[EpisodeBatch]):
+class _EpisodeChunks(Dataset[_ForecastChunk]):
     def __init__(
         self,
         builder: EpisodeBuilder,
@@ -144,7 +262,7 @@ class _EpisodeChunks(Dataset[EpisodeBatch]):
     def __len__(self) -> int:
         return len(self.groups)
 
-    def __getitem__(self, index: int) -> EpisodeBatch:
+    def __getitem__(self, index: int) -> _ForecastChunk:
         return _collate_chunk(self.builder, self.groups[index], self.summary_off)
 
 
@@ -156,7 +274,7 @@ def _forecast_batches(
     summary_off: tuple[str, ...],
     workers: int,
     prefetch: int,
-) -> Generator[tuple[list[EpisodeRequest], EpisodeBatch], None, None]:
+) -> Generator[tuple[list[EpisodeRequest], _ForecastChunk], None, None]:
     if not workers:
         while group := list(islice(requests, batch_episodes)):
             yield group, _collate_chunk(builder, group, summary_off)
@@ -296,6 +414,8 @@ def forecast_items(
     stats = PanelStatsProvider(panel, limit=None)
     builder = EpisodeBuilder(panel, screening, stats=stats)
     values, fallback = {}, set()
+    evidence_requests: list[tuple[int, str | None]] = []
+    evidence_rows: list[_EvidenceRow] = []
     training = model.training
     try:
         model.eval()
@@ -332,9 +452,11 @@ def forecast_items(
                             prefetch,
                         )
                     ) as batches:
-                        for group, batch in batches:
-                            batch = _batch_to_model(batch, device, dtype)
+                        for group, chunk in batches:
+                            batch = _batch_to_model(chunk.batch, device, dtype)
                             selected = model.gates(batch, mode=gates)
+                            evidence_requests.extend((req.item_index, req.target) for req in group)
+                            evidence_rows.extend(_evidence_rows(chunk.evidence, selected, pruned))
                             if pruned:
                                 batch, selected = prune(batch, selected)
                             quantiles = model(batch, selected, router=router).quantiles[:, 0]
@@ -347,9 +469,10 @@ def forecast_items(
                                 values[key] = value
                                 if used_fallback:
                                     fallback.add(key)
-                            del batch, selected, quantiles
+                            del chunk, batch, selected, quantiles
                 finally:
                     stats.release(origin)
     finally:
         model.train(training)
-    return ItemForecasts(values, frozenset(fallback), stats.builds)
+    evidence = _pack_evidence(evidence_requests, evidence_rows)
+    return ItemForecasts(values, frozenset(fallback), stats.builds, evidence)

@@ -12,12 +12,15 @@ from demand_forecast.data.episode import (
     EpisodeRequest,
     PanelStatsProvider,
     ScreeningConfig,
+    collate,
 )
 from demand_forecast.data.episode.schema import (
+    MAX_FEATURE_ROWS,
     MAX_FORECAST_ROWS,
     N_SUMMARY,
     ROLE_KNOWN,
     ROLE_PEER,
+    STEP_FAMILIES,
     SUMMARY_FEATURES,
 )
 from demand_forecast.models import v5
@@ -463,6 +466,248 @@ def test_screening_no_evidence_reaches_the_model(model, monkeypatch):
     assert full.row_score[0, known] > 0
     assert screened.row_names[0].index("promo") == known
     assert screened.row_score[0, known] == 0
+
+
+def test_evidence_of_a_hand_built_panel(model, monkeypatch):
+    panel = _panel(n_items=3, length=48)
+    known = [f"known_{i:02d}" for i in range(MAX_FEATURE_ROWS - 2)] + ["promo"]
+    items = []
+    for i, item in enumerate(panel.items):
+        target = item.targets["y"]
+        rare = np.full_like(target, np.nan)
+        rare[:2] = (0, 1)
+        items.append(
+            replace(
+                item,
+                dynamic={
+                    **{name: target.copy() for name in known},
+                    "constant": np.zeros_like(target),
+                    "past": target.copy(),
+                    "rare": rare,
+                },
+                static={"promo": "shared"} if i < 2 else {},
+            )
+        )
+    panel = replace(
+        panel,
+        items=tuple(items),
+        roles=dict.fromkeys(known, "known") | dict.fromkeys(("constant", "past", "rare"), "past"),
+    )
+    builder = EpisodeBuilder(panel)
+    jobs = [(0, 40), (2, 40)]
+    requests = [EpisodeRequest(index, (origin,), 3, CONTEXT) for index, origin in jobs]
+    episodes = [builder.build(request) for request in requests]
+    assert {c.name: c.removed for c in episodes[0].trace if c.source == "past"} == {
+        "constant": "constant",
+        "past": None,
+        "rare": "budget",
+    }
+    with torch.no_grad():
+        model.gate_net.net[-1].weight.zero_()
+        model.gate_net.net[-1].bias.fill_(-20)
+        model.family_logits.weight.zero_()
+        model.family_logits.bias.fill_(20)
+        model.family_logits.bias[list(STEP_FAMILIES).index("lags")] = -20
+    expected, scales = _reference(model, panel, builder, requests)
+    reference = v5.forecast(model, panel, requests[0], builder=builder)
+
+    forwarded = []
+    forward = model.forward
+
+    def record_forward(batch, *args, **kwargs):
+        forwarded.append(batch.row_names)
+        return forward(batch, *args, **kwargs)
+
+    monkeypatch.setattr(model, "forward", record_forward)
+    for pruned in (True, False):
+        result = v5.forecast_items(model, panel, jobs, 3, context=CONTEXT, pruned=pruned)
+        _assert_forecasts(result.values, expected, scales)
+        evidence = result.evidence
+        assert evidence.requests == [(0, None), (2, None)]
+        assert evidence.candidates == [
+            "dynamic:constant",
+            *[f"dynamic:{name}" for name in known[:-1]],
+            "dynamic:past",
+            "dynamic:promo",
+            "dynamic:rare",
+            "family:lags",
+            "family:rolling",
+            "family:zeros",
+            "static:promo",
+        ]
+        assert evidence.rules == ("constant",)
+        assert evidence.status.dtype == evidence.rule.dtype == np.int8
+        assert evidence.gate.dtype == evidence.score.dtype == np.float32
+        zero = 5 if pruned else 4
+        statuses = [2, *([1] * len(known[:-1])), zero, 1, 3, 4, 1, 1]
+        np.testing.assert_array_equal(evidence.status, [statuses + [zero], statuses + [0]])
+        np.testing.assert_array_equal(evidence.rule, [[0] + [-1] * (len(statuses))] * 2)
+        assert ("past" in forwarded[-1][0]) is not pruned
+        for row, episode in enumerate(episodes):
+            for candidate in episode.trace:
+                source = "dynamic" if candidate.source in ("known", "past") else candidate.source
+                column = evidence.candidates.index(f"{source}:{candidate.name}")
+                assert evidence.score[row, column] == pytest.approx(candidate.score)
+        column = {name: i for i, name in enumerate(evidence.candidates)}
+        for name in ("dynamic:constant", "dynamic:rare"):
+            assert np.isnan(evidence.gate[:, column[name]]).all()
+        assert np.isnan(evidence.gate[1, column["static:promo"]])
+        assert np.isnan(evidence.score[1, column["static:promo"]])
+        for name, report_key in (
+            ("dynamic:past", "row:past"),
+            ("dynamic:promo", "row:promo"),
+            ("static:promo", "candidate:promo"),
+            ("family:lags", "family:lags"),
+        ):
+            assert evidence.gate[0, column[name]] == pytest.approx(reference.gates[report_key])
+
+
+def test_evidence_rows_follow_forecast_order_for_per_target_layouts(model):
+    panel = _panel(n_items=3, n_targets=2)
+    panel = replace(panel, items=tuple(replace(item, static={}) for item in panel.items))
+    jobs = [(2, 44), (1, 36), (0, 36)]
+    order = [(1, None), (0, "y"), (0, "y1"), (2, "y"), (2, "y1")]
+    result = v5.forecast_items(
+        model,
+        panel,
+        jobs,
+        3,
+        context=CONTEXT,
+        layouts=["per_target", "joint", "per_target"],
+        gates="evidence",
+        batch_episodes=1,
+    )
+    assert result.evidence.requests == order
+    assert list(result.values) == [(i, target) for i in (1, 0, 2) for target in ("y", "y1")]
+    assert result.evidence.candidates == [
+        "dynamic:promo",
+        "family:lags",
+        "family:rolling",
+        "family:zeros",
+        "sibling:y",
+        "sibling:y1",
+    ]
+    np.testing.assert_array_equal(
+        result.evidence.status[:, -2:], [[0, 0], [0, 1], [1, 0], [0, 1], [1, 0]]
+    )
+    builder = EpisodeBuilder(panel)
+    for index, target in order:
+        origin = dict(jobs)[index]
+        request = EpisodeRequest(index, (origin,), 3, CONTEXT, target)
+        expected = v5.forecast(model, panel, request, builder=builder, gates="evidence")
+        for row, name in enumerate(expected.names):
+            scale = builder.stats.get(name, origin).scales[index].scale
+            np.testing.assert_allclose(
+                (result.values[index, name] - expected.quantiles[0, row]) / scale,
+                0,
+                atol=1e-5,
+                rtol=0,
+            )
+
+
+def test_evidence_keeps_unrepresented_candidate(model):
+    panel = _panel(n_items=1, length=48)
+    (item,) = panel.items
+    event = np.array([None] * 40 + ["future"] * 8, dtype=object)
+    panel = replace(
+        panel,
+        items=(replace(item, dynamic={"event": event, "event=future": item.targets["y"]}),),
+        roles={"event": "known", "event=future": "known"},
+    )
+    drop = frozenset({"value_stats", "value_effects"})
+    request = EpisodeRequest(0, (40,), 3, CONTEXT, drop=drop)
+    episode = EpisodeBuilder(panel).build(request)
+    candidate = next(c for c in episode.trace if c.name == "event")
+    assert candidate.removed is None
+    assert "event" not in episode.row_names and "event" not in episode.cand_names
+    assert "event=future" in episode.row_names
+
+    result = v5.forecast_items(
+        model, panel, [(0, 40)], 3, context=CONTEXT, drop=drop, gates="evidence"
+    )
+    missing, represented = (
+        result.evidence.candidates.index(name) for name in ("dynamic:event", "dynamic:event=future")
+    )
+    np.testing.assert_array_equal(result.evidence.status[0, [missing, represented]], [1, 1])
+    np.testing.assert_array_equal(result.evidence.gate[0, [missing, represented]], [np.nan, 1])
+    assert result.evidence.score[0, missing] == pytest.approx(candidate.score)
+
+
+def _panel_with_colliding_row_names():
+    panel = _panel(n_items=1, length=48)
+    (item,) = panel.items
+    target = np.arange(48, dtype=np.float64)
+    category = np.resize(np.array(["b", "c", "d", "e"], dtype=object), len(target))
+    item = replace(item, targets={"y": target}, dynamic={"a": category, "a=b": target.copy()})
+    return replace(panel, items=(item,), roles={"a": "past", "a=b": "past"})
+
+
+def test_evidence_reports_maximum_learned_gate_for_expanded_category(model):
+    panel = _panel_with_colliding_row_names()
+    drop = frozenset({"value_stats"})
+    episode = EpisodeBuilder(panel).build(EpisodeRequest(0, (40,), 3, CONTEXT, drop=drop))
+    batch = collate([episode])
+    with torch.no_grad():
+        # The last layer starts with zero weights, which gives every past row the same gate.
+        model.gate_net.net[-1].weight.fill_(0.25)
+        model.gate_net.net[-1].bias.zero_()
+        row_gates = model.eval().gates(batch).row[0]
+
+    rows = [i for i, key in enumerate(episode.row_keys) if key == ("past", "a")]
+    expanded_gates = row_gates[rows]
+    assert len(expanded_gates) == 5
+    assert expanded_gates.min() < expanded_gates.max()
+    evidence = v5.forecast_items(
+        model, panel, [(0, 40)], 3, context=CONTEXT, drop=drop, gates="learned"
+    ).evidence
+    column = evidence.candidates.index("dynamic:a")
+    assert evidence.gate[0, column] == expanded_gates.max().item()
+    assert evidence.status[0, column] == 1
+
+
+@pytest.mark.parametrize("pruned, zero_status", [(False, 4), (True, 5)])
+def test_evidence_keeps_colliding_row_names_with_their_candidates(model, pruned, zero_status):
+    panel = _panel_with_colliding_row_names()
+    screening = ScreeningConfig(no_evidence=0.5)
+    drop = frozenset({"value_stats"})
+    episode = EpisodeBuilder(panel, screening).build(
+        EpisodeRequest(0, (40,), 3, CONTEXT, drop=drop)
+    )
+    assert episode.row_names.count("a=b") == 2
+    literal_rows = [i for i, key in enumerate(episode.row_keys) if key and key[1] == "a=b"]
+    category_rows = [i for i, key in enumerate(episode.row_keys) if key and key[1] == "a"]
+    assert [episode.row_names[i] for i in literal_rows] == ["a=b"]
+    assert "a=b" in [episode.row_names[i] for i in category_rows]
+
+    evidence = v5.forecast_items(
+        model,
+        panel,
+        [(0, 40)],
+        3,
+        context=CONTEXT,
+        screening=screening,
+        drop=drop,
+        gates="evidence",
+        pruned=pruned,
+    ).evidence
+    category = evidence.candidates.index("dynamic:a")
+    literal = evidence.candidates.index("dynamic:a=b")
+    assert evidence.score[0, category] == 0 < evidence.score[0, literal]
+    np.testing.assert_array_equal(evidence.gate[0, [category, literal]], [0, 1])
+    np.testing.assert_array_equal(evidence.status[0, [category, literal]], [zero_status, 1])
+
+
+def test_evidence_rejects_episode_without_row_keys(model, monkeypatch):
+    build = EpisodeBuilder.build
+
+    def without_keys(builder, request):
+        episode = build(builder, request)
+        episode.row_keys = ()
+        return episode
+
+    monkeypatch.setattr(EpisodeBuilder, "build", without_keys)
+    with pytest.raises(ValueError, match=r"Episode\.row_keys has length 0 for 2 rows"):
+        v5.forecast_items(model, _panel(n_items=1), [(0, 40)], 3, context=CONTEXT)
 
 
 def test_gates_ones_and_uniform_router_reach_the_model(model, monkeypatch):
