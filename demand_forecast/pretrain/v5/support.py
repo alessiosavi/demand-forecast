@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from demand_forecast.data.episode.kinds import is_missing
+from demand_forecast.data.episode.kinds import is_missing, observed_mask
 from demand_forecast.data.episode.schema import Item
 from demand_forecast.data.episode.screening import ScreeningConfig
 from demand_forecast.synthetic.typed import GeneratedPanel, necessary_items
@@ -48,10 +48,6 @@ def _slice(item, values, left, right):
 def has_prior_event(item: Item, column: str, origin: int) -> bool:
     """Check the complete event flag from the item's start up to the origin."""
     return bool((_slice(item, item.dynamic[column], item.start, origin) == 1).any())
-
-
-def _available(values):
-    return ~np.frompyfunc(is_missing, 1, 1)(values).astype(bool)
 
 
 def _target(item):
@@ -111,12 +107,14 @@ def supported(
         column = item.dynamic[record.name]
         prefix = _slice(item, column, item.start, cutoff)
         target = _slice(item, _target(item), item.start, cutoff)
-        if (_available(prefix) & np.isfinite(target)).sum() < _MIN.min_steps:
+        if (observed_mask(prefix) & np.isfinite(target)).sum() < _MIN.min_steps:
             return False
         history = _slice(item, column, origin - context, origin)
         future = _slice(item, column, origin, origin + horizon)
         if mechanism == "known_driver":
-            return bool(_available(history).sum() >= _MIN.min_steps and _available(future).any())
+            return bool(
+                observed_mask(history).sum() >= _MIN.min_steps and observed_mask(future).any()
+            )
         if mechanism in ("planned_event", "event_response"):
             truth = next(i for i in generated.complete.items if i.item_id == item_id)
             if (
@@ -126,11 +124,11 @@ def supported(
             ):
                 return False
             events = _slice(truth, truth.dynamic[record.name], origin, origin + horizon)
-            return bool((_available(future) & (events == 1)).any())
+            return bool((observed_mask(future) & (events == 1)).any())
         if mechanism.startswith("dynamic_category_"):
             right = origin if record.role == "past" else origin + horizon
             values = _slice(item, column, origin - context, right)
-            present = _available(values)
+            present = observed_mask(values)
             return any(
                 a and b and x != y
                 for a, b, x, y in zip(present[:-1], present[1:], values[:-1], values[1:])
@@ -145,7 +143,7 @@ def supported(
                 lag = lag[truth.static[attribute]]
             return bool(
                 origin - item.start >= lag + _MIN.min_steps
-                and _available(history).sum() >= _MIN.min_steps
+                and observed_mask(history).sum() >= _MIN.min_steps
             )
     if mechanism == "seasonal_lag":
         lag = generated.panel.long_lag

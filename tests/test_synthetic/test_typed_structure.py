@@ -12,7 +12,7 @@ import pytest
 
 from demand_forecast.data.episode import FREQ_CLASSES
 from demand_forecast.synthetic.typed import RANGES, PanelRecipe, generate_typed_panel
-from demand_forecast.synthetic.typed.draft import Streams, grid, stream
+from demand_forecast.synthetic.typed.draft import Contribution, Streams, compose, grid, stream
 from demand_forecast.synthetic.typed.structure import STRUCTURE
 
 ALL = (
@@ -136,8 +136,8 @@ def test_calendar_equation(freq):
         PanelRecipe(("calendar",), n_items=9, length=(40, 300), freq=freq, seed=3)
     )
     q = g.params["calendar"]
-    assert q["fields"] == {"h": ("hour", "dow"), "D": ("dow", "month")}.get(freq, ("month",))
-    sizes = {"hour": 24, "dow": 7, "month": 12}
+    assert q["fields"] == {"h": ("hour", "dow"), "D": ("dow", "dom", "month")}.get(freq, ("month",))
+    sizes = {"hour": 24, "dow": 7, "dom": 31, "month": 12}
     for field in q["fields"]:
         table = np.array(q["tables"][field])
         assert len(table) == sizes[field]
@@ -145,9 +145,69 @@ def test_calendar_equation(freq):
         assert np.max(np.abs(table)) == pytest.approx(q["amplitude"][field], abs=1e-12)
     for item in g.complete.items:
         dates = g.complete.timestamps(item.start, targets(item).shape[1])
-        values = {"hour": dates.hour, "dow": dates.day_of_week, "month": dates.month - 1}
+        values = {
+            "hour": dates.hour,
+            "dow": dates.day_of_week,
+            "dom": dates.day - 1,
+            "month": dates.month - 1,
+        }
         expected = sum(np.array(q["tables"][field])[values[field]] for field in q["fields"])
         np.testing.assert_allclose(g.parts[item.item_id]["add:calendar"][0], expected)
+
+
+def calendar_draw(rng, size, heldout):
+    amplitude = rng.uniform(*RANGES["calendar"]["amplitude"][int(heldout)])
+    weights = rng.uniform(-1, 1, size)
+    centered = weights - weights.mean()
+    return amplitude, amplitude * centered / np.max(np.abs(centered))
+
+
+@pytest.mark.parametrize("heldout", [False, True])
+def test_daily_calendar_draws_day_of_month_after_day_of_week_and_month(heldout):
+    recipe = PanelRecipe(("calendar",), n_items=2, length=(64, 64), seed=3, heldout=heldout)
+    q = generate_typed_panel(recipe).params["calendar"]
+    rng = stream(recipe.seed, "calendar:effect")
+    for field, size in (("dow", 7), ("month", 12), ("dom", 31)):
+        amplitude, table = calendar_draw(rng, size, heldout)
+        assert q["amplitude"][field] == pytest.approx(amplitude, abs=1e-12)
+        np.testing.assert_allclose(q["tables"][field], table, rtol=0, atol=1e-12)
+
+
+def test_daily_calendar_reuses_day_of_month_in_a_64_day_window():
+    g = generate_typed_panel(PanelRecipe(("calendar",), n_items=2, length=(64, 64), seed=3))
+    item = g.complete.items[0]
+    dates = g.complete.timestamps(item.start, 64)
+    day = dates.day[-1]
+    repeated = np.flatnonzero(dates.day == day)
+    assert len(repeated) >= 2
+    tables = g.params["calendar"]["tables"]
+    add = g.parts[item.item_id]["add:calendar"][0]
+    dow = np.asarray(tables["dow"])[dates.day_of_week]
+    month = np.asarray(tables["month"])[dates.month - 1]
+    np.testing.assert_allclose(
+        (add - dow - month)[repeated], tables["dom"][day - 1], rtol=0, atol=1e-12
+    )
+
+
+@pytest.mark.parametrize("freq", ["30min", "h", "W-MON", "ME", "QE", "YE"])
+def test_non_daily_calendar_panels_match_legacy_draws_byte_for_byte(freq):
+    recipe = PanelRecipe(("calendar",), n_items=2, length=(64, 64), freq=freq, seed=3)
+    g = generate_typed_panel(recipe)
+    draft = grid(recipe)
+    rng = stream(recipe.seed, "calendar:effect")
+    dates = [draft.timestamps(i) for i in range(recipe.n_items)]
+    # Rebuild the legacy panels in this environment so byte equality is local.
+    if freq in ("30min", "h"):
+        _, hour = calendar_draw(rng, 24, recipe.heldout)
+        _, dow = calendar_draw(rng, 7, recipe.heldout)
+        additions = [hour[d.hour] + dow[d.day_of_week] for d in dates]
+    else:
+        _, month = calendar_draw(rng, 12, recipe.heldout)
+        additions = [month[d.month - 1] for d in dates]
+    expected, _, _ = compose(draft, [("calendar", Contribution(add=additions))])
+    for panel in (g.complete, g.panel):
+        for actual, legacy in zip(panel.items, expected.items, strict=True):
+            assert targets(actual).tobytes() == targets(legacy).tobytes()
 
 
 def test_each_structure_equation():
