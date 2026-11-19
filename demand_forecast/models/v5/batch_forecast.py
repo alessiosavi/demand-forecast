@@ -167,6 +167,7 @@ def planned_layouts(
     context: int,
     screening: ScreeningConfig = ScreeningConfig(),
     drop: frozenset[str] = frozenset(),
+    derive: frozenset[str] = frozenset(),
 ) -> list[str]:
     """Return the builder's joint or per-target layout in input job order."""
     stats = PanelStatsProvider(panel, limit=None)
@@ -176,7 +177,13 @@ def planned_layouts(
         try:
             for _, position, index in same_origin:
                 requests = builder.plan_requests(
-                    index, (origin,), horizon, context=context, cutoff=origin, drop=drop
+                    index,
+                    (origin,),
+                    horizon,
+                    context=context,
+                    cutoff=origin,
+                    drop=drop,
+                    derive=derive,
                 )
                 if requests[0].target is not None:
                     layouts[position] = "per_target"
@@ -192,6 +199,7 @@ def _validate_joint_layouts(
     horizon: int,
     context: int,
     drop: frozenset[str],
+    derive: frozenset[str],
 ) -> None:
     for origin, position, index in jobs:
         if layouts[position] != "joint":
@@ -200,7 +208,7 @@ def _validate_joint_layouts(
         if not 1 < len(builder.panel.items[index].targets) <= MAX_FORECAST_ROWS:
             continue
         requests = builder.plan_requests(
-            index, (origin,), horizon, context=context, cutoff=origin, drop=drop
+            index, (origin,), horizon, context=context, cutoff=origin, drop=drop, derive=derive
         )
         if requests[0].target is not None:
             raise ValueError(f"item index {index} at origin {origin} must be forecast per target")
@@ -214,10 +222,11 @@ def _requests_for_job(
     context: int,
     layout: str | None,
     drop: frozenset[str],
+    derive: frozenset[str],
 ) -> list[EpisodeRequest]:
     if layout is None:
         return builder.plan_requests(
-            index, (origin,), horizon, context=context, cutoff=origin, drop=drop
+            index, (origin,), horizon, context=context, cutoff=origin, drop=drop, derive=derive
         )
     targets = builder.panel.items[index].targets
     if not targets:
@@ -226,7 +235,7 @@ def _requests_for_job(
         sorted(targets) if layout == "per_target" or len(targets) > MAX_FORECAST_ROWS else [None]
     )
     return [
-        EpisodeRequest(index, (origin,), horizon, context, target, origin, drop)
+        EpisodeRequest(index, (origin,), horizon, context, target, origin, drop, derive=derive)
         for target in designated
     ]
 
@@ -394,6 +403,7 @@ def forecast_items(
     screening: ScreeningConfig = ScreeningConfig(),
     layouts: Sequence[str] | None = None,
     drop: frozenset[str] = frozenset(),
+    derive: frozenset[str] = frozenset(),
     summary_off: tuple[str, ...] = (),
     gates: str = "learned",
     router: str = "learned",
@@ -453,7 +463,7 @@ def forecast_items(
                         # Reuse this origin's validation statistics until its forecasts finish.
                         validation_jobs, same_origin = tee(same_origin)
                         _validate_joint_layouts(
-                            builder, validation_jobs, layouts, horizon, context, drop
+                            builder, validation_jobs, layouts, horizon, context, drop, derive
                         )
                     requests = (
                         request
@@ -466,6 +476,7 @@ def forecast_items(
                             context,
                             None if layouts is None else layouts[position],
                             drop,
+                            derive,
                         )
                     )
                     with closing(

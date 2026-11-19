@@ -103,9 +103,25 @@ status 1. Batch tolerances are `atol=rtol=1e-6`. Output tolerances are
 
 Run `bash scripts/ci/v5_parity.sh` to run the Linux CI gate locally. It uses
 Python 3.12, CPU torch 2.8.0 and the relevant training and scoring pins. It
-creates a seeded, untrained tiny export with `selftest` in the training
-environment and checks it in the scoring environment. If the gate fails on
-merged code, scoring work pauses while the environment choice is revisited.
+creates seeded, untrained tiny exports with and without `increment_spread` in
+the training environment and checks them in the scoring environment. If the
+gate fails on merged code, scoring work pauses while the environment choice
+is revisited.
+
+**Optional input presentations.** Set `sampler.derive` to `[increment_spread]` to
+replace a dynamic category's second value statistic with the root mean square
+of its one-step target increments divided by `sqrt(2)`. A pair counts when both
+adjacent cells have the active label and finite targets and the later cell is
+strictly before the context cell or the forecast origin for a known horizon.
+With zero pairs, the statistic is zero. For independent noise around a constant
+level it estimates the noise spread. For AR(1) noise it estimates
+`sigma * sqrt(1 - rho)` at constant level, with half the squared baseline step
+added to the squared statistic when the level moves.
+
+The switch defaults to an empty list. The export records enabled names and
+the adapter uses them for scoring. Use the `no_derived` scoring variant to
+disable them on the same weights. `lag_rows` and `onset_rows` are accepted names
+reserved for later presentations.
 
 ### Export as a resumable job
 
@@ -244,6 +260,11 @@ often than its row count alone would give. The sampler counts refused
 rows in `skips`, so the realised folder shares can differ from the proposal
 shares. Source weights apply to panel draws. A typed panel can supply several
 episodes, while corpus and upstream panels supply at most one.
+
+**Calendar effect of generated panels.** On daily typed panels with the calendar
+mechanism, each target's calendar effect adds day-of-week, day-of-month and month table entries. The generator
+draws day-of-month after the two existing tables, preserving their values for
+the same seed.
 
 For Q, use `--action qualify --config q.yaml --name q-typed`. Run a separate
 unit for typed 0.5 + corpus 0.5 with the corpus options. Both the generator and

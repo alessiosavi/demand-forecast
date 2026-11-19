@@ -16,6 +16,7 @@ import torch
 from safetensors.torch import load_file, save_file
 
 from demand_forecast.data.episode import (
+    DERIVABLE,
     EpisodeBatch,
     EpisodeBuilder,
     EpisodeRequest,
@@ -141,18 +142,17 @@ def _read_panel(arrays: _Arrays, prefix: str) -> Panel:
 
 
 def _store_requests(requests: list[EpisodeRequest]) -> np.ndarray:
-    return _json_array(
-        [
-            {
-                **asdict(request),
-                "drop": sorted(request.drop),
-                "keep_columns": None
-                if request.keep_columns is None
-                else sorted(request.keep_columns),
-            }
-            for request in requests
-        ]
-    )
+    stored = []
+    for request in requests:
+        data = asdict(request)
+        del data["derive"]
+        data["drop"] = sorted(request.drop)
+        if request.keep_columns is not None:
+            data["keep_columns"] = sorted(request.keep_columns)
+        if request.derive:
+            data["derive"] = sorted(request.derive)
+        stored.append(data)
+    return _json_array(stored)
 
 
 def _read_requests(array: np.ndarray) -> list[EpisodeRequest]:
@@ -160,6 +160,7 @@ def _read_requests(array: np.ndarray) -> list[EpisodeRequest]:
     for request in _read_json(array):
         request["origins"] = tuple(request["origins"])
         request["drop"] = frozenset(request["drop"])
+        request["derive"] = frozenset(request.get("derive", ()))
         if request["keep_columns"] is not None:
             request["keep_columns"] = frozenset(request["keep_columns"])
         requests.append(EpisodeRequest(**request))
@@ -168,6 +169,7 @@ def _read_requests(array: np.ndarray) -> list[EpisodeRequest]:
 
 def _parity_cases(
     screening: ScreeningConfig,
+    derive: frozenset[str],
 ) -> Iterator[tuple[Panel, list[EpisodeRequest]]]:
     """Author small inputs that exercise the scoring builder's distinct paths."""
     rng = np.random.default_rng(2026)
@@ -182,7 +184,9 @@ def _parity_cases(
         return Item(f"item-{i}", 0, targets, dynamic or {}, static or {})
 
     def regular(panel: Panel) -> tuple[Panel, list[EpisodeRequest]]:
-        return panel, EpisodeBuilder(panel, screening).plan_requests(0, (48,), 8, context=48)
+        return panel, EpisodeBuilder(panel, screening).plan_requests(
+            0, (48,), 8, context=48, derive=derive
+        )
 
     # Both spellings have peers. Changing the first cell from 1 to 1.0 changes its group.
     groups = (1, "1", "1", "1", "1.0", "1.0", "1.0", "1.0", "two", "two", "two", None)
@@ -259,7 +263,7 @@ def _parity_cases(
     yield (
         Panel("ragged-fallback", ragged, {}, None, None, True),
         [
-            EpisodeRequest(i, (origin,), 8, context=context)
+            EpisodeRequest(i, (origin,), 8, context=context, derive=derive)
             for i, (origin, context) in enumerate(((48, 48), (35, 32), (12, 16)))
         ],
     )
@@ -293,9 +297,11 @@ def _output_arrays(model: V5Model, batch: EpisodeBatch) -> dict[str, np.ndarray]
     }
 
 
-def _write_parity(path: Path, model: V5Model, screening: ScreeningConfig) -> None:
+def _write_parity(
+    path: Path, model: V5Model, screening: ScreeningConfig, derive: frozenset[str]
+) -> None:
     arrays = {}
-    for i, (panel, requests) in enumerate(_parity_cases(screening), start=1):
+    for i, (panel, requests) in enumerate(_parity_cases(screening, derive), start=1):
         prefix = f"case_{i}"
         _store_panel(arrays, prefix, panel)
         arrays[f"{prefix}/requests"] = _store_requests(requests)
@@ -363,7 +369,12 @@ def write_export(checkpoint: Path, out: Path) -> dict:
             staging / _WEIGHTS,
         )
         model = _load_model(metadata["model"], weights).float()
-        _write_parity(staging / _PARITY, model, _screening(training))
+        _write_parity(
+            staging / _PARITY,
+            model,
+            _screening(training),
+            frozenset(training["sampler"].get("derive", ())),
+        )
         metadata["files"] = {name: file_digest(staging / name) for name in (_WEIGHTS, _PARITY)}
         (staging / _CONFIG).write_text(
             json.dumps(metadata, sort_keys=True, indent=2, allow_nan=False) + "\n", encoding="utf-8"
@@ -485,7 +496,7 @@ def _print_table(differences: _Differences) -> None:
         print(f"{case:<18} {max(batch, default=0):12.6g} {max(output, default=0):12.6g}  {exact}")
 
 
-def _selftest(out: Path) -> None:
+def _selftest(out: Path, derive: tuple[str, ...] = ()) -> None:
     config = V5TrainConfig(
         V5Config(
             d_model=16,
@@ -500,7 +511,7 @@ def _selftest(out: Path) -> None:
             d_out=4,
         ),
         (),
-        SamplerConfig(),
+        SamplerConfig(derive=derive),
         OptimConfig(max_steps=1, warmup_steps=0, ema_decay=None),
         seed=2026,
         device="cpu",
@@ -508,13 +519,19 @@ def _selftest(out: Path) -> None:
     with torch.random.fork_rng(devices=[]):
         torch.random.default_generator.manual_seed(config.seed)
         model = V5Model(config.model)
+    # Retain the selftest's original checkpoint representation and source digest.
+    checkpoint_config = asdict(config)
+    if config.sampler.derive:
+        checkpoint_config["sampler"]["derive"] = list(config.sampler.derive)
+    else:
+        del checkpoint_config["sampler"]["derive"]
     with TemporaryDirectory(prefix="v5-selftest-") as directory:
         checkpoint, _ = save_checkpoint(
             directory,
             {
                 "model": model.state_dict(),
                 "export": "model",
-                "config": asdict(config),
+                "config": checkpoint_config,
                 "identity": identity(config, code="selftest", corpus=None, init=None, env=None),
                 "counters": {"batch": 0, "updates": 0, "saves": 1},
             },
@@ -534,11 +551,12 @@ def main() -> int:
     check.add_argument("--device", default="cpu")
     selftest = verbs.add_parser("selftest", help="export a tiny seeded untrained model")
     selftest.add_argument("directory", type=Path)
+    selftest.add_argument("--derive", action="append", default=[], choices=DERIVABLE)
     args = parser.parse_args()
     if args.verb == "write":
         write_export(args.checkpoint, args.out)
     elif args.verb == "selftest":
-        _selftest(args.directory)
+        _selftest(args.directory, tuple(args.derive))
     else:
         differences = check_parity(args.directory, args.device)
         _print_table(differences)

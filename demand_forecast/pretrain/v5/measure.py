@@ -62,6 +62,7 @@ def forecast_panel(
     horizon: int,
     *,
     context: int = 512,
+    derive: frozenset[str] = frozenset(),
     batch_episodes: int = 64,
     gates: str = "learned",
     pruned: bool = True,
@@ -92,6 +93,7 @@ def forecast_panel(
         [(index, origin) for index in range(len(panel.items))],
         horizon,
         context=context,
+        derive=derive,
         batch_episodes=batch_episodes,
         gates=gates,
         pruned=pruned,
@@ -142,7 +144,15 @@ def worst_batch(config: V5TrainConfig) -> EpisodeBatch:
         True,
     )
     episode = EpisodeBuilder(panel).build(
-        EpisodeRequest(0, positions, horizon, context, "target_00", positions[0])
+        EpisodeRequest(
+            0,
+            positions,
+            horizon,
+            context,
+            "target_00",
+            positions[0],
+            derive=frozenset(sampler.derive),
+        )
     )
     if sampler.designate_target:
         episode.label_mask[:, ~episode.keep] = False
@@ -543,6 +553,7 @@ def _inference_measure(config, device, panel_items, panel_length, workers):
                 origin,
                 28,
                 context=512,
+                derive=frozenset(config.sampler.derive),
                 gates="ones",
                 pruned=False,
                 workers=workers,

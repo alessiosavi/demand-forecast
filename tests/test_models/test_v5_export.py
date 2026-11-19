@@ -12,7 +12,14 @@ import pytest
 import torch
 from safetensors.torch import load_file, save_file
 
-from demand_forecast.data.episode import EpisodeBatch, EpisodeRequest, Item, Panel, screening
+from demand_forecast.data.episode import (
+    CH_VALUE_STATS,
+    EpisodeBatch,
+    EpisodeRequest,
+    Item,
+    Panel,
+    screening,
+)
 from demand_forecast.data.episode import builder as episode_builder
 from demand_forecast.models.v5 import V5Config, V5Model, forecast
 from demand_forecast.pretrain.v5 import (
@@ -49,12 +56,12 @@ def export_api():
     return importlib.import_module("demand_forecast.models.v5.export")
 
 
-def _checkpoint(directory, weights="model", model=None, *, fair_spread=False):
+def _checkpoint(directory, weights="model", model=None, *, fair_spread=False, sampler_options=None):
     model = TINY if model is None else model
     config = V5TrainConfig(
         model,
         (SourceConfig("corpus", 1.0, root="/unused/local/corpus"),),
-        SamplerConfig(screen_no_evidence=0.2),
+        SamplerConfig(screen_no_evidence=0.2, **(sampler_options or {})),
         OptimConfig(max_steps=1, warmup_steps=0, ema_decay=0.999 if weights == "ema" else None),
         device="cpu",
         workers=1,
@@ -175,6 +182,80 @@ def test_dense_export_round_trips_with_parity(tmp_path, export_api):
 def _read_archive(path):
     with np.load(path, allow_pickle=False) as archive:
         return dict(archive)
+
+
+def test_canonical_serialized_and_export_omit_an_empty_derive(export_api, reference_export):
+    _, metadata = export_api.load_export(reference_export)
+    assert "derive" not in metadata["training"]["sampler"]
+    arrays = _read_archive(reference_export / "parity.npz")
+    for name, value in arrays.items():
+        if name.endswith("/requests"):
+            assert all("derive" not in request for request in json.loads(value.item()))
+            assert all(
+                request.derive == frozenset() for request in export_api._read_requests(value)
+            )
+
+
+@pytest.mark.parametrize(
+    "derive",
+    [
+        ("increment_spread",),
+        ("lag_rows",),
+        ("onset_rows",),
+        ("onset_rows", "increment_spread", "lag_rows"),
+    ],
+)
+def test_enabled_names_round_trip_sorted(tmp_path, export_api, derive):
+    checkpoint = _checkpoint(tmp_path, sampler_options={"derive": derive})
+    payload = export_api.read_payload(checkpoint)
+    assert payload["config"]["sampler"]["derive"] == sorted(derive)
+    _, config = load_model(checkpoint)
+    assert config.sampler.derive == tuple(sorted(derive))
+    out = tmp_path / "export"
+    export_api.write_export(checkpoint, out)
+    _, metadata = export_api.load_export(out)
+    assert metadata["training"]["sampler"]["derive"] == sorted(derive)
+    arrays = _read_archive(out / "parity.npz")
+    for name, value in arrays.items():
+        if name.endswith("/requests"):
+            assert all(request["derive"] == sorted(derive) for request in json.loads(value.item()))
+            assert all(
+                request.derive == frozenset(derive) for request in export_api._read_requests(value)
+            )
+
+
+def test_derive_reaches_every_request(tmp_path, export_api, monkeypatch):
+    derive = ("increment_spread", "lag_rows")
+    checkpoint = _checkpoint(tmp_path, sampler_options={"derive": derive})
+    seen = []
+    validate = episode_builder.EpisodeBuilder._validate
+
+    def observe(builder, request):
+        seen.append(request.derive)
+        return validate(builder, request)
+
+    monkeypatch.setattr(episode_builder.EpisodeBuilder, "_validate", observe)
+    export_api.write_export(checkpoint, tmp_path / "export")
+    assert len(seen) > 17 and set(seen) == {frozenset(derive)}
+
+
+def test_an_enabled_export_passes_parity(tmp_path, export_api, reference_export):
+    out = tmp_path / "export"
+    with torch.random.fork_rng(devices=[]):
+        torch.random.default_generator.manual_seed(123)
+        checkpoint = _checkpoint(tmp_path, sampler_options={"derive": ("increment_spread",)})
+    export_api.write_export(checkpoint, out)
+    export_api.require_parity(out)
+    original = _read_archive(reference_export / "parity.npz")
+    enabled = _read_archive(out / "parity.npz")
+    spread = CH_VALUE_STATS + 1
+    for field in ("x", "xh"):
+        key = f"case_6/batch/{field}"
+        before, after = original[key], enabled[key]
+        assert before.dtype == after.dtype
+        np.testing.assert_array_equal(before[..., :spread], after[..., :spread])
+        np.testing.assert_array_equal(before[..., spread + 1 :], after[..., spread + 1 :])
+        assert np.any(before[..., spread] != after[..., spread])
 
 
 def _rehash(out, filename):
@@ -328,10 +409,10 @@ def test_parity_needs_no_generator_and_no_pickle(export_api, artifact, monkeypat
 def paired_parity_case(export_api, monkeypatch):
     original = export_api._parity_cases
 
-    def cases(config):
-        other_cases = iter(original(config))
+    def cases(config, derive):
+        other_cases = iter(original(config, derive))
         next(other_cases)
-        yield paired_static_panel(), [EpisodeRequest(0, (48,), 8, context=48)]
+        yield paired_static_panel(), [EpisodeRequest(0, (48,), 8, context=48, derive=derive)]
         yield from other_cases
 
     monkeypatch.setattr(export_api, "_parity_cases", cases)

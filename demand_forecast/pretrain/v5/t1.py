@@ -224,6 +224,7 @@ def _build(generated, entry, config):
         entry["target"],
         entry["cutoff"],
         frozenset(config.sampler.drop_always),
+        derive=frozenset(config.sampler.derive),
     )
     screening = ScreeningConfig(
         no_evidence=config.sampler.screen_no_evidence,
@@ -272,14 +273,15 @@ def eval_set(
 ) -> list[dict]:
     """Plan on true held-out panels, retaining at most one episode per panel.
 
-    The training base supplies the screening level. The held-out sampler uses
-    the fixed T1 settings and path overrides to preserve replay digests.
+    The training base supplies the screening level and optional presentations.
+    The held-out sampler uses the fixed T1 settings and path overrides.
     A scoring episode has one origin. Admission, cutoff fallback, target choice
     and the nonconstant-prefix/observed-label checks belong to P3's planner.
     """
     if episodes < 1 or max_panels < 0 or min_count < 1:
         raise ValueError("episodes/min_count must be positive and max_panels nonnegative")
-    config = t1_config(path, "true", seed=seed, base=T1_BASE)
+    planning_base = replace(T1_BASE, sampler=replace(T1_BASE.sampler, derive=base.sampler.derive))
+    config = t1_config(path, "true", seed=seed, base=planning_base)
     source = replace(config.sources[0], heldout=True)
     sampler = replace(
         config.sampler,
@@ -397,8 +399,9 @@ def evaluate(
     *,
     batch_episodes: int = 32,
     forced: bool = False,
+    derive_override: frozenset[str] | None = None,
 ) -> dict:
-    """Score exports in frozen order, using true labels and the true affine frame."""
+    """Score in frozen order, optionally overriding presentations for the scored arm."""
     if batch_episodes < 1:
         raise ValueError("batch_episodes must be positive")
     model, saved = load_model(checkpoint, weights="export")
@@ -422,6 +425,8 @@ def evaluate(
     )
     config = t1_config(path, arm, seed=saved.seed, base=base)
     true_config = t1_config(path, "true", seed=saved.seed, base=base)
+    if derive_override is not None:
+        config = replace(config, sampler=replace(config.sampler, derive=tuple(derive_override)))
     if config.router == "rolled":
         if len(episodes) < 2:
             raise ValueError("the rolled null needs at least two episodes")

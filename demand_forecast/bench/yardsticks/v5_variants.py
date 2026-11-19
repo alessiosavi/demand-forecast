@@ -13,6 +13,7 @@ VARIANT_NAMES = (
     "no_panel_row",
     "no_typed_context",
     "no_value_stats",
+    "no_derived",
     "no_calendar",
     "no_rolling",
     "no_lags",

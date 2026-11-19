@@ -1,6 +1,13 @@
 """Public v5 episode records, dimensions, kind rules and scaling helpers."""
 
-from .builder import DROPPABLE, Episode, EpisodeBuilder, EpisodeRequest, apply_summary_off
+from .builder import (
+    DERIVABLE,
+    DROPPABLE,
+    Episode,
+    EpisodeBuilder,
+    EpisodeRequest,
+    apply_summary_off,
+)
 from .collate import EpisodeBatch, collate
 from .kinds import flag_codes, infer_kind, infer_static_kind, is_missing, label_of
 from .panel_stats import PanelStatsProvider
@@ -49,6 +56,7 @@ from .screening import Candidate, ScreeningConfig
 
 __all__ = [
     "BANK_WINDOW",
+    "DERIVABLE",
     "DROPPABLE",
     "Episode",
     "EpisodeBatch",

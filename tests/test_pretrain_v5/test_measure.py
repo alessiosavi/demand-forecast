@@ -241,6 +241,27 @@ def test_worst_batch_origins_fit_context():
     assert batch.origin_patches.tolist() == [[2]]
 
 
+@pytest.mark.parametrize("entry", ["worst_batch", "inference"])
+def test_derive_reaches_every_request(monkeypatch, entry):
+    measure = api()
+    train = config()
+    derive = ("increment_spread", "lag_rows")
+    train = replace(train, sampler=replace(train.sampler, derive=derive))
+    seen = []
+    build = EpisodeBuilder.build
+
+    def observe(builder, request):
+        seen.append(request.derive)
+        return build(builder, request)
+
+    monkeypatch.setattr(EpisodeBuilder, "build", observe)
+    if entry == "worst_batch":
+        measure.worst_batch(train)
+    else:
+        measure._inference_measure(train, torch.device("cpu"), 2, 64, workers=0)
+    assert seen == [frozenset(derive)] * (1 if entry == "worst_batch" else 2)
+
+
 def assert_numbers(value):
     if isinstance(value, dict):
         for key, item in value.items():

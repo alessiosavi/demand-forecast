@@ -1,6 +1,8 @@
 """In-memory v5 benchmark adapter fixtures and contracts."""
 
+import json
 from dataclasses import asdict, replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -18,6 +20,7 @@ from demand_forecast.data.episode.scale import fit_scale  # noqa: E402
 from demand_forecast.data.episode.schema import (  # noqa: E402
     CH_STEP,
     CH_STEP_FLAG,
+    CH_VALUE_STATS,
     ROLE_PEER,
     ROLE_SIBLING,
     STEP_FAMILIES,
@@ -41,7 +44,9 @@ TASK = SimpleNamespace(
 )
 
 
-def _export(directory, *, drop=(), summary=(), threshold=0.0, fair_spread=False):
+def _export(
+    directory, *, drop=(), summary=(), threshold=0.0, fair_spread=False, sampler_options=None
+):
     config = V5TrainConfig(
         V5Config(
             d_model=16,
@@ -63,6 +68,7 @@ def _export(directory, *, drop=(), summary=(), threshold=0.0, fair_spread=False)
             screen_no_evidence=threshold,
             max_cells=None if drop or summary else 4_000_000,
             designate_target=bool(drop or summary),
+            **(sampler_options or {}),
         ),
         OptimConfig(max_steps=1, warmup_steps=0, ema_decay=None),
         device="cpu",
@@ -365,6 +371,7 @@ REMOVALS = {
     "no_panel_row": (),
     "no_typed_context": (),
     "no_value_stats": (),
+    "no_derived": (),
     "no_calendar": (),
     "no_rolling": (),
     "no_lags": (),
@@ -501,6 +508,48 @@ def test_training_drops_are_applied_at_scoring(make_adapter, monkeypatch, tmp_pa
     assert "__panel__" in episode.row_names and ROLE_PEER not in episode.row_role
     index = SUMMARY_FEATURES.index("log_length")
     assert not episode.row_summary_flags[..., index].any()
+
+
+def test_a_legacy_export_replays_and_scores_unchanged(make_adapter):
+    exported = Path(__file__).parents[1] / "fixtures" / "v5_legacy_export"
+    expected = np.asarray(json.loads((exported / "forecasts.json").read_text()))
+    window = _window(1, features=True)
+    for variant in ("full", "no_derived"):
+        adapter = make_adapter(checkpoint=exported, variant=variant)
+        (actual,) = adapter.predict([window], HORIZON, [0.5])
+        assert np.asarray(actual).dtype == expected.dtype
+        assert np.asarray(actual).shape == expected.shape
+        np.testing.assert_allclose(actual, expected, **TOL)
+
+
+def test_derive_reaches_every_request(make_adapter, monkeypatch, tmp_path):
+    from demand_forecast.bench.yardsticks import v5_adapter as api
+
+    derive = ("increment_spread", "onset_rows")
+    exported = _export(tmp_path, sampler_options={"derive": derive})
+    planned = []
+    plan = api.planned_layouts
+
+    def observe(*args, **kwargs):
+        planned.append(kwargs["derive"])
+        return plan(*args, **kwargs)
+
+    monkeypatch.setattr(api, "planned_layouts", observe)
+    episodes = _capture_episodes(monkeypatch)
+    built = []
+    for variant in ("full", "no_derived"):
+        adapter = make_adapter(checkpoint=exported, variant=variant)
+        adapter.predict([_window(1, features=True)], HORIZON, [0.5])
+        built.append(episodes["sku-0", None])
+    assert planned == [frozenset(derive)] * 2
+    full, off = built
+    assert full.row_names == off.row_names
+    index = full.row_names.index("event")
+    spread = CH_VALUE_STATS + 1
+    assert not full.x[index, ..., spread].any()  # The window's labels alternate.
+    assert off.x[index, ..., spread].any()
+    np.testing.assert_array_equal(full.x[..., :spread], off.x[..., :spread])
+    np.testing.assert_array_equal(full.x[..., spread + 1 :], off.x[..., spread + 1 :])
 
 
 def test_non_default_level_survives_yaml_checkpoint_export_and_adapter(make_adapter, tmp_path):

@@ -53,6 +53,26 @@ def test_batch_is_pure():
     assert ra == rb and ra["episodes"] == 4 and ra["supervised"] > 0
 
 
+@pytest.mark.parametrize("designate_target", [False, True], ids=["planned", "direct"])
+def test_derive_reaches_every_request(monkeypatch, designate_target):
+    panel_ = panel(targets=2)
+    derive = ("increment_spread", "onset_rows")
+    train = config(designate_target=designate_target, derive=derive)
+    validate = EpisodeBuilder._validate
+    seen = []
+
+    def observe(builder, request):
+        seen.append(request.derive)
+        return validate(builder, request)
+
+    monkeypatch.setattr(EpisodeBuilder, "_validate", observe)
+    _, plans, _ = api().plan_panel(
+        panel_, {}, train.sampler, train.sources[0], np.random.default_rng(12)
+    )
+    assert plans and all(plan.request.derive == frozenset(derive) for plan in plans)
+    assert seen == ([] if designate_target else [frozenset(derive)] * len(plans))
+
+
 # Batch index 3 at 508a326. Floating arrays use the helper's tolerant summaries.
 _COLD_BASE_FINGERPRINTS = {
     7: json.loads("""

@@ -28,6 +28,7 @@ class Variant:
     gates: str = "learned"
     router: str = "learned"
     pruned: bool = True
+    derive: frozenset[str] | None = None
 
 
 VARIANTS: dict[str, Variant] = {
@@ -52,6 +53,7 @@ VARIANTS: dict[str, Variant] = {
         ),
     ),
     "no_value_stats": Variant(drop=frozenset({"value_stats"})),
+    "no_derived": Variant(derive=frozenset()),
     "no_calendar": Variant(drop=frozenset({"calendar"})),
     "no_rolling": Variant(drop=frozenset({"rolling"})),
     "no_lags": Variant(drop=frozenset({"lags"})),
@@ -142,6 +144,8 @@ class V5Adapter:
         self.variant = VARIANTS[self.options.variant or "full"]
         self._training_drop = frozenset(sampler["drop_always"])
         self._drop = self._training_drop | self.variant.drop
+        self._training_derive = frozenset(sampler.get("derive", ()))
+        self._derive = self._training_derive if self.variant.derive is None else self.variant.derive
         self._summary_off = tuple(
             dict.fromkeys((*sampler["summary_off"], *self.variant.summary_off))
         )
@@ -174,6 +178,7 @@ class V5Adapter:
                     context=self.context,
                     screening=self.screening,
                     drop=self._training_drop,
+                    derive=self._training_derive,
                 )
             )
             for part in full.parts
@@ -195,6 +200,7 @@ class V5Adapter:
                 screening=self.screening,
                 layouts=layouts[part.positions],
                 drop=self._drop,
+                derive=self._derive,
                 summary_off=self._summary_off,
                 gates=self.variant.gates,
                 router=self.variant.router,
