@@ -512,6 +512,19 @@ def test_uniform_router_and_ones_gates_train(tmp_path):
     )
 
 
+def test_rolled_training_rejects_a_single_episode_from_the_loader(tmp_path, monkeypatch):
+    loop = api()
+    base = config(steps=1)
+    batch, report = make_batch(base, 0)
+    assert batch.x.shape[0] == 1
+    c = replace(base, sampler=replace(base.sampler, episodes_per_batch=2), router="rolled")
+    monkeypatch.setattr(
+        loop, "loader", lambda config, start, *, corpus_root: iter([(0, batch, report)])
+    )
+    with pytest.raises(ValueError, match=r"batch 0:.*rolled.*at least two episodes"):
+        loop.train(c, tmp_path)
+
+
 def test_history_means_only_successful_updates(tmp_path, monkeypatch):
     loop = api()
     observations = []

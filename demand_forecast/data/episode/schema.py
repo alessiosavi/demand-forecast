@@ -1,11 +1,13 @@
 """Dataset-independent dimensions and numpy input records for v5 episodes."""
 
 from dataclasses import dataclass
+from functools import lru_cache
 
 import numpy as np
 import pandas as pd
 
 from demand_forecast.data.frequency import to_offset
+from demand_forecast.data.frequency import to_offset as _parse_validation_offset
 from demand_forecast.pretrain.periods import pretrain_long_lag, pretrain_period
 
 PATCH = 16
@@ -88,6 +90,11 @@ CALENDAR_SIZES = (24, 7, 31, 12, 53, 4)
 N_PHASES = 16
 
 
+@lru_cache
+def _validation_offset(freq: str) -> pd.offsets.BaseOffset:
+    return _parse_validation_offset(freq)
+
+
 @dataclass(frozen=True)
 class Item:
     """One item's arrays, beginning at an absolute integer grid position."""
@@ -117,7 +124,7 @@ class Panel:
                 raise ValueError(f"Panel {self.name!r}: an epoch requires a freq")
         else:
             try:
-                offset = to_offset(self.freq)
+                offset = _validation_offset(self.freq)
             except (TypeError, ValueError) as error:
                 raise ValueError(f"Panel {self.name!r}: invalid freq {self.freq!r}") from error
             if offset.n <= 0:

@@ -190,9 +190,14 @@ class V5Model(nn.Module):
     def forward(
         self, batch: EpisodeBatch, gates: Gates | None = None, *, router: str = "learned"
     ) -> V5Output:
-        """Encode and decode with learned, uniform or deterministically rolled routing."""
+        """Encode and decode with learned, uniform or deterministically rolled routing.
+
+        Rolled routing requires at least two episodes in the batch.
+        """
         if router not in ("learned", "uniform", "rolled"):
             raise ValueError("router must be 'learned', 'uniform' or 'rolled'")
+        if router == "rolled" and batch.x.shape[0] == 1:
+            raise ValueError("the rolled router needs at least two episodes")
         gates = self.gates(batch) if gates is None else gates
         summary = batch.row_summary * gates.summary_mask
         flags = batch.row_summary_flags & (gates.summary_mask > 0)
