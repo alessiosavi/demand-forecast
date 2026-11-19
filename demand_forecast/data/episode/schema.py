@@ -6,7 +6,7 @@ from functools import lru_cache
 import numpy as np
 import pandas as pd
 
-from demand_forecast.data.frequency import to_offset
+from demand_forecast.data.frequency import grid_range, shift_grid, to_offset
 from demand_forecast.data.frequency import to_offset as _parse_validation_offset
 from demand_forecast.pretrain.periods import pretrain_long_lag, pretrain_period
 
@@ -169,8 +169,8 @@ class Panel:
         if self.epoch is None:
             return None
         offset = to_offset(self.freq)
-        first = self.epoch + start * offset
-        return pd.date_range(start=first, periods=length, freq=offset)
+        first = shift_grid(self.epoch, start, offset)
+        return grid_range(first, length, offset)
 
     @property
     def season(self) -> int:

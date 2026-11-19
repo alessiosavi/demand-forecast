@@ -114,4 +114,6 @@ if $run_tests; then
         tests/test_models tests/test_data/test_episode_*.py \
         tests/test_pretrain_v5/test_t1.py tests/test_pretrain_v5/test_sampler.py \
         -k 'not worker and not loader_resume and not multiprocess and not file_limit'
+    uv pip install --python "$work/scoring/bin/python" pytest
+    "$work/scoring/bin/python" -m pytest -o addopts= -q tests/test_data/test_episode_calendar.py
 fi
