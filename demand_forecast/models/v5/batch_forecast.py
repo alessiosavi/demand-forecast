@@ -240,6 +240,27 @@ def _validate_workers(workers: int, prefetch: int) -> None:
         raise ValueError("prefetch must be a positive integer")
 
 
+def usable_workers(requested: int) -> tuple[int, str | None]:
+    """Return the worker count and any serial fallback reason for a nonnegative request.
+
+    A positive Linux request may raise the process file-descriptor limit.
+    """
+    if type(requested) is not int or requested < 0:
+        raise ValueError("workers must be a nonnegative integer")
+    if requested == 0:
+        return 0, None
+    if sys.platform != "linux":
+        return 0, "forecast workers are supported only on Linux"
+
+    from demand_forecast.pretrain.v5 import sampler
+
+    try:
+        sampler._ensure_worker_file_limit(requested)
+    except RuntimeError as error:
+        return 0, str(error)
+    return requested, None
+
+
 def _collate_chunk(
     builder: EpisodeBuilder, group: list[EpisodeRequest], summary_off: tuple[str, ...]
 ) -> _ForecastChunk:
@@ -280,8 +301,6 @@ def _forecast_batches(
             yield group, _collate_chunk(builder, group, summary_off)
         return
 
-    from demand_forecast.pretrain.v5 import loop
-
     groups = []
     targets: set[str] = set()
     while group := list(islice(requests, batch_episodes)):
@@ -299,10 +318,17 @@ def _forecast_batches(
     for target in sorted(targets):
         builder.stats.get(target, origin)
 
+    if len(groups) <= 1:
+        for group in groups:
+            yield group, _collate_chunk(builder, group, summary_off)
+        return
+
+    from demand_forecast.pretrain.v5 import loop
+
     iterator = iter(
         DataLoader(
             _EpisodeChunks(builder, groups, summary_off),
-            num_workers=workers,
+            num_workers=min(workers, len(groups)),
             multiprocessing_context="fork",
             batch_size=None,
             prefetch_factor=prefetch,
@@ -381,8 +407,9 @@ def forecast_items(
     The cutoff is exclusive for observed inputs. Explicit layouts follow the
     input job order and can preserve the full panel's layout through ablations.
     Joint layout compatibility is checked before forecasting each origin.
-    On Linux, workers can build and collate chunks, with prefetch chunks queued
-    per worker. Statistics construction and model inference run in the caller.
+    On Linux, workers can build and collate chunks for origins with multiple
+    chunks, with prefetch chunks queued per worker. Statistics construction
+    and model inference run in the caller.
     """
     _validate_workers(workers, prefetch)
     if workers:
