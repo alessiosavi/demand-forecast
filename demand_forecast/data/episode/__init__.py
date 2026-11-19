@@ -1,8 +1,9 @@
 """Public v5 episode records, dimensions, kind rules and scaling helpers."""
 
-from .builder import DROPPABLE, Episode, EpisodeBuilder, EpisodeRequest
+from .builder import DROPPABLE, Episode, EpisodeBuilder, EpisodeRequest, apply_summary_off
 from .collate import EpisodeBatch, collate
 from .kinds import flag_codes, infer_kind, infer_static_kind, is_missing, label_of
+from .panel_stats import PanelStatsProvider
 from .scale import Scale, compress, fit_scale, to_scaled
 from .schema import (
     BANK_WINDOW,
@@ -44,7 +45,7 @@ from .schema import (
     Item,
     Panel,
 )
-from .screening import ScreeningConfig
+from .screening import Candidate, ScreeningConfig
 
 __all__ = [
     "BANK_WINDOW",
@@ -53,6 +54,8 @@ __all__ = [
     "EpisodeBatch",
     "EpisodeBuilder",
     "EpisodeRequest",
+    "Candidate",
+    "PanelStatsProvider",
     "ScreeningConfig",
     "CALENDAR_FIELDS",
     "CALENDAR_SIZES",
@@ -92,6 +95,7 @@ __all__ = [
     "Item",
     "Panel",
     "Scale",
+    "apply_summary_off",
     "compress",
     "collate",
     "fit_scale",

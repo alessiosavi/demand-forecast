@@ -11,7 +11,7 @@ import pandas as pd
 from scipy.stats import rankdata
 
 from .kinds import flag_codes, infer_kind, is_missing, label_of
-from .panel_stats import PanelStats
+from .panel_stats import PanelStats, PanelStatsProvider
 from .scale import fit_scale, to_scaled
 from .schema import (
     KIND_CATEGORY,
@@ -211,10 +211,11 @@ def relevance_static_number(
     return score
 
 
-def _other_stats(stats: PanelStats, target: str) -> PanelStats:
-    key = "target", target
+def _standalone_provider(stats: PanelStats) -> PanelStatsProvider:
+    # Direct screen callers can supply just one PanelStats and reuse it across items.
+    key = ("provider",)
     if key not in stats.screen_cache:
-        stats.screen_cache[key] = PanelStats(stats.panel, target, stats.cutoff)
+        stats.screen_cache[key] = PanelStatsProvider(stats.panel, limit=None)
     return stats.screen_cache[key]
 
 
@@ -265,6 +266,8 @@ def screen(
     targets: tuple[str, ...],
     cutoff: int,
     config: ScreeningConfig = ScreeningConfig(),
+    *,
+    provider: PanelStatsProvider | None = None,
 ) -> list[Candidate]:
     """Return every candidate in (source, name) order, using only permitted history."""
     if not 0 <= item_index < len(panel.items):
@@ -320,7 +323,12 @@ def screen(
     static = {}
     if stats.static_kinds:
         for target in sorted(targets):
-            current = stats if target == stats.target else _other_stats(stats, target)
+            if target == stats.target:
+                current = stats
+            else:
+                if provider is None:
+                    provider = _standalone_provider(stats)
+                current = provider.get(target, cutoff)
             for candidate in _static_candidates(current, config.min_items):
                 previous = static.get(candidate.name)
                 if previous is None or candidate.score > previous.score:

@@ -13,7 +13,7 @@ from tests.helpers.batch_fingerprint import assert_fingerprint, batch_fingerprin
 class Batch:
     ids: torch.Tensor
     name: str
-    values: np.ndarray
+    values: np.ndarray | torch.Tensor
     parts: list[torch.Tensor]
 
 
@@ -53,12 +53,36 @@ def test_tolerates_float_rounding(batch):
     assert_fingerprint(replace(batch, values=rounded), batch_fingerprint(batch))
 
 
+@pytest.mark.parametrize("as_array", [np.asarray, torch.from_numpy], ids=["numpy", "torch"])
+def test_detects_float_dtype_changes_and_accepts_legacy_entries(batch, as_array):
+    values = batch.values.astype(np.float32)
+    original = replace(batch, values=as_array(values))
+    promoted = replace(original, values=as_array(values.astype(np.float64)))
+    expected = batch_fingerprint(original)
+    with pytest.raises(AssertionError, match=r"^values:"):
+        assert_fingerprint(promoted, expected)
+
+    del expected["values"]["dtype"]
+    assert_fingerprint(original, expected)
+    assert_fingerprint(promoted, expected)
+
+
 def test_records_fields_in_order_with_float64_summaries(batch):
     result = batch_fingerprint(batch)
     assert list(result) == ["ids", "name", "values", "parts"]
-    assert result["values"] == {"shape": [4], "nan": 1, "sums": [3.0, 7.0, 3.25]}
+    assert result["values"] == {
+        "dtype": np.dtype("float64").str,
+        "shape": [4],
+        "nan": 1,
+        "sums": [3.0, 7.0, 3.25],
+    }
     floating, discrete = result["parts"]
-    assert floating == {"shape": [2], "nan": 0, "sums": [3.0, 3.0, 2.5]}
+    assert floating == {
+        "dtype": np.dtype("float32").str,
+        "shape": [2],
+        "nan": 0,
+        "sums": [3.0, 3.0, 2.5],
+    }
     assert len(discrete["sha256"]) == 64
 
 
