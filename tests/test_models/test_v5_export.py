@@ -285,7 +285,7 @@ def test_enabled_export_holds_the_rows(tmp_path, export_api):
     assert len(scaled) >= local >= 168
     previous_season = local - 1 - (local - 1 - cells) % 24
     previous_week = local - 1 - (local - 1 - cells) % 168
-    drift = (scaled[local - 24 : local] - scaled[local - 48 : local - 24]).mean() / 24
+    drift = (scaled[local - 72 : local] - scaled[local - 96 : local - 24]).mean() / 24
     expected = {
         "last": np.full(request.horizon, scaled[local - 1]),
         "season": scaled[previous_season],

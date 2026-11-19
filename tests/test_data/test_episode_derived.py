@@ -296,6 +296,7 @@ def test_missing_cells_are_left_out_and_a_fifth_missing_stops_the_scan():
 
 def _naive_reference(scaled, *, season, long_lag, left, right, origin):
     width = season * ((8 + season - 1) // season)
+    drift_width = season * ((64 + season - 1) // season)
     periods = {"last": 1}
     if season > 1:
         periods["season"] = season
@@ -314,7 +315,9 @@ def _naive_reference(scaled, *, season, long_lag, left, right, origin):
                     if name == ("season" if season > 1 else "last"):
                         differences = [
                             (scaled[i] - scaled[i - season]) / season
-                            for i in range(max(season, bound - width), min(bound, len(scaled)))
+                            for i in range(
+                                max(season, bound - drift_width), min(bound, len(scaled))
+                            )
                             if np.isfinite(scaled[i]) and np.isfinite(scaled[i - season])
                         ]
                         if 2 * len(differences) >= width:
@@ -348,6 +351,23 @@ def test_naive_series_equals_a_loop_reference(season, long_lag):
             assert observed.dtype == np.bool_
             np.testing.assert_array_equal(observed, expected_observed)
             np.testing.assert_allclose(values, expected_values, atol=1e-12, rtol=1e-12)
+
+
+def test_drift_slope_uses_the_long_window():
+    naive_series = import_module("demand_forecast.data.episode.derived").naive_series
+    season = 7
+    origin = 77
+    scaled = np.arange(origin, dtype=np.float64)
+    # The 56 older seasonal differences have slope 1 and the last 14 have slope 3.
+    scaled[-14:] += 2 * season
+    scaled[-7:] += 2 * season
+    values, observed = naive_series(
+        scaled, season=season, long_lag=None, left=origin, right=origin + season + 1, origin=origin
+    )["drift"]
+
+    # Endpoints a season apart use the same base, so their change measures the fitted slope.
+    assert observed.all()
+    assert (values[-1] - values[0]) / season == pytest.approx((56 + 14 * 3) / 70)
 
 
 @pytest.mark.parametrize(("gap", "origin", "expected"), [(1, 40, 38), (31, 40, 8), (32, 40, None)])

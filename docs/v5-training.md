@@ -154,8 +154,8 @@ four seasons when `S > 1`. `<target>~season2` uses the same rule with the long
 lag when it exceeds `S` and the item has at least that many cells before the
 first origin. `<target>~drift` extends the seasonal value (the last value when
 `S = 1`) by the time since its source times the mean per-step seasonal
-change. The mean uses the last `W` cells as pair endpoints and requires at
-least half that many finite pairs.
+change. The mean uses pair endpoints in the last `W_d = S * ceil(64 / S)`
+cells and requires at least `W / 2` finite pairs.
 
 Each context cell uses sources strictly before itself, and each horizon
 uses sources strictly before its own origin. Sources can precede the context
