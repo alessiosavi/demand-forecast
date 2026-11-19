@@ -59,7 +59,7 @@ DROPPABLE = (
     "value_stats",
     "value_effects",
 )
-DERIVABLE = ("increment_spread", "lag_rows", "onset_rows")
+DERIVABLE = ("increment_spread", "lag_rows", "naive_rows", "onset_rows")
 
 
 @dataclass(frozen=True)
@@ -159,6 +159,7 @@ class _Row:
     support: np.ndarray | None = None
     candidate_key: tuple[str, str] | None = None
     lag_delay: int = 0
+    naive_suffix: str | None = None
 
 
 def _array(values: object, dtype: type, *shape: int) -> np.ndarray:
@@ -375,6 +376,7 @@ class EpisodeBuilder:
         frozen_at: int | None = None,
         horizon: bool = False,
         derive: frozenset[str] = frozenset(),
+        frozen_values: np.ndarray | None = None,
     ) -> np.ndarray:
         result = np.zeros((right - left, N_CHANNELS), dtype=np.float32)
         start, stop = max(0, left), min(right, len(row.raw))
@@ -411,7 +413,7 @@ class EpisodeBuilder:
             else:
                 result[:, CH_VALUE] = stats[:, 0]
         else:
-            values = _window(row.scaled, left, right)
+            values = _window(row.scaled, left, right) if frozen_values is None else frozen_values
             observed = np.isfinite(values)
             result[:, CH_VALUE] = np.where(
                 observed, compress(values) if row.mode == "number" else values, 0.0
@@ -490,6 +492,41 @@ class EpisodeBuilder:
             )
         )
         return rows
+
+    def _naive_rows(
+        self,
+        history: derived.NaiveHistory,
+        target: str,
+        names: set[str],
+        end: int,
+        *,
+        cutoff: int,
+    ) -> tuple[list[_Row], list[Candidate]]:
+        rows, trace = [], []
+        context = history.series(left=0, right=history.context_end, origin=None)
+        for suffix, (values, observed) in context.items():
+            name = f"{target}~{suffix}"
+            if name in names:
+                continue
+            series = np.where(observed, values, np.nan)
+            summary, flags = self._summary(series, series, end, cutoff=cutoff)
+            rows.append(
+                _Row(
+                    name,
+                    KIND_NUMBER,
+                    ROLE_KNOWN,
+                    1.0,
+                    series,
+                    series,
+                    Scale(0, 1),
+                    summary,
+                    flags,
+                    candidate_key=("derived", name),
+                    naive_suffix=suffix,
+                )
+            )
+            trace.append(Candidate(name, "derived", KIND_NUMBER, 1.0, None))
+        return rows, trace
 
     def _derived_rows(
         self,
@@ -657,7 +694,24 @@ class EpisodeBuilder:
                 dispositions[key] = None
             features.extend((part, key) for part in expanded)
         features.sort(key=lambda pair: (pair[0].role, -pair[0].score, pair[0].name))
-        for row, key in features[:MAX_FEATURE_ROWS]:
+        naive = None
+        naive_rows, naive_trace = [], []
+        if "naive_rows" in request.derive and context_target is not None:
+            long_lag = panel.long_lag
+            if (
+                long_lag is not None
+                and min(request.origins[0] - item.start, len(target_scaled)) < long_lag
+            ):
+                long_lag = None
+            naive = derived.NaiveHistory(
+                rows[0].scaled, season=panel.season, long_lag=long_lag, end=right - item.start
+            )
+            names = {*item.dynamic, *item.targets, *item.static, *(row.name for row, _ in features)}
+            naive_rows, naive_trace = self._naive_rows(
+                naive, context_target, names, end, cutoff=cutoff
+            )
+        base_budget = MAX_FEATURE_ROWS - len(naive_rows)
+        for row, key in features[:base_budget]:
             row.candidate_key = key
             rows.append(row)
             dispositions[key] = None
@@ -761,15 +815,17 @@ class EpisodeBuilder:
             ]
         )
         rows.extend(panel_rows)
-        if len(features) < MAX_FEATURE_ROWS and (
+        if len(features) < base_budget and (
             "lag_rows" in request.derive or "onset_rows" in request.derive
         ):
-            slots = MAX_FEATURE_ROWS - len(features)
+            slots = base_budget - len(features)
             derived_rows, derived_trace = self._derived_rows(
                 rows, stats, request, slots, target_scaled
             )
             rows.extend(derived_rows)
             trace.extend(derived_trace)
+        rows.extend(naive_rows)
+        trace.extend(naive_trace)
         rows.sort(key=lambda row: (row.role, row.name))
 
         x, patch_valid = [], []
@@ -799,6 +855,11 @@ class EpisodeBuilder:
         xh = np.zeros((len(request.origins), len(known_rows), nh * PATCH, N_CHANNELS), np.float32)
         for oi, origin in enumerate(request.origins):
             local = origin - item.start
+            frozen = (
+                naive.series(left=local, right=local + request.horizon, origin=local)
+                if naive is not None and naive_rows
+                else {}
+            )
             for fi, ri in enumerate(forecast_rows):
                 raw = _window(rows[ri].raw, local, local + request.horizon)
                 valid = np.isfinite(raw)
@@ -808,6 +869,10 @@ class EpisodeBuilder:
                 label_mask[oi, fi, : request.horizon] = valid
             for ki, ri in enumerate(known_rows):
                 row = rows[ri]
+                frozen_values = None
+                if row.naive_suffix is not None:
+                    values, observed = frozen[row.naive_suffix]
+                    frozen_values = np.where(observed, values, np.nan)
                 # After the delay, the shifted source is at or after this origin.
                 visible = min(request.horizon, row.lag_delay or request.horizon)
                 xh[oi, ki, :visible] = self._encode(
@@ -818,6 +883,7 @@ class EpisodeBuilder:
                     frozen_at=local,
                     horizon=True,
                     derive=request.derive,
+                    frozen_values=frozen_values,
                 )
 
         cal_phases = np.zeros((request.context, N_PHASES), np.float32)

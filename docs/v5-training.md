@@ -144,6 +144,29 @@ gate floor and can use horizon labels to place onsets. Its response history
 freezes at each origin. A past category's row has the past gate and appears in
 the context only. Forecast evidence uses `derived:<column>~onset`.
 
+Enable `naive_rows` to present classical forecasts of the kept target as
+known numeric rows. This applies to a designated target or the sole target
+of an item. For a joint request on a multi-target item, the presentation is
+inactive. For a season of length `S`, let `W = S * ceil(8 / S)`. The
+`<target>~last` row uses the last finite value within `4W` cells.
+`<target>~season` uses the last finite value at the served cell's phase within
+four seasons when `S > 1`. `<target>~season2` uses the same rule with the long
+lag when it exceeds `S` and the item has at least that many cells before the
+first origin. `<target>~drift` extends the seasonal value (the last value when
+`S = 1`) by the time since its source times the mean per-step seasonal
+change. The mean uses pair endpoints in the last `W_d = S * ceil(64 / S)`
+cells and requires at least `W / 2` finite pairs.
+
+Each context cell uses sources strictly before itself, and each horizon
+uses sources strictly before its own origin. Sources can precede the context
+window and use the target scale fitted at the statistics cutoff. Cells with
+insufficient sources are missing. The rows use the known-row gate floor and
+appear as `derived:<row name>` in forecast evidence. Each row reserves a
+feature slot, skipping a name that collides with an existing column. Base
+features keep their usual ranking in the remaining slots, and lag and onset
+rows can use slots left free. Turning off the presentation restores the
+displaced base features.
+
 The switch defaults to an empty list. The export records enabled names and
 the adapter uses them for scoring. Use the `no_derived` scoring variant to
 disable them on the same weights.

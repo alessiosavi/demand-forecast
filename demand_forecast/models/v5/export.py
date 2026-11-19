@@ -268,6 +268,15 @@ def _parity_cases(
         ],
     )
 
+    if "naive_rows" in derive:
+        steps = np.arange(240, dtype=np.float64)
+        values = steps / 30 + np.sin(2 * np.pi * steps / 24) + np.sin(2 * np.pi * steps / 168)
+        hourly = Item("hourly", 13, {"y": values}, {}, {})
+        yield (
+            Panel("hourly-naive", (hourly,), {}, "h", epoch, True),
+            [EpisodeRequest(0, (hourly.start + 192,), 37, context=64, derive=derive)],
+        )
+
 
 def _screening(training: dict) -> ScreeningConfig:
     sampler = training["sampler"]
@@ -428,11 +437,15 @@ def check_parity(directory: Path, device: str = "cpu") -> dict[str, float | bool
     directory = Path(directory)
     model, metadata = load_export(directory, device)
     model.float()
-    screening = _screening(metadata["training"])
+    training = metadata["training"]
+    screening = _screening(training)
+    case_count = _CASE_COUNT
+    if "naive_rows" in training["sampler"].get("derive", ()):
+        case_count += 1
     tolerance = _CPU_TOLERANCE if torch.device(device).type == "cpu" else _DEVICE_TOLERANCE
     differences = {}
     with np.load(directory / _PARITY, allow_pickle=False) as arrays:
-        prefixes = tuple(f"case_{i}" for i in range(1, _CASE_COUNT + 1))
+        prefixes = tuple(f"case_{i}" for i in range(1, case_count + 1))
         actual = {key.split("/", 1)[0] for key in arrays.files if key.startswith("case_")}
         missing = set(prefixes) - actual
         extra = actual.difference(prefixes)
