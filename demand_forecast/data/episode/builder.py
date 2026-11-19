@@ -378,7 +378,23 @@ class EpisodeBuilder:
     ) -> np.ndarray:
         result = np.zeros((right - left, N_CHANNELS), dtype=np.float32)
         start, stop = max(0, left), min(right, len(row.raw))
-        if row.mode in ("category", "effect"):
+        if row.mode == "onset":
+            if horizon:
+                values, observed = derived.onset_profile(
+                    row.raw,
+                    target,
+                    left=left,
+                    right=right,
+                    frozen_at=frozen_at,
+                    season=self.panel.season,
+                )
+            else:
+                values = _window(row.scaled, left, right)
+                observed = np.zeros(right - left, dtype=bool)
+                if start < stop:
+                    observed[start - left : stop - left] = row.support[start:stop]
+            result[:, CH_VALUE] = np.where(observed, values, 0.0)
+        elif row.mode in ("category", "effect"):
             stats, _ = category_step_stats(
                 row.raw,
                 target,
@@ -390,7 +406,6 @@ class EpisodeBuilder:
             observed = np.zeros(right - left, dtype=bool)
             if start < stop:
                 observed[start - left : stop - left] = observed_mask(row.raw[start:stop])
-            result[:, CH_OBSERVED] = observed
             if row.mode == "category":
                 result[:, CH_VALUE_STATS:] = stats
             else:
@@ -401,14 +416,16 @@ class EpisodeBuilder:
             result[:, CH_VALUE] = np.where(
                 observed, compress(values) if row.mode == "number" else values, 0.0
             )
-            result[:, CH_OBSERVED] = observed
-        if row.mode in ("number", "effect") and not horizon and start < stop:
+        result[:, CH_OBSERVED] = observed
+        if row.mode in ("number", "effect", "onset") and not horizon and start < stop:
             scaled, raw = row.scaled, row.raw
             if row.mode == "effect":
                 effects, _ = category_step_stats(row.raw, target, left=0, right=stop)
                 present = observed_mask(row.raw[:stop])
                 # Effects already inhabit the target's scaled frame.
                 scaled = raw = np.where(present, effects[:, 0], np.nan).astype(np.float64)
+            elif row.mode == "onset":
+                raw = scaled
             values, flags = step_features(
                 scaled,
                 raw,
@@ -474,57 +491,98 @@ class EpisodeBuilder:
         )
         return rows
 
-    def _lag_rows(
-        self, rows: list[_Row], stats: PanelStats, item_index: int, slots: int
+    def _derived_rows(
+        self,
+        rows: list[_Row],
+        stats: PanelStats,
+        request: EpisodeRequest,
+        slots: int,
+        target: np.ndarray,
     ) -> tuple[list[_Row], list[Candidate]]:
+        item_index = request.item_index
         item = self.panel.items[item_index]
         end = max(0, stats.cutoff - item.start)
         left = max(0, end - derived.LAG_SCAN_WINDOW)
         names = {*item.dynamic, *item.targets, *item.static, *(row.name for row in rows)}
         proposals = []
         for base in rows:
-            name = f"{base.name}~lag"
-            if (
-                base.role != ROLE_PAST
-                or base.kind != KIND_NUMBER
-                or "=" in base.name
-                or "~" in base.name
-                or name in names
+            if "onset_rows" in request.derive and base.mode == "category":
+                suffix = "onset"
+            elif (
+                "lag_rows" in request.derive
+                and base.role == ROLE_PAST
+                and base.kind == KIND_NUMBER
+                and "=" not in base.name
+                and "~" not in base.name
             ):
+                suffix = "lag"
+            else:
                 continue
-            key = item_index, base.name
-            if key not in stats.lag_cache:
-                # The provider may be shared by builders with different no_evidence thresholds.
-                stats.lag_cache[key] = derived.scan_delay(
-                    _window(base.raw, left, end),
-                    _window(item.targets[stats.target], left, end),
-                    season=self.panel.season,
-                    no_evidence=0.0,
-                )
-            delay, score, _ = stats.lag_cache[key]
-            if delay and score > self.config.no_evidence:
-                proposals.append(
-                    (Candidate(name, "derived", KIND_NUMBER, score, None), base, delay)
-                )
+            name = f"{base.name}~{suffix}"
+            if name in names:
+                continue
+            delay, score = 0, base.score
+            if suffix == "lag":
+                key = item_index, base.name
+                if key not in stats.lag_cache:
+                    # Builders sharing the provider can use different no_evidence thresholds.
+                    stats.lag_cache[key] = derived.scan_delay(
+                        _window(base.raw, left, end),
+                        _window(item.targets[stats.target], left, end),
+                        season=self.panel.season,
+                        no_evidence=0.0,
+                    )
+                delay, score, _ = stats.lag_cache[key]
+                if not (delay and score > self.config.no_evidence):
+                    continue
+            proposals.append((Candidate(name, "derived", KIND_NUMBER, score, None), base, delay))
         proposals.sort(key=lambda proposal: (-proposal[0].score, proposal[0].name))
 
+        context_end = request.origins[-1] - item.start
+        context_left = max(0, context_end - request.context)
         admitted, trace = [], []
-        for candidate, base, delay in proposals[:slots]:
-            shifted = np.pad(base.raw, (delay, 0), constant_values=np.nan)
-            row = self._row(
-                candidate.name,
-                shifted,
-                KIND_NUMBER,
-                ROLE_KNOWN,
-                candidate.score,
-                end,
-                cutoff=stats.cutoff,
-            )
+        for candidate, base, delay in proposals:
+            if not delay:
+                right = max(0, min(len(base.raw), context_end))
+                values, observed = derived.onset_profile(
+                    base.raw, target, left=0, right=right, frozen_at=None, season=self.panel.season
+                )
+                if not observed[context_left:end].any():
+                    continue
+            if len(admitted) == slots:
+                trace.append(replace(candidate, removed="budget"))
+                continue
+            if delay:
+                shifted = np.pad(base.raw, (delay, 0), constant_values=np.nan)
+                row = self._row(
+                    candidate.name,
+                    shifted,
+                    KIND_NUMBER,
+                    ROLE_KNOWN,
+                    candidate.score,
+                    end,
+                    cutoff=stats.cutoff,
+                )
+            else:
+                series = np.where(observed, values, np.nan)
+                summary, flags = self._summary(series, series, end, cutoff=stats.cutoff)
+                row = _Row(
+                    candidate.name,
+                    KIND_NUMBER,
+                    base.role,
+                    candidate.score,
+                    base.raw,
+                    series,
+                    Scale(0, 1),
+                    summary,
+                    flags,
+                    "onset",
+                    support=observed,
+                )
             row.candidate_key = candidate.source, candidate.name
             row.lag_delay = delay
             admitted.append(row)
             trace.append(candidate)
-        trace.extend(replace(candidate, removed="budget") for candidate, _, _ in proposals[slots:])
         return admitted, trace
 
     def build(self, request: EpisodeRequest) -> Episode:
@@ -703,11 +761,15 @@ class EpisodeBuilder:
             ]
         )
         rows.extend(panel_rows)
-        if "lag_rows" in request.derive and len(features) < MAX_FEATURE_ROWS:
+        if len(features) < MAX_FEATURE_ROWS and (
+            "lag_rows" in request.derive or "onset_rows" in request.derive
+        ):
             slots = MAX_FEATURE_ROWS - len(features)
-            lag_rows, lag_trace = self._lag_rows(rows, stats, request.item_index, slots)
-            rows.extend(lag_rows)
-            trace.extend(lag_trace)
+            derived_rows, derived_trace = self._derived_rows(
+                rows, stats, request, slots, target_scaled
+            )
+            rows.extend(derived_rows)
+            trace.extend(derived_trace)
         rows.sort(key=lambda row: (row.role, row.name))
 
         x, patch_valid = [], []

@@ -1,4 +1,4 @@
-"""Causal increment spread and delay scans."""
+"""Causal increment spread, delay scans and onset profiles."""
 
 from importlib import import_module
 
@@ -77,6 +77,103 @@ def test_increment_spread_reads_nothing_at_or_after_its_bound(spread, frozen_at)
     expected = spread(labels, target, **bounds)
     assert expected[-1] > 0
     np.testing.assert_array_equal(spread(labels, changed, **bounds), expected)
+
+
+@pytest.fixture
+def onset():
+    return import_module("demand_forecast.data.episode.derived").onset_profile
+
+
+def _onset_reference(labels, target, *, left, right, frozen_at, season):
+    def onset_at(t):
+        if not 0 <= t < len(labels) or is_missing(labels[t]):
+            return None
+        label = label_of(labels[t])
+        for start in range(t, max(0, t - 31) - 1, -1):
+            if start == 0 or is_missing(labels[start - 1]):
+                return None
+            if label_of(labels[start - 1]) != label:
+                return start, label
+        return None
+
+    values = np.zeros(right - left)
+    observed = np.zeros(right - left, dtype=bool)
+    for i, t in enumerate(range(left, right)):
+        active = onset_at(t)
+        if active is None:
+            continue
+        start, label = active
+        age = t - start
+        bound = t if frozen_at is None else min(t, frozen_at)
+        total, count = 0.0, 0
+        for p in range(age + 1, min(bound, len(target))):
+            previous = p - age
+            if onset_at(p) != (previous, label) or not np.isfinite(target[p]):
+                continue
+            before = target[max(0, previous - min(season, 8)) : previous]
+            finite = before[np.isfinite(before)]
+            if len(finite):
+                base = finite.mean()
+                if np.isfinite(base):
+                    total += target[p] - base
+                    count += 1
+        if count:
+            values[i] = (count / (count + 2)) * (total / count)
+            observed[i] = True
+    return values, observed
+
+
+@pytest.mark.parametrize("frozen_at", [None, 0, 31, 197])
+@pytest.mark.parametrize("season", [1, 7, 24])
+def test_onset_profile_equals_a_loop_reference(onset, frozen_at, season):
+    rng = np.random.default_rng(189)
+    names = np.array([1, "1", "b", "c", None, "", [], ("b",)], dtype=object)
+    labels = np.repeat(rng.choice(names, size=51), rng.integers(1, 9, size=51))
+    target = rng.normal(size=len(labels) - 11)
+    target[::11], target[5::29] = np.nan, np.inf
+    bounds = dict(left=-3, right=len(labels) + 4, frozen_at=frozen_at, season=season)
+    expected, flags = _onset_reference(labels, target, **bounds)
+    actual, observed = onset(labels, target, **bounds)
+    assert actual.shape == observed.shape == (bounds["right"] - bounds["left"],)
+    assert observed.dtype == bool
+    np.testing.assert_array_equal(observed, flags)
+    np.testing.assert_array_equal(actual, expected)
+
+
+def test_profile_shows_a_planted_pulse_at_its_age(onset):
+    labels = np.tile(np.repeat(["a", "b", "c"], 16), 5)
+    pulse = np.isin(np.arange(len(labels)) % 48, [2, 3, 20, 21, 38, 39])
+    target = 5.0 * pulse
+    bounds = dict(left=192, right=240, frozen_at=192, season=7)
+    values, observed = onset(labels, target, **bounds)
+    pulse = pulse[192:]
+    assert observed.all()
+    np.testing.assert_allclose(values[pulse], 5.0, atol=2.0, rtol=0)
+    assert (np.abs(values[~pulse]) < 1.0).all()
+
+
+def test_alternating_labels_do_not_count_a_pulse_twice(onset):
+    labels = np.array(["b", "a", "b", "a", "b", "a", "b"])
+    target = np.array([0, 6, 0, 6, 0, 6, 0], dtype=float)
+    values, observed = onset(labels, target, left=5, right=7, frozen_at=5, season=1)
+    np.testing.assert_array_equal(observed, [True, True])
+    np.testing.assert_array_equal(values, [3.0, -3.0])
+
+
+def test_first_cell_gap_and_single_occurrence_give_no_value(onset):
+    labels = np.array(["a", "a", "b", "b", None, "b", "b", "c", "c", "a", "a"])
+    target = np.arange(len(labels), dtype=float)
+    values, observed = onset(labels, target, left=0, right=len(labels), frozen_at=None, season=2)
+    assert not observed.any() and not values.any()
+
+
+def test_ages_31_and_32(onset):
+    labels = np.array(["c"] + ["a"] * 34 + ["b"] + ["a"] * 34)
+    target = np.zeros(len(labels))
+    target[32:34] = 9
+    values, observed = onset(labels, target, left=66, right=70, frozen_at=36, season=1)
+    np.testing.assert_array_equal(observed, [True, True, False, False])
+    np.testing.assert_array_equal(values, [0.0, 3.0, 0.0, 0.0])
 
 
 def _scan(x, y, *, season=1, no_evidence=0.0):

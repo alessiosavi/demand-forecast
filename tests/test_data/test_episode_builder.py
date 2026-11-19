@@ -17,7 +17,7 @@ from demand_forecast.data.episode import (
     panel_stats,
 )
 from demand_forecast.data.episode import builder as episode_builder
-from demand_forecast.data.episode.bank import summary_vectors
+from demand_forecast.data.episode.bank import step_features, summary_vectors
 from demand_forecast.data.episode.builder import DROPPABLE
 from demand_forecast.data.episode.kinds import flag_codes
 from demand_forecast.data.episode.panel_stats import PanelStats
@@ -33,6 +33,7 @@ from demand_forecast.data.episode.schema import (
     KIND_FLAG,
     KIND_NUMBER,
     MAX_FEATURE_ROWS,
+    N_CHANNELS,
     ROLE_KNOWN,
     ROLE_PANEL,
     ROLE_PAST,
@@ -43,8 +44,10 @@ from demand_forecast.data.episode.schema import (
 )
 from demand_forecast.data.episode.screening import ScreeningConfig, relevance_number
 from demand_forecast.data.episode.value_stats import category_step_stats
+from demand_forecast.models import v5
 from tests.helpers.episodes import lag_panel, perturb_after, toy_panel
 from tests.helpers.lag_scan_reference import scan_delay as reference_scan
+from tests.helpers.v5_loop import config
 
 
 def _plain(panel):
@@ -76,14 +79,21 @@ def _equal_exact(a, b, exclude=()):
             assert actual == expected, field.name
 
 
-def test_default_requests_are_unchanged():
+def test_onset_option_preserves_a_panel_without_categories():
     panel = toy_panel(n_targets=2)
+    roles = {name: role for name, role in panel.roles.items() if name != "event"}
+    items = tuple(
+        replace(item, dynamic={name: item.dynamic[name] for name in roles}, static={})
+        for item in panel.items
+    )
+    panel = replace(panel, items=items, roles=roles)
     builder = EpisodeBuilder(panel)
     request = EpisodeRequest(1, (320, 336), 16, 64, "y", 304)
+    assert request == replace(request, derive=frozenset())
     baseline = builder.build(request)
-    for derive in (frozenset(), frozenset({"onset_rows"})):
-        actual = builder.build(replace(request, derive=derive))
-        _equal_exact(baseline, actual)
+    assert KIND_CATEGORY not in baseline.row_kind
+    enabled = builder.build(replace(request, derive=frozenset({"onset_rows"})))
+    _equal_exact(baseline, enabled)
 
 
 def test_derive_reaches_every_request(monkeypatch):
@@ -1216,3 +1226,331 @@ def test_a_delay_longer_than_the_horizon_covers_it():
     (i,) = np.flatnonzero(actual.known_rows == actual.row_names.index("driver~lag"))
     np.testing.assert_array_equal(actual.xh[0, i, 0, :4, CH_OBSERVED], np.ones(4))
     assert not actual.xh[0, i, 0, 4:].any()
+
+
+def _onset_panel(role="known", *, run_lengths=(8, 8, 8)):
+    labels = np.resize(np.repeat(["a", "b", "c"], run_lengths), 192).astype(object)
+    target = np.resize(np.repeat([1.0, 9.0, 17.0], run_lengths), len(labels))
+    target[np.r_[True, labels[1:] != labels[:-1]]] += 0.25
+    item = Item("item", 19, {"y": target}, {"event": labels}, {})
+    return Panel("onsets", (item,), {"event": role}, "D", None, True)
+
+
+def test_onset_option_preserves_legacy_rows_in_place():
+    panel = _onset_panel()
+    item = panel.items[0]
+    dynamic = {"amount": np.arange(len(item.targets["y"]), dtype=float), **item.dynamic}
+    panel = replace(
+        panel,
+        items=(replace(item, dynamic=dynamic),),
+        roles={**panel.roles, "amount": "known"},
+    )
+    builder = EpisodeBuilder(panel)
+    request = EpisodeRequest(0, (115, 147), 13, 128, cutoff=102)
+    baseline = builder.build(request)
+    enabled = builder.build(replace(request, derive=frozenset({"onset_rows"})))
+    assert baseline.row_names == ["y", "amount", "event"]
+    assert enabled.row_names == [*baseline.row_names, "event~onset"]
+    assert enabled.row_keys[:-1] == baseline.row_keys
+    assert enabled.trace[:-1] == baseline.trace
+    np.testing.assert_array_equal(enabled.forecast_rows, baseline.forecast_rows)
+    np.testing.assert_array_equal(enabled.known_rows[:-1], baseline.known_rows)
+    for field in (
+        "x",
+        "patch_valid",
+        "row_kind",
+        "row_role",
+        "row_summary",
+        "row_summary_flags",
+        "row_score",
+        "row_cand",
+        "xh",
+    ):
+        expected, actual = getattr(baseline, field), getattr(enabled, field)
+        actual = actual[:, :-1] if field == "xh" else actual[:-1]
+        assert actual.shape == expected.shape, field
+        assert actual.dtype == expected.dtype, field
+        assert actual.tobytes() == expected.tobytes(), field
+
+
+def test_each_onset_horizon_freezes_at_its_own_origin():
+    panel = _onset_panel(run_lengths=(2, 3, 4))
+    item = panel.items[0]
+    origins = (item.start + 96, item.start + 128)
+    request = EpisodeRequest(
+        0, origins, 37, 128, cutoff=origins[0] - 7, derive=frozenset({"onset_rows"})
+    )
+    episode = EpisodeBuilder(panel).build(request)
+    row = episode.row_names.index("event~onset")
+    (known,) = np.flatnonzero(episode.known_rows == row)
+    raw = item.targets["y"]
+    target = to_scaled(raw, fit_scale(raw, request.cutoff - item.start, panel.season))
+    labels = item.dynamic["event"]
+    for oi, origin in enumerate(origins):
+        local = origin - item.start
+        left, right = local, local + request.horizon
+        actual = episode.xh[oi, known].reshape(-1, N_CHANNELS)
+        values, observed = derived.onset_profile(
+            labels, target, left=left, right=right, frozen_at=local, season=panel.season
+        )
+        unfrozen, _ = derived.onset_profile(
+            labels, target, left=left, right=right, frozen_at=None, season=panel.season
+        )
+        expected = np.zeros_like(actual)
+        expected[: request.horizon, CH_VALUE] = values
+        expected[: request.horizon, CH_OBSERVED] = observed
+        assert np.any(expected[: request.horizon, CH_VALUE] != unfrozen.astype(expected.dtype))
+        np.testing.assert_array_equal(actual, expected, err_msg=f"origin {origin}")
+
+    altered = EpisodeBuilder(perturb_after(panel, origins[0], keep_known=True)).build(request)
+    np.testing.assert_array_equal(altered.xh[0, known], episode.xh[0, known])
+
+
+def test_a_change_on_the_origin_cell_counts_in_the_known_role():
+    panel = _onset_panel()
+    item = panel.items[0]
+    local = 96
+    request = EpisodeRequest(0, (item.start + local,), 13, 128, derive=frozenset({"onset_rows"}))
+    builder = EpisodeBuilder(panel)
+    episode = builder.build(request)
+    assert episode.row_names == ["y", "event", "event~onset"]
+    index = episode.row_names.index("event~onset")
+    assert episode.row_kind[index] == KIND_NUMBER
+    assert episode.row_role[index] == ROLE_KNOWN
+    assert episode.row_cand[index] == -1
+    assert episode.row_keys[index] == ("derived", "event~onset")
+    assert episode.row_score[index] == episode.row_score[episode.row_names.index("event")]
+    (known,) = np.flatnonzero(episode.known_rows == index)
+    actual = episode.xh[0, known].reshape(-1, N_CHANNELS)
+    labels = item.dynamic["event"]
+    target = to_scaled(item.targets["y"], fit_scale(item.targets["y"], local, panel.season))
+    values, observed = derived.onset_profile(
+        labels,
+        target,
+        left=local,
+        right=local + request.horizon,
+        frozen_at=local,
+        season=panel.season,
+    )
+    expected = np.zeros((16, N_CHANNELS), dtype=np.float32)
+    expected[: request.horizon, CH_VALUE] = values
+    expected[: request.horizon, CH_OBSERVED] = observed
+    assert observed[0] and values[0] < 0 and values[8] > 0  # Ages reset at the two changes.
+    np.testing.assert_array_equal(actual, expected)
+
+    values, observed = derived.onset_profile(
+        labels, target, left=0, right=local, frozen_at=None, season=panel.season
+    )
+    series = np.where(observed, values, np.nan)
+    steps, flags = step_features(
+        series, series, season=panel.season, long_lag=panel.long_lag, left=0, right=local
+    )
+    expected = np.zeros((request.context, N_CHANNELS), dtype=np.float32)
+    expected[-local:, CH_VALUE] = values
+    expected[-local:, CH_OBSERVED] = observed
+    expected[-local:, CH_STEP:CH_STEP_FLAG] = np.where(observed[:, None], steps, 0)
+    expected[-local:, CH_STEP_FLAG:CH_VALUE_STATS] = observed[:, None] & flags
+    np.testing.assert_array_equal(episode.x[index].reshape(-1, N_CHANNELS), expected)
+
+
+@pytest.mark.parametrize("role", ["known", "past"])
+def test_only_hidden_targets_varied_nothing_visible_moves(role):
+    panel = _onset_panel(role)
+    item = panel.items[0]
+    origins = (item.start + 96, item.start + 128)
+    request = EpisodeRequest(0, origins, 12, 64, derive=frozenset({"onset_rows"}))
+    hidden = perturb_after(panel, origins[0], keep_known=True)
+    hidden = replace(hidden, items=(replace(hidden.items[0], dynamic=item.dynamic),))
+    original = EpisodeBuilder(panel).build(request)
+    changed = EpisodeBuilder(hidden).build(request)
+    index = original.row_names.index("event~onset")
+    assert original.row_role[index] == (ROLE_KNOWN if role == "known" else ROLE_PAST)
+    assert (index in original.known_rows) == (role == "known")
+    _equal_exact(original, changed, exclude=("x", "xh", "labels"))
+    prefix = original.origin_patches[0]
+    np.testing.assert_array_equal(original.x[:, :prefix], changed.x[:, :prefix])
+    np.testing.assert_array_equal(original.xh[0], changed.xh[0])
+    assert not np.array_equal(original.x[index, prefix:], changed.x[index, prefix:])
+    if role == "known":
+        assert not np.array_equal(original.xh[1], changed.xh[1])
+    assert not np.array_equal(original.labels, changed.labels)
+
+    model = v5.V5Model(config().model)
+    before = v5.forecast(model, panel, request, pruned=False)
+    after = v5.forecast(model, hidden, request, pruned=False)
+    assert before.gates == after.gates
+    np.testing.assert_array_equal(before.quantiles[0], after.quantiles[0])
+
+    with torch.no_grad():
+        model.gate_net.net[-1].weight.zero_()
+        model.gate_net.net[-1].bias.fill_(-1000)
+    evidence = v5.forecast_items(
+        model, panel, [(0, origins[0])], 12, context=64, derive=request.derive, pruned=True
+    ).evidence
+    base = evidence.candidates.index("dynamic:event")
+    onset = evidence.candidates.index("derived:event~onset")
+    expected_gate = np.float32(model.gate_net.known_gate_floor if role == "known" else 0)
+    expected_status = 1 if role == "known" else 5
+    np.testing.assert_array_equal(evidence.status[0, [base, onset]], [expected_status] * 2)
+    np.testing.assert_array_equal(evidence.gate[0, [base, onset]], [expected_gate] * 2)
+
+
+def test_no_row_for_a_flag_or_when_value_stats_is_dropped():
+    panel = _onset_panel()
+    item = panel.items[0]
+    flag = np.where(item.dynamic["event"] == "a", "a", "b").astype(object)
+    panel = replace(
+        panel,
+        items=(replace(item, dynamic={**item.dynamic, "flag": flag}),),
+        roles={**panel.roles, "flag": "known"},
+    )
+    builder = EpisodeBuilder(panel)
+    request = EpisodeRequest(0, (115,), 12, 64, derive=frozenset({"onset_rows"}))
+    episode = builder.build(request)
+    assert episode.row_kind[episode.row_names.index("flag")] == KIND_FLAG
+    assert "event~onset" in episode.row_names
+    assert "flag~onset" not in episode.row_names
+    request = replace(request, drop=frozenset({"value_stats"}))
+    dropped = builder.build(request)
+    assert "event~effect" in dropped.row_names
+    _equal_exact(dropped, builder.build(replace(request, derive=frozenset())))
+
+
+@pytest.mark.parametrize(
+    "case", ["constant", "single_change", "support_after_cutoff", "support_before_context"]
+)
+def test_no_onset_row_without_support_in_context_before_cutoff(case):
+    panel = _onset_panel(run_lengths=(2, 3, 4))
+    item = panel.items[0]
+    labels = item.dynamic["event"].copy()
+    if case == "constant":
+        labels[:] = "a"
+    elif case == "single_change":
+        # The isolated third label keeps the column categorical, with one adjacent change.
+        labels[:2] = ["c", None]
+        labels[2:48], labels[48:] = "a", "b"
+    elif case == "support_after_cutoff":
+        labels[:64] = "a"
+    else:
+        labels[32], labels[33:] = None, "a"
+    panel = replace(panel, items=(replace(item, dynamic={"event": labels}),))
+    request = EpisodeRequest(0, (item.start + 128,), 12, 96, cutoff=item.start + 64)
+    builder = EpisodeBuilder(panel)
+    enabled = builder.build(replace(request, derive=frozenset({"onset_rows"})))
+    assert enabled.row_kind[enabled.row_names.index("event")] == KIND_CATEGORY
+    assert "event~onset" not in enabled.row_names
+    assert all(candidate.source != "derived" for candidate in enabled.trace)
+    _equal_exact(builder.build(request), enabled)
+
+
+def test_an_unsupported_onset_leaves_room_for_a_lower_scored_lag(monkeypatch):
+    panel = _onset_panel(run_lengths=(2, 3, 4))
+    item = panel.items[0]
+    labels = item.dynamic["event"].copy()
+    labels[32], labels[33:] = None, "a"
+    driver = lag_panel(length=len(labels)).items[0].dynamic["driver"]
+    panel = replace(
+        panel,
+        items=(replace(item, dynamic={"event": labels, "driver": driver}),),
+        roles={**panel.roles, "driver": "past"},
+    )
+    panel = _fill_legacy_slots(panel, MAX_FEATURE_ROWS - 3)
+    builder = EpisodeBuilder(panel, ScreeningConfig(no_evidence=0.0))
+    request = EpisodeRequest(0, (item.start + 128,), 12, 96, cutoff=item.start + 64)
+    baseline = builder.build(request)
+    assert len(baseline.row_names) == MAX_FEATURE_ROWS
+    score = next(c.score for c in baseline.trace if c.name == "event")
+    assert score > 0
+    monkeypatch.setattr(derived, "scan_delay", lambda *a, **k: (5, score / 2, 0.0))
+
+    enabled = builder.build(replace(request, derive=frozenset({"onset_rows", "lag_rows"})))
+    assert set(enabled.row_names) == {*baseline.row_names, "driver~lag"}
+    assert [(c.name, c.removed) for c in enabled.trace if c.source == "derived"] == [
+        ("driver~lag", None)
+    ]
+
+
+def test_summary_obeys_the_cutoff():
+    panel = _onset_panel()
+    item = panel.items[0]
+    end = 83
+    request = EpisodeRequest(
+        0, (115, 131), 12, 128, cutoff=item.start + end, derive=frozenset({"onset_rows"})
+    )
+    original = EpisodeBuilder(panel).build(request)
+    index = original.row_names.index("event~onset")
+    target = to_scaled(item.targets["y"], fit_scale(item.targets["y"], end, panel.season))
+    values, observed = derived.onset_profile(
+        item.dynamic["event"], target, left=0, right=end, frozen_at=None, season=panel.season
+    )
+    series = np.where(observed, values, np.nan)[None]
+    expected, flags = summary_vectors(
+        series, series, season=panel.season, long_lag=panel.long_lag, end=request.cutoff
+    )
+    np.testing.assert_array_equal(original.row_summary[index], expected[0])
+    np.testing.assert_array_equal(original.row_summary_flags[index], flags[0])
+
+    altered = EpisodeBuilder(perturb_after(panel, request.cutoff, keep_known=True)).build(request)
+    np.testing.assert_array_equal(original.row_summary[index], altered.row_summary[index])
+    np.testing.assert_array_equal(
+        original.row_summary_flags[index], altered.row_summary_flags[index]
+    )
+    assert not np.array_equal(original.x[index], altered.x[index])
+
+
+@pytest.mark.parametrize("lag_margin", [-0.01, 0, 0.01])
+def test_onset_and_lag_compete_for_the_same_free_slot(monkeypatch, lag_margin):
+    panel = _onset_panel()
+    item = panel.items[0]
+    driver = lag_panel(length=len(item.targets["y"])).items[0].dynamic["driver"]
+    panel = replace(
+        panel,
+        items=(replace(item, dynamic={**item.dynamic, "driver": driver}),),
+        roles={**panel.roles, "driver": "past"},
+    )
+    panel = _fill_legacy_slots(panel, MAX_FEATURE_ROWS - 3)
+    builder = EpisodeBuilder(panel, ScreeningConfig(no_evidence=0.0))
+    request = EpisodeRequest(0, (115,), 12, 64)
+    legacy = builder.build(request)
+    assert len(legacy.row_names) == MAX_FEATURE_ROWS
+    score = next(c.score for c in legacy.trace if c.name == "event")
+    monkeypatch.setattr(derived, "scan_delay", lambda *a, **k: (5, score + lag_margin, 0.0))
+    enabled = replace(request, derive=frozenset({"onset_rows", "lag_rows"}))
+    episode = builder.build(enabled)
+    names = ["driver~lag", "event~onset"]
+    if lag_margin < 0:
+        names.reverse()
+    assert set(episode.row_names) == {*legacy.row_names, names[0]}
+    assert [(c.name, c.removed) for c in episode.trace[len(legacy.trace) :]] == [
+        (names[0], None),
+        (names[1], "budget"),
+    ]
+    for i, name in enumerate(legacy.row_names):
+        np.testing.assert_array_equal(episode.x[episode.row_names.index(name)], legacy.x[i])
+    (planned,) = builder.plan_requests(0, (115,), 12, context=64, derive=enabled.derive)
+    _equal_exact(builder.build(planned), episode)
+    for restricted in (
+        replace(enabled, drop=frozenset({"features"})),
+        replace(enabled, keep_columns=frozenset({"driver"})),
+    ):
+        assert "event~onset" not in builder.build(restricted).row_names
+
+    full = EpisodeBuilder(_fill_legacy_slots(panel, MAX_FEATURE_ROWS - 2))
+    capped = full.build(request)
+    assert len(capped.row_names) == MAX_FEATURE_ROWS + 1
+    _equal_exact(capped, full.build(enabled))
+
+
+def test_onset_name_collision_builds_nothing():
+    panel = _onset_panel()
+    item = panel.items[0]
+    request = EpisodeRequest(0, (115,), 12, 64, derive=frozenset({"onset_rows"}))
+    assert "event~onset" in EpisodeBuilder(panel).build(request).row_names
+    panel = replace(
+        panel,
+        items=(replace(item, dynamic={**item.dynamic, "event~onset": np.zeros(192)}),),
+        roles={**panel.roles, "event~onset": "past"},
+    )
+    actual = EpisodeBuilder(panel).build(request)
+    assert "event~onset" not in actual.row_names
+    assert all(c.source != "derived" for c in actual.trace)
