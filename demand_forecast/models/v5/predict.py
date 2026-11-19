@@ -20,11 +20,17 @@ from .config import V5Config
 from .model import V5Model, V5Output, prune
 
 
+def _full_precision(value: Tensor) -> Tensor:
+    """Promote half precision to float32; leave float32 and float64 as they are."""
+    return value.float() if value.dtype in (torch.float16, torch.bfloat16) else value
+
+
 def v5_loss(
-    output: V5Output, batch: EpisodeBatch, config: V5Config
-) -> tuple[Tensor, dict[str, float]]:
+    output: V5Output, batch: EpisodeBatch, config: V5Config, *, label_cap: float | None = None
+) -> tuple[Tensor, dict[str, float | int]]:
     """Supervise real non-fallback rows and add gate and balance costs.
 
+    When set, ``label_cap`` excludes and counts cells beyond the absolute scaled limit.
     Dense expert mode supplies a zero balance cost through ``output.aux``.
     """
     eligible = (
@@ -37,22 +43,40 @@ def v5_loss(
     real_steps = steps[None, :] < batch.horizon[:, None]
     real_steps = real_steps & batch.horizon_mask.repeat_interleave(PATCH, dim=-1)
     mask = batch.label_mask & real_steps[:, None, None, :]
-    pinball, count = pinball_loss(
-        output.quantiles.flatten(0, 2),
-        batch.labels.flatten(0, 2),
-        mask.flatten(0, 2),
-        eligible.flatten(),
-        output.quantiles.new_tensor(config.quantiles),
-    )
-    sparsity, balance = output.gates.expected_l0, output.aux["balance"]
-    loss = pinball + config.sparsity_weight * sparsity + config.balance_weight * balance
-    return loss, {
+    capped = 0
+    with torch.autocast(output.quantiles.device.type, enabled=False):
+        predictions = _full_precision(output.quantiles).flatten(0, 2)
+        labels = _full_precision(batch.labels)
+        if label_cap is not None:
+            selected = mask & eligible[..., None]
+            # Compare in float64: exact for float32 and float64 labels and for any finite cap.
+            over_cap = labels.double().abs() > label_cap
+            capped = int((selected & over_cap).sum().item())
+            mask = selected & ~over_cap
+        if label_cap is not None and not mask.any():
+            # The empty sum stays connected to predictions and never reads a NaN.
+            pinball, count = predictions[:0].sum(), 0
+        else:
+            pinball, count = pinball_loss(
+                predictions,
+                labels.flatten(0, 2),
+                mask.flatten(0, 2),
+                eligible.flatten(),
+                predictions.new_tensor(config.quantiles),
+            )
+        sparsity = _full_precision(output.gates.expected_l0)
+        balance = _full_precision(output.aux["balance"])
+        loss = pinball + config.sparsity_weight * sparsity + config.balance_weight * balance
+    parts = {
         "pinball": float(pinball.detach()),
         "sparsity": float(sparsity.detach()),
         "balance": float(balance.detach()),
         "total": float(loss.detach()),
         "n_labels": float(count),
     }
+    if label_cap is not None:
+        parts["capped"] = capped
+    return loss, parts
 
 
 @dataclass

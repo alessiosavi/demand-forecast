@@ -105,7 +105,7 @@ def test_dense_mode_under_autocast():
         output = model(batch, router="learned")
         loss, _ = v5_loss(output, batch, cfg)
     loss.backward()
-    assert output.quantiles.dtype == torch.bfloat16
+    assert output.quantiles.dtype == torch.float32  # The head leaves autocast.
     assert output.router is None
     assert output.aux["balance"].count_nonzero().item() == 0
     assert torch.isfinite(loss)
