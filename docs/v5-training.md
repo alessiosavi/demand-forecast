@@ -294,7 +294,7 @@ When `naive_rows` is enabled, `zeroed_naive_rows` repeats the figures with
 those rows' horizon values and flags zeroed in the same batch layout.
 With `model.naive_mix` enabled, `anchor_off` masks the paths while preserving
 the decoder inputs. `anchor_only` replaces the forecast's median with the
-anchor. `mix_mean` gives the mean weights over real kept cells and
+anchor. `mix_mean` gives the mean weights over kept cells that have a label and
 `mix_no_seen_share` gives the fraction of those cells with no available
 path. The gate uses the main forecast.
 

@@ -200,7 +200,7 @@ def test_predict_uses_preflight_worker_count(make_adapter, monkeypatch, workers,
 
     requested_counts, forecast_counts = [], []
 
-    def preflight(requested, *, naive_anchor):
+    def preflight(requested, *, naive_anchor=False):
         assert not naive_anchor
         requested_counts.append(requested)
         return workers, reason

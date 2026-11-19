@@ -1116,3 +1116,32 @@ def test_qualify_releases_cold_loader_before_measuring_training(tmp_path, monkey
         panel_items=2,
         panel_length=64,
     )
+
+
+@pytest.mark.parametrize(
+    "derive,expected",
+    [((), {}), (("naive_anchor", "naive_rows"), {"naive_anchor": True})],
+    ids=["plain", "anchored"],
+)
+def test_qualify_preflight_knows_about_anchored_batches(tmp_path, monkeypatch, derive, expected):
+    measure = api()
+    calls = []
+
+    def preflight(requested, **options):
+        calls.append(options)
+        return 0, None
+
+    monkeypatch.setattr(measure, "usable_workers", preflight, raising=False)
+    c = config()
+    c = replace(c, sampler=replace(c.sampler, derive=derive))
+    measure.qualify(
+        c,
+        tmp_path,
+        models={"tiny": c.model},
+        updates=1,
+        workers=(0,),
+        panel_items=2,
+        panel_length=64,
+    )
+    # Without an anchor the call keeps the shape it had before the option existed.
+    assert calls == [expected]
