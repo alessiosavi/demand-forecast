@@ -1,12 +1,15 @@
 """Forecast panel items in bounded batches using each item's own origin."""
 
-from collections.abc import Iterator, Sequence
+import sys
+from collections.abc import Generator, Iterator, Sequence
+from contextlib import closing
 from dataclasses import dataclass, fields, replace
 from itertools import groupby, islice, tee
 from operator import itemgetter
 
 import numpy as np
 import torch
+from torch.utils.data import DataLoader, Dataset
 
 from demand_forecast.data.episode import (
     EpisodeBatch,
@@ -112,6 +115,95 @@ def _requests_for_job(
     ]
 
 
+def _validate_workers(workers: int, prefetch: int) -> None:
+    if type(workers) is not int or workers < 0:
+        raise ValueError("workers must be a nonnegative integer")
+    if workers > 0 and sys.platform != "linux":
+        raise ValueError("forecast workers are supported only on Linux")
+    if type(prefetch) is not int or prefetch < 1:
+        raise ValueError("prefetch must be a positive integer")
+
+
+def _collate_chunk(
+    builder: EpisodeBuilder, group: list[EpisodeRequest], summary_off: tuple[str, ...]
+) -> EpisodeBatch:
+    return collate([apply_summary_off(builder.build(req), summary_off) for req in group])
+
+
+class _EpisodeChunks(Dataset[EpisodeBatch]):
+    def __init__(
+        self,
+        builder: EpisodeBuilder,
+        groups: list[list[EpisodeRequest]],
+        summary_off: tuple[str, ...],
+    ) -> None:
+        self.builder = builder
+        self.groups = groups
+        self.summary_off = summary_off
+
+    def __len__(self) -> int:
+        return len(self.groups)
+
+    def __getitem__(self, index: int) -> EpisodeBatch:
+        return _collate_chunk(self.builder, self.groups[index], self.summary_off)
+
+
+def _forecast_batches(
+    builder: EpisodeBuilder,
+    requests: Iterator[EpisodeRequest],
+    origin: int,
+    batch_episodes: int,
+    summary_off: tuple[str, ...],
+    workers: int,
+    prefetch: int,
+) -> Generator[tuple[list[EpisodeRequest], EpisodeBatch], None, None]:
+    if not workers:
+        while group := list(islice(requests, batch_episodes)):
+            yield group, _collate_chunk(builder, group, summary_off)
+        return
+
+    from demand_forecast.pretrain.v5 import loop
+
+    groups = []
+    targets: set[str] = set()
+    while group := list(islice(requests, batch_episodes)):
+        groups.append(group)
+        for request in group:
+            if request.target is not None:
+                targets.add(request.target)
+                continue
+            item_targets = builder.panel.items[request.item_index].targets
+            # Joint screening reads the other targets only when static kinds exist.
+            stats = builder.stats.get(min(item_targets), origin)
+            if stats.static_kinds:
+                targets.update(item_targets)
+    # Workers inherit the same unbounded provider used for planning.
+    for target in sorted(targets):
+        builder.stats.get(target, origin)
+
+    iterator = iter(
+        DataLoader(
+            _EpisodeChunks(builder, groups, summary_off),
+            num_workers=workers,
+            multiprocessing_context="fork",
+            batch_size=None,
+            prefetch_factor=prefetch,
+            generator=torch.Generator(),
+        )
+    )
+    drained = False
+    try:
+        yield from zip(groups, iterator, strict=True)
+        drained = True
+    finally:
+        try:
+            loop._release(iterator)
+        except Exception:
+            # Preserve a loader error or the forecast error that triggered close().
+            if drained:
+                raise
+
+
 def _batch_to_model(batch: EpisodeBatch, device: torch.device, dtype: torch.dtype) -> EpisodeBatch:
     if dtype == torch.float32:
         return batch.to(device)
@@ -163,13 +255,23 @@ def forecast_items(
     router: str = "learned",
     pruned: bool = True,
     batch_episodes: int = 64,
+    workers: int = 0,
+    prefetch: int = 2,
 ) -> ItemForecasts:
     """Forecast one origin per item in the model's floating-point dtype and device.
 
     The cutoff is exclusive for observed inputs. Explicit layouts follow the
     input job order and can preserve the full panel's layout through ablations.
     Joint layout compatibility is checked before forecasting each origin.
+    On Linux, workers can build and collate chunks, with prefetch chunks queued
+    per worker. Statistics construction and model inference run in the caller.
     """
+    _validate_workers(workers, prefetch)
+    if workers:
+        # Pretraining imports the model, so load its helpers only at runtime.
+        from demand_forecast.pretrain.v5 import sampler
+
+        sampler._ensure_worker_file_limit(workers)
     if type(batch_episodes) is not int or batch_episodes < 1:
         raise ValueError("batch_episodes must be a positive integer")
     if router not in ("learned", "uniform"):
@@ -219,25 +321,33 @@ def forecast_items(
                             drop,
                         )
                     )
-                    while group := list(islice(requests, batch_episodes)):
-                        batch = collate(
-                            [apply_summary_off(builder.build(req), summary_off) for req in group]
+                    with closing(
+                        _forecast_batches(
+                            builder,
+                            requests,
+                            origin,
+                            batch_episodes,
+                            summary_off,
+                            workers,
+                            prefetch,
                         )
-                        batch = _batch_to_model(batch, device, dtype)
-                        selected = model.gates(batch, mode=gates)
-                        if pruned:
-                            batch, selected = prune(batch, selected)
-                        quantiles = model(batch, selected, router=router).quantiles[:, 0]
-                        for key, value, used_fallback in _kept_forecasts(
-                            batch, quantiles, group, horizon
-                        ):
-                            if not np.isfinite(value).all():
-                                item = panel.items[key[0]].item_id
-                                raise ValueError(f"nonfinite forecast for {item!r}, {key[1]!r}")
-                            values[key] = value
-                            if used_fallback:
-                                fallback.add(key)
-                        del batch, selected, quantiles
+                    ) as batches:
+                        for group, batch in batches:
+                            batch = _batch_to_model(batch, device, dtype)
+                            selected = model.gates(batch, mode=gates)
+                            if pruned:
+                                batch, selected = prune(batch, selected)
+                            quantiles = model(batch, selected, router=router).quantiles[:, 0]
+                            for key, value, used_fallback in _kept_forecasts(
+                                batch, quantiles, group, horizon
+                            ):
+                                if not np.isfinite(value).all():
+                                    item = panel.items[key[0]].item_id
+                                    raise ValueError(f"nonfinite forecast for {item!r}, {key[1]!r}")
+                                values[key] = value
+                                if used_fallback:
+                                    fallback.add(key)
+                            del batch, selected, quantiles
                 finally:
                     stats.release(origin)
     finally:
