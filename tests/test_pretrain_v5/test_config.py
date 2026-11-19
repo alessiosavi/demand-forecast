@@ -405,6 +405,15 @@ def test_router_and_gates_reject_unknown_modes(field):
 _INVALID_ROLLED_SAMPLER_OPTIONS = [("episodes_per_batch", 1), ("max_cells", 100)]
 
 
+@pytest.mark.parametrize("router", ["uniform", "rolled"])
+def test_dense_expert_mode_requires_the_learned_router(router):
+    base = config_module().T1_BASE
+    dense = replace(base.model, expert_mode="dense")
+    assert replace(base, model=dense).router == "learned"
+    with pytest.raises(ValueError, match="dense expert mode requires router=learned"):
+        replace(base, model=dense, router=router)
+
+
 @pytest.mark.parametrize("field,value", _INVALID_ROLLED_SAMPLER_OPTIONS)
 def test_rolled_config_rejects_sampler_options_that_allow_singletons(field, value):
     base = config_module().T1_BASE

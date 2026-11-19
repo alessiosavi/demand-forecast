@@ -287,6 +287,8 @@ class V5TrainConfig:
             raise ValueError("router must be learned, uniform or rolled")
         if self.gates not in ("learned", "ones"):
             raise ValueError("gates must be learned or ones")
+        if self.model.expert_mode == "dense" and self.router != "learned":
+            raise ValueError("the dense expert mode requires router=learned")
         if self.router == "rolled":
             if self.sampler.episodes_per_batch < 2:
                 raise ValueError(
