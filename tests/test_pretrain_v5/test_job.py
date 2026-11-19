@@ -1,17 +1,20 @@
 """P7 units publish only after real, resumable work and verified artifacts."""
 
 import copy
+import hashlib
 import importlib
 import json
 import signal
 import subprocess
 import sys
 import time
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import pytest
+import torch
 
+from demand_forecast.models.v5 import V5Model
 from demand_forecast.pretrain.v5 import checkpoint, loop, measure, t1
 from demand_forecast.pretrain.v5.checkpoint import file_digest, latest_checkpoint, read_manifest
 from demand_forecast.pretrain.v5.config import V5TrainConfig
@@ -37,6 +40,135 @@ def settings(tmp_path):
 def args(tmp_path, action="train", **values):
     options = dict(run_dir=tmp_path, code=CODE, job_sha256=JOB, env_sha256=ENV, **values)
     return [action, *(s for k, v in options.items() for s in ("--" + k.replace("_", "-"), str(v)))]
+
+
+@pytest.fixture
+def export_api():
+    return importlib.import_module("demand_forecast.models.v5.export")
+
+
+@pytest.fixture
+def export_checkpoint(tmp_path):
+    training = config(steps=1)
+    with torch.random.fork_rng(devices=[]):
+        torch.random.default_generator.manual_seed(123)
+        model = V5Model(training.model)
+    path, _ = checkpoint.save_checkpoint(
+        tmp_path / "input",
+        {
+            "model": model.state_dict(),
+            "export": "model",
+            "config": asdict(training),
+            "identity": "seeded-checkpoint",
+            "counters": {"batch": 1, "updates": 1, "saves": 1},
+        },
+        counter=1,
+    )
+    return path
+
+
+def export_args(run, source, digest):
+    return args(run, "export", name="model", checkpoint_file=source, checkpoint_sha256=digest)
+
+
+def test_export_publishes_verified_unit_and_reuses_it(
+    job, export_api, export_checkpoint, tmp_path, monkeypatch
+):
+    run = tmp_path / "run"
+    digest = file_digest(export_checkpoint)
+    command = export_args(run, export_checkpoint, digest)
+    assert job.main(command) == 0
+
+    unit = run / "state/export/model"
+    manifest = read_manifest(unit / "unit.json")
+    assert manifest is not None
+    files = {"config.json", "model.safetensors", "parity.npz"}
+    assert set(manifest["files"]) == files
+    assert {p.name for p in unit.iterdir()} == files | {"unit.json"}
+    assert manifest["code"] == CODE
+    assert manifest["job_sha256"] == JOB
+    assert manifest["env_sha256"] == ENV
+    canonical = (
+        f'{{"action":"export","checkpoint_sha256":"{digest}","code":"{CODE}",'
+        f'"env_sha256":"{ENV}","name":"model"}}'
+    )
+    assert manifest["identity"] == hashlib.sha256(canonical.encode()).hexdigest()
+    _, metadata = export_api.load_export(unit)
+    assert metadata["source"]["sha256"] == digest
+    export_api.require_parity(unit)
+    assert list((run / "staging").iterdir()) == []
+
+    before = {p.name: (p.stat().st_ino, p.read_bytes()) for p in unit.iterdir()}
+
+    def unexpected_export(*_args):
+        pytest.fail("a valid unit should skip export")
+
+    monkeypatch.setattr(export_api, "write_export", unexpected_export)
+    assert job.main(command) == 0
+    assert {p.name: (p.stat().st_ino, p.read_bytes()) for p in unit.iterdir()} == before
+
+
+def test_export_rejects_wrong_digest_before_writing(job, export_checkpoint, tmp_path, capsys):
+    run = tmp_path / "run"
+    assert job.main(export_args(run, export_checkpoint, "0" * 64)) == 1
+    assert "checkpoint SHA-256 mismatch" in capsys.readouterr().err
+    assert not run.exists()
+
+
+def test_export_failure_during_promotion_publishes_no_unit(
+    job, export_checkpoint, tmp_path, monkeypatch
+):
+    run = tmp_path / "run"
+    command = export_args(run, export_checkpoint, file_digest(export_checkpoint))
+    manifest = run / "state/export/model/unit.json"
+    original, promoted = job._copy, []
+
+    def interrupted(source, destination, staging):
+        promoted.append(destination.name)
+        if len(promoted) == 2:
+            raise OSError("simulated crash")
+        original(source, destination, staging)
+
+    monkeypatch.setattr(job, "_copy", interrupted)
+    assert job.main(command) == 1
+    assert len(promoted) == 2
+    assert read_manifest(manifest) is None
+    monkeypatch.setattr(job, "_copy", original)
+    assert job.main(command) == 0
+    files = {"config.json", "model.safetensors", "parity.npz"}
+    assert set(read_manifest(manifest)["files"]) == files
+
+
+@pytest.mark.parametrize("action", ["train", "export"])
+def test_invalid_unit_manifest_is_removed_before_retry(
+    job, export_api, export_checkpoint, tmp_path, monkeypatch, action
+):
+    run = tmp_path / "run"
+    if action == "train":
+        settings = tmp_path / "config.yaml"
+        config(steps=1).to_yaml(settings)
+        command = args(run, config=settings, name="model")
+        module, compute = loop, "train"
+    else:
+        command = export_args(run, export_checkpoint, file_digest(export_checkpoint))
+        module, compute = export_api, "write_export"
+    assert job.main(command) == 0
+    manifest = run / "state" / action / "model/unit.json"
+    manifest.write_text("{")
+    assert read_manifest(manifest) is None
+    original = getattr(module, compute)
+    retried = False
+
+    def retry(*values, **options):
+        nonlocal retried
+        assert not manifest.exists()
+        retried = True
+        return original(*values, **options)
+
+    monkeypatch.setattr(module, compute, retry)
+    assert job.main(command) == 0
+    assert retried
+    assert read_manifest(manifest) is not None
 
 
 def test_train_stop_resume_does_not_repeat_batches(job, settings, tmp_path):

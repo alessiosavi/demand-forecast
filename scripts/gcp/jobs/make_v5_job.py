@@ -198,14 +198,43 @@ def generate(
     corpus_uri: str | None = None,
     corpus_digest: str | None = None,
     upstream: bool = False,
+    member_uri: str | None = None,
+    member_sha256: str | None = None,
 ) -> str:
     """Return one deterministic shell script; config/base name local YAML files."""
     _name(name, "name")
     _hex(repo_sha, 40, "repo_sha")
     if type(upstream) is not bool:
         raise ValueError("upstream must be a boolean")
-    if action not in ("train", "qualify", "t1"):
-        raise ValueError("action must be train, qualify or t1")
+    if action not in ("train", "qualify", "t1", "export"):
+        raise ValueError("action must be train, qualify, t1 or export")
+    if action == "export":
+        if upstream or any(
+            value is not None
+            for value in (
+                config,
+                corpus_uri,
+                corpus_digest,
+                init_uri,
+                init_sha256,
+                base,
+                leg,
+                path,
+                arm,
+                seed,
+                episodes,
+                max_panels,
+            )
+        ):
+            raise ValueError(
+                "export does not support config, corpus, upstream, init, leg or T1 arguments"
+            )
+        if member_uri is None or member_sha256 is None:
+            raise ValueError("export requires member_uri and member_sha256")
+        _uri(member_uri)
+        _hex(member_sha256, 64, "member_sha256")
+    elif member_uri is not None or member_sha256 is not None:
+        raise ValueError("member_uri and member_sha256 apply only to export")
     if upstream and action == "t1":
         raise ValueError("--upstream is not supported for t1")
     if (corpus_uri is None) != (corpus_digest is None):
@@ -246,6 +275,9 @@ def generate(
             str(max_panels),
         ]
         config_path, config_flag = base, "--base"
+    elif action == "export":
+        unit = f"state/export/{name}"
+        command += ["--name", name]
     else:
         if config is None or any(
             v is not None for v in (base, path, arm, seed, episodes, max_panels)
@@ -257,25 +289,36 @@ def generate(
         unit = f"state/{action}/{unit_name}"
         command += ["--name", unit_name]
         config_path, config_flag = config, "--config"
-    data = Path(config_path).read_bytes()
-    # T1 embeds the exact base bytes; the installed job validates the YAML.
-    # Only train/qualify need to inspect corpus settings during generation.
-    if action != "t1":
-        import yaml
+    member_step = config_step = ""
+    if action == "export":
+        member_step = f"""gcloud storage cp {shlex.quote(member_uri)} "$scratch/checkpoint-final.pt"
+[[ $(python3 "$helper" hash "$scratch/checkpoint-final.pt") == {member_sha256} ]] || {{ echo 'checkpoint SHA-256 mismatch' >&2; exit 2; }}
+"""
+        input_args = (
+            f'--checkpoint-file "$scratch/checkpoint-final.pt" --checkpoint-sha256 {member_sha256}'
+        )
+    else:
+        data = Path(config_path).read_bytes()
+        # T1 embeds the exact base bytes; the installed job validates the YAML.
+        # Only train/qualify need to inspect corpus settings during generation.
+        if action != "t1":
+            import yaml
 
-        parsed = yaml.safe_load(data)
-        if not isinstance(parsed, dict):
-            raise ValueError("configuration requires a mapping")
-        sources = parsed.get("sources", [])
-        if any(s.get("kind") == "corpus" and s.get("root") is not None for s in sources):
-            raise ValueError("cloud corpus sources must carry root: null")
-        if any(s.get("kind") == "corpus" for s in sources) != (corpus_uri is not None):
-            raise ValueError("corpus sources and corpus_uri must be supplied together")
-        if any(s.get("kind") == "upstream" for s in sources) != upstream:
-            raise ValueError("upstream sources and --upstream must be supplied together")
+            parsed = yaml.safe_load(data)
+            if not isinstance(parsed, dict):
+                raise ValueError("configuration requires a mapping")
+            sources = parsed.get("sources", [])
+            if any(s.get("kind") == "corpus" and s.get("root") is not None for s in sources):
+                raise ValueError("cloud corpus sources must carry root: null")
+            if any(s.get("kind") == "corpus" for s in sources) != (corpus_uri is not None):
+                raise ValueError("corpus sources and corpus_uri must be supplied together")
+            if any(s.get("kind") == "upstream" for s in sources) != upstream:
+                raise ValueError("upstream sources and --upstream must be supplied together")
+        packed_config = base64.b64encode(data).decode()
+        config_sha = hashlib.sha256(data).hexdigest()
+        config_step = f'python3 "$helper" config {shlex.quote(packed_config)} {config_sha} "$scratch/config.yaml"\n'
+        input_args = f'{config_flag} "$scratch/config.yaml"'
     packed_helper = base64.b64encode(GUEST.encode()).decode()
-    packed_config = base64.b64encode(data).decode()
-    config_sha = hashlib.sha256(data).hexdigest()
     command_text = shlex.join(command)
     upstream_step = upstream_path = ""
     if upstream:
@@ -330,7 +373,7 @@ git -C "$repo" remote add origin https://github.com/alessiosavi/demand-forecast.
 git -C "$repo" fetch --depth=1 origin {repo_sha}
 git -C "$repo" checkout --detach FETCH_HEAD
 [[ $(git -C "$repo" rev-parse HEAD) == {repo_sha} ]] || {{ echo 'repository SHA mismatch' >&2; exit 2; }}
-{upstream_step}if ! command -v uv >/dev/null 2>&1; then
+{upstream_step}{member_step}if ! command -v uv >/dev/null 2>&1; then
     python3 -m pip install --target "$scratch/uv-bootstrap" uv
     export PATH="$scratch/uv-bootstrap/bin:$PATH"
 fi
@@ -360,9 +403,8 @@ extra+=(--corpus-root "$RUN_DIR/corpus")
         script += f"""gcloud storage cp {shlex.quote(init_uri)} "$scratch/initial.pt"
 extra+=(--init-file "$scratch/initial.pt" --init-sha256 {init_sha256})
 """
-    script += f"""python3 "$helper" config {shlex.quote(packed_config)} {config_sha} "$scratch/config.yaml"
-exec "$python" -m demand_forecast.pretrain.v5.job {command_text} \\
-    {config_flag} "$scratch/config.yaml" --run-dir "$RUN_DIR" --code {repo_sha} \\
+    script += f"""{config_step}exec "$python" -m demand_forecast.pretrain.v5.job {command_text} \\
+    {input_args} --run-dir "$RUN_DIR" --code {repo_sha} \\
     --job-sha256 "$job_sha256" --env-sha256 "$env_sha256" ${{extra[@]+"${{extra[@]}}"}}
 """
     return script
@@ -382,6 +424,8 @@ def main(argv: list[str] | None = None) -> int:
         "arm",
         "corpus-uri",
         "corpus-digest",
+        "member-uri",
+        "member-sha256",
     ):
         parser.add_argument("--" + key)
     for key in ("seed", "episodes", "max-panels"):

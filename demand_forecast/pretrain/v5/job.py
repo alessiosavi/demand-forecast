@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import re
@@ -44,7 +45,7 @@ def _positive(value: str) -> int:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     actions = parser.add_subparsers(dest="action", required=True)
-    for action in ("train", "qualify", "t1"):
+    for action in ("train", "qualify", "t1", "export"):
         sub = actions.add_parser(action)
         sub.add_argument("--run-dir", type=Path, required=True)
         sub.add_argument("--code", type=lambda v: _hex(v, 40), required=True)
@@ -57,6 +58,10 @@ def _parser() -> argparse.ArgumentParser:
             sub.add_argument("--seed", type=int, required=True)
             sub.add_argument("--episodes", type=_positive, default=T1_EVAL_DEFAULTS[0])
             sub.add_argument("--max-panels", type=_positive, default=T1_EVAL_DEFAULTS[1])
+        elif action == "export":
+            sub.add_argument("--name", type=_name, required=True)
+            sub.add_argument("--checkpoint-file", type=Path, required=True)
+            sub.add_argument("--checkpoint-sha256", type=lambda v: _hex(v, 64), required=True)
         else:
             sub.add_argument("--config", type=Path, required=True)
             sub.add_argument("--name", type=_name, required=True)
@@ -97,6 +102,48 @@ def _complete(unit: Path, expected: dict) -> bool:
         return True
     (unit / "unit.json").unlink(missing_ok=True)
     return False
+
+
+def _publish_unit(unit: Path, expected: dict, files: list[str]) -> None:
+    write_manifest(unit / "unit.json", {**expected, "files": files})
+    if read_manifest(unit / "unit.json") is None:
+        raise RuntimeError("unit publication does not validate")
+
+
+def _run_export(args: argparse.Namespace, unit: Path) -> int:
+    from demand_forecast.models.v5.export import load_export, require_parity, write_export
+
+    inputs = {
+        "action": "export",
+        "name": args.name,
+        "code": args.code,
+        "env_sha256": args.env_sha256,
+        "checkpoint_sha256": args.checkpoint_sha256,
+    }
+    canonical = json.dumps(inputs, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    expected = {
+        "code": args.code,
+        "job_sha256": args.job_sha256,
+        "env_sha256": args.env_sha256,
+        "identity": hashlib.sha256(canonical.encode()).hexdigest(),
+    }
+    if _complete(unit, expected):
+        return 0
+
+    files = ["config.json", "model.safetensors", "parity.npz"]
+    staging = args.run_dir / "staging"
+    staging.mkdir(parents=True, exist_ok=True)
+    with TemporaryDirectory(prefix="export-", dir=staging) as temporary:
+        output = Path(temporary) / "artifact"
+        metadata = write_export(args.checkpoint_file, output)
+        if metadata["source"]["sha256"] != args.checkpoint_sha256:
+            raise ValueError("checkpoint SHA-256 mismatch during export")
+        load_export(output)
+        require_parity(output)
+        for name in files:
+            _copy(output / name, unit / name, staging)
+    _publish_unit(unit, expected, files)
+    return 0
 
 
 def _comparison_arm(directory: Path, expected: dict, config: V5TrainConfig) -> tuple[dict, dict]:
@@ -329,9 +376,7 @@ def _run(args, unit: Path, training: Path) -> int:
             if read_manifest(unit / "train.json") is None:
                 raise RuntimeError("copied training manifest does not validate")
             files.append("result.json")
-    write_manifest(unit / "unit.json", {**expected, "files": files})
-    if read_manifest(unit / "unit.json") is None:
-        raise RuntimeError("unit publication does not validate")
+    _publish_unit(unit, expected, files)
     return 0
 
 
@@ -352,6 +397,14 @@ def main(argv: list[str] | None = None) -> int:
     else:
         unit = args.run_dir / "state" / args.action / args.name
         training = unit
+    if args.action == "export":
+        # Reject an unverified input before creating or invalidating any unit state.
+        try:
+            if file_digest(args.checkpoint_file) != args.checkpoint_sha256:
+                raise ValueError("checkpoint SHA-256 mismatch")
+        except (OSError, ValueError) as error:
+            print(f"export: {error}", file=sys.stderr)
+            return 1
     unit.mkdir(parents=True, exist_ok=True)
     (unit / "failure.json").unlink(missing_ok=True)
 
@@ -360,6 +413,8 @@ def main(argv: list[str] | None = None) -> int:
 
     previous = signal.signal(signal.SIGTERM, stop)
     try:
+        if args.action == "export":
+            return _run_export(args, unit)
         return _run(args, unit, training)
     except KeyboardInterrupt:
         (unit / "unit.json").unlink(missing_ok=True)
