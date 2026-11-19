@@ -1185,14 +1185,16 @@ receipts and statistics by design. The 4.1 release checker
 (`scripts/corpus_v4/verify_published.py`) and the release inventory require
 those records and refuse a 4.2 prefix. Use 4.1 for the overlap audit.
 
-Generate the guest script with the full code revision in `REPO_SHA` and the
-reviewed 4.1 training-tree listing digest in `PARENT_DIGEST`.
+Generate the guest script with the full code revision in `REPO_SHA`, the
+reviewed 4.1 training-tree listing digest in `PARENT_DIGEST`, and the bucket
+prefixes of the 4.1 parent and of the new 4.2 tree in `PARENT_URI` and
+`OUTPUT_URI`.
 
 ```bash
 python -m scripts.corpus_v4.make_regroup_job \
   --name regroup-example --repo-sha "$REPO_SHA" \
-  --parent-uri gs://example-bucket/corpus-v4.1 --parent-digest "$PARENT_DIGEST" \
-  --output-uri gs://example-bucket/corpus-v4.2 --output /tmp/regroup-example.sh
+  --parent-uri "$PARENT_URI" --parent-digest "$PARENT_DIGEST" \
+  --output-uri "$OUTPUT_URI" --output /tmp/regroup-example.sh
 ```
 
 Give the guest an absolute `RUN_DIR` and a `STATE_URI` disjoint from both corpus
