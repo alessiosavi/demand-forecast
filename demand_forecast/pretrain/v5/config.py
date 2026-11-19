@@ -159,9 +159,11 @@ class SamplerConfig:
     screen_no_evidence: float = 0.0
     cold_share: float = 0.0
     cold_steps: tuple[int, int] = (3, 4)
+    first_event_only: bool = False
 
     def __post_init__(self) -> None:
         _flag(self, "designate_target")
+        _flag(self, "first_event_only")
         for name in ("episodes_per_batch", "episodes_per_panel", "origins", "origin_stride"):
             _normalize(self, name, integer=True, minimum=1)
         if not self.contexts:
@@ -320,6 +322,8 @@ class V5TrainConfig:
             del data["sampler"]["cold_share"]
         if self.sampler.cold_steps == (3, 4):
             del data["sampler"]["cold_steps"]
+        if not self.sampler.first_event_only:
+            del data["sampler"]["first_event_only"]
         for source in data["sources"]:
             del source["root"]
         return data

@@ -204,7 +204,7 @@ def test_paths_recipes_37_valid_arms_and_exact_overrides():
         module.t1_config("bank", "typo", seed=0)
 
 
-def test_only_the_three_repaired_paths_change():
+def test_only_the_four_repaired_paths_change():
     module = api()
     assert module.PATHS.keys() == _BASE_ARM_DIGESTS.keys()
     for path, entry in module.PATHS.items():
@@ -212,6 +212,7 @@ def test_only_the_three_repaired_paths_change():
         for arm in entry["arms"]:
             cfg = asdict(module.t1_config(path, arm, seed=7))
             sampler = cfg["sampler"]
+            assert sampler.pop("first_event_only") is (path == "event_response")
             cold_share = sampler.pop("cold_share")
             assert sampler.pop("cold_steps") == (3, 4)
             if path in ("static_category", "multi_label"):
@@ -257,6 +258,20 @@ def test_eval_set_of_several_targets_uses_short_horizons():
     assert max(entry["horizon"] for entry in entries) == 4
 
 
+def _assert_no_own_earlier_events(generated, entry):
+    item = next(item for item in generated.complete.items if item.item_id == entry["item_id"])
+    flag = next(r.name for r in generated.inputs_of("event_response") if r.where == "dynamic")
+    assert not (item.dynamic[flag][: entry["origin"] - item.start] == 1).any(), entry
+
+
+def test_eval_set_of_event_response_has_no_own_earlier_events():
+    entries = api().eval_set("event_response", episodes=30, max_panels=400)
+    assert len(entries) == 30
+    for entry in entries:
+        generated = generate_typed_panel(PanelRecipe(**entry["recipe"]))
+        _assert_no_own_earlier_events(generated, entry)
+
+
 @pytest.mark.parametrize("path", PATH_NAMES)
 def test_eval_set_supported_present_labelled_deterministic(small, path):
     episodes = small.eval_set(path, episodes=2, max_panels=60, min_count=1)
@@ -276,9 +291,12 @@ def test_eval_set_supported_present_labelled_deterministic(small, path):
                 context=entry["context"],
                 horizon=entry["horizon"],
                 cutoff=entry["cutoff"],
+                first_event_only=cfg.sampler.first_event_only,
             )
             for m in mechanisms
         )
+        if path == "event_response":
+            _assert_no_own_earlier_events(generated, entry)
         built = small._build(generated, entry, cfg)
         assert built.label_mask.any() and not built.fallback[built.keep].any()
         assert small._present(path, generated, built, mechanisms)
@@ -302,6 +320,18 @@ def test_default_eval_set_reproduces_the_base_revision_digest(monkeypatch):
     custom_sampler = replace(module.T1_BASE.sampler, contexts=(64,), horizon=(16, 24))
     custom_base = replace(module.T1_BASE, sampler=custom_sampler)
     assert module.eval_set("static_category", base=custom_base, **options) == entries
+
+
+def test_planned_event_eval_set_preserves_first_event_slice_and_digest():
+    module = api()
+    entries = module.eval_set("planned_event", episodes=200, max_panels=1000)
+    assert len(entries) == 200
+    first_events = [i for i, entry in enumerate(entries) if "first_event" in entry["slices"]]
+    assert first_events == [5, 25, 36, 55, 92, 114, 118, 126, 127, 137, 185, 188, 198]
+    assert (
+        module.eval_digest(entries)
+        == "7eae8a6dd21daa58d634c3b34266e10be37fd3d3270e3fbdfe09116bf04812cf"
+    )
 
 
 def test_eval_limit_required_bank_quota_and_digest_order(small):

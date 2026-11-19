@@ -151,6 +151,7 @@ def _plan_panel(panel, record, config, source, rng, *, path_quota=None, ordinary
                 context=context,
                 horizon=horizon,
                 cutoff=frame[1],
+                first_event_only=config.first_event_only,
             ):
                 lead, anchor, mechanism = index, t, candidate
                 lead_frame, lead_cold = frame, is_cold
@@ -181,6 +182,7 @@ def _plan_panel(panel, record, config, source, rng, *, path_quota=None, ordinary
                 context=context,
                 horizon=horizon,
                 cutoff=cutoff,
+                first_event_only=config.first_event_only,
             ):
                 selected.append((index, mechanism))
         path_items = {index for index, _ in selected}
