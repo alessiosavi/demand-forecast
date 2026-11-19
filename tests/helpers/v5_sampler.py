@@ -56,6 +56,23 @@ def panel(length=96, count=4, targets=1):
     )
 
 
+def paired_static_panel():
+    """Panel whose paired labels get a perfect legacy spread score."""
+    data = panel(count=12)
+    offsets = np.random.default_rng(23).permutation(len(data.items))
+    return replace(
+        data,
+        items=tuple(
+            replace(
+                item,
+                targets={"y0": item.targets["y0"] - i + offsets[i]},
+                static={"pair": f"group{i // 2}"},
+            )
+            for i, item in enumerate(data.items)
+        ),
+    )
+
+
 class FixedSource:
     def __init__(self, value, record=None):
         self.value = value

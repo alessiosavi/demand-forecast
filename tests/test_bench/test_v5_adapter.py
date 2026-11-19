@@ -35,6 +35,7 @@ from demand_forecast.pretrain.v5 import (  # noqa: E402
     identity,
     save_checkpoint,
 )
+from tests.helpers.v5_sampler import paired_static_panel  # noqa: E402
 
 HORIZON = 2
 TOL = {"atol": 1e-5, "rtol": 1e-5}
@@ -43,7 +44,9 @@ TASK = SimpleNamespace(
 )
 
 
-def _export(directory, *, drop=(), summary=(), threshold=0.0, sampler_options=None):
+def _export(
+    directory, *, drop=(), summary=(), threshold=0.0, fair_spread=False, sampler_options=None
+):
     config = V5TrainConfig(
         V5Config(
             d_model=16,
@@ -70,6 +73,8 @@ def _export(directory, *, drop=(), summary=(), threshold=0.0, sampler_options=No
         OptimConfig(max_steps=1, warmup_steps=0, ema_decay=None),
         device="cpu",
     )
+    if fair_spread:
+        config = replace(config, sampler=replace(config.sampler, screen_fair_spread=True))
     config.to_yaml(directory / "training.yaml")
     config = V5TrainConfig.from_yaml(directory / "training.yaml")
     with torch.random.fork_rng(devices=[]):
@@ -299,6 +304,24 @@ def _capture_episodes(monkeypatch):
 
     monkeypatch.setattr(EpisodeBuilder, "build", record)
     return episodes
+
+
+def test_fair_spread_reaches_every_screening_site(make_adapter, tmp_path, monkeypatch):
+    legacy = make_adapter()
+    calibrated = make_adapter(checkpoint=_export(tmp_path, fair_spread=True))
+    panel = paired_static_panel()
+    window = _window(len(panel.items))
+    for series, item in zip(window.items, panel.items, strict=True):
+        series.target = item.targets["y0"][None, :48]
+        series.static = item.static
+    episodes = _capture_episodes(monkeypatch)
+
+    def score(adapter):
+        adapter.predict([window], HORIZON, [0.5])
+        episode = episodes["sku-0", None]
+        return episode.cand_score[episode.cand_names.index("pair")]
+
+    assert score(calibrated) < score(legacy) == pytest.approx(1.0)
 
 
 def test_off_grid_items_are_forecast_alone_and_the_rest_keep_their_peers(make_adapter, monkeypatch):

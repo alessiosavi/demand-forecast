@@ -6,11 +6,13 @@ import importlib
 import json
 from dataclasses import asdict, replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
 
+from demand_forecast.data.episode import EpisodeBuilder, EpisodeRequest
 from demand_forecast.data.episode.schema import (
     CH_STEP_FLAG,
     N_SUMMARY,
@@ -26,6 +28,7 @@ from demand_forecast.pretrain.v5.checkpoint import save_checkpoint
 from demand_forecast.pretrain.v5.support import supported
 from demand_forecast.synthetic.typed import PanelRecipe, generate_typed_panel
 from tests.helpers.v5_loop import config
+from tests.helpers.v5_sampler import paired_static_panel
 from tests.test_pretrain_v5.test_sources import equal_panels
 
 PATH_NAMES = (
@@ -220,6 +223,7 @@ def test_only_the_four_repaired_paths_change():
                 assert source.pop("plain_share") == 0.0
             assert sampler.pop("first_event_only") is (path == "event_response")
             assert sampler.pop("derive") == ()
+            assert sampler.pop("screen_fair_spread") is False
             cold_share = sampler.pop("cold_share")
             assert sampler.pop("cold_steps") == (3, 4)
             if path in ("static_category", "multi_label"):
@@ -497,6 +501,43 @@ def test_t1_evaluation_uses_the_configured_level(monkeypatch, tmp_path):
     observed.clear()
     module.evaluate(checkpoint, "static_category", "null", episodes)
     assert observed == [expected, expected]
+
+
+@pytest.mark.parametrize("site", ["eval-set", "replay"])
+def test_fair_spread_reaches_every_screening_site(site, monkeypatch):
+    module = api()
+    panel = paired_static_panel()
+    request = EpisodeRequest(0, (48,), 8, context=48, target="y0")
+    entry = {
+        "item_id": panel.items[0].item_id,
+        "origin": 48,
+        "horizon": 8,
+        "context": 48,
+        "target": "y0",
+        "cutoff": 48,
+    }
+
+    def score(enabled):
+        base = module.T1_BASE
+        base = replace(base, sampler=replace(base.sampler, screen_fair_spread=enabled))
+        if site == "replay":
+            cfg = module.t1_config("static_category", "true", seed=0, base=base)
+            episode = module._build(SimpleNamespace(panel=panel), entry, cfg)
+            return episode.cand_score[episode.cand_names.index("pair")]
+
+        scores = []
+
+        def observe(candidate_panel, screening):
+            episode = EpisodeBuilder(panel, screening).build(request)
+            scores.append(episode.cand_score[episode.cand_names.index("pair")])
+            return EpisodeBuilder(candidate_panel, screening)
+
+        monkeypatch.setattr(module, "EpisodeBuilder", observe)
+        assert module.eval_set("static_category", episodes=1, min_count=1, max_panels=30, base=base)
+        assert len(set(scores)) == 1
+        return scores[0]
+
+    assert score(True) < score(False) == pytest.approx(1.0)
 
 
 def test_absent_screened_candidate_is_counted_and_still_scored(small, monkeypatch):
