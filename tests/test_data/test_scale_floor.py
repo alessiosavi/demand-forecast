@@ -198,7 +198,9 @@ def test_screen_refuses_statistics_of_another_floor():
     unfloored = panel_stats.PanelStats(panel, "y", CUTOFF)
     floored = panel_stats.PanelStats(panel, "y", CUTOFF, scale_floor=FLOOR)
     with pytest.raises(ValueError, match="scale_floor"):
-        screening.screen(panel, unfloored, 0, ("y", "z"), CUTOFF, ScreeningConfig(scale_floor=FLOOR))
+        screening.screen(
+            panel, unfloored, 0, ("y", "z"), CUTOFF, ScreeningConfig(scale_floor=FLOOR)
+        )
     with pytest.raises(ValueError, match="scale_floor"):
         screening.screen(panel, floored, 0, ("y", "z"), CUTOFF, ScreeningConfig())
     screening.screen(panel, floored, 0, ("y", "z"), CUTOFF, ScreeningConfig(scale_floor=FLOOR))
