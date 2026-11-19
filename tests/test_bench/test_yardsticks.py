@@ -945,12 +945,14 @@ def v5_run(panel_task, v5_export, tmp_path):
 
 def test_run_yardstick_with_v5(v5_run, monkeypatch):
     from demand_forecast.bench import yardsticks
+    from demand_forecast.bench.yardsticks import v5_adapter
     from demand_forecast.bench.yardsticks.runner import file_digest
     from scripts.fev_yardstick import main
 
     tasks, options, out = v5_run
     task = tasks[0]
     monkeypatch.setattr(yardsticks, "load_tasks", lambda path, names: [task])
+    monkeypatch.setattr(v5_adapter, "usable_workers", lambda requested: (0, "injected"))
     assert (
         main(
             [
@@ -988,6 +990,8 @@ def test_run_yardstick_with_v5(v5_run, monkeypatch):
     report = json.loads((directory / "v5-report.json").read_text())
     assert report["v5_short_items"] == 4
     assert report["v5_workers"] == 0
+    assert report.pop("v5_worker_reason") == "injected"
+    assert "v5_worker_reason" not in frame.columns
     assert all(frame[key].iloc[0] == value for key, value in report.items())
     assert record["evidence_sha256"] == {
         filename: file_digest(directory / filename)

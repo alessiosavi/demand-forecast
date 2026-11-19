@@ -274,7 +274,10 @@ class CorpusIndex:
         if power is None:
             return int(rng.integers(self.rows))
         weights = np.array([folder.values for folder in self.folders], dtype=np.float64) ** power
-        folder = self.folders[int(rng.choice(len(self.folders), p=weights / weights.sum()))]
+        total_weight = weights.sum()
+        if total_weight <= 0:
+            raise ValueError("corpus folders hold no values to weight")
+        folder = self.folders[int(rng.choice(len(self.folders), p=weights / total_weight))]
         return int(rng.integers(folder.first_row, folder.first_row + folder.rows))
 
 

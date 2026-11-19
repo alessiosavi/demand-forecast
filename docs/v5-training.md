@@ -261,8 +261,9 @@ the same kind are counted together). Its `panels`
 counts returned panels, including those that yield no retained episode.
 `episodes` counts retained episodes and `cells` counts their supervised
 labels. At `exposure.corpus.folders`, each `<kind>/<dataset>` entry records
-the same three counts. Each qualification trial in `qualify.json` sums these
-counts across all observed batches.
+the same three counts. If every draw from a source or folder is refused, those
+draws contribute only to the reason counts under `skips`. Each qualification
+trial in `qualify.json` sums these counts across all observed batches.
 
 On Linux, PyTorch loader workers pass batch tensors through file descriptors,
 and prefetched batches can keep many descriptors open. Before starting workers,

@@ -4,6 +4,7 @@ import gc
 import hashlib
 import importlib
 import json
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -114,6 +115,13 @@ def test_pick_with_one_folder_and_one_row(tmp_path, power):
     write_rows(tmp_path / "univariate/only/train-000.parquet", [[np.arange(32)]])
     index = api().CorpusIndex.build(tmp_path)
     assert index.pick(np.random.default_rng(0), power) == 0
+
+
+def test_pick_refuses_zero_total_folder_weight(folder_index):
+    index, _ = folder_index
+    index = replace(index, folders=tuple(replace(folder, values=0) for folder in index.folders))
+    with pytest.raises(ValueError, match="^corpus folders hold no values to weight$"):
+        index.pick(np.random.default_rng(0), power=1)
 
 
 def test_equal_sized_changed_footer_changes_metadata_identity(tmp_path):

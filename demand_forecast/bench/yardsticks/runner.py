@@ -710,6 +710,7 @@ def run_yardstick(
             if is_v5:
                 input_metadata = json.loads(report_path.read_text())
                 del input_metadata["run_identity"]
+                input_metadata.pop("v5_worker_reason", None)
             predictions = [
                 fev_predictions(a, levels, w.targets) for a, w in zip(arrays, windows, strict=True)
             ]

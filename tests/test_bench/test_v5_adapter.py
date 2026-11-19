@@ -177,6 +177,34 @@ def test_predict_shapes_order_and_units(make_adapter):
     assert evidence.candidates == sorted(set(evidence.candidates))
 
 
+@pytest.mark.parametrize("workers,reason", [(0, "injected"), (16, None)])
+def test_predict_uses_preflight_worker_count(make_adapter, monkeypatch, workers, reason):
+    from demand_forecast.bench.yardsticks import v5_adapter
+
+    requested_counts, forecast_counts = [], []
+
+    def preflight(requested):
+        requested_counts.append(requested)
+        return workers, reason
+
+    def record_forecast(*args, workers, **kwargs):
+        forecast_counts.append(workers)
+        # Run inference serially so this test does not need Linux workers.
+        return forecast_items(*args, workers=0, **kwargs)
+
+    monkeypatch.setattr(v5_adapter, "_worker_count", lambda device: 16)
+    monkeypatch.setattr(v5_adapter, "usable_workers", preflight)
+    monkeypatch.setattr(v5_adapter, "forecast_items", record_forecast)
+    adapter = make_adapter()
+    [[actual]] = adapter.predict([_window()], HORIZON, [0.5])
+
+    assert actual.shape == (1, HORIZON, 1)
+    assert forecast_counts == [workers]
+    assert adapter.metadata()["v5_worker_reason"] == reason
+    assert adapter.metadata()["v5_workers"] == workers
+    assert requested_counts == [16]
+
+
 def test_levels_are_indexed_or_interpolated(make_adapter):
     adapter = make_adapter()
     window = _window()

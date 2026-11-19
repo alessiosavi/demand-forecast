@@ -13,7 +13,7 @@ import numpy as np
 from demand_forecast.bench.v5_panels import describe, window_panels
 from demand_forecast.data.episode import ScreeningConfig
 from demand_forecast.data.episode.schema import MAX_CONTEXT, PATCH, SUMMARY_FEATURES
-from demand_forecast.models.v5 import Evidence, forecast_items, planned_layouts
+from demand_forecast.models.v5 import Evidence, forecast_items, planned_layouts, usable_workers
 from demand_forecast.models.v5.export import load_export, require_parity
 
 from .runner import Options, WindowInput
@@ -142,7 +142,7 @@ class V5Adapter:
         self._summary_off = tuple(
             dict.fromkeys((*sampler["summary_off"], *self.variant.summary_off))
         )
-        self._workers = _worker_count(self.options.device)
+        self._workers, self._worker_reason = usable_workers(_worker_count(self.options.device))
         self.prepare(task)
 
     def prepare(self, task) -> None:
@@ -233,6 +233,7 @@ class V5Adapter:
         return {
             **self._counts,
             "v5_workers": self._workers,
+            "v5_worker_reason": self._worker_reason,
             "peak_rss_bytes": _peak_rss_bytes(resource.RUSAGE_SELF),
             "peak_rss_children_bytes": _peak_rss_bytes(resource.RUSAGE_CHILDREN),
         }
