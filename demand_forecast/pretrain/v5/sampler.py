@@ -26,6 +26,8 @@ from .corpus import CorpusValueError, SamplerSkip, ShortRow
 from .sources import SourceMix
 from .support import PROTECT, supported
 
+COLD_MECHANISMS = ("static_category", "multi_label")
+
 _FILE_LIMIT_LOCK = Lock()
 
 
@@ -34,6 +36,7 @@ class EpisodePlan:
     request: EpisodeRequest
     item_id: str
     mechanism: str | None
+    cold: bool = False
 
 
 def _length(item):
@@ -83,6 +86,9 @@ def plan_panel(
 
 
 def _plan_panel(panel, record, config, source, rng, *, path_quota=None, ordinary_quota=None):
+    # An injected SourceMix or direct planner call can bypass V5TrainConfig.
+    if config.cold_share > 0 and source.control == "missing_as_zero":
+        raise ValueError("missing_as_zero requires sampler.cold_share == 0")
     target_paths = round(config.path_share * config.episodes_per_batch)
     path_quota = target_paths if path_quota is None else path_quota
     ordinary_quota = (
@@ -95,8 +101,12 @@ def _plan_panel(panel, record, config, source, rng, *, path_quota=None, ordinary
     at_origin = rng.random() < config.cutoff_at_origin
     frac = rng.random()
     skips = Counter()
+    if config.cold_share > 0:
+        skips.update(cold_attempted=0, cold_planned=0)
     mechanism = None
     lead, anchor = None, None
+    lead_frame = None
+    lead_cold = False
     eligible = [i for i, item in enumerate(original.items) if _length(item) >= PATCH + 1]
 
     def choose(pool):
@@ -118,20 +128,33 @@ def _plan_panel(panel, record, config, source, rng, *, path_quota=None, ordinary
         candidate = str(rng.choice(generated.recipe.mechanisms))
         ids = set(necessary_items(generated, candidate)) if candidate in INPUT_MECHANISMS else None
         pool = [i for i in eligible if ids is None or original.items[i].item_id in ids]
+        cold_rng = (
+            rng.spawn(1)[0] if candidate in COLD_MECHANISMS and config.cold_share > 0 else None
+        )
         for _ in range(8 if pool else 0):
             index, t = choose(pool)
             item = original.items[index]
-            _, cutoff = episode_frame(item, t)
+            is_cold = cold_rng is not None and cold_rng.random() < config.cold_share
+            origin = t
+            if is_cold:
+                low, high = config.cold_steps
+                origin = item.start + int(cold_rng.integers(low, high + 1))
+                frame = ((origin,), origin)
+                skips["cold_attempted"] += 1
+            else:
+                frame = episode_frame(item, t)
             if supported(
                 generated,
                 candidate,
                 item.item_id,
-                t,
+                origin,
                 context=context,
                 horizon=horizon,
-                cutoff=cutoff,
+                cutoff=frame[1],
+                first_event_only=config.first_event_only,
             ):
                 lead, anchor, mechanism = index, t, candidate
+                lead_frame, lead_cold = frame, is_cold
                 break
         if lead is None:
             skips["no_support"] += 1
@@ -159,6 +182,7 @@ def _plan_panel(panel, record, config, source, rng, *, path_quota=None, ordinary
                 context=context,
                 horizon=horizon,
                 cutoff=cutoff,
+                first_event_only=config.first_event_only,
             ):
                 selected.append((index, mechanism))
         path_items = {index for index, _ in selected}
@@ -172,7 +196,10 @@ def _plan_panel(panel, record, config, source, rng, *, path_quota=None, ordinary
     builder = None
     for index, path in selected:
         item = original.items[index]
-        origins, cutoff = episode_frame(item, anchor)
+        cold = index == lead and lead_cold
+        origins, cutoff = (
+            lead_frame if index == lead and lead_frame is not None else episode_frame(item, anchor)
+        )
         if config.designate_target or record.get("source") == "corpus":
             target = record.get("target")
             if target is None:
@@ -208,7 +235,9 @@ def _plan_panel(panel, record, config, source, rng, *, path_quota=None, ordinary
         ):
             skips["no_labels"] += 1
             continue
-        plans.append(EpisodePlan(request, item.item_id, path))
+        plans.append(EpisodePlan(request, item.item_id, path, cold=cold))
+        if cold:
+            skips["cold_planned"] += 1
     if source.control == "missing_as_zero":
         items = []
         for item in panel.items:
@@ -343,17 +372,25 @@ def _make_batch(config, k, sources):
                 break
         if closed:
             break
+    report = {}
+    if config.sampler.cold_share > 0:
+        report["cold"] = {
+            "attempted": skips.pop("cold_attempted", 0),
+            "planned": skips.pop("cold_planned", 0),
+        }
     if not episodes:
-        raise RuntimeError(f"no episodes after panel limit; skips={dict(skips)}")
-    return collate(episodes), {
-        "episodes": len(episodes),
-        "supervised": sum(map(_supervised, episodes)),
-        "cells": _cells(episodes),
-        "skips": dict(skips),
-        "sources": dict(source_counts),
-        "paths": dict(paths),
-        "paths_without_candidate": dict(absent),
-    }
+        cold_details = f"; cold={report['cold']}" if "cold" in report else ""
+        raise RuntimeError(f"no episodes after panel limit; skips={dict(skips)}{cold_details}")
+    report.update(
+        episodes=len(episodes),
+        supervised=sum(map(_supervised, episodes)),
+        cells=_cells(episodes),
+        skips=dict(skips),
+        sources=dict(source_counts),
+        paths=dict(paths),
+        paths_without_candidate=dict(absent),
+    )
+    return collate(episodes), report
 
 
 class _Batches(IterableDataset):

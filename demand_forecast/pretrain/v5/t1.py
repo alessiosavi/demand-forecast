@@ -38,7 +38,7 @@ from .config import T1_BASE, SourceConfig, V5TrainConfig
 from .loop import load_model
 from .sampler import _postprocess, _supervised, plan_panel
 from .sources import TypedSource, apply_control
-from .support import supported
+from .support import has_prior_event, supported
 
 
 def _path(sets, *, both=None, arms=None, slices=(), required=(), present="inputs"):
@@ -57,8 +57,13 @@ def _path(sets, *, both=None, arms=None, slices=(), required=(), present="inputs
 
 
 PATHS: dict[str, dict] = {
-    name: _path(((name,),)) for name in ("static_category", "multi_label", "static_number")
+    name: _path(
+        ((name,),),
+        both={"sampler": {"cold_share": 1.0, "cold_steps": (3, 4), "episodes_per_panel": 1}},
+    )
+    for name in ("static_category", "multi_label")
 }
+PATHS["static_number"] = _path((("static_number",),))
 PATHS.update(
     {
         f"category_{effect}": _path(
@@ -79,7 +84,9 @@ PATHS.update(
     ),
     several_targets=_path(
         (("multi_target",),),
-        both={"sampler": {"designate_target": True}},
+        # Requested horizons of 1 to 4 steps: the sampler truncates a log-uniform draw, so the
+        # upper bound of the range is exclusive.
+        both={"sampler": {"designate_target": True, "horizon": (1, 5)}},
         arms={"null": {"sampler": {"drop_always": ("siblings",)}}},
         present="siblings",
     ),
@@ -108,6 +115,7 @@ PATHS.update(
     **{
         name: _path(
             ((name,),),
+            both={"sampler": {"first_event_only": True}} if name == "event_response" else None,
             arms={"null": {"source": {"control": "shuffle", "control_inputs": "attribute"}}},
         )
         for name in ("event_response", "label_lag")
@@ -244,8 +252,8 @@ def _slices(path, generated, item_id, origin, horizon):
                     slices.append(name)
         if mechanism == "planned_event":
             record = generated.inputs_of(mechanism)[0]
-            positions = np.flatnonzero(item.dynamic[record.name] == 1)
-            if len(positions) and left <= positions[0] < right:
+            events = item.dynamic[record.name][left:right]
+            if not has_prior_event(item, record.name, origin) and (events == 1).any():
                 slices.append("first_event")
     return tuple(slices)
 
@@ -307,6 +315,7 @@ def eval_set(
                 context=request.context,
                 horizon=request.horizon,
                 cutoff=request.cutoff,
+                first_event_only=sampler.first_event_only,
             )
         )
         if path != "selection" and len(mechanisms) != len(generated.recipe.mechanisms):

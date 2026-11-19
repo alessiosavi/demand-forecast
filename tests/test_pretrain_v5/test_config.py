@@ -97,6 +97,77 @@ def test_default_screen_no_evidence_keeps_base_identities(with_corpus, expected)
     assert api.identity(cfg, code="0" * 40, corpus=None, init=None, env="e" * 64) == expected
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("cold_share", 1.2),
+        ("cold_steps", (2, 4)),
+        ("cold_steps", (5, 3)),
+        ("cold_steps", (3, 16)),
+    ],
+)
+def test_cold_sampler_bounds(field, value):
+    with pytest.raises(ValueError, match=field):
+        config_module().SamplerConfig(**{field: value})
+
+
+@pytest.mark.parametrize("overrides", [{"cold_share": 1.0}, {"cold_steps": (3, 5)}])
+def test_cold_sampler_yaml_and_identity(tmp_path, overrides):
+    base = training_config()
+    default = base.canonical()["sampler"]
+    assert "cold_share" not in default and "cold_steps" not in default
+    cfg = replace(base, sampler=replace(base.sampler, **overrides))
+    path = tmp_path / "cold.yaml"
+    cfg.to_yaml(path)
+    raw = yaml.safe_load(path.read_text())["sampler"]
+    assert raw["cold_share"] == cfg.sampler.cold_share
+    assert raw["cold_steps"] == list(cfg.sampler.cold_steps)
+    assert type(cfg).from_yaml(path) == cfg
+    actual = cfg.canonical()["sampler"]
+    assert {field: actual[field] for field in ("cold_share", "cold_steps") if field in actual} == {
+        field: raw[field] for field in overrides
+    }
+    identity = config_module().identity
+    parts = dict(code="0" * 40, corpus=None, init=None, env="e" * 64)
+    assert identity(cfg, **parts) != identity(base, **parts)
+
+
+def test_cold_share_refuses_missing_as_zero():
+    base = training_config()
+    sampler = replace(
+        base.sampler, origins=1, designate_target=True, max_cells=None, cold_share=0.5
+    )
+    sources = (replace(base.sources[0], control="missing_as_zero"),)
+    with pytest.raises(
+        ValueError, match=r"cold_share.*missing_as_zero|missing_as_zero.*cold_share"
+    ):
+        replace(base, sampler=sampler, sources=sources)
+
+
+def test_first_event_only_yaml_and_identity(tmp_path):
+    base = training_config()
+    assert base.sampler.first_event_only is False
+    assert "first_event_only" not in base.canonical()["sampler"]
+    cfg = replace(base, sampler=replace(base.sampler, first_event_only=True))
+    path = tmp_path / "first-event.yaml"
+    cfg.to_yaml(path)
+    raw = yaml.safe_load(path.read_text())
+    assert raw["sampler"]["first_event_only"] is True
+    assert type(cfg).from_yaml(path) == cfg
+    assert cfg.canonical()["sampler"]["first_event_only"] is True
+    parts = dict(code="0" * 40, corpus=None, init=None, env="e" * 64)
+    identity = config_module().identity
+    assert identity(cfg, **parts) != identity(base, **parts)
+
+    raw["sampler"]["first_event_only"] = "false"
+    path.write_text(yaml.safe_dump(raw))
+    with pytest.raises(ValueError, match="first_event_only"):
+        type(cfg).from_yaml(path)
+    del raw["sampler"]["first_event_only"]
+    path.write_text(yaml.safe_dump(raw))
+    assert type(cfg).from_yaml(path) == base
+
+
 @pytest.mark.parametrize("section", [None, "model", "sources", "sampler", "optim"])
 def test_yaml_rejects_unknown_keys_at_every_level(tmp_path, section):
     cfg = training_config()

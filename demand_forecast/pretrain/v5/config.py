@@ -157,9 +157,13 @@ class SamplerConfig:
     # Zero scores below this level. Within each budget's existing priorities,
     # zero scores rank last and are cut first when the budget binds.
     screen_no_evidence: float = 0.0
+    cold_share: float = 0.0
+    cold_steps: tuple[int, int] = (3, 4)
+    first_event_only: bool = False
 
     def __post_init__(self) -> None:
         _flag(self, "designate_target")
+        _flag(self, "first_event_only")
         for name in ("episodes_per_batch", "episodes_per_panel", "origins", "origin_stride"):
             _normalize(self, name, integer=True, minimum=1)
         if not self.contexts:
@@ -172,8 +176,11 @@ class SamplerConfig:
             raise ValueError(f"contexts must be positive multiples of {PATCH}")
         object.__setattr__(self, "contexts", contexts)
         object.__setattr__(self, "horizon", _range(self.horizon, "horizon", maximum=MAX_HORIZON))
-        for name in ("cutoff_at_origin", "path_share"):
+        for name in ("cutoff_at_origin", "path_share", "cold_share"):
             _normalize(self, name, minimum=0, maximum=1)
+        object.__setattr__(
+            self, "cold_steps", _range(self.cold_steps, "cold_steps", minimum=3, maximum=PATCH - 1)
+        )
         _normalize(self, "screen_no_evidence", minimum=0)
         if self.screen_no_evidence >= 1:
             raise ValueError("screen_no_evidence must be in [0, 1)")
@@ -276,6 +283,8 @@ class V5TrainConfig:
             if self.sampler.max_cells is not None:
                 raise ValueError("the rolled router requires sampler.max_cells=None")
         if any(source.control == "missing_as_zero" for source in self.sources):
+            if self.sampler.cold_share > 0:
+                raise ValueError("missing_as_zero requires sampler.cold_share == 0")
             if self.sampler.origins != 1:
                 raise ValueError("missing_as_zero requires sampler.origins == 1")
         controlled = (
@@ -309,6 +318,12 @@ class V5TrainConfig:
         del data["workers"], data["device"]
         if self.sampler.screen_no_evidence == 0.0:
             del data["sampler"]["screen_no_evidence"]
+        if self.sampler.cold_share == 0.0:
+            del data["sampler"]["cold_share"]
+        if self.sampler.cold_steps == (3, 4):
+            del data["sampler"]["cold_steps"]
+        if not self.sampler.first_event_only:
+            del data["sampler"]["first_event_only"]
         for source in data["sources"]:
             del source["root"]
         return data

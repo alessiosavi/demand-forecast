@@ -223,6 +223,32 @@ of the training seed, and all arms share the same frozen evaluation digest.
 The unit records path, arm, training seed, base-file hash, requested episodes and
 max panels, and the actual replay digest in addition to its training identity.
 
+**Cold-start episodes.** `sampler.cold_share` is the probability per attempt in
+the support loop of trying a cold frame for a `static_category` or `multi_label`
+path lead. It defaults to zero. The support rule rejects cold frames more often
+than ordinary frames because peers need enough observations before the earlier
+cutoff. Use the attempt and plan counts in `report["cold"]` to gauge realised
+cold-lead exposure. Below `1.0`, the realised share can differ from `cold_share`.
+`sampler.cold_steps` is the inclusive range of grid positions from the item's
+start to its single origin and defaults to `(3, 4)`. The origin is also the
+statistics cutoff. Only the lead can be cold, so a panel that supplies eight
+episodes can contribute at most one cold episode. Both static T1 paths use one
+episode per panel and a cold share of one in every arm, giving every path
+episode a cold lead and drawing more panels per training batch.
+
+The `several_targets` path sets `sampler.horizon` to `(1, 5)` for both training
+arms and their shared held-out evaluation: requested horizons of 1 to 4 steps,
+because the sampler truncates a log-uniform draw and the range's upper bound is
+exclusive.
+
+Both `event_response` arms and their shared held-out evaluation enable
+`sampler.first_event_only`. A path episode qualifies only if the complete
+event flag has no event from that item's start up to the forecast origin,
+including positions with missing targets or flags in the exposed data. An
+event at the origin is part of the horizon. The existing visible horizon
+event and same-label peer requirements still apply. The option defaults to
+`false` and applies only to `event_response` path episodes.
+
 After a stop between training and evaluation, rerun the same job: the completed
 training is validated and reused. For an inconclusive result, double both
 `--episodes` and `--max-panels`, give the script a new name and job URI, and use
