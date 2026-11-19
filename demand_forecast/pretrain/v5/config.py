@@ -75,6 +75,8 @@ class SourceConfig:
     singleton_share: float = 0.0
     control: str | None = None
     control_inputs: str = "all"
+    folder_power: float | None = None
+    plain_share: float = 0.0
 
     def __post_init__(self) -> None:
         _flag(self, "heldout")
@@ -84,10 +86,19 @@ class SourceConfig:
             raise ValueError("weight must be positive")
         _normalize(self, "max_items", integer=True, minimum=1)
         _normalize(self, "n_nuisance", integer=True, minimum=0)
+        if self.folder_power is not None:
+            _normalize(self, "folder_power", minimum=0, maximum=1)
+        _normalize(self, "plain_share", minimum=0, maximum=1)
         object.__setattr__(self, "length", _range(self.length, "length", minimum=8))
         if self.kind not in ("typed", "corpus", "upstream"):
             raise ValueError("kind must be typed, corpus or upstream")
-        if self.kind != "typed":
+        if self.kind == "typed":
+            if self.folder_power is not None:
+                raise ValueError("folder_power is only valid for corpus sources")
+            if self.plain_share != 0.0:
+                raise ValueError("plain_share is only valid for upstream sources")
+        else:
+            source_kinds = {"folder_power": "corpus", "plain_share": "upstream"}
             for field in fields(self):
                 if field.name in ("kind", "weight", "root"):
                     continue
@@ -96,8 +107,9 @@ class SourceConfig:
                 # act inside the typed generator and stay typed-only.
                 if field.name == "control" and value == "missing_as_zero":
                     continue
-                if value != field.default:
-                    raise ValueError(f"{field.name} is only valid for typed sources")
+                kind = source_kinds.get(field.name, "typed")
+                if value != field.default and self.kind != kind:
+                    raise ValueError(f"{field.name} is only valid for {kind} sources")
         if self.root is not None and self.kind != "corpus":
             raise ValueError("root is only valid for corpus sources")
         if self.control not in (None, "shuffle", "no_dates", "missing_as_zero"):
@@ -310,11 +322,21 @@ class V5TrainConfig:
         return cls(**data)
 
     def to_yaml(self, path: Path) -> None:
-        path.write_text(yaml.safe_dump(_plain(asdict(self)), sort_keys=False), encoding="utf-8")
+        path.write_text(yaml.safe_dump(self._serialized(), sort_keys=False), encoding="utf-8")
+
+    def _serialized(self) -> dict:
+        """Keep portable settings and omit source options at their defaults."""
+        data = _plain(asdict(self))
+        for source in data["sources"]:
+            if source["folder_power"] is None:
+                del source["folder_power"]
+            if source["plain_share"] == 0.0:
+                del source["plain_share"]
+        return data
 
     def canonical(self) -> dict:
         """Return detached semantics, independent of machine and corpus location."""
-        data = _plain(asdict(self))
+        data = self._serialized()
         del data["workers"], data["device"]
         if self.sampler.screen_no_evidence == 0.0:
             del data["sampler"]["screen_no_evidence"]

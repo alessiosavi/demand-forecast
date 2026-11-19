@@ -294,7 +294,8 @@ def make_batch(
 ) -> tuple[EpisodeBatch, dict]:
     """Build a nonempty batch, accepting only a SourceMix override.
 
-    The report's ``cells`` counts padded token cells, not tensor elements.
+    The report's ``cells`` counts padded token cells. Exposure counts returned
+    panels, retained episodes and their supervised cells by source and folder.
     """
     if sources is not None and not isinstance(sources, SourceMix):
         raise TypeError("sources must be a SourceMix or None")
@@ -309,11 +310,19 @@ def _make_batch(config, k, sources):
     sources = SourceMix(config.sources) if sources is None else sources
     episodes = []
     skips, source_counts, paths, absent = Counter(), Counter(), Counter(), Counter()
+    exposure = {}
     target_paths = round(config.sampler.path_share * config.sampler.episodes_per_batch)
     closed = False
     for _ in range(4 * config.sampler.episodes_per_batch):
         try:
             panel, record, source = _draw(sources, rng)
+            kind = record.get("source", source.kind)
+            counts = [exposure.setdefault(kind, {"panels": 0, "episodes": 0, "cells": 0})]
+            if (folder := record.get("folder")) is not None:
+                folders = counts[0].setdefault("folders", {})
+                counts.append(folders.setdefault(folder, {"panels": 0, "episodes": 0, "cells": 0}))
+            for count in counts:
+                count["panels"] += 1
             kept_paths = sum(paths.values())
             room = config.sampler.episodes_per_batch - len(episodes)
             path_quota = min(target_paths - kept_paths, room)
@@ -360,7 +369,10 @@ def _make_batch(config, k, sources):
                     closed = True
                     break
             episodes.append(episode)
-            source_counts[record.get("source", source.kind)] += 1
+            source_counts[kind] += 1
+            for count in counts:
+                count["episodes"] += 1
+                count["cells"] += supervised
             if plan.mechanism is not None:
                 paths[plan.mechanism] += 1
                 inputs = record["generated"].inputs_of(plan.mechanism)
@@ -387,6 +399,7 @@ def _make_batch(config, k, sources):
         cells=_cells(episodes),
         skips=dict(skips),
         sources=dict(source_counts),
+        exposure=exposure,
         paths=dict(paths),
         paths_without_candidate=dict(absent),
     )

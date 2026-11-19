@@ -234,6 +234,15 @@ class _HostPeak:
             self._thread.join()
 
 
+def _sum_exposure(totals, exposure):
+    for name, counts in exposure.items():
+        total = totals.setdefault(name, {})
+        for key in ("panels", "episodes", "cells"):
+            total[key] = total.get(key, 0) + counts[key]
+        if "folders" in counts:
+            _sum_exposure(total.setdefault("folders", {}), counts["folders"])
+
+
 def _trial(config, directory, device):
     """Observe real train() batches, synchronizing before/after each GPU update.
 
@@ -283,8 +292,10 @@ def _trial(config, directory, device):
     updated = [entry["updates"] for entry in result.history]
     successful = [i for i in range(tail_start, len(durations)) if updated[i]]
     skips = Counter()
+    exposure = {}
     for report in reports:
         skips.update(report["skips"])
+        _sum_exposure(exposure, report.get("exposure", {}))
     if result.skipped:
         skips["nonfinite"] += result.skipped
     metrics = {
@@ -302,6 +313,7 @@ def _trial(config, directory, device):
         if successful
         else None,
         "skips": dict(skips),
+        "exposure": exposure,
         "host_memory_bytes": memory.peak,
         "peak_gpu_bytes": _peak_gpu(device),
         "total_seconds": elapsed,
