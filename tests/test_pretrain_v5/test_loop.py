@@ -22,7 +22,9 @@ from demand_forecast.pretrain.v5.checkpoint import (
     read_manifest,
     save_checkpoint,
 )
+from demand_forecast.pretrain.v5.config import T1_BASE, SourceConfig, identity
 from demand_forecast.pretrain.v5.sampler import make_batch
+from tests.helpers.batch_fingerprint import assert_fingerprint, batch_fingerprint
 from tests.helpers.v5_loop import config, equal, training_equal
 
 
@@ -502,6 +504,61 @@ def test_init_loads_export_and_load_model_selects_weights(tmp_path):
     damaged.write_bytes(trained.checkpoint.read_bytes()[:-1])
     with pytest.raises(CheckpointError):
         loop.load_model(damaged)
+
+
+@pytest.mark.parametrize(
+    ("with_corpus", "expected"),
+    [
+        (False, "78ebcb17fc17387284f5a0bc2e2ceec2fe9cd3419a043b5cb9286b0156443987"),
+        (True, "1a57e2ab20aebd7f9475de7fb00172e60b67914b2f051a155680ac24d7de93f9"),
+    ],
+    ids=["T1_BASE", "typed+corpus"],
+)
+def test_default_expert_mode_preserves_base_identities(with_corpus, expected):
+    cfg = T1_BASE
+    if with_corpus:
+        cfg = replace(
+            cfg,
+            sources=(SourceConfig("typed", 1), SourceConfig("corpus", 1, root="/unused-corpus")),
+        )
+    parts = dict(code="0" * 40, corpus="c" * 64, init="1" * 64, env="e" * 64)
+    assert "expert_mode" not in cfg.canonical()["model"]
+    assert identity(cfg, **parts) == expected
+    dense = replace(cfg, model=replace(cfg.model, expert_mode="dense"))
+    assert dense.canonical()["model"]["expert_mode"] == "dense"
+    assert identity(dense, **parts) != expected
+
+
+def test_old_checkpoint_loads_and_dense_checkpoint_round_trips(tmp_path):
+    loop = api()
+    cfg = config(steps=1, ema=0.9)
+    cfg = replace(
+        cfg,
+        model=replace(cfg.model, n_experts=2, expert_enc_layers=1, expert_dec_layers=1),
+    )
+    routed = loop.train(cfg, tmp_path / "routed")
+    assert routed.updates == 1
+    legacy = payload(routed)
+    assert "expert_mode" not in legacy["config"]["model"]
+    model, restored = loop.load_model(routed.checkpoint)
+    assert restored == cfg
+    assert model.config.expert_mode == "routed"
+    torch.testing.assert_close(model.state_dict(), legacy["ema"], atol=1e-7, rtol=1e-6)
+
+    dense = replace(cfg, model=replace(cfg.model, expert_mode="dense"))
+    routed_batch, _ = make_batch(cfg, 0)
+    dense_batch, _ = make_batch(dense, 0)
+    assert_fingerprint(dense_batch, batch_fingerprint(routed_batch))
+    trained = loop.train(dense, tmp_path / "dense")
+    assert trained.updates == 1
+    saved = payload(trained)
+    assert saved["config"]["model"]["expert_mode"] == "dense"
+    for weights, key in (("raw", "model"), ("ema", "ema"), ("export", "ema")):
+        model, restored = loop.load_model(trained.checkpoint, weights=weights)
+        assert restored == dense
+        torch.testing.assert_close(model.state_dict(), saved[key], atol=1e-7, rtol=1e-6)
+        with torch.no_grad():
+            assert model.eval()(dense_batch).router is None
 
 
 def test_uniform_router_and_ones_gates_train(tmp_path):

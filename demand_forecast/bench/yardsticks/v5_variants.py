@@ -1,0 +1,27 @@
+"""Names accepted by the v5 yardstick and its score jobs."""
+
+VARIANT_NAMES = (
+    "full",
+    "no_features",
+    "no_known",
+    "no_past",
+    "no_dynamic_categories",
+    "no_statics",
+    "no_static_categories",
+    "no_static_numbers",
+    "no_peers",
+    "no_panel_row",
+    "no_typed_context",
+    "no_value_stats",
+    "no_calendar",
+    "no_rolling",
+    "no_lags",
+    "no_zeros",
+    "no_step_families",
+    "no_summary",
+    "per_target",
+    "no_siblings",
+    "gates_one",
+    "screening_alone",
+    "router_uniform",
+)

@@ -140,6 +140,65 @@ The Simons conversion follows its Apache-2.0 benchmark implementation, Copyright
 2026 Abel AI Lab. This product includes software developed at Abel AI Lab
 (https://abel.ai).
 
+## v5 exports
+
+Pass a local export directory containing `config.json`, `model.safetensors`
+and `parity.npz`. The adapter validates the export and checks parity on CPU
+and on the selected device before scoring. The run identity includes the export
+digest, package versions and a hash of the Python source under `demand_forecast/`.
+
+```bash
+python scripts/fev_yardstick.py --model v5 --checkpoint /checkpoints/v5/export \
+  --processing raw --tasks shifted.yaml --model-name v5-full \
+  --out-dir results/v5-full --resume --keep-going
+```
+
+v5 receives the full target and covariate histories provided by fev, the known
+future covariates, timestamp axes, statics, and declared column types. A dated
+panel uses each item's own forecast origin. Items outside the proven grid run
+in individual panels without statics. A window with more than 16 dated origins
+also uses individual panels. Native forecast quantiles are selected directly.
+Other requested quantiles are interpolated linearly with constant tails.
+
+`--processing raw`, `--covariates all` and `--cross-series on` are required.
+The default encoder context is the largest context in the training sampler.
+`--max-context` sets the encoder context, rounds down to a multiple of 16 and
+caps it at 2,048. The minimum is 16. Scaling and panel statistics still use
+the full available history up to the forecast origin. `--batch-size` counts
+episodes and defaults to 64. Linux CUDA scoring uses 16 episode-building
+workers when at least 18 CPU cores are available to the process.
+
+The default `--variant full` uses the export's trained drops and summary
+mask. Those settings apply to every variant. Ablations retain the full
+variant's target layout, with explicit per-target layouts for `per_target`
+and `no_siblings`.
+
+| Variant | Scoring change |
+|---|---|
+| `full` | Baseline with the export's training settings |
+| `no_features` | Remove all dynamic covariates from the panel |
+| `no_known` | Remove known-future covariates, including their history |
+| `no_past` | Remove past-only covariates |
+| `no_dynamic_categories` | Remove categorical dynamic covariates |
+| `no_statics` | Remove all static covariates |
+| `no_static_categories` | Remove categorical static covariates |
+| `no_static_numbers` | Remove numerical static covariates |
+| `no_peers` | Drop peer rows |
+| `no_panel_row` | Drop the whole-panel row |
+| `no_typed_context` | Drop attribute tokens, static numbers, peer and whole-panel rows, and category value statistics and effects. A dynamic category is represented by flags for its most frequent values |
+| `no_value_stats` | Replace a dynamic category's value statistics with flags and an effect row |
+| `no_calendar` | Remove calendar features |
+| `no_rolling` | Remove the rolling per-step family |
+| `no_lags` | Remove the lag per-step family |
+| `no_zeros` | Remove the zero-history per-step family |
+| `no_step_families` | Remove rolling, lag and zero-history per-step families |
+| `no_summary` | Mask all summary-vector entries and their flags |
+| `per_target` | Forecast each target separately with siblings available |
+| `no_siblings` | Use the per-target layout with sibling rows dropped |
+| `gates_one` | Use gates fixed at one and disable pruning |
+| `screening_alone` | Use screening-derived gates |
+| `router_uniform` | Use uniform expert routing |
+
 ## Evidence and resume
 
 `summaries.csv` uses fev's summary schema plus `task`, the adapter name, every CLI
@@ -177,6 +236,25 @@ rebuilt from intact recorded windows. A model is never loaded for complete tasks
 Local weight directories are content-hashed; Hub aliases resolve to commit SHAs.
 The default IDs above use the pinned SHAs even when `--revision` is omitted.
 
+For v5, each task also has a `v5-report.json` and an
+`evidence_window_N.npz` per forecast window. The report records counts of
+items forecast alone, grid failures, missing time axes, short histories,
+windows over the origin budget, mixed column kinds, and fallback target
+rows. It also records the maximum distinct origins, worker count, and peak
+resident memory of the process and its children in bytes.
+
+Each evidence archive records the request's zero-based `item_position` in
+the window, its `target`, and a boolean `joint` mask for requests covering
+the item together. The `candidates` and `rules` arrays label the columns
+and the fixed-rule codes. Each request-by-candidate matrix records
+`status`, `rule`, `gate`, and screening `score`. Status codes 0 through 5
+mean absent, kept, removed by a fixed rule, removed by a budget, zero gate
+retained, and zero gate pruned. A rule index of −1 means no fixed rule. The
+archive uses plain arrays and opens with `np.load(..., allow_pickle=False)`.
+Both artifact types record `run_identity`. Both resume paths verify
+`evidence_sha256` in `run.json` in addition to the forecast window digests.
+The report supplies the v5 metadata when the summary is reconstructed.
+
 ## Cloud scoring jobs
 
 `make_score_job.py` uses the same harness, saved forecast windows and completion
@@ -202,11 +280,22 @@ python scripts/gcp/jobs/make_score_job.py --model chronos2 --name chronos2 \
   --tasks-uri gs://bucket/tasks.yaml --tasks-sha256 "$TASKS_SHA256" \
   --hub-weights amazon/chronos-2 --hub-revision 29ec3766d36d6f73f0696f85560a422f50e8498c \
   --output /tmp/score-chronos2.sh
+python scripts/gcp/jobs/make_score_job.py --model v5 --name v5-full \
+  --repo-sha "$REPO_SHA" --upstream-pin "$(cat third_party/simons/PINNED)" \
+  --tasks-uri gs://bucket/tasks.yaml --tasks-sha256 "$TASKS_SHA256" \
+  --checkpoint-uri gs://bucket/state/export/model --export-digest "$EXPORT_DIGEST" \
+  --output /tmp/score-v5.sh
 ```
+
+A v5 job scores an export unit: `--checkpoint-uri` is the prefix that holds `config.json`,
+`model.safetensors` and `parity.npz`, and `--export-digest` is the SHA-256 of that `config.json`. The guest
+checks the three fetched files against the digest before it keeps or reuses them. `--variant NAME` selects one
+of the scoring variants; the only processing is `raw`.
 
 Reference jobs require Hub weights at a full commit SHA, refuse checkpoint URIs
 and nondefault `--processing`, and save their native output in `raw` only.
-`--covariates all|none` and `--max-context` apply to every model. To average these
+`--covariates all|none` and `--max-context` apply to the reference models and Simons; v5 refuses
+`--covariates none` and a `--max-context` below 16, its patch length. To average these
 runs with Simons, select `--processing raw|published|both`; references contribute
 `raw` native forecasts in every mode, while Simons contributes that mode. Member tasks, covariates, context limits and scoring runtime must match. Model-specific
 packages, native batching and Simons's dropped-covariate report may differ across

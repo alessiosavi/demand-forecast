@@ -3,6 +3,8 @@
 import torch
 from torch import Tensor, nn
 
+from demand_forecast.data.episode.schema import N_SUMMARY
+
 from .attention import MaskedAttention
 from .config import V5Config
 
@@ -46,6 +48,30 @@ class ExpertFFN(nn.Module):
         return result
 
 
+def _expert_parameter_match(config: V5Config) -> tuple[int, int]:
+    """Return the extra hidden width per expert block and dense minus routed parameters."""
+    d_model, n_experts = config.d_model, config.n_experts
+    blocks = config.expert_enc_layers + config.expert_dec_layers
+    # ExpertRouter projects d_model + 2 * N_SUMMARY -> d_model -> d_model -> n_experts.
+    router = d_model * (2 * d_model + 2 * N_SUMMARY + n_experts + 2) + n_experts
+    # Combining the experts keeps the hidden weights and biases at their summed width
+    # and leaves one output bias per block. Each extra unit adds two weights and a bias.
+    missing = router + blocks * (n_experts - 1) * d_model
+    increment = blocks * (2 * d_model + 1)
+    extra = (missing + increment - 1) // increment
+    return extra, extra * increment - missing
+
+
+def _block_ffn(config: V5Config, expert: bool) -> nn.Module:
+    if not expert:
+        return _ffn(config, config.dim_feedforward)
+    if config.expert_mode == "routed":
+        return ExpertFFN(config)
+    extra, _ = _expert_parameter_match(config)
+    width = config.n_experts * (config.dim_feedforward // config.n_experts) + extra
+    return _ffn(config, width)
+
+
 class EncoderBlock(nn.Module):
     """Pre-norm causal time attention, gated row attention and feedforward."""
 
@@ -54,7 +80,7 @@ class EncoderBlock(nn.Module):
         self.time_attention = MaskedAttention(config.d_model, config.nhead, config.dropout, True)
         self.row_attention = MaskedAttention(config.d_model, config.nhead, config.dropout, False)
         self.norms = nn.ModuleList(nn.LayerNorm(config.d_model) for _ in range(3))
-        self.feedforward = ExpertFFN(config) if expert else _ffn(config, config.dim_feedforward)
+        self.feedforward = _block_ffn(config, expert)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(
@@ -111,7 +137,7 @@ class DecoderBlock(nn.Module):
         self.cross_attention = MaskedAttention(config.d_model, config.nhead, config.dropout, True)
         self.row_attention = MaskedAttention(config.d_model, config.nhead, config.dropout, False)
         self.norms = nn.ModuleList(nn.LayerNorm(config.d_model) for _ in range(4))
-        self.feedforward = ExpertFFN(config) if expert else _ffn(config, config.dim_feedforward)
+        self.feedforward = _block_ffn(config, expert)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(

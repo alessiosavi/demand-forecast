@@ -94,3 +94,19 @@ def test_evidence_mode_under_autocast():
             getattr(actual, field.name), getattr(expected, field.name), atol=0, rtol=0
         )
     assert torch.isfinite(output.quantiles).all()
+
+
+def test_dense_mode_under_autocast():
+    panel = toy_panel(n_items=2, length=48)
+    batch = collate([EpisodeBuilder(panel).build(EpisodeRequest(0, (40,), 3, 32))])
+    cfg = replace(config().model, expert_enc_layers=1, expert_dec_layers=1, expert_mode="dense")
+    model = V5Model(cfg).eval()
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        output = model(batch, router="learned")
+        loss, _ = v5_loss(output, batch, cfg)
+    loss.backward()
+    assert output.quantiles.dtype == torch.bfloat16
+    assert output.router is None
+    assert output.aux["balance"].count_nonzero().item() == 0
+    assert torch.isfinite(loss)
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters())

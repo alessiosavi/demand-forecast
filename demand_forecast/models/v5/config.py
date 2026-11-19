@@ -30,6 +30,7 @@ class V5Config:
     sparsity_weight: float = 1e-3
     balance_weight: float = 1e-2
     gate_init: float = 3.0
+    expert_mode: str = "routed"
 
     def __post_init__(self) -> None:
         """Reject invalid dimensions and regularisation before constructing layers."""
@@ -79,6 +80,10 @@ class V5Config:
         ):
             if not 0 <= getattr(self, name) <= maximum:
                 raise ValueError(f"{name} must be in [0, {maximum}]")
+        if not isinstance(self.expert_mode, str) or self.expert_mode not in ("routed", "dense"):
+            raise ValueError("expert_mode must be 'routed' or 'dense'")
+        if self.expert_mode == "dense" and self.expert_enc_layers == self.expert_dec_layers == 0:
+            raise ValueError("dense expert mode requires at least one expert block")
         for name in ("dropout", "known_gate_floor"):
             if not 0 <= getattr(self, name) < 1:
                 raise ValueError(f"{name} must be in [0, 1)")

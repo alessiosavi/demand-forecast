@@ -212,6 +212,8 @@ def test_only_the_four_repaired_paths_change():
         for arm in entry["arms"]:
             cfg = asdict(module.t1_config(path, arm, seed=7))
             sampler = cfg["sampler"]
+            # The model field added after the base revision; every T1 arm keeps the routed experts.
+            assert cfg["model"].pop("expert_mode") == "routed"
             for source in cfg["sources"]:
                 # Source fields added after the base revision; every T1 arm leaves them at their defaults.
                 assert source.pop("folder_power") is None
