@@ -126,9 +126,27 @@ gate floor. At each origin its horizon shows shifted values only when their
 source cells are finite and strictly before that origin. Forecast evidence
 reports the lag row separately as `derived:<column>~lag`.
 
+Enable `onset_rows` to give a retained dynamic category a numeric row named
+`<column>~onset` when `value_stats` are enabled. The row uses the category's
+role and takes a free feature slot. Lag and onset rows compete for those slots
+by descending score and then by name. The onset row is built only when its
+profile has an observed value among the context cells before the statistics
+cutoff. Otherwise the category gets no onset row, takes no slot and has no
+`derived:<column>~onset` evidence entry.
+
+The onset row starts at an observed change of label and covers up to 32 cells
+of the run. A missing label ends the run. Each cell averages earlier completed
+responses at the same label and age, subtracting the mean of the finite targets
+in the preceding `min(season, 8)` cells at each earlier onset. The mean is
+shrunk by `n / (n + 2)`, and at least one response is required for an observed
+value. The row uses scaled target units. A known category's row has the known
+gate floor and can use horizon labels to place onsets. Its response history
+freezes at each origin. A past category's row has the past gate and appears in
+the context only. Forecast evidence uses `derived:<column>~onset`.
+
 The switch defaults to an empty list. The export records enabled names and
 the adapter uses them for scoring. Use the `no_derived` scoring variant to
-disable them on the same weights. `onset_rows` is reserved for a later presentation.
+disable them on the same weights.
 
 ### Export as a resumable job
 

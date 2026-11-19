@@ -6,6 +6,7 @@ import pandas as pd
 from .kinds import labels_of, observed_mask
 
 LAG_SCAN_WINDOW = 512
+_ONSET_AGES = 32
 
 
 def _adjust(values: np.ndarray, observed: np.ndarray, phases: int) -> np.ndarray:
@@ -147,3 +148,67 @@ def increment_spread(
             squares = np.r_[0.0, (difference**2).cumsum()][count]
             values[selected - left] = np.sqrt(squares / np.maximum(count, 1) / 2)
     return np.nan_to_num(values, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def onset_profile(
+    labels: np.ndarray,
+    target: np.ndarray,
+    *,
+    left: int,
+    right: int,
+    frozen_at: int | None,
+    season: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return the shrunk mean response at each cell's label and age since onset."""
+    labels, target = np.asarray(labels), np.asarray(target)
+    if labels.ndim != 1 or target.ndim != 1:
+        raise ValueError("labels and target must be one-dimensional")
+    if right < left:
+        raise ValueError("right must be at least left")
+    values = np.zeros(right - left, dtype=np.float64)
+    observed = np.zeros(right - left, dtype=bool)
+    start, stop = max(0, left), min(right, len(labels))
+    end = min(stop - 1, len(target))
+    if frozen_at is not None:
+        end = min(end, frozen_at)
+    if start >= stop or end <= 1:
+        return values, observed
+
+    target = target[:end].astype(np.float64, copy=False)
+    finite = np.isfinite(target)
+    labels = labels[:stop].astype(object, copy=False)
+    present = observed_mask(labels)
+    names = np.empty(stop, dtype=object)
+    # Bound the work of labels_of's numeric deduplication even on high-cardinality input.
+    for offset in range(0, stop, 1024):
+        block = slice(offset, offset + 1024)
+        names[block] = labels_of(labels[block])
+
+    history: dict[tuple[str, int], tuple[float, int]] = {}
+    previous = onset = base = None
+    window = min(season, 8)
+    for t, (name, valid) in enumerate(zip(names, present, strict=True)):
+        if not valid:
+            previous = onset = None
+            continue
+        if previous is not None and name != previous:
+            onset, base = t, None
+            if t < end:
+                before = slice(max(0, t - window), t)
+                prefix = target[before][finite[before]]
+                if len(prefix):
+                    base = float(prefix.mean())
+        previous = name
+        if onset is None or t - onset >= _ONSET_AGES:
+            continue
+
+        key = name, t - onset
+        total, count = history.get(key, (0.0, 0))
+        if t >= start and count:
+            values[t - left] = (count / (count + 2)) * (total / count)
+            observed[t - left] = True
+        # Read before updating. After end, the horizon can change the age but never the history.
+        if t < end and finite[t] and base is not None and np.isfinite(base):
+            history[key] = total + (float(target[t]) - base), count + 1
+
+    return values, observed

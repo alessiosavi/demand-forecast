@@ -520,13 +520,18 @@ def test_derive_reaches_every_request(make_adapter, monkeypatch, tmp_path):
         built.append(episodes["sku-0", None])
     assert planned == [frozenset(derive)] * 2
     full, off = built
-    assert full.row_names == off.row_names
-    index = full.row_names.index("event")
+    # The trained presentations reach scoring: the derived row is built, and `no_derived` removes it.
+    assert "event~onset" in full.row_names
+    assert "event~onset" not in off.row_names
+    assert [name for name in full.row_names if name != "event~onset"] == list(off.row_names)
+    legacy = [full.row_names.index(name) for name in off.row_names]
+    index = off.row_names.index("event")
     spread = CH_VALUE_STATS + 1
-    assert not full.x[index, ..., spread].any()  # The window's labels alternate.
+    kept = full.x[legacy]
+    assert not kept[index, ..., spread].any()  # The window's labels alternate.
     assert off.x[index, ..., spread].any()
-    np.testing.assert_array_equal(full.x[..., :spread], off.x[..., :spread])
-    np.testing.assert_array_equal(full.x[..., spread + 1 :], off.x[..., spread + 1 :])
+    np.testing.assert_array_equal(kept[..., :spread], off.x[..., :spread])
+    np.testing.assert_array_equal(kept[..., spread + 1 :], off.x[..., spread + 1 :])
 
 
 def test_non_default_level_survives_yaml_checkpoint_export_and_adapter(make_adapter, tmp_path):
