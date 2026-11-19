@@ -21,6 +21,7 @@ from .config import V5TrainConfig, identity
 from .sources import SourceMix
 
 T1_EVAL_DEFAULTS = (200, 1000)
+_DERIVE_OFF_RESULT = "result-derive-off.json"
 
 
 def _name(value: str) -> str:
@@ -140,9 +141,13 @@ def _copy(source: Path, destination: Path, staging: Path) -> None:
     _atomic_write(destination, write, staging=staging)
 
 
-def _complete(unit: Path, expected: dict) -> bool:
+def _complete(unit: Path, expected: dict, *, required_files: tuple[str, ...] = ()) -> bool:
     saved = read_manifest(unit / "unit.json")
-    if saved is not None and all(saved.get(k) == v for k, v in expected.items()):
+    if (
+        saved is not None
+        and all(saved.get(k) == v for k, v in expected.items())
+        and all(name in saved["files"] for name in required_files)
+    ):
         return True
     (unit / "unit.json").unlink(missing_ok=True)
     return False
@@ -190,6 +195,20 @@ def _run_export(args: argparse.Namespace, unit: Path) -> int:
     return 0
 
 
+def _read_evaluation(directory: Path, name: str, digest: str) -> dict:
+    result = json.loads((directory / name).read_text())
+    if not isinstance(result, dict):
+        raise ValueError(f"{name} must hold an evaluation object")
+    if result.get("eval_digest") != digest:
+        raise ValueError(f"eval_digest mismatch between {name} and unit.json")
+    losses = result.get("loss")
+    if not isinstance(losses, list) or any(
+        type(value) not in (int, float) or not math.isfinite(value) or value < 0 for value in losses
+    ):
+        raise ValueError(f"{name} losses must be a list of finite nonnegative numbers")
+    return result
+
+
 def _comparison_arm(directory: Path, expected: dict, config: V5TrainConfig) -> tuple[dict, dict]:
     """Read a copied unit without the cloud completion helper's invalidation writes."""
     unit = read_manifest(directory / "unit.json")
@@ -210,21 +229,12 @@ def _comparison_arm(directory: Path, expected: dict, config: V5TrainConfig) -> t
     )
     if unit.get("identity") != requested:
         raise ValueError("training identity mismatch in unit.json")
-    result = json.loads((directory / "result.json").read_text())
-    if not isinstance(result, dict):
-        raise ValueError("result.json must hold an evaluation object")
-    if result.get("eval_digest") != unit["eval_digest"]:
-        raise ValueError("eval_digest mismatch between result.json and unit.json")
-    losses = result.get("loss")
-    if not isinstance(losses, list) or any(
-        type(value) not in (int, float) or not math.isfinite(value) or value < 0 for value in losses
-    ):
-        raise ValueError("result.json losses must be a list of finite nonnegative numbers")
-    return unit, result
+    return unit, _read_evaluation(directory, "result.json", unit["eval_digest"])
 
 
 def _t1_compare(args) -> int:
     entry = t1.PATHS[args.path]
+    decide_on = entry["decide_on"]
     directories = {}
     for argument in args.arm:
         arm, separator, directory = argument.partition("=")
@@ -252,10 +262,22 @@ def _t1_compare(args) -> int:
         max_panels=args.max_panels,
     )
     units, results, hashes = {}, {}, {}
+    off = None
     for arm in entry["arms"]:
         try:
             config = t1.t1_config(args.path, arm, seed=args.seed, base=base)
             unit, result = _comparison_arm(directories[arm], {**expected, "arm": arm}, config)
+            presentations = list(config.sampler.derive)
+            if presentations and result.get("derive") != presentations:
+                raise ValueError(f"result.json derive must match the configured {presentations}")
+            if arm == "true" and presentations and _DERIVE_OFF_RESULT in unit["files"]:
+                off = _read_evaluation(directories[arm], _DERIVE_OFF_RESULT, unit["eval_digest"])
+                if off.get("derive") != []:
+                    raise ValueError(f"{_DERIVE_OFF_RESULT} derive must be empty")
+                if {"lag_rows", "onset_rows"}.intersection(presentations) and off.get(
+                    "derived"
+                ) != [[] for _ in off["loss"]]:
+                    raise ValueError(f"{_DERIVE_OFF_RESULT} derived must be empty for each episode")
             if units:
                 reference = next(iter(units.values()))
                 for key in ("env_sha256", "eval_digest"):
@@ -273,6 +295,8 @@ def _t1_compare(args) -> int:
             raise ValueError(f"{arm}: eval_digest differs from rebuilt evaluation set")
         if len(results[arm]["loss"]) != len(episodes):
             raise ValueError(f"{arm}: result.json losses do not align with evaluation episodes")
+    if off is not None and len(off["loss"]) != len(episodes):
+        raise ValueError(f"true: {_DERIVE_OFF_RESULT} losses do not align with evaluation episodes")
 
     comparisons = []
     for true, null, decides in entry["comparisons"]:
@@ -281,6 +305,7 @@ def _t1_compare(args) -> int:
             results[null]["loss"],
             episodes=episodes,
             required=entry["required"],
+            decide_on=decide_on,
         )
         comparisons.append({"true": true, "null": null, "decides": decides, **comparison})
     outcomes = [c["outcome"] for c in comparisons if c["decides"]]
@@ -291,6 +316,10 @@ def _t1_compare(args) -> int:
         "units": hashes,
         "comparisons": comparisons,
     }
+    if off is not None:
+        report["removal"] = t1._removal(
+            results["true"]["loss"], off["loss"], episodes, decide_on=decide_on
+        )
     if args.path == "selection":
         try:
             report["selection_report"] = t1.selection_report(
@@ -333,6 +362,7 @@ def _run(args, unit: Path, training: Path) -> int:
             episodes=args.episodes,
             max_panels=args.max_panels,
         )
+    derive_off = args.action == "t1" and args.arm == "true" and bool(config.sampler.derive)
     if args.action == "qualify":
         # Scope affects report reuse, independently of the training configuration identity.
         scope = _qualification_scope(args) or {}
@@ -340,7 +370,7 @@ def _run(args, unit: Path, training: Path) -> int:
 
     # Identity is checked even for complete units; stale completion must not
     # survive a failed attempt under another environment or configuration.
-    cached = _complete(unit, expected)
+    cached = _complete(unit, expected, required_files=(_DERIVE_OFF_RESULT,) if derive_off else ())
     if args.action == "qualify":
         sidecar = unit / "identity.json"
         if sidecar.exists():
@@ -418,8 +448,9 @@ def _run(args, unit: Path, training: Path) -> int:
             episodes = t1.eval_set(
                 args.path, base=base, episodes=args.episodes, max_panels=args.max_panels
             )
+            checkpoint = training / "checkpoint-final.pt"
             evaluation = t1.evaluate(
-                training / "checkpoint-final.pt",
+                checkpoint,
                 args.path,
                 args.arm,
                 episodes,
@@ -429,11 +460,20 @@ def _run(args, unit: Path, training: Path) -> int:
             if evaluation.get("eval_digest") != expected["eval_digest"]:
                 raise RuntimeError("evaluation digest mismatch")
             _json(unit / "result.json", evaluation)
+            if derive_off:
+                off = t1.evaluate(
+                    checkpoint, args.path, args.arm, episodes, derive_override=frozenset()
+                )
+                if off.get("eval_digest") != expected["eval_digest"]:
+                    raise RuntimeError(f"{_DERIVE_OFF_RESULT} evaluation digest mismatch")
+                _json(unit / _DERIVE_OFF_RESULT, off)
             for name in files:
                 _copy(training / name, unit / name, args.run_dir / "staging")
             if read_manifest(unit / "train.json") is None:
                 raise RuntimeError("copied training manifest does not validate")
             files.append("result.json")
+            if derive_off:
+                files.append(_DERIVE_OFF_RESULT)
     _publish_unit(unit, expected, files)
     return 0
 
