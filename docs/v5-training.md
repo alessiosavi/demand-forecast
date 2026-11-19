@@ -171,6 +171,18 @@ The switch defaults to an empty list. The export records enabled names and
 the adapter uses them for scoring. Use the `no_derived` scoring variant to
 disable them on the same weights.
 
+Enable `naive_anchor` in `sampler.derive` to supply six forecast paths in
+uncompressed label units. The fixed order is none, last, level, season,
+season2, drift. None is zero in scaled units, which corresponds to the
+row's fitted location. It is available when at least one other path is
+available. Level averages the finite values in the last `W` cells before the
+origin and requires at least `ceil(W / 2)` values. Undefined paths and scaled
+values with magnitude above `1e6` are masked. The paths use the kept
+target's own scale and cover the requested horizon, including cells with
+missing labels. They use no feature slots and can be enabled independently
+of `naive_rows`. Scoring plans one request per target for multi-target items
+when `naive_anchor` is enabled.
+
 **Calibrated score for static categories.** Set `sampler.screen_fair_spread` to
 `true` to score a static category attribute against 32 seeded permutations of
 its labels. The default score is the share of spread between label groups, which
@@ -199,6 +211,14 @@ weights and bias start at zero, so the initial model gives the same forecasts
 in evaluation mode. At the default width of 384, the projection adds 147,840
 parameters. The option defaults to false and is omitted from saved
 configurations at that setting. Checkpoints and exports record it when enabled.
+
+**Optional naive mix.** Set `model.naive_mix` to `true` to learn a
+per-cell softmax over the available naive paths. The model adds their
+weighted sum to every quantile. Initial weights favor seasonal naive when
+available and give most of the weight to last and level when the season
+is one. Cells without available paths use the existing quantile head.
+The option adds 198 parameters at the default `d_out` of 32. It defaults
+to false and is recorded in saved configurations when enabled.
 
 ### Export as a resumable job
 
@@ -271,8 +291,12 @@ The reference uses a four-season average by phase for `seasonal_h` and
 `level_shift` and the history median for noise and intermittent demand.
 
 When `naive_rows` is enabled, `zeroed_naive_rows` repeats the figures with
-those rows' horizon values and flags zeroed in the same batch layout. The
-gate uses the main forecast.
+those rows' horizon values and flags zeroed in the same batch layout.
+With `model.naive_mix` enabled, `anchor_off` masks the paths while preserving
+the decoder inputs. `anchor_only` replaces the forecast's median with the
+anchor. `mix_mean` gives the mean weights over real kept cells and
+`mix_no_seen_share` gives the fraction of those cells with no available
+path. The gate uses the main forecast.
 
 The five shape families require MASE at most seasonal naive's and
 correlation of at least 0.5. Noise allows MASE up to 1.05 times the history

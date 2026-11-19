@@ -1788,3 +1788,13 @@ def test_naive_rows_use_only_the_kept_forecast_target():
     np.testing.assert_allclose(
         _naive_horizon(episode, "actual~last")[:, CH_VALUE], np.arcsinh(scaled[191]), atol=1e-6
     )
+
+
+def test_builder_rejects_unknown_derive_names_with_naive_anchor():
+    t = np.arange(64, dtype=float)
+    panel = Panel("anchor", (Item("one", 0, {"y": t}, {}, {}),), {}, None, None, False)
+    builder = EpisodeBuilder(panel)
+    request = EpisodeRequest(0, (32,), 5, context=32, derive=frozenset({"naive_anchor"}))
+    assert builder.build(request).naive_seen[..., :5, 1].all()
+    with pytest.raises(ValueError, match="unknown derive switch"):
+        builder.plan_requests(0, (32,), 5, context=32, derive=frozenset({"naive_anchors"}))

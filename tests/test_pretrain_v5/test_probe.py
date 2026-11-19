@@ -435,3 +435,55 @@ def test_zero_naive_rows_refuses_a_batch_without_row_keys(probe):
     plain = EpisodeBatch(**{f.name: getattr(keyed, f.name) for f in fields(EpisodeBatch)})
     with pytest.raises(TypeError, match="row keys"):
         probe.zero_naive_rows(plain)
+
+
+def test_probe_reports_mix_anchor_only_and_anchor_off(probe, monkeypatch):
+    panel = probe.probe_panels()["seasonal_d"]
+    panel = replace(panel, items=panel.items[:2])
+    monkeypatch.setattr(probe, "probe_panels", lambda: {panel.name: panel})
+    settings = probe.ProbeSettings(derive=frozenset({"naive_rows", "naive_anchor"}))
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(23)
+        model = V5Model(replace(config().model, naive_mix=True)).eval()
+        with torch.no_grad():
+            model.mix_projection.weight.normal_(std=0.75)
+    report = probe.run_probe(model, settings)["families"][panel.name]
+    levels = model.config.quantiles
+    options = dict(context=512, derive=settings.derive)
+    jobs = [(i, ORIGIN) for i in range(len(panel.items))]
+    from demand_forecast.data.episode import EpisodeBatch
+
+    seen = []
+
+    def inspect(batch, output):
+        assert batch.naive_seen[..., 0].all()
+        seen.append((batch, output))
+        cleared = probe.anchor_off(batch)
+        assert cleared.xh is batch.xh and cleared.naive_paths is batch.naive_paths
+        assert not cleared.naive_seen.any()
+        off = model(cleared, output.gates).quantiles
+        plain = EpisodeBatch(**{f.name: getattr(batch, f.name) for f in fields(EpisodeBatch)})
+        torch.testing.assert_close(off, model(plain, output.gates).quantiles, atol=0, rtol=0)
+
+    actual = forecast_items(model, panel, jobs, HORIZON, output_hook=inspect, **options)
+    [(batch, output)] = seen
+    assert report["mix_mean"] == pytest.approx(
+        dict(
+            zip(
+                ("none", "last", "level", "season", "season2", "drift"),
+                output.mix[:, 0, 0, :HORIZON].mean(dim=(0, 1)).tolist(),
+                strict=True,
+            )
+        )
+    )
+    assert report["mix_no_seen_share"] == pytest.approx(0)
+    knots = np.stack([actual.values[i, "y"] for i, _ in jobs])
+    anchor = batch.loc[:, 0, None] + batch.scale[:, 0, None] * output.anchor[:, 0, 0, :HORIZON]
+    knots[..., levels.index(0.5)] = anchor.numpy()
+    assert report["anchor_only"] == probe.score_panel(panel, knots, levels)
+    off = forecast_items(model, panel, jobs, HORIZON, batch_hook=probe.anchor_off, **options)
+    off_knots = np.stack([off.values[i, "y"] for i, _ in jobs])
+    assert report["anchor_off"] == probe.score_panel(panel, off_knots, levels)
+    assert report["anchor_off"]["mase"] != pytest.approx(report["mase"])
+    assert report["anchor_only"]["mase"] != pytest.approx(report["mase"])
+    assert report["zeroed_naive_rows"]["mase"] != pytest.approx(report["mase"])

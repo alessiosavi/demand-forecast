@@ -246,6 +246,7 @@ def test_only_the_four_aligned_paths_change_config_digests():
             # Model options added after the base revision stay at their defaults in every T1 arm.
             assert cfg["model"].pop("expert_mode") == "routed"
             assert cfg["model"].pop("horizon_seed") is False
+            assert cfg["model"].pop("naive_mix") is False
             # The optimiser field added after the base revision; no T1 arm sets a label cap.
             assert cfg["optim"].pop("label_cap") is None
             for source in cfg["sources"]:
@@ -1335,3 +1336,27 @@ def test_selection_report_threads_bootstrap_seed_and_resamples():
         assert (record["low"], record["high"]) == pytest.approx(
             np.quantile(draws[name], (0.05, 0.95))
         )
+
+
+def test_derive_off_replays_a_mix_model(small, monkeypatch):
+    base = tiny()
+    base = replace(
+        base,
+        model=replace(base.model, naive_mix=True),
+        sampler=replace(base.sampler, derive=("naive_anchor",)),
+    )
+    episodes = small.eval_set("category_mean", base=base, episodes=1, min_count=1, max_panels=60)
+    saved = small.t1_config("category_mean", "true", seed=17, base=base)
+    model = V5Model(saved.model)
+    monkeypatch.setattr(small, "load_model", lambda *a, **kw: (model, saved))
+    anchors = []
+
+    def capture(_model, _args, output):
+        anchors.append(output.anchor)
+
+    with model.register_forward_hook(capture):
+        result = small.evaluate(
+            Path("unused"), "category_mean", "true", episodes, derive_override=frozenset()
+        )
+    assert result["derive"] == []
+    assert anchors and all(anchor is None for anchor in anchors)

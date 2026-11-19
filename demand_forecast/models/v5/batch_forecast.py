@@ -26,7 +26,7 @@ from demand_forecast.data.episode import (
 from demand_forecast.data.episode.schema import MAX_FORECAST_ROWS, STEP_FAMILIES
 from demand_forecast.data.episode.screening import Candidate
 
-from .model import Gates, V5Model, prune
+from .model import Gates, V5Model, V5Output, prune
 
 
 @dataclass
@@ -204,8 +204,9 @@ def _validate_joint_layouts(
     for origin, position, index in jobs:
         if layouts[position] != "joint":
             continue
-        # Single targets are already designated, and wide items always split.
-        if not 1 < len(builder.panel.items[index].targets) <= MAX_FORECAST_ROWS:
+        target_count = len(builder.panel.items[index].targets)
+        # Wide items already split unless an explicit joint layout conflicts with anchoring.
+        if target_count <= 1 or (target_count > MAX_FORECAST_ROWS and "naive_anchor" not in derive):
             continue
         requests = builder.plan_requests(
             index, (origin,), horizon, context=context, cutoff=origin, drop=drop, derive=derive
@@ -386,9 +387,9 @@ def _batch_to_model(batch: EpisodeBatch, device: torch.device, dtype: torch.dtyp
     for field in fields(batch):
         value = getattr(batch, field.name)
         if isinstance(value, torch.Tensor):
-            # Keep the inverse transform in the builder's float64 frame.
+            # Keep the inverse frame and the full float32 precision of the naive paths.
             target_dtype = value.dtype
-            if value.is_floating_point() and field.name not in ("loc", "scale"):
+            if value.is_floating_point() and field.name not in ("loc", "scale", "naive_paths"):
                 target_dtype = dtype
             tensors[field.name] = value.to(device=device, dtype=target_dtype)
     return replace(batch, **tensors)
@@ -434,6 +435,7 @@ def forecast_items(
     workers: int = 0,
     prefetch: int = 2,
     batch_hook: Callable[[EpisodeBatch], EpisodeBatch] | None = None,
+    output_hook: Callable[[EpisodeBatch, V5Output], None] | None = None,
 ) -> ItemForecasts:
     """Forecast one origin per item in the model's floating-point dtype and device.
 
@@ -442,16 +444,20 @@ def forecast_items(
     Joint layout compatibility is checked before forecasting each origin.
     On Linux, workers can build and collate chunks for origins with multiple
     chunks, with prefetch chunks queued per worker. Statistics construction
-    and model inference run in the caller. The optional hook transforms each
+    and model inference run in the caller. The optional batch hook transforms each
     collated batch with row keys before device transfer and model gating,
-    preserving its layout.
+    preserving its layout. The output hook observes the batch after any pruning
+    and the model's output.
     """
     _validate_workers(workers, prefetch)
     if workers:
         # Pretraining imports the model, so load its helpers only at runtime.
         from demand_forecast.pretrain.v5 import sampler
 
-        sampler._ensure_worker_file_limit(workers)
+        if "naive_anchor" in derive:
+            sampler._ensure_worker_file_limit(workers, naive_anchor=True)
+        else:
+            sampler._ensure_worker_file_limit(workers)
     if type(batch_episodes) is not int or batch_episodes < 1:
         raise ValueError("batch_episodes must be a positive integer")
     if router not in ("learned", "uniform"):
@@ -513,7 +519,7 @@ def forecast_items(
                             summary_off,
                             workers,
                             prefetch,
-                            include_row_keys=batch_hook is not None,
+                            include_row_keys=batch_hook is not None or output_hook is not None,
                         )
                     ) as batches:
                         for group, chunk in batches:
@@ -526,7 +532,10 @@ def forecast_items(
                             evidence_rows.extend(_evidence_rows(chunk.evidence, selected, pruned))
                             if pruned:
                                 batch, selected = prune(batch, selected)
-                            quantiles = model(batch, selected, router=router).quantiles[:, 0]
+                            output = model(batch, selected, router=router)
+                            if output_hook is not None:
+                                output_hook(batch, output)
+                            quantiles = output.quantiles[:, 0]
                             for key, value, used_fallback in _kept_forecasts(
                                 batch, quantiles, group, horizon
                             ):
@@ -536,7 +545,7 @@ def forecast_items(
                                 values[key] = value
                                 if used_fallback:
                                     fallback.add(key)
-                            del chunk, batch, selected, quantiles
+                            del chunk, batch, selected, output, quantiles
                 finally:
                     stats.release(origin)
     finally:

@@ -45,7 +45,14 @@ TASK = SimpleNamespace(
 
 
 def _export(
-    directory, *, drop=(), summary=(), threshold=0.0, fair_spread=False, sampler_options=None
+    directory,
+    *,
+    drop=(),
+    summary=(),
+    threshold=0.0,
+    fair_spread=False,
+    sampler_options=None,
+    naive_mix=False,
 ):
     config = V5TrainConfig(
         V5Config(
@@ -59,6 +66,7 @@ def _export(
             d_calendar=4,
             d_step=4,
             d_out=4,
+            **({"naive_mix": True} if naive_mix else {}),
         ),
         (),
         SamplerConfig(
@@ -674,3 +682,36 @@ def test_workers_use_process_affinity(platform, device, cores, expected, monkeyp
     monkeypatch.setattr(api.sys, "platform", platform)
     monkeypatch.setattr(api.os, "sched_getaffinity", lambda pid: range(cores), raising=False)
     assert api._worker_count(device) == expected
+
+
+def test_naive_anchor_scores_each_target_and_no_derived_runs_head_only(tmp_path, make_adapter):
+    checkpoint = _export(tmp_path, sampler_options={"derive": ("naive_anchor",)}, naive_mix=True)
+    full = make_adapter(checkpoint=checkpoint)
+    per_target = make_adapter(checkpoint=checkpoint, variant="per_target")
+    no_derived = make_adapter(checkpoint=checkpoint, variant="no_derived")
+    window = _window(targets=2)
+    levels = list(full.model.config.quantiles)
+    for adapter in (full, per_target, no_derived):
+        with torch.no_grad():
+            adapter.model.step_projection.weight.zero_()
+            adapter.model.step_projection.bias.zero_()
+            adapter.model.head.projection.bias.zero_()
+            adapter.model.mix_projection.bias.fill_(-50)
+            adapter.model.mix_projection.bias[3] = 50
+    (anchored,) = full.predict([window], HORIZON, levels)
+    (split,) = per_target.predict([window], HORIZON, levels)
+    (head,) = no_derived.predict([window], HORIZON, levels)
+    np.testing.assert_allclose(anchored, split, **TOL)
+    (part,) = _panels(window).parts
+    y = window.items[0].target
+    season = part.panel.season
+    np.testing.assert_allclose(
+        anchored[0][..., levels.index(0.5)], y[:, -season:][:, :HORIZON], **TOL
+    )
+    np.testing.assert_allclose(
+        head[0][..., levels.index(0.5)],
+        np.median(y, axis=1)[:, None] + np.zeros((2, HORIZON)),
+        **TOL,
+    )
+    assert full.evidence()[0].requests == per_target.evidence()[0].requests
+    assert full.evidence()[0].requests == no_derived.evidence()[0].requests

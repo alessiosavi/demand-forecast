@@ -4,13 +4,16 @@ from dataclasses import dataclass, fields, replace
 
 import torch
 from torch import Tensor, nn
+from torch.nn.functional import linear
 
 from demand_forecast.data.episode import EpisodeBatch
+from demand_forecast.data.episode.collate import EpisodeBatchWithNaive
 from demand_forecast.data.episode.schema import (
     CH_STEP,
     CH_STEP_FLAG,
     KIND_NUMBER,
     N_SUMMARY,
+    NAIVE_OPTIONS,
     PATCH,
     ROLE_FORECAST,
     ROLE_KNOWN,
@@ -53,6 +56,8 @@ class V5Output:
     gates: Gates
     router: Tensor | None
     aux: dict[str, Tensor]
+    anchor: Tensor | None = None
+    mix: Tensor | None = None
 
 
 def _reference(batch: EpisodeBatch, summary: Tensor, flags: Tensor) -> tuple[Tensor, Tensor]:
@@ -108,6 +113,27 @@ class V5Model(nn.Module):
             self.horizon_seed_projection = nn.Linear(config.d_model, config.d_model)
             nn.init.zeros_(self.horizon_seed_projection.weight)
             nn.init.zeros_(self.horizon_seed_projection.bias)
+        if config.naive_mix:
+            self.mix_projection = nn.Linear(config.d_out, len(NAIVE_OPTIONS))
+            nn.init.zeros_(self.mix_projection.weight)
+            with torch.no_grad():
+                self.mix_projection.bias.copy_(
+                    self.mix_projection.bias.new_tensor((-3, 0, 0, 4.5, 0, -2))
+                )
+
+    def _mix_naive(
+        self, steps_out: Tensor, batch: EpisodeBatchWithNaive, real: Tensor
+    ) -> tuple[Tensor, Tensor]:
+        projection = self.mix_projection
+        dtype = torch.float64 if projection.weight.dtype == torch.float64 else torch.float32
+        logits = linear(steps_out.to(dtype), projection.weight.to(dtype), projection.bias.to(dtype))
+        seen = batch.naive_seen & real[..., None]
+        has_option = seen.any(dim=-1, keepdim=True)
+        # Give an empty cell finite logits for softmax, then zero its weights.
+        logits = logits.masked_fill(~seen, -torch.inf).masked_fill(~has_option, 0)
+        mix = logits.softmax(dim=-1).masked_fill(~seen, 0)
+        paths = batch.naive_paths.to(dtype).masked_fill(~seen, 0)
+        return (mix * paths).sum(-1), mix
 
     def parameter_report(self) -> dict[str, int | None]:
         """Return both parameter totals and the extra width of each dense expert block.
@@ -333,16 +359,31 @@ class V5Model(nn.Module):
                 dec_gate,
                 dec_weights,
             )
+        real = batch.origin_mask[:, :, None, None] & batch.forecast_mask[:, None, :, None]
+        anchor = mix = None
         # Low precision can round the gaps between adjacent quantiles to zero.
         with torch.autocast(h.device.type, enabled=False):
             # Match the float32 weights in training and honor an explicit forecast dtype.
             states = h[:, :, :nf].to(self.step_projection.weight.dtype)
             steps_out = self.step_projection(states).unflatten(-1, (PATCH, self.config.d_out))
-            quantiles = self.head(steps_out.flatten(3, 4))
-        real = batch.origin_mask[:, :, None, None] & batch.forecast_mask[:, None, :, None]
+            steps_out = steps_out.flatten(3, 4)
+            quantiles = self.head(steps_out)
+            if self.config.naive_mix and isinstance(batch, EpisodeBatchWithNaive):
+                real_steps = real & step_mask.flatten(1)[:, None, None, :]
+                anchor, mix = self._mix_naive(steps_out, batch, real_steps)
+                quantiles = torch.where(
+                    batch.naive_seen.any(dim=-1, keepdim=True) & real_steps[..., None],
+                    quantiles + anchor[..., None],
+                    quantiles,
+                )
         quantiles = quantiles.masked_fill(~real[..., None], 0)
         return V5Output(
-            quantiles, gates, weights, {"sparsity": gates.expected_l0, "balance": balance}
+            quantiles,
+            gates,
+            weights,
+            {"sparsity": gates.expected_l0, "balance": balance},
+            anchor,
+            mix,
         )
 
 
@@ -404,7 +445,7 @@ def prune(batch: EpisodeBatch, gates: Gates) -> tuple[EpisodeBatch, Gates]:
                 if name in names:
                     value = value[selected]
                     break
-            if name in ("labels", "label_mask"):
+            if name in ("labels", "label_mask", "naive_paths", "naive_seen"):
                 value = value[:, forecast]
             if name == "xh":
                 value = value[:, known]
