@@ -162,6 +162,32 @@ def _record_batches(model, monkeypatch):
     return batches
 
 
+def test_batch_hook_replaces_each_collated_batch_before_model_gates(model, monkeypatch):
+    panel = _panel()
+    batches = _record_batches(model, monkeypatch)
+    replacements = []
+
+    def hook(batch):
+        assert torch.count_nonzero(batch.xh)
+        changed = replace(batch, xh=torch.zeros_like(batch.xh))
+        replacements.append(changed)
+        return changed
+
+    v5.forecast_items(
+        model,
+        panel,
+        [(i, 40) for i in range(4)],
+        8,
+        context=CONTEXT,
+        batch_episodes=2,
+        batch_hook=hook,
+    )
+    assert len(batches) == len(replacements) == 2
+    for (batch, _), replacement in zip(batches, replacements, strict=True):
+        torch.testing.assert_close(batch.xh, replacement.xh)
+        assert batch.row_names == replacement.row_names
+
+
 def test_equals_single_episode_forecast(model):
     panel = _panel()
     jobs = [(i, 40) for i in range(len(panel.items))]
