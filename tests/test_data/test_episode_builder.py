@@ -30,6 +30,7 @@ from demand_forecast.data.episode.schema import (
     CH_VALUE_STATS,
     KIND_CATEGORY,
     KIND_FLAG,
+    MAX_FEATURE_ROWS,
     ROLE_KNOWN,
     ROLE_PANEL,
     ROLE_PAST,
@@ -58,6 +59,89 @@ def _equal_inputs(a, b, exclude=()):
             np.testing.assert_allclose(x, y, rtol=0, atol=1e-6, equal_nan=True, err_msg=field.name)
         else:
             assert x == y, field.name
+
+
+def _equal_exact(a, b, exclude=()):
+    for field in fields(a):
+        if field.name in exclude:
+            continue
+        expected, actual = getattr(a, field.name), getattr(b, field.name)
+        if isinstance(expected, np.ndarray):
+            assert actual.dtype == expected.dtype
+            np.testing.assert_array_equal(actual, expected, err_msg=field.name)
+        else:
+            assert actual == expected, field.name
+
+
+def test_default_requests_are_unchanged():
+    panel = toy_panel(n_targets=2)
+    builder = EpisodeBuilder(panel)
+    request = EpisodeRequest(1, (320, 336), 16, 64, "y", 304)
+    baseline = builder.build(request)
+    for derive in (frozenset(), frozenset({"lag_rows", "onset_rows"})):
+        actual = builder.build(replace(request, derive=derive))
+        _equal_exact(baseline, actual)
+
+
+def test_derive_reaches_every_request(monkeypatch):
+    builder = EpisodeBuilder(toy_panel(n_targets=2))
+    real_validate = builder._validate
+    probes = []
+
+    def validate(request):
+        probes.append(request)
+        return real_validate(request)
+
+    monkeypatch.setattr(builder, "_validate", validate)
+    derive = frozenset({"increment_spread"})
+    requests = builder.plan_requests(0, (336,), 5, context=64, derive=derive)
+    assert [r.target for r in requests] == ["y", "y1"]
+    assert [r.derive for r in [*probes, *requests]] == [derive] * 3
+    with pytest.raises(ValueError, match="unknown derive"):
+        builder.plan_requests(0, (336,), 5, derive=frozenset({"unknown"}))
+
+
+def test_increment_spread_preserves_feature_admission_and_other_channels():
+    panel = toy_panel(n_items=1)
+    item = panel.items[0]
+    event = np.resize(np.repeat(np.array(["a", "b", "c"], dtype=object), 4), len(item.targets["y"]))
+    dynamic = {
+        "event": event,
+        **{f"number_{i:02}": item.dynamic["temp"] + i for i in range(MAX_FEATURE_ROWS)},
+    }
+    roles = dict.fromkeys(dynamic, "past")
+    roles["event"] = "known"
+    panel = replace(panel, items=(replace(item, dynamic=dynamic),), roles=roles)
+    builder = EpisodeBuilder(panel)
+    request = EpisodeRequest(0, (320, 336), 16, 64, cutoff=304)
+    enabled = replace(request, derive=frozenset({"increment_spread"}))
+    original, actual = builder.build(request), builder.build(enabled)
+    index = original.row_names.index("event")
+    assert np.isin(actual.row_role, [ROLE_KNOWN, ROLE_PAST]).sum() == MAX_FEATURE_ROWS
+    spread = CH_VALUE_STATS + 1
+    assert np.any(original.x[index, ..., spread] != actual.x[index, ..., spread])
+    assert np.any(original.xh[..., spread] != actual.xh[..., spread])
+    _equal_exact(actual, original, exclude=("x", "xh"))
+    for field in ("x", "xh"):
+        base, changed = getattr(original, field), getattr(actual, field)
+        assert base.dtype == changed.dtype
+        np.testing.assert_array_equal(base[..., :spread], changed[..., :spread])
+        np.testing.assert_array_equal(base[..., spread + 1 :], changed[..., spread + 1 :])
+    for drop in (frozenset({"features"}), frozenset({"value_stats"})):
+        plain, derived = (builder.build(replace(r, drop=drop)) for r in (request, enabled))
+        np.testing.assert_array_equal(plain.x, derived.x)
+        np.testing.assert_array_equal(plain.xh, derived.xh)
+        assert plain.row_names == derived.row_names
+
+    # The earlier horizon can overlap the later origin's visible context.
+    changed = EpisodeBuilder(perturb_after(panel, request.origins[0], keep_known=True)).build(
+        enabled
+    )
+    first_origin_patches = actual.origin_patches[0]
+    np.testing.assert_array_equal(
+        changed.x[:, :first_origin_patches], actual.x[:, :first_origin_patches]
+    )
+    np.testing.assert_array_equal(changed.xh[0], actual.xh[0])
 
 
 def test_inputs_ignore_what_is_not_available():

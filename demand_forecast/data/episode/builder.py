@@ -57,6 +57,7 @@ DROPPABLE = (
     "value_stats",
     "value_effects",
 )
+DERIVABLE = ("increment_spread", "lag_rows", "onset_rows")
 
 
 @dataclass(frozen=True)
@@ -71,6 +72,7 @@ class EpisodeRequest:
     cutoff: int | None = None
     drop: frozenset[str] = frozenset()
     keep_columns: frozenset[str] | None = None
+    derive: frozenset[str] = frozenset()
 
 
 @dataclass
@@ -211,6 +213,8 @@ class EpisodeBuilder:
             raise ValueError("statistics cutoff follows the earliest origin")
         if set(request.drop) - set(DROPPABLE):
             raise ValueError("unknown drop switch")
+        if request.derive.difference(DERIVABLE):
+            raise ValueError("unknown derive switch")
         targets = self.panel.items[request.item_index].targets
         if not targets or (request.target is not None and request.target not in targets):
             raise ValueError("a forecast target must exist")
@@ -256,6 +260,7 @@ class EpisodeBuilder:
         cutoff: int | None = None,
         drop: frozenset[str] = frozenset(),
         keep_columns: frozenset[str] | None = None,
+        derive: frozenset[str] = frozenset(),
     ) -> list[EpisodeRequest]:
         """Split multi-target items when typed context needs a designated column."""
         if not 0 <= item_index < len(self.panel.items):
@@ -264,7 +269,7 @@ class EpisodeBuilder:
         if not targets:
             raise ValueError("a forecast target must exist")
         probe = EpisodeRequest(
-            item_index, origins, horizon, context, targets[0], cutoff, drop, keep_columns
+            item_index, origins, horizon, context, targets[0], cutoff, drop, keep_columns, derive
         )
         end = self._validate(probe)
         candidates = screen(
@@ -279,7 +284,7 @@ class EpisodeBuilder:
         split = len(targets) > MAX_FORECAST_ROWS or self._typed(self._restricted(candidates, probe))
         return [
             EpisodeRequest(
-                item_index, origins, horizon, context, target, cutoff, drop, keep_columns
+                item_index, origins, horizon, context, target, cutoff, drop, keep_columns, derive
             )
             for target in (targets if split and len(targets) > 1 else [None])
         ]
@@ -350,12 +355,18 @@ class EpisodeBuilder:
         *,
         frozen_at: int | None = None,
         horizon: bool = False,
+        derive: frozenset[str] = frozenset(),
     ) -> np.ndarray:
         result = np.zeros((right - left, N_CHANNELS), dtype=np.float32)
         start, stop = max(0, left), min(right, len(row.raw))
         if row.mode in ("category", "effect"):
             stats, _ = category_step_stats(
-                row.raw, target, left=left, right=right, frozen_at=frozen_at
+                row.raw,
+                target,
+                left=left,
+                right=right,
+                frozen_at=frozen_at,
+                use_increment_spread=row.mode == "category" and "increment_spread" in derive,
             )
             observed = np.zeros(right - left, dtype=bool)
             if start < stop:
@@ -633,7 +644,9 @@ class EpisodeBuilder:
                 data[:, CH_SUPPORT] = np.log1p(row.support)
                 valid = (row.support.reshape(npatches, PATCH) > 0).any(axis=1)
             else:
-                data = self._encode(row, left - item.start, right - item.start, target_scaled)
+                data = self._encode(
+                    row, left - item.start, right - item.start, target_scaled, derive=request.derive
+                )
                 steps = np.arange(left, right).reshape(npatches, PATCH)
                 valid = ((steps >= item.start) & (steps < item.start + len(row.raw))).any(axis=1)
             for family, span in STEP_FAMILIES.items():
@@ -664,6 +677,7 @@ class EpisodeBuilder:
                     target_scaled,
                     frozen_at=local,
                     horizon=True,
+                    derive=request.derive,
                 )
 
         cal_phases = np.zeros((request.context, N_PHASES), np.float32)

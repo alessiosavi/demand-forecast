@@ -54,6 +54,47 @@ def test_yaml_round_trip_is_plain_and_restores_tuples(tmp_path):
     assert isinstance(restored.model.quantiles, tuple)
 
 
+def test_canonical_serialized_and_export_omit_an_empty_derive(tmp_path):
+    from demand_forecast.pretrain.v5.loop import _configuration
+
+    cfg = training_config()
+    assert cfg.sampler.derive == ()
+    saved = cfg._serialized()
+    assert "derive" not in saved["sampler"]
+    assert "derive" not in cfg.canonical()["sampler"]
+    assert _configuration(saved) == cfg
+    path = tmp_path / "train.yaml"
+    cfg.to_yaml(path)
+    assert "derive" not in yaml.safe_load(path.read_text())["sampler"]
+    assert type(cfg).from_yaml(path).sampler.derive == ()
+
+
+def test_enabled_names_round_trip_sorted(tmp_path):
+    from demand_forecast.pretrain.v5.loop import _configuration
+
+    base = training_config()
+    cfg = replace(
+        base,
+        sampler=replace(
+            base.sampler, derive=["onset_rows", "lag_rows", "increment_spread", "onset_rows"]
+        ),
+    )
+    expected = ["increment_spread", "lag_rows", "onset_rows"]
+    assert cfg.sampler.derive == tuple(expected)
+    assert (
+        cfg._serialized()["sampler"]["derive"] == cfg.canonical()["sampler"]["derive"] == expected
+    )
+    assert _configuration(cfg._serialized()) == cfg
+    path = tmp_path / "train.yaml"
+    cfg.to_yaml(path)
+    assert type(cfg).from_yaml(path) == cfg
+    identity = config_module().identity
+    parts = dict(code="0" * 40, corpus=None, init=None, env=None)
+    assert identity(cfg, **parts) != identity(base, **parts)
+    with pytest.raises(ValueError, match="derive"):
+        replace(base.sampler, derive=("unknown",))
+
+
 @pytest.mark.parametrize(
     "value", [-0.01, 1.0, 1.01, False, True, "0.5", float("nan"), float("inf")]
 )

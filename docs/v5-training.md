@@ -103,9 +103,25 @@ status 1. Batch tolerances are `atol=rtol=1e-6`. Output tolerances are
 
 Run `bash scripts/ci/v5_parity.sh` to run the Linux CI gate locally. It uses
 Python 3.12, CPU torch 2.8.0 and the relevant training and scoring pins. It
-creates a seeded, untrained tiny export with `selftest` in the training
-environment and checks it in the scoring environment. If the gate fails on
-merged code, scoring work pauses while the environment choice is revisited.
+creates seeded, untrained tiny exports with and without `increment_spread` in
+the training environment and checks them in the scoring environment. If the
+gate fails on merged code, scoring work pauses while the environment choice
+is revisited.
+
+**Optional input presentations.** Set `sampler.derive` to `[increment_spread]` to
+replace a dynamic category's second value statistic with the root mean square
+of its one-step target increments divided by `sqrt(2)`. A pair counts when both
+adjacent cells have the active label and finite targets and the later cell is
+strictly before the context cell or the forecast origin for a known horizon.
+With zero pairs, the statistic is zero. For independent noise around a constant
+level it estimates the noise spread. For AR(1) noise it estimates
+`sigma * sqrt(1 - rho)` at constant level, with half the squared baseline step
+added to the squared statistic when the level moves.
+
+The switch defaults to an empty list. The export records enabled names and
+the adapter uses them for scoring. Use the `no_derived` scoring variant to
+disable them on the same weights. `lag_rows` and `onset_rows` are accepted names
+reserved for later presentations.
 
 ### Export as a resumable job
 

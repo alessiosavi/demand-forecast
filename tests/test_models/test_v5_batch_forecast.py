@@ -31,6 +31,67 @@ from tests.helpers.v5_loop import config, equal
 CONTEXT = 32
 
 
+@pytest.mark.parametrize("layout", [None, "per_target", "joint", "plan"])
+def test_derive_reaches_every_request(model, monkeypatch, layout):
+    panel = _panel_with_known_category()
+    if layout == "joint":
+        panel = replace(
+            panel, items=tuple(replace(item, dynamic={}) for item in panel.items), roles={}
+        )
+    derive = frozenset({"increment_spread", "lag_rows"})
+    planned, built = [], []
+    validate = EpisodeBuilder._validate
+    build = EpisodeBuilder.build
+
+    def observe_probe(builder, request):
+        planned.append(request.derive)
+        return validate(builder, request)
+
+    def observe_build(builder, request):
+        built.append(request.derive)
+        return build(builder, request)
+
+    monkeypatch.setattr(EpisodeBuilder, "_validate", observe_probe)
+    monkeypatch.setattr(EpisodeBuilder, "build", observe_build)
+    kwargs = dict(context=CONTEXT, derive=derive)
+    if layout == "plan":
+        assert v5.planned_layouts(panel, [(0, 40)], 3, **kwargs) == ["per_target"]
+        assert planned == [derive] and not built
+    else:
+        v5.forecast_items(
+            model, panel, [(0, 40)], 3, layouts=None if layout is None else [layout], **kwargs
+        )
+        count = 1 if layout == "joint" else 2
+        assert built == [derive] * count
+        assert planned == [derive] * (count + (layout != "per_target"))
+
+
+def test_increment_spread_hidden_targets_leave_forecasts_and_gates_unchanged(model):
+    panel = toy_panel()
+    origin = 336
+    item = panel.items[0]
+    event = np.resize(np.repeat(np.array(["a", "b", "c"], dtype=object), 4), len(item.targets["y"]))
+    item = replace(item, dynamic={**item.dynamic, "event": event})
+    panel = replace(panel, items=(item, *panel.items[1:]))
+    hidden = perturb_after(panel, origin, keep_known=True)
+    request = EpisodeRequest(0, (origin,), 16, CONTEXT, derive=frozenset({"increment_spread"}))
+    before = EpisodeBuilder(panel).build(request)
+    after = EpisodeBuilder(hidden).build(request)
+    for field in fields(before):
+        if field.name == "labels":
+            continue
+        expected, actual = getattr(before, field.name), getattr(after, field.name)
+        if isinstance(expected, np.ndarray):
+            assert expected.dtype == actual.dtype
+            np.testing.assert_array_equal(actual, expected, err_msg=field.name)
+        else:
+            assert actual == expected
+    full = v5.forecast(model, panel, request)
+    changed = v5.forecast(model, hidden, request)
+    np.testing.assert_array_equal(changed.quantiles, full.quantiles)
+    assert changed.names == full.names and changed.gates == full.gates
+
+
 def _panel(*, n_items=4, length=64, n_targets=1):
     panel = toy_panel(n_items=n_items, length=length, seed=37, n_targets=n_targets)
     return replace(

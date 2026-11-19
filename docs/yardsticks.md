@@ -168,8 +168,9 @@ the full available history up to the forecast origin. `--batch-size` counts
 episodes and defaults to 64. Linux CUDA scoring uses 16 episode-building
 workers when at least 18 CPU cores are available to the process.
 
-The default `--variant full` uses the export's trained drops and summary
-mask. Those settings apply to every variant. Ablations retain the full
+The default `--variant full` uses the export's trained drops, summary mask and
+optional presentations (`derive`). Those settings apply to every variant
+except where a variant says otherwise. Ablations retain the full
 variant's target layout, with explicit per-target layouts for `per_target`
 and `no_siblings`.
 
@@ -187,6 +188,7 @@ and `no_siblings`.
 | `no_panel_row` | Drop the whole-panel row |
 | `no_typed_context` | Drop attribute tokens, static numbers, peer and whole-panel rows, and category value statistics and effects. A dynamic category is represented by flags for its most frequent values |
 | `no_value_stats` | Replace a dynamic category's value statistics with flags and an effect row |
+| `no_derived` | Score with the export's trained optional presentations (`derive`) disabled |
 | `no_calendar` | Remove calendar features |
 | `no_rolling` | Remove the rolling per-step family |
 | `no_lags` | Remove the lag per-step family |
