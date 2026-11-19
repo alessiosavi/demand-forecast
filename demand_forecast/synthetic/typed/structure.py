@@ -56,11 +56,13 @@ def _calendar(draft: Draft, streams: Streams, ranges: RangeFn) -> Result:
     fields = {
         "subhourly": ("hour", "dow"),
         "hourly": ("hour", "dow"),
-        "daily": ("dow", "month"),
+        "daily": ("dow", "dom", "month"),
     }.get(freq_class, ("month",))
-    sizes = {"hour": 24, "dow": 7, "month": 12}
+    # Keep the original day-of-week and month draws for existing daily seeds.
+    draw_order = ("dow", "month", "dom") if freq_class == "daily" else fields
+    sizes = {"hour": 24, "dow": 7, "dom": 31, "month": 12}
     amplitudes, tables = {}, {}
-    for field in fields:
+    for field in draw_order:
         amplitude = float(rng.uniform(*ranges("amplitude")))
         weights = rng.uniform(-1, 1, sizes[field])
         weights -= weights.mean()
@@ -71,6 +73,8 @@ def _calendar(draft: Draft, streams: Streams, ranges: RangeFn) -> Result:
     for i in range(draft.recipe.n_items):
         dates = draft.timestamps(i)
         indices = {"hour": dates.hour, "dow": dates.day_of_week, "month": dates.month - 1}
+        if freq_class == "daily":
+            indices["dom"] = dates.day - 1
         additions.append(sum(np.array(tables[field])[indices[field]] for field in fields))
     return Result(
         (),
