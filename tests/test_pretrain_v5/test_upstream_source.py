@@ -1,6 +1,7 @@
 """Adapt the prepared upstream generators without importing their trainer."""
 
 import importlib
+import importlib.util
 import os
 import subprocess
 import sys
@@ -19,6 +20,101 @@ from tests.test_pretrain_v5.test_sources import equal_panels
 
 def loaded_simons():
     return [name for name in sys.modules if name == "simons" or name.startswith("simons.")]
+
+
+def install_fake_simons(tmp_path, monkeypatch):
+    """Install recording stubs for the two standalone upstream APIs."""
+    for name in loaded_simons():
+        monkeypatch.delitem(sys.modules, name)
+    modules = {
+        "simons": "",
+        "simons.synth": """
+import torch
+calls = []
+
+def generate(count, length, generator, device, *, pad):
+    calls.append((count, length, generator.initial_seed(), device, pad))
+    return torch.arange(length, dtype=torch.float64).expand(count, length)
+""",
+        "simons.synth.covariates": "",
+        "simons.synth.covariates.effects": """
+import numpy as np
+calls = []
+
+def synthetic(panel, rng, context, horizon):
+    base, _ = panel.uni[0]
+    calls.append((int(rng.integers(2**31)), context, horizon))
+    return base + 5, [np.cos(base)]
+""",
+    }
+    for name, code in modules.items():
+        path = tmp_path.joinpath(*name.split("."), "__init__.py")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(code, encoding="utf-8")
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        monkeypatch.setitem(sys.modules, name, module)
+        spec.loader.exec_module(module)
+    return sys.modules["simons.synth"].calls, sys.modules["simons.synth.covariates.effects"].calls
+
+
+def draw_fake_upstream(share, caller_seed):
+    from demand_forecast.pretrain.v5.sources import UpstreamSource
+
+    rng = np.random.default_rng(caller_seed)
+    caller = np.random.default_rng(caller_seed)
+    seed = int(caller.integers(0, 2**63))
+    panel, record = UpstreamSource(SourceConfig("upstream", 1, plain_share=share)).panel(rng)
+    assert record["seed"] == seed
+    assert rng.bit_generator.state == caller.bit_generator.state
+    panel.validate()
+    return panel
+
+
+def test_plain_share_zero_keeps_base_revision_upstream_calls(tmp_path, monkeypatch):
+    generate, effects = install_fake_simons(tmp_path, monkeypatch)
+    panel = draw_fake_upstream(0, 12)
+    (call,) = generate
+    assert call[:4] == (1, 2336, 2313447293076694940, "cpu")
+    assert call[4] == pytest.approx(0.0)
+    assert effects == [(1400094754, 2048, 288)]
+    assert set(panel.roles) == {"cov_000"}
+    np.testing.assert_allclose(
+        panel.items[0].targets["target_000"], np.arange(2336) + 5, rtol=0, atol=1e-12
+    )
+
+
+def test_plain_share_one_returns_base_without_covariate_effects(tmp_path, monkeypatch):
+    generate, effects = install_fake_simons(tmp_path, monkeypatch)
+    panel = draw_fake_upstream(1, 12)
+    assert len(generate) == 1 and effects == []
+    (item,) = panel.items
+    assert not item.dynamic and not panel.roles
+    np.testing.assert_allclose(item.targets["target_000"], np.arange(2336), rtol=0, atol=1e-12)
+
+
+def test_plain_share_half_uses_the_source_local_seed_for_each_decision(tmp_path, monkeypatch):
+    generate, effects = install_fake_simons(tmp_path, monkeypatch)
+    panels = [draw_fake_upstream(0.5, caller_seed) for caller_seed in range(16)]
+    assert [not panel.items[0].dynamic for panel in panels] == [
+        True,
+        True,
+        False,
+        False,
+        True,
+        True,
+        True,
+        False,
+        True,
+        True,
+        False,
+        False,
+        True,
+        False,
+        True,
+        True,
+    ]
+    assert len(generate) == 16 and len(effects) == 6
 
 
 @pytest.fixture

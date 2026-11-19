@@ -212,6 +212,10 @@ def test_only_the_four_repaired_paths_change():
         for arm in entry["arms"]:
             cfg = asdict(module.t1_config(path, arm, seed=7))
             sampler = cfg["sampler"]
+            for source in cfg["sources"]:
+                # Source fields added after the base revision; every T1 arm leaves them at their defaults.
+                assert source.pop("folder_power") is None
+                assert source.pop("plain_share") == 0.0
             assert sampler.pop("first_event_only") is (path == "event_response")
             cold_share = sampler.pop("cold_share")
             assert sampler.pop("cold_steps") == (3, 4)

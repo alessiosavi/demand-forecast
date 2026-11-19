@@ -131,6 +131,14 @@ def _check_numeric_schema(parquet, kind: str, relative: str) -> tuple[str, ...]:
 
 
 @dataclass(frozen=True)
+class CorpusFolder:
+    name: str
+    first_row: int
+    rows: int
+    values: int
+
+
+@dataclass(frozen=True)
 class CorpusIndex:
     """Index of admitted corpus rows."""
 
@@ -143,6 +151,7 @@ class CorpusIndex:
     _file_starts: tuple[int, ...] = field(default=(), repr=False)
     unparsed_frequencies: dict[str, int] = field(default_factory=dict, hash=False)
     """Unparsed label counts for admitted rows, with ``rows`` as the denominator."""
+    folders: tuple[CorpusFolder, ...] = ()
 
     @classmethod
     def build(cls, root: Path, *, max_group_bytes: int = 256 << 20) -> CorpusIndex:
@@ -201,12 +210,16 @@ class CorpusIndex:
 
         groups, excluded, frequencies, ends, starts = [], [], [], [], []
         unparsed_frequencies: Counter[str] = Counter()
+        folders: dict[str, CorpusFolder] = {}
         rows = 0
         for path in paths:
-            relative = path.relative_to(root).as_posix()
-            kind = path.relative_to(root).parts[0]
+            relative_path = path.relative_to(root)
+            relative = relative_path.as_posix()
+            kind = relative_path.parts[0]
+            folder = relative_path.parent.as_posix()
             if not path.name.startswith(("train-", "validation-")):
                 raise ValueError(f"unsupported parquet shard: {relative}")
+            first_row, values = rows, 0
             with pq.ParquetFile(path, pre_buffer=False, buffer_size=64 << 10) as parquet:
                 columns = _check_numeric_schema(parquet, kind, relative)
                 file_start = 0
@@ -231,8 +244,15 @@ class CorpusIndex:
                         frequencies.append(_frequencies(parquet, i, unparsed_frequencies))
                         starts.append(file_start)
                         rows += group.num_rows
+                        values += num_values
                         ends.append(rows)
                     file_start += group.num_rows
+            if rows > first_row:
+                previous = folders.get(folder)
+                if previous is not None:
+                    first_row = previous.first_row
+                    values += previous.values
+                folders[folder] = CorpusFolder(folder, first_row, rows - first_row, values)
         return cls(
             root,
             tuple(groups),
@@ -242,11 +262,20 @@ class CorpusIndex:
             tuple(ends),
             tuple(starts),
             unparsed_frequencies=dict(unparsed_frequencies),
+            folders=tuple(folders.values()),
         )
 
     @property
     def rows(self) -> int:
         return self._ends[-1] if self._ends else 0
+
+    def pick(self, rng: np.random.Generator, power: float | None) -> int:
+        """Propose an admitted row uniformly, or draw its folder first."""
+        if power is None:
+            return int(rng.integers(self.rows))
+        weights = np.array([folder.values for folder in self.folders], dtype=np.float64) ** power
+        folder = self.folders[int(rng.choice(len(self.folders), p=weights / weights.sum()))]
+        return int(rng.integers(folder.first_row, folder.first_row + folder.rows))
 
 
 class SamplerSkip(Exception):  # noqa: N818 - public sampler contract
