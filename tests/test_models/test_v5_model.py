@@ -501,7 +501,7 @@ def test_uniform_router_uses_all_experts_in_encoder_and_decoder():
     torch.testing.assert_close(uniform.aux["balance"], learned.aux["balance"], rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("episodes,shift", [(1, 1), (3, 1), (4, 2)])
+@pytest.mark.parametrize("episodes,shift", [(2, 1), (3, 1), (4, 2)])
 def test_rolled_router_is_a_deterministic_batch_roll(episodes, shift):
     batch, model = routing_batch(episodes), V5Model(TINY).eval()
     learned = model(batch)
@@ -513,11 +513,13 @@ def test_rolled_router_is_a_deterministic_batch_roll(episodes, shift):
     torch.testing.assert_close(first.router, second.router, rtol=0, atol=0)
     torch.testing.assert_close(first.quantiles, second.quantiles, rtol=0, atol=0)
     torch.testing.assert_close(first.aux["balance"], learned.aux["balance"], rtol=0, atol=0)
-    if episodes == 1:
-        torch.testing.assert_close(first.quantiles, learned.quantiles, rtol=0, atol=0)
-    else:
-        assert not torch.equal(first.router, learned.router)
-        assert not torch.allclose(first.quantiles, learned.quantiles, atol=1e-6)
+    assert not torch.equal(first.router, learned.router)
+    assert not torch.allclose(first.quantiles, learned.quantiles, atol=1e-6)
+
+
+def test_rolled_router_rejects_one_episode():
+    with pytest.raises(ValueError, match="^the rolled router needs at least two episodes$"):
+        V5Model(TINY).eval()(routing_batch(1), router="rolled")
 
 
 def test_unknown_router_raises():

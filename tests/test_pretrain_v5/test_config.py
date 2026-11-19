@@ -10,6 +10,8 @@ import yaml
 
 from demand_forecast.data.episode.schema import MAX_CONTEXT, MAX_HORIZON, PATCH
 from demand_forecast.models.v5 import V5Config, V5Model
+from demand_forecast.synthetic.typed.draft import INPUT_MECHANISMS
+from demand_forecast.synthetic.typed.recipe import MECHANISMS
 
 
 def config_module():
@@ -24,10 +26,10 @@ def training_config():
             cfg.SourceConfig(
                 "typed",
                 0.5,
-                recipes=(("trend", "seasonality"),),
+                recipes=(("static_number", "known_driver"),),
                 freq="D",
                 length=(128, 256),
-                nuisance_from=("noise",),
+                nuisance_from=("static_number",),
             ),
             cfg.SourceConfig("corpus", 0.5, root="/corpus"),
         ),
@@ -41,7 +43,7 @@ def test_yaml_round_trip_is_plain_and_restores_tuples(tmp_path):
     path = tmp_path / "train.yaml"
     cfg.to_yaml(path)
     raw = yaml.safe_load(path.read_text())
-    assert raw["sources"][0]["recipes"] == [["trend", "seasonality"]]
+    assert raw["sources"][0]["recipes"] == [["static_number", "known_driver"]]
     assert raw["sampler"]["contexts"] == [256, 512, 1024]
     assert raw["model"]["quantiles"] == [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
     restored = type(cfg).from_yaml(path)
@@ -249,6 +251,22 @@ def test_t1_model_and_base_are_valid_and_small():
     assert base.optim.checkpoint_minutes == 10
 
 
+def test_every_t1_arm_constructs_with_default_base():
+    t1 = importlib.import_module("demand_forecast.pretrain.v5.t1")
+    for path, entry in t1.PATHS.items():
+        for arm in entry["arms"]:
+            config = t1.t1_config(path, arm, seed=0)
+            assert config.sources[0].recipes == entry["sets"]
+
+
+def test_t1_null_rolled_arm_uses_unbudgeted_multi_episode_batches():
+    t1 = importlib.import_module("demand_forecast.pretrain.v5.t1")
+    config = t1.t1_config("routing", "null_rolled", seed=7)
+    assert config.router == "rolled"
+    assert config.sampler.episodes_per_batch >= 2
+    assert config.sampler.max_cells is None
+
+
 def test_missing_as_zero_requires_one_origin():
     api = config_module()
     base = api.T1_BASE
@@ -290,6 +308,29 @@ def test_router_and_gates_reject_unknown_modes(field):
         replace(config_module().T1_BASE, **{field: "unrecognised"})
 
 
+_INVALID_ROLLED_SAMPLER_OPTIONS = [("episodes_per_batch", 1), ("max_cells", 100)]
+
+
+@pytest.mark.parametrize("field,value", _INVALID_ROLLED_SAMPLER_OPTIONS)
+def test_rolled_config_rejects_sampler_options_that_allow_singletons(field, value):
+    base = config_module().T1_BASE
+    sampler = replace(base.sampler, **{field: value})
+    with pytest.raises(ValueError, match=rf"rolled.*{field}"):
+        replace(base, sampler=sampler, router="rolled")
+
+
+@pytest.mark.parametrize("field,value", _INVALID_ROLLED_SAMPLER_OPTIONS)
+def test_rolled_yaml_rejects_sampler_options_that_allow_singletons(tmp_path, field, value):
+    base = config_module().T1_BASE
+    raw = base.canonical()
+    raw["router"] = "rolled"
+    raw["sampler"][field] = value
+    path = tmp_path / "train.yaml"
+    path.write_text(yaml.safe_dump(raw))
+    with pytest.raises(ValueError, match=rf"rolled.*{field}"):
+        type(base).from_yaml(path)
+
+
 _TYPED_OPTIONS = (
     ("control", "shuffle"),
     ("control", "no_dates"),
@@ -297,12 +338,12 @@ _TYPED_OPTIONS = (
     ("control_inputs", "attribute"),
     ("control_inputs", "column"),
     ("heldout", True),
-    ("recipes", (("trend",),)),
+    ("recipes", (("static_number",),)),
     ("freq", "D"),
     ("length", (64, 128)),
     ("max_items", 2),
     ("n_nuisance", 1),
-    ("nuisance_from", ("noise",)),
+    ("nuisance_from", ("static_number",)),
     ("singleton_share", 0.5),
 )
 
@@ -316,7 +357,76 @@ def test_non_typed_sources_reject_typed_options(kind, field, value):
 
 @pytest.mark.parametrize("field,value", [row for row in _TYPED_OPTIONS if row[1] is not False])
 def test_typed_sources_accept_typed_options(field, value):
-    assert getattr(config_module().SourceConfig("typed", 1.0, **{field: value}), field) == value
+    options = {"recipes": (("static_number",),)} if field in ("n_nuisance", "nuisance_from") else {}
+    options[field] = value
+    assert getattr(config_module().SourceConfig("typed", 1.0, **options), field) == value
+
+
+_UNKNOWN_MECHANISMS = (
+    ("recipes", (("no_such",),)),
+    ("nuisance_from", ("no_such",)),
+)
+
+
+@pytest.mark.parametrize("field,value", _UNKNOWN_MECHANISMS)
+def test_typed_sources_reject_unknown_mechanism_names(field, value):
+    options = {"recipes": (("static_number",),), field: value}
+    with pytest.raises(ValueError, match=rf"{field}.*no_such"):
+        config_module().SourceConfig("typed", 1.0, **options)
+
+
+@pytest.mark.parametrize("mechanism", MECHANISMS)
+def test_typed_recipes_accept_every_mechanism(mechanism):
+    recipes = ((mechanism,),)
+    assert config_module().SourceConfig("typed", 1.0, recipes=recipes).recipes == recipes
+
+
+@pytest.mark.parametrize("mechanism", INPUT_MECHANISMS)
+def test_typed_nuisance_from_accepts_every_input_mechanism(mechanism):
+    names = (mechanism,)
+    source = config_module().SourceConfig(
+        "typed", 1.0, recipes=(names,), n_nuisance=1, nuisance_from=names
+    )
+    assert source.nuisance_from == names
+
+
+def test_typed_nuisance_from_rejects_a_mechanism_without_inputs():
+    with pytest.raises(ValueError, match=r"nuisance_from.*level_shift"):
+        config_module().SourceConfig(
+            "typed", 1.0, recipes=(("level_shift",),), n_nuisance=1, nuisance_from=("level_shift",)
+        )
+
+
+def test_typed_nuisance_from_requires_membership_in_every_recipe():
+    with pytest.raises(ValueError, match=r"nuisance_from.*static_number.*recipe.*known_driver"):
+        config_module().SourceConfig(
+            "typed",
+            1.0,
+            recipes=(("static_number",), ("known_driver",)),
+            n_nuisance=1,
+            nuisance_from=("static_number",),
+        )
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("n_nuisance", 1),
+        ("nuisance_from", ("static_number",)),
+        ("nuisance_from", ("no_such",)),
+        ("nuisance_from", ()),
+    ],
+)
+def test_typed_nuisance_options_require_explicit_recipes(field, value):
+    with pytest.raises(ValueError, match=rf"{field}.*requires recipes.*ignored"):
+        config_module().SourceConfig("typed", 1.0, **{field: value})
+
+
+@pytest.mark.parametrize("kind", ["corpus", "upstream"])
+@pytest.mark.parametrize("field,value", _UNKNOWN_MECHANISMS)
+def test_non_typed_sources_reject_mechanism_fields_before_checking_names(kind, field, value):
+    with pytest.raises(ValueError, match=rf"^{field} is only valid for typed sources$"):
+        config_module().SourceConfig(kind, 1.0, **{field: value})
 
 
 @pytest.mark.parametrize("kind", ["typed", "corpus", "upstream"])

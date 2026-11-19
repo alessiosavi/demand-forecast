@@ -35,6 +35,8 @@ def tiny_units(tmp_path_factory):
         source.update(max_items=4, length=(128, 160))
         if name == "bank":
             source.update(freq="h", length=(400, 480))
+        if name == "routing":
+            entry["both"].setdefault("sampler", {})["episodes_per_batch"] = 2
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(t1, "T1_BASE", base)
         patch.setattr(t1, "PATHS", paths)

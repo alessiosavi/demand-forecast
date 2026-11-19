@@ -138,7 +138,7 @@ def steps_between(a: pd.Timestamp, b: pd.Timestamp, freq: str | pd.offsets.BaseO
     Common offsets are counted without allocating a grid. Other pandas offsets
     (such as business calendars) fall back to an exact date-range membership check.
     """
-    offset = to_offset(freq)
+    offset = freq if isinstance(freq, pd.offsets.BaseOffset) else to_offset(freq)
     if offset.n <= 0:
         raise ValueError("Grid frequency must have a positive step")
     a, b = pd.Timestamp(a), pd.Timestamp(b)

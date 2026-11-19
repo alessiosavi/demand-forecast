@@ -134,7 +134,13 @@ def tiny():
     return replace(
         base,
         model=replace(base.model, n_experts=2, top_k=2, expert_enc_layers=1),
-        sampler=replace(base.sampler, designate_target=True, horizon=(16, 32), contexts=(64,)),
+        sampler=replace(
+            base.sampler,
+            episodes_per_batch=2,
+            designate_target=True,
+            horizon=(16, 32),
+            contexts=(64,),
+        ),
     )
 
 
