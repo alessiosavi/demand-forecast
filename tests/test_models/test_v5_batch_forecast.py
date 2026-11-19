@@ -322,6 +322,24 @@ def test_later_observations_of_another_item_do_not_change_a_forecast(model, monk
     assert not torch.equal(peer, earlier_peer)
 
 
+@pytest.mark.parametrize(
+    "jobs, layouts, message",
+    [
+        ([(0, 40), (0, 41)], None, "one origin per item"),
+        ([(4, 40)], None, "item index outside the panel"),
+        ([(-1, 40)], None, "item index outside the panel"),
+        ([(0, 40)], ["joint", "joint"], "layouts must give"),
+        ([(0, 40)], ["both"], "layouts must give"),
+    ],
+)
+def test_invalid_jobs_and_layouts_are_refused_before_the_model_is_touched(
+    model, monkeypatch, jobs, layouts, message
+):
+    monkeypatch.setattr(model, "eval", lambda: pytest.fail("the model was touched"))
+    with pytest.raises(ValueError, match=message):
+        v5.forecast_items(model, _panel(), jobs, 3, context=CONTEXT, layouts=layouts)
+
+
 def test_layouts_are_honoured(model, monkeypatch):
     panel = _panel(n_targets=2)
     bare = replace(panel, items=tuple(replace(item, static={}) for item in panel.items))
