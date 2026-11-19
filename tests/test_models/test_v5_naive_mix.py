@@ -22,7 +22,7 @@ from demand_forecast.data.episode import (
 from demand_forecast.data.episode.collate import EpisodeBatchWithRowKeys
 from demand_forecast.data.episode.derived import naive_series
 from demand_forecast.data.episode.schema import ROLE_SIBLING
-from demand_forecast.models.v5 import V5Model, forecast_items, planned_layouts
+from demand_forecast.models.v5 import V5Model, forecast_items, planned_layouts, usable_workers
 from demand_forecast.models.v5.model import prune
 from tests.helpers.v5_loop import config
 
@@ -55,10 +55,10 @@ def episode(data, derive=BOTH, *, origins=(205,), horizon=19, screening=Screenin
     )
 
 
-def model(*, mix=True, zero_head=False):
+def model(*, mix=True, zero_head=False, config=TINY):
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(37)
-        net = V5Model(replace(TINY, naive_mix=mix)).eval()
+        net = V5Model(replace(config, naive_mix=mix)).eval()
     if zero_head:
         with torch.no_grad():
             net.step_projection.weight.zero_()
@@ -231,22 +231,24 @@ def test_mixed_episodes_padding_and_pruned_sibling(keyed):
     assert not before.mix[1].any()
 
 
-def test_empty_mask_has_finite_forward_and_backward_and_only_last_can_be_seen():
+def test_empty_naive_cell_has_finite_softmax_backward():
     batch = collate([episode(panel(), ANCHOR)])
     paths, seen = torch.full_like(batch.naive_paths, torch.nan), torch.zeros_like(batch.naive_seen)
     paths[0, 0, 0, 0, 1] = 17
     seen[0, 0, 0, 0, 1] = True
     batch = replace(batch, naive_paths=paths, naive_seen=seen)
-    net = model(zero_head=True)
-    result = net(batch)
-    assert result.mix[0, 0, 0, 0, 1].item() == 1
-    assert result.quantiles[0, 0, 0, 0, 4].item() == 17
-    assert not result.mix[0, 0, 0, 1:].any()
-    assert not result.anchor[0, 0, 0, 1:].any()
-    assert result.quantiles.isfinite().all()
-    result.quantiles.sum().backward()
-    assert net.mix_projection.weight.grad.isfinite().all()
-    assert net.mix_projection.bias.grad.isfinite().all()
+    net = model(zero_head=True, config=replace(TINY, expert_mode="dense", expert_enc_layers=1))
+    with torch.autograd.set_detect_anomaly(True):
+        result = net(batch)
+        assert result.mix[0, 0, 0, 0, 1].item() == pytest.approx(1)
+        assert result.quantiles[0, 0, 0, 0, 4].item() == pytest.approx(17)
+        assert not result.mix[0, 0, 0, 1:].any()
+        assert not result.anchor[0, 0, 0, 1:].any()
+        assert result.quantiles.isfinite().all()
+        result.quantiles[0, 0, 0, 1].sum().backward()
+    for name, parameter in net.named_parameters():
+        assert parameter.grad is not None, name
+        assert parameter.grad.isfinite().all(), name
 
 
 @pytest.mark.parametrize(
@@ -350,9 +352,10 @@ def test_naive_batch_types_transport_through_loader_workers(keyed):
 def test_file_descriptor_budget_accounts_for_two_extra_tensors(monkeypatch):
     import resource
 
-    from demand_forecast.pretrain.v5.sampler import _ensure_worker_file_limit
-
     base_budget = 256 + 4 * len(fields(EpisodeBatch))
     monkeypatch.setattr(resource, "getrlimit", lambda key: (base_budget, base_budget))
-    with pytest.raises(RuntimeError, match=str(base_budget + 8)):
-        _ensure_worker_file_limit(1, naive_anchor=True)
+    monkeypatch.setattr(sys, "platform", "linux")
+    assert usable_workers(1) == (1, None)
+    workers, reason = usable_workers(1, naive_anchor=True)
+    assert workers == 0
+    assert reason is not None and f"below the {base_budget + 8} file descriptors" in reason

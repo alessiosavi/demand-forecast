@@ -1,7 +1,7 @@
 """In-memory v5 benchmark adapter fixtures and contracts."""
 
 import json
-from dataclasses import asdict, replace
+from dataclasses import asdict, fields, replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -15,7 +15,7 @@ pytestmark = pytest.mark.bench
 
 from demand_forecast.bench.v5_panels import time_axis, window_panels  # noqa: E402
 from demand_forecast.bench.yardsticks.runner import Options, SeriesInput, WindowInput  # noqa: E402
-from demand_forecast.data.episode import EpisodeBuilder, EpisodeRequest  # noqa: E402
+from demand_forecast.data.episode import EpisodeBatch, EpisodeBuilder, EpisodeRequest  # noqa: E402
 from demand_forecast.data.episode.scale import fit_scale  # noqa: E402
 from demand_forecast.data.episode.schema import (  # noqa: E402
     CH_STEP,
@@ -200,7 +200,8 @@ def test_predict_uses_preflight_worker_count(make_adapter, monkeypatch, workers,
 
     requested_counts, forecast_counts = [], []
 
-    def preflight(requested):
+    def preflight(requested, *, naive_anchor):
+        assert not naive_anchor
         requested_counts.append(requested)
         return workers, reason
 
@@ -220,6 +221,25 @@ def test_predict_uses_preflight_worker_count(make_adapter, monkeypatch, workers,
     assert adapter.metadata()["v5_worker_reason"] == reason
     assert adapter.metadata()["v5_workers"] == workers
     assert requested_counts == [16]
+
+
+def test_anchored_export_and_forecast_agree_on_worker_fallback(tmp_path, make_adapter, monkeypatch):
+    from demand_forecast.bench.yardsticks import v5_adapter
+
+    checkpoint = _export(tmp_path, sampler_options={"derive": ("naive_anchor",)}, naive_mix=True)
+    plain_need = 256 + 4 * len(fields(EpisodeBatch))
+    monkeypatch.setattr(v5_adapter.resource, "getrlimit", lambda key: (plain_need, plain_need))
+    monkeypatch.setattr(v5_adapter.sys, "platform", "linux")
+    monkeypatch.setattr(v5_adapter, "_worker_count", lambda device: 1)
+
+    adapter = make_adapter(checkpoint=checkpoint)
+    [[actual]] = adapter.predict([_window(targets=2)], HORIZON, [0.5])
+
+    assert actual.shape == (2, HORIZON, 1)
+    assert np.isfinite(actual).all()
+    metadata = adapter.metadata()
+    assert metadata["v5_workers"] == 0
+    assert "RLIMIT_NOFILE" in metadata["v5_worker_reason"]
 
 
 def test_levels_are_indexed_or_interpolated(make_adapter):

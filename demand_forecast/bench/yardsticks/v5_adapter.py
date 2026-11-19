@@ -150,7 +150,9 @@ class V5Adapter:
         self._summary_off = tuple(
             dict.fromkeys((*sampler["summary_off"], *self.variant.summary_off))
         )
-        self._workers, self._worker_reason = usable_workers(_worker_count(self.options.device))
+        self._workers, self._worker_reason = usable_workers(
+            _worker_count(self.options.device), naive_anchor="naive_anchor" in self._derive
+        )
         self.prepare(task)
 
     def prepare(self, task) -> None:

@@ -250,7 +250,7 @@ def _validate_workers(workers: int, prefetch: int) -> None:
         raise ValueError("prefetch must be a positive integer")
 
 
-def usable_workers(requested: int) -> tuple[int, str | None]:
+def usable_workers(requested: int, *, naive_anchor: bool = False) -> tuple[int, str | None]:
     """Return the worker count and any serial fallback reason for a nonnegative request.
 
     A positive Linux request may raise the process file-descriptor limit.
@@ -265,7 +265,7 @@ def usable_workers(requested: int) -> tuple[int, str | None]:
     from demand_forecast.pretrain.v5 import sampler
 
     try:
-        sampler._ensure_worker_file_limit(requested)
+        sampler._ensure_worker_file_limit(requested, naive_anchor=naive_anchor)
     except RuntimeError as error:
         return 0, str(error)
     return requested, None

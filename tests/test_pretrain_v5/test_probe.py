@@ -487,3 +487,28 @@ def test_probe_reports_mix_anchor_only_and_anchor_off(probe, monkeypatch):
     assert report["anchor_off"]["mase"] != pytest.approx(report["mase"])
     assert report["anchor_only"]["mase"] != pytest.approx(report["mase"])
     assert report["zeroed_naive_rows"]["mase"] != pytest.approx(report["mase"])
+
+
+def test_probe_mix_excludes_a_missing_horizon_label(probe):
+    panel = probe.probe_panels()["seasonal_d"]
+    item = panel.items[0]
+    target = item.targets["y"].copy()
+    missing_step = 3
+    target[ORIGIN + missing_step] = np.nan
+    panel = replace(panel, items=(replace(item, targets={"y": target}),))
+    model = V5Model(replace(config().model, naive_mix=True)).eval()
+    settings = probe.ProbeSettings(derive=frozenset({"naive_anchor"}))
+
+    def last_only(batch):
+        assert not batch.label_mask[0, 0, 0, missing_step]
+        seen = torch.zeros_like(batch.naive_seen)
+        seen[..., :HORIZON, 1] = True
+        seen[..., missing_step, 1] = False
+        return replace(batch, naive_seen=seen)
+
+    report = probe._score_model(model, panel, settings, batch_hook=last_only, observe_mix=True)
+
+    assert report["mix_mean"] == pytest.approx(
+        dict(none=0, last=1, level=0, season=0, season2=0, drift=0)
+    )
+    assert report["mix_no_seen_share"] == pytest.approx(0)

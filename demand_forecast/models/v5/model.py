@@ -129,7 +129,7 @@ class V5Model(nn.Module):
         logits = linear(steps_out.to(dtype), projection.weight.to(dtype), projection.bias.to(dtype))
         seen = batch.naive_seen & real[..., None]
         has_option = seen.any(dim=-1, keepdim=True)
-        # Give an empty cell finite logits for softmax, then zero its weights.
+        # Keep empty logits finite (test_empty_naive_cell_has_finite_softmax_backward).
         logits = logits.masked_fill(~seen, -torch.inf).masked_fill(~has_option, 0)
         mix = logits.softmax(dim=-1).masked_fill(~seen, 0)
         paths = batch.naive_paths.to(dtype).masked_fill(~seen, 0)

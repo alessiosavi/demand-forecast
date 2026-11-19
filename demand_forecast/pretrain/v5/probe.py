@@ -237,11 +237,12 @@ def _score_model(
     batch_hook: Callable[[EpisodeBatch], EpisodeBatch] | None = None,
     observe_mix: bool = False,
 ) -> dict:
-    anchors, weights = [], []
+    anchors, weights, label_masks = [], [], []
 
     def observe(batch: EpisodeBatch, output: V5Output) -> None:
         # Probe jobs have one origin and one kept target per item, in item order.
         keep = batch.keep & batch.forecast_mask & batch.origin_mask[:, :1]
+        label_masks.append(batch.label_mask[:, 0][keep][:, :_HORIZON].cpu().numpy())
         loc = batch.loc[keep][:, None]
         if output.anchor is None:
             anchors.append(loc.expand(-1, _HORIZON).cpu().numpy())
@@ -271,10 +272,15 @@ def _score_model(
     if observe_mix:
         quantiles[..., levels.index(0.5)] = np.concatenate(anchors)
         figures["anchor_only"] = score_panel(panel, quantiles, levels)
-        mix = np.concatenate(weights)
-        mean_weights = mix.mean(axis=(0, 1), dtype=np.float64).tolist()
+        mix = np.concatenate(weights)[np.concatenate(label_masks)]
+        if len(mix):
+            mean_weights = mix.mean(axis=0, dtype=np.float64).tolist()
+            no_seen_share = float((~mix.any(axis=-1)).mean())
+        else:
+            mean_weights = [None] * len(NAIVE_OPTIONS)
+            no_seen_share = None
         figures["mix_mean"] = dict(zip(NAIVE_OPTIONS, mean_weights, strict=True))
-        figures["mix_no_seen_share"] = float((~mix.any(axis=-1)).mean())
+        figures["mix_no_seen_share"] = no_seen_share
     return figures
 
 
