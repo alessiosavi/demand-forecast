@@ -1,6 +1,7 @@
 """Offline execution of the generated scoring job; external installation is faked."""
 
 import ast
+import base64
 import gzip
 import hashlib
 import importlib.util
@@ -56,6 +57,44 @@ def reference_arguments(model="timestral", **overrides):
         hub_revision="b" * 40,
         **overrides,
     )
+
+
+def v5_arguments(**overrides):
+    return arguments(**{"model": "v5", "export_digest": "d" * 64, **overrides})
+
+
+@pytest.mark.parametrize(
+    "model,default,selected",
+    [
+        (
+            "chronos2",
+            "09452e7a3286f0dd19ae95eda06e3abbbf513ad08aa7f10d1127c1797cbba6e8",
+            "bf833f40f4ee847a055d3d67805f4579a4de0f1a35bd20ec5ca1a4d7d097f62b",
+        ),
+        (
+            "timestral",
+            "33aa6294bd6056b613afbf4fee83a863b2861e5ae0ca7ddf26123ffdd749bedb",
+            "8319e8bf6c60d58e0929b0eeb54db20fbd1529c741b8443cb81146fb0598061a",
+        ),
+    ],
+)
+def test_reference_jobs_match_base_revision(score_jobs, model, default, selected):
+    selection = {
+        "names_uri": "gs://offline/names.txt",
+        "names_sha256": hashlib.sha256(NAMES).hexdigest(),
+        "covariates": "none",
+        "max_context": 1024,
+    }
+    for options, expected in [({}, default), (selection, selected)]:
+        job = score_jobs.generate(**reference_arguments(model, **options)).encode()
+        packed = job.split(b'packed = base64.b64decode("', 1)[1].split(b'")\n', 1)[0]
+        guest = gzip.decompress(base64.b64decode(packed))
+        # Pins from a753e18's generator. zlib output varies across platforms,
+        # so pin the guest bytes and assert the base's exact local gzip encoding.
+        assert packed == base64.b64encode(gzip.compress(guest, mtime=0))
+        assert (
+            hashlib.sha256(job.replace(packed, base64.b64encode(guest), 1)).hexdigest() == expected
+        )
 
 
 @pytest.mark.parametrize(
@@ -244,6 +283,100 @@ def test_covariates_cli(tmp_path, covariates):
     assert config["covariates"] == (covariates or "all")
 
 
+@pytest.mark.parametrize("variant", [None, "no_peers"])
+def test_v5_cli_emits_raw_job(tmp_path, variant):
+    output = tmp_path / "job.sh"
+    command = [sys.executable, str(ROOT / "scripts/gcp/jobs/make_score_job.py")]
+    for key, value in v5_arguments(variant=variant).items():
+        if value is not None:
+            command += ["--" + key.replace("_", "-"), value]
+    result = subprocess.run(command + ["--output", str(output)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert os.access(output, os.X_OK)
+    result = subprocess.run(["bash", "-n", str(output)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    job = output.read_text()
+    install = next(line for line in job.splitlines() if '--editable "$repo[bench]"' in line)
+    assert install.endswith('--editable "$repo[bench]"')
+    assert "Simons.git" not in job
+    snippet = job.split("<<'SCORE_BUNDLE'\n", 1)[1].split("\nSCORE_BUNDLE\n", 1)[0]
+    result = subprocess.run(
+        [sys.executable, "-", str(tmp_path)], input=snippet, capture_output=True, text=True
+    )
+    assert result.returncode == 0, result.stderr
+    config = json.loads((tmp_path / "inputs.json").read_text())
+    assert config["model"] == "v5" and config["modes"] == ["raw"]
+    assert config["export_digest"] == "d" * 64 and config["variant"] == variant
+    guest = (tmp_path / "score.py").read_text()
+    ast.parse(guest, feature_version=(3, 10))
+    assert '"--model", "simons"' not in guest
+    assert 'metadata.distribution("simons")' not in guest
+
+
+def test_v5_generation_loads_variants_without_torch(request, monkeypatch):
+    monkeypatch.setitem(sys.modules, "torch", None)
+    monkeypatch.setitem(sys.modules, "demand_forecast", None)
+    score_jobs = request.getfixturevalue("score_jobs")
+    assert score_jobs.generate(**v5_arguments(variant="no_value_stats")).startswith(
+        "#!/usr/bin/env bash"
+    )
+
+
+@pytest.mark.parametrize(
+    "change,message",
+    [
+        ({"checkpoint_uri": None}, "checkpoint URI"),
+        ({"checkpoint_uri": None, "hub_weights": "abel/model"}, "Hub weights"),
+        ({"hub_revision": "b" * 40}, "revision"),
+        ({"processing": "published"}, "raw"),
+        ({"export_digest": None}, "export digest"),
+        ({"export_digest": "d" * 63}, "export digest"),
+        ({"export_digest": "D" * 64}, "export digest"),
+        ({"variant": "unknown"}, "unknown v5 variant"),
+        ({"covariates": "none"}, "covariates"),
+        ({"max_context": 15}, "at least 16"),
+        ({"upstream_pin": "b" * 40}, "upstream pin"),
+    ],
+)
+def test_v5_refuses_invalid_options(score_jobs, change, message):
+    with pytest.raises(ValueError, match=message):
+        score_jobs.generate(**v5_arguments(**change))
+
+
+@pytest.mark.parametrize("model", ["simons", "timestral", "chronos2"])
+@pytest.mark.parametrize(
+    "change, message",
+    [({"variant": "full"}, "variant"), ({"export_digest": "d" * 64}, "export digest")],
+)
+def test_other_models_refuse_v5_options(score_jobs, model, change, message):
+    options = arguments(model=model) if model == "simons" else reference_arguments(model)
+    with pytest.raises(ValueError, match=message):
+        score_jobs.generate(**options, **change)
+
+
+@pytest.mark.parametrize(
+    "target,anchor",
+    [
+        ("Simons package check", '    upstream = json.loads(metadata.distribution("simons")'),
+        ("Simons child command", '"--model", "simons",'),
+        ("checkpoint fetch files", '    for filename in ("config.json", "model.safetensors"):'),
+        ("checkpoint hash files", ' for name in ("config.json", "model.safetensors")'),
+        ("checkpoint hash keys", 'set(value) == {"config.json", "model.safetensors"}'),
+        ("export digest check", '}\n    prior = root / "checkpoint-sha256.json"'),
+        ("task evidence scan", '            windows = record["window_sha256"]'),
+        (
+            "completion artifacts",
+            '                required.update(mode + "/" + name + "/" + p for p in record["window_sha256"])',
+        ),
+    ],
+)
+def test_v5_generation_refuses_missing_template_site(score_jobs, monkeypatch, target, anchor):
+    assert score_jobs.GUEST.count(anchor) == 1
+    monkeypatch.setattr(score_jobs, "GUEST", score_jobs.GUEST.replace(anchor, ""))
+    with pytest.raises(RuntimeError, match=target):
+        score_jobs.generate(**v5_arguments())
+
+
 @pytest.fixture
 def machine(score_jobs, tmp_path):
     score_name = "probe_" + hashlib.sha256(str(tmp_path).encode()).hexdigest()[:16]
@@ -300,10 +433,21 @@ def machine(score_jobs, tmp_path):
         args = sys.argv[1:]
         def value(flag): return args[args.index(flag) + 1]
         model = value('--model')
-        assert model in ('simons', 'timestral', 'chronos2')
+        assert model in ('simons', 'timestral', 'chronos2', 'v5')
         assert '--resume' in args and '--keep-going' in args
         if model == 'simons':
             assert pathlib.Path(value('--checkpoint'), 'model.safetensors').is_file()
+        elif model == 'v5':
+            checkpoint = pathlib.Path(value('--checkpoint'))
+            export = pathlib.Path(os.environ['CLOUD']) / 'export'
+            for name in ('config.json', 'model.safetensors', 'parity.npz'):
+                assert (checkpoint / name).read_bytes() == (export / name).read_bytes()
+            assert value('--processing') == 'raw'
+            assert not any(flag in args for flag in ('--weights', '--revision', '--covariates'))
+            if 'EXPECTED_VARIANT' in os.environ:
+                assert value('--variant') == os.environ['EXPECTED_VARIANT']
+            else:
+                assert '--variant' not in args
         else:
             assert value('--weights') == 'abel/model'
             assert value('--revision') == 'b' * 40
@@ -312,7 +456,7 @@ def machine(score_jobs, tmp_path):
         if '--names' in args:
             assert pathlib.Path(value('--names')[1:]).read_text() == 'alpha\\nbeta/new\\n'
         assert not pathlib.Path(os.environ['HF_DATASETS_CACHE']).is_relative_to(pathlib.Path(os.environ['RUN_DIR']) / 'state')
-        mode = value('--processing') if model == 'simons' else 'raw'
+        mode = value('--processing') if model in ('simons', 'v5') else 'raw'
         out = pathlib.Path(value('--out-dir'))
         out.mkdir(parents=True, exist_ok=True)
         with open(os.environ['EVENTS'], 'a') as log:
@@ -334,10 +478,23 @@ def machine(score_jobs, tmp_path):
             else:
                 window.write_bytes(b'resume sentinel')
             row = {'task': name, 'model_name': value('--model-name'), 'run_identity': 'identity'}
-            (task / 'run.json').write_text(json.dumps({'run_identity': 'identity', 'summary': row, 'window_sha256': {'window_0.npz': hashlib.sha256(window.read_bytes()).hexdigest()}}))
+            record = {'run_identity': 'identity', 'summary': row, 'window_sha256': {'window_0.npz': hashlib.sha256(window.read_bytes()).hexdigest()}}
+            if model == 'v5':
+                damage = os.environ.get('V5_DAMAGE') if name == 'alpha' else None
+                row['test_error'] = 'NaN' if damage == 'nonfinite' else 0.5
+                evidence = {'v5-report.json': b'{"run_identity": "identity"}', 'evidence_window_0.npz': b'offline evidence'}
+                record['evidence_sha256'] = {p: hashlib.sha256(data).hexdigest() for p, data in evidence.items()}
+                for p, data in evidence.items():
+                    if damage == 'missing' and p == 'evidence_window_0.npz':
+                        continue
+                    (task / p).write_bytes(data)
+            (task / 'run.json').write_text(json.dumps(record))
             rows.append(row)
         with (out / 'summaries.csv').open('w') as stream:
-            writer = csv.DictWriter(stream, fieldnames=['task', 'model_name', 'run_identity'])
+            fields = ['task', 'model_name', 'run_identity']
+            if model == 'v5':
+                fields.append('test_error')
+            writer = csv.DictWriter(stream, fieldnames=fields)
             writer.writeheader()
             writer.writerows(rows)
         (out / 'failures.json').write_text(json.dumps(failures))
@@ -360,6 +517,7 @@ def machine(score_jobs, tmp_path):
             (target / 'python').symlink_to(os.environ['FAKE_PYTHON'])
             sys.exit(0)
         if args[:3] == ['-m', 'pip', 'install']:
+            assert '' not in args, 'empty pip operand'
             if 'uv' in args:
                 target = pathlib.Path(args[args.index('--target') + 1]) / 'bin'
                 target.mkdir(parents=True)
@@ -445,6 +603,140 @@ def machine(score_jobs, tmp_path):
             checkpoint = Path(event[2][event[2].index("--checkpoint") + 1])
             if checkpoint.parent.name.startswith("demand-forecast-score-"):
                 shutil.rmtree(checkpoint.parent, ignore_errors=True)
+
+
+@pytest.fixture
+def v5_machine(machine):
+    _, _, _, cloud = machine
+    shutil.rmtree(cloud.parent / "packages/simons-0.1.1.dist-info")
+    export = cloud / "export"
+    (export / "parity.npz").write_bytes(b"offline parity")
+    config = {
+        "format": "v5-export-1",
+        "model": {"width": 24},
+        "files": {
+            name: hashlib.sha256((export / name).read_bytes()).hexdigest()
+            for name in ("model.safetensors", "parity.npz")
+        },
+    }
+    (export / "config.json").write_text(json.dumps(config, indent=2) + "\n")
+    digest = hashlib.sha256((export / "config.json").read_bytes()).hexdigest()
+    return machine, {"model": "v5", "export_digest": digest}
+
+
+def test_v5_scores_export_and_completed_job_skips_fetch(v5_machine):
+    (run, state, events, cloud), options = v5_machine
+    options.update(variant="no_peers", max_context=16, processing="raw")
+    result = run(options, EXPECTED_VARIANT="no_peers")
+    assert result.returncode == 0, result.stderr
+    steps = events()
+    assert [e[3] for e in steps if e[0] == "gcloud"] == [
+        "gs://offline/tasks.yaml",
+        "gs://offline/export/config.json",
+        "gs://offline/export/model.safetensors",
+        "gs://offline/export/parity.npz",
+    ]
+    install = next(e for e in steps if e[:5] == ["python", "-m", "pip", "install", "-r"])
+    assert len(install) == 8
+    assert install[5].endswith("/requirements-yardsticks.txt")
+    assert install[6] == "--editable" and install[7].endswith("/repository[bench]")
+    scores = [e for e in steps if e[0] == "score"]
+    assert len(scores) == 1 and scores[0][1] == "raw"
+    args = scores[0][2]
+    assert args[args.index("--max-context") + 1] == "16"
+    marker_path = state / "completed.json"
+    before = marker_path.read_bytes()
+    marker = json.loads(before)
+    assert marker["inputs"]["export_digest"] == options["export_digest"]
+    assert marker["inputs"]["variant"] == "no_peers"
+    assert marker["modes"]["raw"]["completed"] == ["alpha", "beta/new"]
+    assert {"raw/alpha/v5-report.json", "raw/alpha/evidence_window_0.npz"} <= marker[
+        "artifacts"
+    ].keys()
+    shutil.rmtree(cloud / "export")
+    assert run(options).returncode == 0
+    assert marker_path.read_bytes() == before
+    assert not any(e[0] in ["git", "gcloud", "score", "uv"] for e in events()[len(steps) :])
+    for change in [{"export_digest": "f" * 64}, {"variant": "full"}]:
+        result = run({**options, **change})
+        assert result.returncode != 0 and "different inputs" in result.stderr
+
+
+def test_v5_interrupted_run_resumes_from_three_key_record(v5_machine):
+    (run, state, events, cloud), options = v5_machine
+    assert run(options, FAIL_TASK="1").returncode == 1
+    marker = state / "completed.json"
+    assert json.loads(marker.read_text())["modes"]["raw"]["completed"] == ["beta/new"]
+    marker.unlink()
+    record = state / "checkpoint-sha256.json"
+    saved = record.read_bytes()
+    assert json.loads(saved) == {
+        name: hashlib.sha256((cloud / "export" / name).read_bytes()).hexdigest()
+        for name in ("config.json", "model.safetensors", "parity.npz")
+    }
+    before = len(events())
+    result = run(options)
+    assert result.returncode == 0, result.stderr
+    assert record.read_bytes() == saved
+    assert json.loads(marker.read_text())["modes"]["raw"]["completed"] == ["alpha", "beta/new"]
+    assert sum(e[0] == "gcloud" and "/export/" in e[3] for e in events()[before:]) == 3
+
+
+@pytest.mark.parametrize("filename", ["config.json", "model.safetensors", "parity.npz"])
+@pytest.mark.parametrize("resume", [False, True], ids=["first-run", "resume"])
+def test_v5_rejects_changed_export_before_committing_checkpoint(v5_machine, filename, resume):
+    (run, state, events, cloud), options = v5_machine
+    manifest = state / "checkpoint-sha256.json"
+    if resume:
+        assert run(options, FAIL_TASK="1").returncode == 1
+        saved = manifest.read_bytes()
+    start = len(events())
+    target = cloud / "export" / filename
+    target.write_bytes(target.read_bytes() + b" ")
+    result = run(options)
+    assert result.returncode != 0, result.stderr
+    assert "sha256 mismatch" in result.stderr and filename in result.stderr
+    assert not any(
+        e[0] == "python" and e[1].endswith("/scripts/fev_yardstick.py") for e in events()[start:]
+    )
+    if resume:
+        assert manifest.read_bytes() == saved
+        step = next(e for e in events() if e[0] == "score")
+        checkpoint = Path(step[2][step[2].index("--checkpoint") + 1])
+        assert (checkpoint / filename).read_bytes() != target.read_bytes()
+    else:
+        assert not manifest.exists()
+
+
+@pytest.mark.parametrize("damage", ["nonfinite", "missing"])
+def test_v5_incomplete_task_is_reported_even_if_child_succeeds(v5_machine, damage):
+    (run, state, _, _), options = v5_machine
+    result = run(options, V5_DAMAGE=damage)
+    assert result.returncode == 1, result.stderr
+    report = json.loads((state / "completed.json").read_text())["modes"]["raw"]
+    assert report["exit_code"] == 0
+    assert report["completed"] == ["beta/new"] and set(report["failed"]) == {"alpha"}
+
+
+@pytest.mark.parametrize("filename", ["v5-report.json", "evidence_window_0.npz"])
+@pytest.mark.parametrize("damage", ["changed", "unlisted"])
+def test_v5_preflight_checks_runner_digests_and_completion_manifest(v5_machine, filename, damage):
+    (run, state, events, _), options = v5_machine
+    assert run(options).returncode == 0
+    marker_path = state / "completed.json"
+    marker = json.loads(marker_path.read_text())
+    relative = "raw/alpha/" + filename
+    if damage == "changed":
+        artifact = state / relative
+        artifact.write_bytes(b"changed")
+        # The outer manifest agrees with disk, but the runner's digest disagrees.
+        marker["artifacts"][relative] = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    else:
+        del marker["artifacts"][relative]
+    marker_path.write_text(json.dumps(marker))
+    before = len(events())
+    assert run(options).returncode == 0
+    assert sum(e[0] == "score" for e in events()[before:]) == 1
 
 
 @pytest.mark.parametrize("model", ["timestral", "chronos2"])

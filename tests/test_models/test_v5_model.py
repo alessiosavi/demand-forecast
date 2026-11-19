@@ -1,6 +1,8 @@
 """Task 8 network, gating, loss, pruning and forecast contracts."""
 
 import dataclasses
+import hashlib
+import json
 from dataclasses import replace
 
 import numpy as np
@@ -25,7 +27,9 @@ from demand_forecast.data.episode.schema import (
 from demand_forecast.models.losses import pinball_loss
 from demand_forecast.models.v5 import V5Config, V5Model, forecast, v5_loss
 from demand_forecast.models.v5.blocks import DecoderBlock, EncoderBlock, ExpertFFN
+from demand_forecast.models.v5.context import ExpertRouter
 from demand_forecast.models.v5.model import Gates, V5Output, prune
+from demand_forecast.pretrain.v5.config import T1_MODEL
 from tests.helpers.episodes import toy_panel
 
 TINY = V5Config(d_model=64, nhead=4, enc_layers=2, dec_layers=2, dim_feedforward=128)
@@ -58,6 +62,116 @@ def bare_panel(values=None, *, dated=False, n_targets=1):
 def test_default_size():
     n = sum(p.numel() for p in V5Model().parameters())
     assert 15_000_000 <= n <= 30_000_000
+
+
+def test_default_configuration_is_unchanged():
+    model = V5Model()
+    signature = [(name, list(value.shape)) for name, value in model.state_dict().items()]
+    encoded = json.dumps(signature, separators=(",", ":")).encode()
+    assert hashlib.sha256(encoded).hexdigest() == (
+        "998bfb647b62831f40f0716ab5cf18450e39815b9501af91d31fd1ff9d5dcfc2"
+    )
+    assert sum(p.numel() for p in model.parameters()) == 23_810_557
+    assert model.config.expert_mode == "routed"
+
+
+@pytest.mark.parametrize(
+    ("config", "extra_expected", "delta_expected"),
+    [(V5Config(), 106, 2724), (T1_MODEL, 58, 1380)],
+    ids=["default", "T1"],
+)
+def test_dense_total_parameters_match_the_routed_model(config, extra_expected, delta_expected):
+    routed = V5Model(config)
+    dense = V5Model(replace(config, expert_mode="dense"))
+    routed_total = sum(p.numel() for p in routed.parameters())
+    dense_total = sum(p.numel() for p in dense.parameters())
+    report = dense.parameter_report()
+    extra = report["extra"]
+    delta = dense_total - routed_total
+    print(f"routed={routed_total:,} dense={dense_total:,} extra={extra} delta={delta:,}")
+    assert report == routed.parameter_report()
+    assert report["routed"] == routed_total
+    assert report["dense"] == dense_total
+    assert extra == extra_expected
+    assert delta == delta_expected
+    assert 0 <= delta < 0.001 * routed_total
+    width = config.n_experts * (config.dim_feedforward // config.n_experts) + extra
+    for blocks, n_expert in (
+        (dense.encoder, config.expert_enc_layers),
+        (dense.decoder, config.expert_dec_layers),
+    ):
+        for i, block in enumerate(blocks):
+            ff = block.feedforward
+            hidden = config.dim_feedforward if i < len(blocks) - n_expert else width
+            assert ff[0].out_features == ff[-1].in_features == hidden
+            assert ff[0].bias is not None and ff[-1].bias is not None
+
+
+def test_dense_mode_builds_no_router_and_its_balance_is_zero(monkeypatch):
+    def unexpected_router(*args):
+        pytest.fail("dense mode constructed a router")
+
+    monkeypatch.setattr("demand_forecast.models.v5.model.ExpertRouter", unexpected_router)
+    model = V5Model(replace(TINY, expert_mode="dense")).eval()
+    assert not any(isinstance(module, ExpertRouter) for module in model.modules())
+    assert not any(isinstance(module, ExpertFFN) for module in model.modules())
+    out = model(toy_batch())
+    assert out.router is None
+    balance = out.aux["balance"]
+    assert balance.shape == torch.Size([])
+    assert balance.device == out.quantiles.device
+    assert balance.count_nonzero().item() == 0
+
+
+@pytest.mark.parametrize("router", ["uniform", "rolled", "unknown"])
+def test_dense_mode_refuses_uniform_and_rolled_routing(router, monkeypatch):
+    model = V5Model(replace(TINY, expert_mode="dense"))
+
+    def unexpected_gates(*args):
+        pytest.fail("dense mode computed gates before rejecting the router")
+
+    monkeypatch.setattr(model, "gates", unexpected_gates)
+    with pytest.raises(ValueError, match="dense.*learned"):
+        model(toy_batch(), router=router)
+
+
+def test_dense_forward_loss_prune_and_forecast():
+    panel = toy_panel(n_items=4, length=48, n_targets=2)
+    request = EpisodeRequest(0, (40,), 3, 32, "y")
+    batch = collate([EpisodeBuilder(panel).build(request)])
+    routed = V5Model(TINY).eval()
+    config = replace(TINY, expert_mode="dense")
+    dense = V5Model(config).eval()
+
+    output = dense(batch)
+    with torch.no_grad():
+        assert output.quantiles.shape == routed(batch).quantiles.shape
+    loss, parts = v5_loss(output, batch, config)
+    assert torch.isfinite(loss) and parts["n_labels"] > 0
+    loss.backward()
+    for name, parameter in dense.named_parameters():
+        assert parameter.grad is not None and torch.isfinite(parameter.grad).all(), name
+
+    with torch.no_grad():
+        for mode in ("learned", "evidence"):
+            gates = dense.gates(batch, mode=mode)
+            if mode == "evidence":
+                expected = routed.gates(batch, mode=mode)
+                for field in dataclasses.fields(gates):
+                    torch.testing.assert_close(
+                        getattr(gates, field.name),
+                        getattr(expected, field.name),
+                        atol=1e-6,
+                        rtol=1e-6,
+                    )
+            pruned_batch, pruned_gates = prune(batch, gates)
+            assert dense(pruned_batch, pruned_gates).router is None
+            result = forecast(dense, panel, request, gates=mode, pruned=True)
+            full = forecast(dense, panel, request, gates=mode, pruned=False)
+            assert result.names == full.names == ["y"]
+            assert result.quantiles.shape == (1, 1, 3, len(config.quantiles))
+            assert np.isfinite(result.quantiles).all()
+            np.testing.assert_allclose(result.quantiles, full.quantiles, atol=1e-5, rtol=1e-5)
 
 
 def test_shapes_and_monotone_quantiles():

@@ -47,16 +47,17 @@ def export_api():
     return importlib.import_module("demand_forecast.models.v5.export")
 
 
-def _checkpoint(directory, weights="model"):
+def _checkpoint(directory, weights="model", model=None):
+    model = TINY if model is None else model
     config = V5TrainConfig(
-        TINY,
+        model,
         (SourceConfig("corpus", 1.0, root="/unused/local/corpus"),),
         SamplerConfig(screen_no_evidence=0.2),
         OptimConfig(max_steps=1, warmup_steps=0, ema_decay=0.999 if weights == "ema" else None),
         device="cpu",
         workers=1,
     )
-    raw = V5Model(TINY).state_dict()
+    raw = V5Model(model).state_dict()
     ema = None
     if weights == "ema":
         ema = {name: value.clone() for name, value in raw.items()}
@@ -116,7 +117,10 @@ def test_round_trip_of_the_whole_state_dict(tmp_path, monkeypatch, export_api, w
     assert written == metadata
     assert set(metadata) == {"format", "model", "training", "source", "files"}
     assert metadata["format"] == "v5-export-1"
-    assert metadata["model"] == json.loads(json.dumps(asdict(TINY)))
+    # The stored model mapping leaves the default expert mode out, as it did before the mode existed.
+    stored = json.loads(json.dumps(asdict(TINY)))
+    assert stored.pop("expert_mode") == "routed"
+    assert metadata["model"] == stored
     assert metadata["training"] == config.canonical()
     assert metadata["source"] == {
         "sha256": file_digest(checkpoint),
@@ -149,6 +153,19 @@ def test_round_trip_of_the_whole_state_dict(tmp_path, monkeypatch, export_api, w
     )
     assert actual_forecast.names == expected_forecast.names
     assert actual_forecast.gates == expected_forecast.gates
+
+
+def test_dense_export_round_trips_with_parity(tmp_path, export_api):
+    out = tmp_path / "export"
+    with torch.random.fork_rng(devices=[]):
+        torch.random.default_generator.manual_seed(123)
+        dense = replace(TINY, expert_mode="dense")
+        metadata = export_api.write_export(_checkpoint(tmp_path, model=dense), out)
+    assert metadata["model"]["expert_mode"] == "dense"
+    loaded, _ = export_api.load_export(out)
+    assert loaded.config.expert_mode == "dense"
+    assert not any("router" in name for name, _ in loaded.named_parameters())
+    export_api.require_parity(out)
 
 
 def _read_archive(path):

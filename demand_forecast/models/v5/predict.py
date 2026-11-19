@@ -23,7 +23,10 @@ from .model import V5Model, V5Output, prune
 def v5_loss(
     output: V5Output, batch: EpisodeBatch, config: V5Config
 ) -> tuple[Tensor, dict[str, float]]:
-    """Supervise real non-fallback rows, including siblings, and add gate/router costs."""
+    """Supervise real non-fallback rows and add gate and balance costs.
+
+    Dense expert mode supplies a zero balance cost through ``output.aux``.
+    """
     eligible = (
         batch.origin_mask[:, :, None]
         & batch.forecast_mask[:, None, :]

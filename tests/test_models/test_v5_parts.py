@@ -86,6 +86,14 @@ def test_config_rejects_invalid_settings(changes):
         replace(TINY, **changes)
 
 
+def test_dense_without_expert_blocks_and_unknown_mode_are_refused():
+    for mode in ("unknown", None, True):
+        with pytest.raises(ValueError, match="expert_mode"):
+            replace(TINY, expert_mode=mode)
+    with pytest.raises(ValueError, match="dense.*expert block"):
+        replace(TINY, expert_mode="dense", expert_enc_layers=0, expert_dec_layers=0)
+
+
 def test_config_accepts_valid_boundaries():
     assert V5Config().d_model == 384
     config = replace(
