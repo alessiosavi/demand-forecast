@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import time
 import traceback
@@ -25,6 +26,7 @@ from demand_forecast.bench.specs import dataset_fingerprint
 
 if TYPE_CHECKING:
     from demand_forecast.bench.v5_panels import ParsedFrequency, TimeAxis
+    from demand_forecast.models.v5 import Evidence
 
 PROTOCOL_VERSION = 1
 FEV_SOURCE = "9cf943c388e5cfaf352175ea3c69e408b197d997"
@@ -50,12 +52,32 @@ class Options:
     device: str = "cuda"
     weights_revision: str | None = None
     processing: str | None = None
+    variant: str | None = None
 
     def resolved(self) -> Options:
         """Validate choices and fill only published batching/context defaults."""
-        if self.model not in (*DEFAULT_WEIGHTS, "simons"):
-            raise ValueError("model must be chronos2, timestral or simons")
-        if self.model == "simons":
+        if self.model not in (*DEFAULT_WEIGHTS, "simons", "v5"):
+            raise ValueError("model must be chronos2, timestral, simons or v5")
+        if self.model != "v5" and self.variant is not None:
+            raise ValueError("--variant is supported only for v5")
+        if self.model == "v5":
+            from demand_forecast.data.episode.schema import PATCH
+
+            from .v5_variants import VARIANT_NAMES
+
+            if self.processing != "raw":
+                raise ValueError("v5 requires --processing raw")
+            if self.revision is not None:
+                raise ValueError("v5 uses a local export directory; --revision is unsupported")
+            if self.cross_series != "on" or self.covariates != "all":
+                raise ValueError("v5 requires --cross-series on and --covariates all")
+            if self.variant is not None and self.variant not in VARIANT_NAMES:
+                raise ValueError(f"unknown v5 variant {self.variant!r}")
+            if self.max_context is not None and (
+                type(self.max_context) is not int or self.max_context < PATCH
+            ):
+                raise ValueError(f"v5 --max-context must be an integer of at least {PATCH}")
+        elif self.model == "simons":
             if self.processing not in ("raw", "published"):
                 raise ValueError("Simons requires --processing raw|published")
             if self.revision is not None:
@@ -63,7 +85,7 @@ class Options:
                     "Simons uses a local exported directory; --revision is unsupported"
                 )
         elif self.processing is not None:
-            raise ValueError("--processing is supported only for Simons")
+            raise ValueError("--processing is supported only for Simons and v5")
         if not self.model_name.strip():
             raise ValueError("model-name must be nonempty")
         if self.covariates not in ("all", "none") or self.cross_series not in ("on", "off"):
@@ -79,7 +101,7 @@ class Options:
         return replace(
             self,
             batch_size=self.batch_size
-            or {"chronos2": 100, "timestral": 1024, "simons": 256}[self.model],
+            or {"chronos2": 100, "timestral": 1024, "simons": 256, "v5": 64}[self.model],
         )
 
 
@@ -136,6 +158,16 @@ def file_digest(path: Path) -> str:
 def resolve_weights(options: Options) -> Options:
     """Pin Hub aliases before model loading; content-hash local checkpoint files."""
     path = Path(options.weights).expanduser()
+    if options.model == "v5":
+        from demand_forecast.models.v5.export import export_digest
+
+        if not path.is_dir():
+            raise ValueError("v5 requires a local export directory")
+        return replace(
+            options,
+            weights=str(path.resolve()),
+            weights_revision="local-sha256:" + export_digest(path),
+        )
     if options.model == "simons":
         if not path.is_dir():
             raise ValueError("Simons requires a local exported checkpoint directory")
@@ -174,9 +206,10 @@ def resolve_weights(options: Options) -> Options:
 
 def _options_payload(options: Options) -> dict:
     values = asdict(options)
-    # Stage-1 manifests and summaries predate this Simons-only option. Keep their
-    # exact serialization so existing configuration/window hashes still resume.
-    if options.model != "simons":
+    # Keep the exact serialization used by existing configuration/window hashes.
+    if options.model != "v5":
+        values.pop("variant")
+    if options.model not in ("simons", "v5"):
         values.pop("processing")
     return values
 
@@ -207,8 +240,25 @@ def _simons_implementation() -> dict:
     return {"vcs_commit": commit, "source_sha256": digest(files) if files else None}
 
 
+def _source_sha256(root: Path) -> str:
+    result = hashlib.sha256()
+    files = (path for path in root.rglob("*.py") if path.is_file())
+    for path in sorted(files, key=lambda path: path.relative_to(root).as_posix()):
+        result.update(path.relative_to(root).as_posix().encode())
+        result.update(b"\0")
+        result.update(path.read_bytes())
+        result.update(b"\0")
+    return result.hexdigest()
+
+
 def runtime_identity(options: Options) -> dict:
     """Include the inference implementation and numerical runtime in resume checks."""
+    model_packages = {
+        "chronos2": ("chronos-forecasting",),
+        "timestral": ("timestral",),
+        "simons": ("simons",),
+        "v5": ("scipy", "safetensors"),
+    }
     packages = {}
     for name in (
         "fev",
@@ -217,9 +267,7 @@ def runtime_identity(options: Options) -> dict:
         "pandas",
         "pyarrow",
         "torch",
-        {"chronos2": "chronos-forecasting", "timestral": "timestral", "simons": "simons"}[
-            options.model
-        ],
+        *model_packages[options.model],
     ):
         try:
             packages[name] = version(name)
@@ -234,6 +282,10 @@ def runtime_identity(options: Options) -> dict:
     if options.model == "simons":
         identity["simons_source"] = SIMONS_SOURCE
         identity["simons_implementation"] = _simons_implementation()
+    if options.model == "v5":
+        identity["v5_implementation"] = {
+            "source_sha256": _source_sha256(Path(__file__).resolve().parents[2])
+        }
     return identity
 
 
@@ -349,8 +401,8 @@ def prepare_windows(task, options: Options) -> list[WindowInput]:
             key = str(row[task.id_column])
             ids.append(key)
             target = np.stack([np.asarray(row[t], dtype=np.float64) for t in targets])
-            # Default caps are checkpoint settings, enforced by each adapter. An
-            # explicit ablation is applied here to every dynamic history column.
+            # Reference adapters receive truncated histories for an explicit cap.
+            # v5 needs the full histories for statistics and caps encoder input.
             start = 0
             if not is_v5 and options.max_context:
                 start = max(0, target.shape[-1] - options.max_context)
@@ -477,7 +529,34 @@ def read_window(
         return arrays, elapsed
 
 
+def _save_v5_evidence(path: Path, evidence: Evidence, identity: str) -> None:
+    with NamedTemporaryFile(dir=path.parent, suffix=".npz", delete=False) as stream:
+        temporary = Path(stream.name)
+        try:
+            np.savez(
+                stream,
+                item_position=np.asarray([i for i, _ in evidence.requests], dtype=np.int64),
+                target=np.asarray([target or "" for _, target in evidence.requests], dtype=str),
+                joint=np.asarray([target is None for _, target in evidence.requests], dtype=bool),
+                candidates=np.asarray(evidence.candidates, dtype=str),
+                rules=np.asarray(evidence.rules, dtype=str),
+                status=evidence.status,
+                rule=evidence.rule,
+                gate=evidence.gate,
+                score=evidence.score,
+                run_identity=np.asarray(identity, dtype=str),
+            )
+            stream.close()
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
 def _adapter(options, task):
+    if options.model == "v5":
+        from .v5_adapter import V5Adapter
+
+        return V5Adapter(options, task)
     from .adapters import Chronos2Adapter, SimonsAdapter, TimestralAdapter
 
     return {"chronos2": Chronos2Adapter, "timestral": TimestralAdapter, "simons": SimonsAdapter}[
@@ -494,6 +573,7 @@ def run_yardstick(
     each ablation. Existing baseline rows are retained. Model loading is lazy.
     """
     options = resolve_weights(options.resolved())
+    is_v5 = options.model == "v5"
     run = runtime_identity(options)
     run["configuration_identity"] = digest(run)
     out_dir = Path(out_dir)
@@ -549,8 +629,23 @@ def run_yardstick(
             paths = [directory / f"window_{i}.npz" for i in range(len(windows))]
             rows = frame.loc[(frame.task == name) & (frame.model_name == options.model_name)]
             record = json.loads(record_path.read_text()) if record_path.exists() else {}
+            if is_v5:
+                report_path = directory / "v5-report.json"
+                evidence_paths = [
+                    directory / f"evidence_window_{i}.npz" for i in range(len(windows))
+                ]
+                evidence_files = [report_path, *evidence_paths]
+                evidence_digests = record.get("evidence_sha256", {})
+            evidence_valid = not is_v5 or (
+                resume
+                and all(
+                    p.is_file() and file_digest(p) == evidence_digests.get(p.name)
+                    for p in evidence_files
+                )
+            )
             valid = (
                 resume
+                and evidence_valid
                 and len(rows) == 1
                 and rows.iloc[0].get("run_identity") == identity
                 and record.get("summary") is not None
@@ -573,9 +668,13 @@ def run_yardstick(
             if summary_path.exists():
                 _save_summaries(frame, summary_path)
             arrays, elapsed = [], 0.0
-            cached = resume and all(
-                p.exists() and file_digest(p) == record.get("window_sha256", {}).get(p.name)
-                for p in paths
+            cached = (
+                resume
+                and evidence_valid
+                and all(
+                    p.exists() and file_digest(p) == record.get("window_sha256", {}).get(p.name)
+                    for p in paths
+                )
             )
             if cached:
                 for p, w in zip(paths, windows, strict=True):
@@ -597,10 +696,20 @@ def run_yardstick(
                 elapsed = time.perf_counter() - start
                 if len(outputs) != len(windows):
                     raise ValueError("adapter window count mismatch")
+                if is_v5:
+                    evidence = adapter.evidence()
+                    if len(evidence) != len(windows):
+                        raise ValueError("adapter evidence window count mismatch")
+                    for path, details in zip(evidence_paths, evidence, strict=True):
+                        _save_v5_evidence(path, details, identity)
+                    _save_failures(report_path, {**adapter.metadata(), "run_identity": identity})
                 for p, w, output in zip(paths, windows, outputs, strict=True):
                     a = assemble(w, output, task.horizon, levels)
                     arrays.append(a)
                     _save_window(p, w, a, levels, identity, elapsed / len(windows))
+            if is_v5:
+                input_metadata = json.loads(report_path.read_text())
+                del input_metadata["run_identity"]
             predictions = [
                 fev_predictions(a, levels, w.targets) for a, w in zip(arrays, windows, strict=True)
             ]
@@ -631,6 +740,8 @@ def run_yardstick(
             }
             if options.model == "simons":
                 record["input_metadata"] = input_metadata
+            if is_v5:
+                record["evidence_sha256"] = {p.name: file_digest(p) for p in evidence_files}
             _save_failures(record_path, record)
             row = pd.DataFrame([summary])
             frame = row if frame.empty else pd.concat([frame, row], ignore_index=True)

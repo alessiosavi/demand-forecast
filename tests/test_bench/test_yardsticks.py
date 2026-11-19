@@ -19,6 +19,7 @@ from demand_forecast.bench.yardsticks import (  # noqa: E402
 )
 from demand_forecast.bench.yardsticks.runner import prepare_windows  # noqa: E402
 from tests.helpers.fev_fixture import write_fev_fixture  # noqa: E402
+from tests.test_bench.test_v5_adapter import v5_export as v5_export  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -810,3 +811,254 @@ def test_report_unreadable_yardstick_tasks_exits_cleanly(scenario, tmp_path, cap
     error = capsys.readouterr().err
     assert "--tasks" in error and "YAML" in error and str(task_file) in error
     assert "Traceback" not in error and not destination.exists()
+
+
+@pytest.mark.parametrize(
+    ("model", "payload", "identity"),
+    [
+        (
+            "chronos2",
+            "5c6077d3bb6a13cd97b68f6c952ed396256f1a89e7b8e6b772635a0e3ab63820",
+            "c05bc3c6b2e444790d9f25b9fc24797f4facefb97df25a15018e284c940a16f7",
+        ),
+        (
+            "timestral",
+            "0b1fd097f5b72f134ee4a8be6950580517eaec2a980eb59803c64e29709253a7",
+            "5bc5feab938ac4850ac478318c6ad84e5615f0e56ae95210a32ed10d8d8fe3db",
+        ),
+        (
+            "simons",
+            "32b0e709c73c7584dadaa87a1167dd2f432472423d3900227e679e5eaf2268d7",
+            "79e3c8df22805f931f12b38cab455680ca755f626821bc4cb27d83ce0adc01a8",
+        ),
+    ],
+)
+def test_payloads_and_identities_of_existing_models_are_pinned(
+    model, payload, identity, monkeypatch
+):
+    import hashlib
+
+    from demand_forecast.bench.yardsticks import runner
+
+    def missing_distribution(name):
+        raise runner.PackageNotFoundError(name)
+
+    monkeypatch.setattr(runner, "version", lambda pkg: f"fixture-{pkg}")
+    monkeypatch.setattr(runner, "distribution", missing_distribution)
+    monkeypatch.setattr(runner, "find_spec", lambda name: None)
+    # Captured from base 819599e3717c using its sorted JSON serialization.
+    options = Options(
+        model, "fixture", "label", processing="raw" if model == "simons" else None
+    ).resolved()
+    for result, expected in (
+        (runner._options_payload(options), payload),
+        (runner.runtime_identity(options), identity),
+    ):
+        assert hashlib.sha256(json.dumps(result, sort_keys=True).encode()).hexdigest() == expected
+
+
+def test_v5_options(tmp_path, monkeypatch):
+    from demand_forecast.bench.yardsticks import runner
+    from demand_forecast.models.v5.export import export_digest
+
+    options = Options("v5", str(tmp_path), "native", processing="raw")
+    assert options.resolved().batch_size == 64
+    assert replace(options, variant="full", max_context=37).resolved().max_context == 37
+    for change, message in (
+        ({"processing": None}, "processing"),
+        ({"processing": "published"}, "processing"),
+        ({"revision": "x"}, "revision"),
+        ({"cross_series": "off"}, "cross.series"),
+        ({"covariates": "none"}, "covariates"),
+        ({"variant": "unknown"}, "variant"),
+        ({"max_context": 8}, "max.context"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            replace(options, **change).resolved()
+    for model in ("chronos2", "timestral", "simons"):
+        with pytest.raises(ValueError, match="variant"):
+            replace(
+                options,
+                model=model,
+                variant="full",
+                processing="raw" if model == "simons" else None,
+            ).resolved()
+    with pytest.raises(ValueError, match="export directory"):
+        runner.resolve_weights(replace(options, weights="hub/name").resolved())
+    (tmp_path / "config.json").write_text("{}")
+    resolved = runner.resolve_weights(options.resolved())
+    assert resolved.weights == str(tmp_path.resolve())
+    assert resolved.weights_revision == f"local-sha256:{export_digest(tmp_path)}"
+    monkeypatch.setattr(runner, "version", lambda pkg: f"fixture-{pkg}")
+    identity = runner.runtime_identity(resolved)
+    assert identity["packages"] == {
+        pkg: f"fixture-{pkg}"
+        for pkg in (
+            "fev",
+            "datasets",
+            "numpy",
+            "pandas",
+            "pyarrow",
+            "torch",
+            "scipy",
+            "safetensors",
+        )
+    }
+    assert identity["options"]["processing"] == "raw"
+    assert identity["options"]["variant"] is None
+    assert len(identity["v5_implementation"]["source_sha256"]) == 64
+
+
+def test_v5_source_hash_covers_only_sorted_python_sources(tmp_path):
+    import hashlib
+
+    from demand_forecast.bench.yardsticks.runner import _source_sha256
+
+    package = tmp_path / "demand_forecast"
+    (package / "a").mkdir(parents=True)
+    (package / "__pycache__").mkdir()
+    (package / "z.py").write_bytes(b"z\r\n")
+    (package / "a" / "b.py").write_bytes(b"b\n")
+    (package / "__pycache__" / "z.cpython-312.pyc").write_bytes(b"bytecode")
+    (package / "info.txt").write_bytes(b"ignored")
+    assert _source_sha256(package) == hashlib.sha256(b"a/b.py\0b\n\0z.py\0z\r\n\0").hexdigest()
+    (package / "a" / "b.py").write_bytes(b"changed")
+    assert _source_sha256(package) == hashlib.sha256(b"a/b.py\0changed\0z.py\0z\r\n\0").hexdigest()
+
+
+@pytest.fixture
+def v5_run(panel_task, v5_export, tmp_path):
+    from datasets import Dataset
+
+    # fev uses its cached in-memory dataset just as it would use a preprocessed load.
+    tasks = []
+    for name, indices in (("first", [0, 1]), ("second", [0])):
+        task = fev.Task(**{**panel_task.to_dict(), "task_name": name})
+        task._full_dataset = panel_task._full_dataset.select(indices)
+        assert isinstance(task._full_dataset, Dataset)
+        task._freq = panel_task._freq
+        task._dataset_fingerprint = fev.utils.generate_fingerprint(task._full_dataset)
+        tasks.append(task)
+    options = Options("v5", str(v5_export), "native", processing="raw", device="cpu")
+    return tasks, options, tmp_path / "v5-out"
+
+
+def test_run_yardstick_with_v5(v5_run, monkeypatch):
+    from demand_forecast.bench import yardsticks
+    from demand_forecast.bench.yardsticks.runner import file_digest
+    from scripts.fev_yardstick import main
+
+    tasks, options, out = v5_run
+    task = tasks[0]
+    monkeypatch.setattr(yardsticks, "load_tasks", lambda path, names: [task])
+    assert (
+        main(
+            [
+                "--model",
+                "v5",
+                "--checkpoint",
+                options.weights,
+                "--processing",
+                "raw",
+                "--variant",
+                "no_peers",
+                "--max-context",
+                "37",
+                "--batch-size",
+                "3",
+                "--device",
+                "cpu",
+                "--tasks",
+                "in-memory.yaml",
+                "--model-name",
+                options.model_name,
+                "--out-dir",
+                str(out),
+            ]
+        )
+        == 0
+    )
+    options = replace(options, variant="no_peers", max_context=37, batch_size=3)
+    frame = pd.read_csv(out / "summaries.csv")
+    assert len(frame) == 1 and frame.task.iloc[0] == task.task_name
+    assert frame.variant.iloc[0] == "no_peers"
+    assert frame.max_context.iloc[0] == 37 and frame.batch_size.iloc[0] == 3
+    directory = out / task.task_name
+    record = json.loads((directory / "run.json").read_text())
+    report = json.loads((directory / "v5-report.json").read_text())
+    assert report["v5_short_items"] == 4
+    assert report["v5_workers"] == 0
+    assert all(frame[key].iloc[0] == value for key, value in report.items())
+    assert record["evidence_sha256"] == {
+        filename: file_digest(directory / filename)
+        for filename in ("v5-report.json", "evidence_window_0.npz", "evidence_window_1.npz")
+    }
+    with np.load(directory / "evidence_window_0.npz", allow_pickle=False) as evidence:
+        assert set(evidence.files) == {
+            "item_position",
+            "target",
+            "joint",
+            "candidates",
+            "rules",
+            "status",
+            "rule",
+            "gate",
+            "score",
+            "run_identity",
+        }
+        assert all(not evidence[key].dtype.hasobject for key in evidence.files)
+        assert all(evidence[key].dtype.kind == "U" for key in ("target", "candidates", "rules"))
+        assert set(evidence["item_position"]) == {0, 1}
+        assert evidence["status"].shape == evidence["gate"].shape == evidence["score"].shape
+        assert evidence["run_identity"].item() == record["run_identity"]
+    before = {p: p.read_bytes() for p in out.rglob("*") if p.is_file()}
+    run_yardstick(
+        [task], options, out, resume=True, adapter_factory=lambda _: pytest.fail("loaded")
+    )
+    assert before == {p: p.read_bytes() for p in out.rglob("*") if p.is_file()}
+
+
+@pytest.mark.parametrize("resume_path", ["completed", "saved-windows"])
+@pytest.mark.parametrize("filename", ["v5-report.json", "evidence_window_0.npz"])
+@pytest.mark.parametrize("damage", ["deleted", "corrupt", "foreign"])
+def test_resume_requires_the_evidence(v5_run, monkeypatch, resume_path, filename, damage):
+    from demand_forecast.bench.yardsticks import runner
+    from demand_forecast.bench.yardsticks.v5_adapter import V5Adapter
+
+    tasks, options, out = v5_run
+    run_yardstick(tasks, options, out)
+    first, second = (out / task.task_name for task in tasks)
+    target = first / filename
+    if damage == "deleted":
+        target.unlink()
+    elif damage == "corrupt":
+        target.write_bytes(b"garbled")
+    else:
+        target.write_bytes((second / filename).read_bytes())
+    if resume_path == "saved-windows":
+        (out / "summaries.csv").unlink()
+
+    calls = []
+    predict = V5Adapter.predict
+
+    def record(self, *args, **kwargs):
+        calls.append(len(args[0]))
+        return predict(self, *args, **kwargs)
+
+    monkeypatch.setattr(V5Adapter, "predict", record)
+    run_yardstick(tasks, options, out, resume=True)
+    assert calls == [tasks[0].num_windows]
+    manifest = json.loads((first / "run.json").read_text())
+    assert runner.file_digest(target) == manifest["evidence_sha256"][filename]
+
+
+def test_saved_windows_restore_v5_metadata(v5_run):
+    tasks, options, out = v5_run
+    original = run_yardstick(tasks, options, out).set_index("task")
+    assert list(original.v5_short_items) == [4, 2]
+    (out / "summaries.csv").unlink()
+    restored = run_yardstick(
+        tasks, options, out, resume=True, adapter_factory=lambda _: pytest.fail("loaded")
+    ).set_index("task")
+    columns = [name for name in original if name.startswith("v5_") or name.startswith("peak_rss_")]
+    pd.testing.assert_frame_equal(restored[columns], original[columns])

@@ -17,20 +17,30 @@ work="$(mktemp -d "${V5_PARITY_TMPDIR:-${TMPDIR:-/tmp}}/v5-parity.XXXXXX")"
 trap 'rm -rf -- "$work"' EXIT
 export TMPDIR="$work"
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
+export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1
+
+extract_pin() {
+    awk -F '==' -v name="$1" '
+        $1 == name && NF == 2 { print; count++ }
+        END { if (count != 1) exit 1 }
+    ' "$repo/$2" || {
+        printf 'Expected one %s pin in %s\n' "$1" "$2" >&2
+        return 1
+    }
+}
 
 make_env() {
     local name="$1" requirements="$2"
     local python="$work/$name/bin/python" pins="$work/$name-pins.txt"
     local package project="$repo" torch_pin
-    for package in numpy pandas scipy pyarrow safetensors; do
-        if ! awk -F '==' -v name="$package" '
-            $1 == name && NF == 2 { print; count++ }
-            END { if (count != 1) exit 1 }
-        ' "$repo/$requirements"; then
-            printf 'Expected one %s pin in %s\n' "$package" "$requirements" >&2
-            return 1
-        fi
-    done > "$pins"
+    {
+        for package in numpy pandas scipy pyarrow safetensors datasets; do
+            extract_pin "$package" "$requirements"
+        done
+        # Both environments install the same fev, so the stored task reloads; the windows
+        # themselves are stored by the first environment and read back by the second.
+        extract_pin fev requirements-yardsticks.txt
+    } > "$pins"
 
     printf '\n%s pins from %s\n' "$name" "$requirements"
     cat "$pins"
@@ -77,7 +87,7 @@ PY
 
 require_distinct_versions() {
     local package
-    for package in numpy pandas; do
+    for package in numpy pandas datasets; do
         if [ "$(grep "^$package==" "$1")" = "$(grep "^$package==" "$2")" ]; then
             printf 'Training and scoring have the same %s version, so the gate would test one environment\n' "$package" >&2
             return 1
@@ -90,6 +100,10 @@ make_env scoring requirements-yardsticks.txt
 require_distinct_versions "$work/training-installed.txt" "$work/scoring-installed.txt"
 "$work/training/bin/python" -m demand_forecast.models.v5.export selftest "$work/export"
 "$work/scoring/bin/python" -m demand_forecast.models.v5.export check "$work/export"
+"$work/training/bin/python" -m demand_forecast.bench.yardsticks.v5_adapter \
+    selftest "$work/export" "$work/adapter"
+"$work/scoring/bin/python" -m demand_forecast.bench.yardsticks.v5_adapter \
+    check "$work/export" "$work/adapter"
 
 if $run_tests; then
     cd "$repo"
