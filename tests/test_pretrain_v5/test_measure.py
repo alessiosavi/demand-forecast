@@ -242,8 +242,9 @@ def test_worst_batch_origins_fit_context():
 
 def assert_numbers(value):
     if isinstance(value, dict):
-        for item in value.values():
-            assert_numbers(item)
+        for key, item in value.items():
+            if key not in ("status", "worker_reason"):
+                assert_numbers(item)
     elif isinstance(value, (tuple, list)):
         for item in value:
             assert_numbers(item)
@@ -251,7 +252,7 @@ def assert_numbers(value):
         assert value is None or isinstance(value, (int, float)) and math.isfinite(value)
 
 
-@pytest.mark.parametrize("updated", [(1, 0, 0, 0, 1, 0), (1, 0, 0, 0, 0, 0)])
+@pytest.mark.parametrize("updated", [(1, 0, 0, 0, 1, 0), (1, 0, 0, 0, 0, 0), (0, 0, 0, 0, 0, 0)])
 def test_trial_update_rate_counts_successes_over_all_tail_seconds(tmp_path, monkeypatch, updated):
     measure = api()
     elapsed = [0.0]
@@ -264,6 +265,15 @@ def test_trial_update_rate_counts_successes_over_all_tail_seconds(tmp_path, monk
         "sources": {"typed": 1},
         "paths": {},
         "paths_without_candidate": {},
+        "exposure": {
+            "typed": {"panels": 1, "episodes": 1, "cells": 30},
+            "corpus": {
+                "panels": 2,
+                "episodes": 1,
+                "cells": 50,
+                "folders": {"univariate/a": {"panels": 2, "episodes": 1, "cells": 50}},
+            },
+        },
     }
 
     def trial_train(c, directory):
@@ -296,6 +306,49 @@ def test_trial_update_rate_counts_successes_over_all_tail_seconds(tmp_path, monk
     assert metrics["updates_per_hour"] == pytest.approx(tail_updates * 240)
     assert metrics["seconds_per_update"] == (4 if tail_updates else None)
     assert metrics["supervised_cells_per_update"] == (80 if tail_updates else None)
+    if tail_updates:
+        assert metrics["supervised_cells_per_second"] == pytest.approx(
+            metrics["supervised_cells_per_update"] * metrics["updates_per_second"]
+        )
+    else:
+        assert metrics["supervised_cells_per_second"] is None
+    assert metrics["exposure"] == {
+        "typed": {"panels": 6, "episodes": 6, "cells": 180},
+        "corpus": {
+            "panels": 12,
+            "episodes": 6,
+            "cells": 300,
+            "folders": {"univariate/a": {"panels": 12, "episodes": 6, "cells": 300}},
+        },
+    }
+
+
+def test_trial_keeps_observed_exposure_and_memory_on_oom(tmp_path, monkeypatch):
+    measure = api()
+    exposure = {"typed": {"panels": 1, "episodes": 1, "cells": 20}}
+
+    def train_until_oom(c, directory):
+        iterator = measure.loop.loader(c, 0)
+        try:
+            next(iterator)
+            raise torch.OutOfMemoryError("injected during training")
+        finally:
+            measure.loop._release(iterator)
+
+    monkeypatch.setattr(measure, "train", train_until_oom)
+    monkeypatch.setattr(
+        measure.loop, "loader", lambda *args: iter([(0, None, {"exposure": exposure})])
+    )
+    monkeypatch.setattr(measure, "_host_memory", lambda: (500, 250))
+    monkeypatch.setattr(measure, "_rusage_peak", lambda: 1000)
+    metrics, checkpoint = measure._trial(config(), tmp_path, torch.device("cpu"))
+    assert checkpoint is None
+    assert (metrics["status"], metrics["message"]) == ("oom", "injected during training")
+    assert metrics["exposure"] == exposure
+    assert (metrics["host_memory_bytes"], metrics["host_memory_pss_bytes"]) == (500, 250)
+    assert metrics["host_memory_rusage_bytes"] == 1000
+    assert metrics["peak_gpu_bytes"] is None
+    assert metrics["supervised_cells_per_second"] is None
 
 
 def test_inference_panel_is_aligned_dated_and_deterministic():
@@ -333,7 +386,7 @@ def test_inference_panel_is_aligned_dated_and_deterministic():
 
 
 @pytest.mark.parametrize("failure", ["missing_forecast", "fallback"])
-def test_qualify_rejects_missing_or_fallback_inference(tmp_path, monkeypatch, failure):
+def test_qualify_records_missing_or_fallback_inference(tmp_path, monkeypatch, failure):
     measure = api()
     if failure == "missing_forecast":
         real_forecast = measure.forecast_panel
@@ -357,17 +410,189 @@ def test_qualify_rejects_missing_or_fallback_inference(tmp_path, monkeypatch, fa
 
         monkeypatch.setattr(measure, "_inference_panel", constant)
     c = config()
-    with pytest.raises(RuntimeError, match="inference"):
-        measure.qualify(
-            c,
-            tmp_path,
-            models={"tiny": c.model},
-            updates=1,
-            workers=(0,),
-            panel_items=2,
-            panel_length=64,
-        )
-    assert not (tmp_path / "qualify.json").exists()
+    report = measure.qualify(
+        c,
+        tmp_path,
+        models={"tiny": c.model},
+        updates=1,
+        workers=(0,),
+        panel_items=2,
+        panel_length=64,
+    )
+    assert json.loads((tmp_path / "qualify.json").read_text()) == report
+    model = report["models"]["tiny"]
+    assert model["inference"]["status"] == "failed"
+    assert "inference" in model["inference"]["message"]
+    assert model["workers"]["0"]["status"] == "ok"
+    assert model["parameters"]["total"] > 0
+
+
+@pytest.fixture
+def recorded_qualification(monkeypatch):
+    measure = api()
+    calls = []
+
+    def trial(c, directory, device):
+        calls.append((c.model, c.workers, c.optim.max_steps, c.sampler.origins))
+        return {"batches": c.optim.max_steps, "updates": c.optim.max_steps}, directory / "model.pt"
+
+    monkeypatch.setattr(measure, "loader", lambda *args: iter([None]))
+    monkeypatch.setattr(measure, "_trial", trial)
+    monkeypatch.setattr(measure, "_checkpoint_measure", lambda *args: {"writes": 5})
+    monkeypatch.setattr(measure, "load_model", lambda _: (torch.nn.Identity(), None))
+    monkeypatch.setattr(measure, "_worst_measure", lambda *args: {"forward_backward_seconds": 1})
+    return measure, calls
+
+
+def test_qualify_defaults_run_both_models_and_all_workers(
+    tmp_path, recorded_qualification, monkeypatch
+):
+    measure, calls = recorded_qualification
+    c = config()
+    t1 = replace(c.model, d_model=24)
+    monkeypatch.setattr(measure, "T1_MODEL", t1)
+    panel_sizes = []
+    real_panel = measure._inference_panel
+
+    def tiny_panel(*, seed, items: int, length: int):
+        panel_sizes.append((items, length))
+        return real_panel(seed=seed, items=2, length=64)
+
+    # Keep the default request visible and substitute a tiny panel for its forecast.
+    monkeypatch.setattr(measure, "_inference_panel", tiny_panel)
+    monkeypatch.setattr(measure, "forecast_panel", lambda *a, **kw: dict.fromkeys(range(30_490)))
+    report = measure.qualify(c, tmp_path)
+    assert calls == [(m, w, 200, 1) for m in (c.model, t1) for w in (8, 16, 32, 46)]
+    assert panel_sizes == [(30_490, 1_941)] * 2
+    assert report["models"].keys() == {"full", "t1"}
+    for model in report["models"].values():
+        assert model["workers"].keys() == {"8", "16", "32", "46"}
+        assert model["checkpoint"]["writes"] == 5
+        assert model["inference"]["status"] == "ok"
+
+
+@pytest.mark.parametrize("part", ["trial", "worst_batch", "cold_start", "checkpoint"])
+def test_qualify_preserves_other_parts_after_failure(
+    tmp_path, recorded_qualification, monkeypatch, part
+):
+    measure, calls = recorded_qualification
+    cfg = config()
+    t1 = replace(cfg.model, d_model=24)
+    message = f"injected {part} failure"
+    status = "oom" if part in ("trial", "worst_batch") else "failed"
+
+    def fail():
+        raise (torch.cuda.OutOfMemoryError if status == "oom" else ValueError)(message)
+
+    if part == "trial":
+        trial = measure._trial
+
+        def fail_first_trial(c, *args):
+            if c.model == cfg.model and c.workers == 0:
+                fail()
+            return trial(c, *args)
+
+        monkeypatch.setattr(measure, "_trial", fail_first_trial)
+    elif part == "worst_batch":
+        worst = measure._worst_measure
+
+        def fail_full_worst(c, *args):
+            if c.model == cfg.model:
+                fail()
+            return worst(c, *args)
+
+        monkeypatch.setattr(measure, "_worst_measure", fail_full_worst)
+    elif part == "cold_start":
+        monkeypatch.setattr(measure, "_corpus_measure", lambda *args: fail())
+    else:
+        monkeypatch.setattr(measure, "_checkpoint_measure", lambda *args: fail())
+
+    report = measure.qualify(
+        cfg,
+        tmp_path,
+        models={"full": cfg.model, "t1": t1},
+        updates=1,
+        workers=(0, 1),
+        panel_items=2,
+        panel_length=64,
+    )
+    assert json.loads((tmp_path / "qualify.json").read_text()) == report
+    full, other = (report["models"][name] for name in ("full", "t1"))
+    failed = {
+        "trial": full["workers"]["0"],
+        "worst_batch": full["worst_batch"],
+        "cold_start": report["cold_start"],
+        "checkpoint": full["checkpoint"],
+    }[part]
+    assert (failed["status"], failed["message"]) == (status, message)
+    assert full["workers"]["1"]["status"] == other["workers"]["0"]["status"] == "ok"
+    assert full["inference"]["status"] == other["inference"]["status"] == "ok"
+    assert calls[-1][:2] == (t1, 1)
+    if part == "trial":
+        assert full["origins"]["1"] == failed
+        assert failed["supervised_cells_per_second"] is None
+        assert full["checkpoint"]["status"] == "ok"
+    elif part == "cold_start":
+        assert report["cold_start"]["first_batch_seconds"] is not None
+
+
+@pytest.mark.parametrize("checkpoint_succeeds", [True, False], ids=["retry-ok", "retry-exhausted"])
+def test_qualify_retries_checkpoint_measurement(
+    tmp_path, recorded_qualification, monkeypatch, checkpoint_succeeds
+):
+    measure, _ = recorded_qualification
+    attempted = []
+
+    def trial(c, directory, device):
+        return {"updates": 1}, directory / f"{c.workers}.pt"
+
+    def checkpoint(path, directory, device):
+        worker = int(path.stem)
+        attempted.append(worker)
+        if worker == 1 and checkpoint_succeeds:
+            return {"seconds": 0.25, "bytes": 123, "writes": 5}
+        error = torch.OutOfMemoryError if worker == 2 else ValueError
+        raise error(f"checkpoint error at {worker} workers")
+
+    monkeypatch.setattr(measure, "_trial", trial)
+    monkeypatch.setattr(measure, "_checkpoint_measure", checkpoint)
+    cfg = config()
+    report = measure.qualify(
+        cfg, tmp_path, models="full", updates=1, workers=(0, 1, 2), no_inference=True
+    )
+    result = report["models"]["full"]["checkpoint"]
+    if checkpoint_succeeds:
+        assert attempted == [0, 1]
+        assert result["status"] == "ok" and "message" not in result
+        assert (result["bytes"], result["writes"]) == (123, 5)
+        assert result["seconds"] == pytest.approx(0.25)
+        assert report["cold_start"]["restore_seconds"]["full"] is not None
+    else:
+        assert attempted == [0, 1, 2]
+        assert result == {"status": "oom", "message": "checkpoint error at 2 workers"}
+
+
+def test_record_part_keeps_first_failure_status_and_appends_messages():
+    measure = api()
+    outcomes = {}
+    for first, second in (
+        (ValueError, torch.OutOfMemoryError),
+        (torch.OutOfMemoryError, ValueError),
+    ):
+        part = {}
+        with measure._record_part(part):
+            pass
+        with measure._record_part(part):
+            raise first("first error")
+        with measure._record_part(part):
+            raise second("second error")
+        with measure._record_part(part):
+            pass
+        outcomes[first] = part
+    assert outcomes == {
+        ValueError: {"status": "failed", "message": "first error\nsecond error"},
+        torch.OutOfMemoryError: {"status": "oom", "message": "first error\nsecond error"},
+    }
 
 
 @pytest.mark.parametrize("workers", [(0,), (0, 1)], ids=["serial", "multiprocess"])
@@ -415,6 +640,7 @@ def test_qualify_measures_all_sections_and_only_writes_json(tmp_path, workers, m
     } <= cold.keys()
     assert cold["corpus_index_seconds"] is None and cold["excluded_row_share"] is None
     assert cold["unparsed_frequency_rows"] is None
+    assert cold["status"] == "ok"
     assert_numbers(cold)
     for name, architecture in models.items():
         measured = report["models"][name]
@@ -428,8 +654,14 @@ def test_qualify_measures_all_sections_and_only_writes_json(tmp_path, workers, m
                 "padded_cells_per_batch",
                 "skips",
                 "host_memory_bytes",
+                "host_memory_pss_bytes",
+                "host_memory_rusage_bytes",
                 "peak_gpu_bytes",
+                "supervised_cells_per_second",
+                "exposure",
+                "status",
             } <= run.keys()
+            assert run["status"] == "ok"
             assert run["batches"] == run["updates"] == 6 and run["tail_batches"] == 5
             assert run["batches_per_second"] > 0 and run["updates_per_hour"] > 0
             assert run["supervised_cells_per_batch"] > 0 and run["padded_cells_per_batch"] > 0
@@ -442,20 +674,31 @@ def test_qualify_measures_all_sections_and_only_writes_json(tmp_path, workers, m
                 "peak_gpu_bytes",
             } <= run.keys()
             assert run["supervised_cells_per_update"] > 0 and run["seconds_per_update"] > 0
+            assert run["status"] == "ok"
             assert_numbers(run)
         assert measured["worst_batch"].keys() == {
             "forward_backward_seconds",
             "forward_backward_peak_gpu_bytes",
+            "status",
         }
         assert measured["worst_batch"]["forward_backward_seconds"] > 0
+        assert measured["worst_batch"]["status"] == "ok"
         assert_numbers(measured["worst_batch"])
         assert {"seconds", "bytes", "writes"} <= measured["checkpoint"].keys()
         assert measured["checkpoint"]["writes"] == 5 and measured["checkpoint"]["bytes"] > 0
+        assert measured["checkpoint"]["status"] == "ok"
         assert_numbers(measured["checkpoint"])
-        assert {"seconds", "peak_gpu_bytes", "host_memory_bytes"} <= measured["inference"].keys()
+        assert {
+            "seconds",
+            "peak_gpu_bytes",
+            "host_memory_bytes",
+            "host_memory_pss_bytes",
+            "host_memory_rusage_bytes",
+        } <= measured["inference"].keys()
         assert measured["inference"]["origin"] == 172
         assert measured["inference"]["forecasts"] == measured["inference"]["items"] == 12
         assert measured["inference"]["fallback_forecasts"] == 0
+        assert measured["inference"]["status"] == "ok"
         assert_numbers(measured["inference"])
         parameters = measured["parameters"]
         assert parameters["total"] == sum(p.numel() for p in V5Model(architecture).parameters())
@@ -470,6 +713,7 @@ def test_qualify_measures_all_sections_and_only_writes_json(tmp_path, workers, m
 def test_qualify_keys_are_unchanged(tmp_path, monkeypatch, platform, cores, expected_workers):
     measure = api()
     real_forecast_panel = measure.forecast_panel
+    host_memory = measure._host_memory
     inference_workers = []
 
     def forecast_panel(*args, **kwargs):
@@ -479,6 +723,12 @@ def test_qualify_keys_are_unchanged(tmp_path, monkeypatch, platform, cores, expe
     monkeypatch.setattr(measure, "sys", SimpleNamespace(platform=platform), raising=False)
     monkeypatch.setattr(measure, "cpu_count", lambda: cores, raising=False)
     monkeypatch.setattr(measure, "forecast_panel", forecast_panel)
+    # Pin the base value on a host without procfs even when running on Linux.
+    monkeypatch.setattr(measure, "_host_memory", lambda: host_memory(tmp_path / "no-proc"))
+    monkeypatch.setattr(measure, "_rusage_peak", lambda: 12345)
+    monkeypatch.setattr(
+        measure, "usable_workers", lambda requested: (requested, None), raising=False
+    )
     c = config()
     report = measure.qualify(
         c,
@@ -498,6 +748,7 @@ def test_qualify_keys_are_unchanged(tmp_path, monkeypatch, platform, cores, expe
         "restore_seconds",
         "excluded_row_share",
         "unparsed_frequency_rows",
+        "status",
     }
     measured = report["models"]["tiny"]
     assert measured.keys() == {
@@ -508,6 +759,10 @@ def test_qualify_keys_are_unchanged(tmp_path, monkeypatch, platform, cores, expe
         "inference",
         "parameters",
     }
+    for part in (measured["workers"]["0"], measured["origins"]["1"], measured["inference"]):
+        assert part["host_memory_bytes"] is None
+        assert part["host_memory_pss_bytes"] is None
+        assert part["host_memory_rusage_bytes"] == 12345
     assert measured["inference"].keys() == {
         "seconds",
         "peak_gpu_bytes",
@@ -516,8 +771,92 @@ def test_qualify_keys_are_unchanged(tmp_path, monkeypatch, platform, cores, expe
         "items",
         "forecasts",
         "fallback_forecasts",
+        "host_memory_pss_bytes",
+        "host_memory_rusage_bytes",
+        "status",
+        "workers",
+        "worker_reason",
     }
     assert inference_workers == [expected_workers]
+    assert measured["inference"]["workers"] == expected_workers
+    assert measured["inference"]["worker_reason"] is None
+
+
+@pytest.mark.parametrize("limit_error", [None, "injected RLIMIT_NOFILE failure"])
+def test_qualify_inference_workers_reach_forecast_items(
+    tmp_path, recorded_qualification, monkeypatch, limit_error
+):
+    measure, _ = recorded_qualification
+    sampler = importlib.import_module("demand_forecast.pretrain.v5.sampler")
+    batch_forecast = importlib.import_module("demand_forecast.models.v5.batch_forecast")
+    checked, used = [], []
+
+    def ensure_limit(workers):
+        checked.append(workers)
+        if limit_error:
+            raise RuntimeError(limit_error)
+
+    def forecast_items(model, panel, jobs, horizon, *, workers, **kwargs):
+        used.append(workers)
+        return SimpleNamespace(values={(index, "target"): None for index, _ in jobs})
+
+    monkeypatch.setattr(batch_forecast, "sys", SimpleNamespace(platform="linux"))
+    monkeypatch.setattr(sampler, "_ensure_worker_file_limit", ensure_limit)
+    monkeypatch.setattr(measure, "forecast_items", forecast_items)
+    c = config()
+    report = measure.qualify(
+        c,
+        tmp_path,
+        models={"tiny": c.model},
+        updates=1,
+        workers=(0,),
+        inference_workers=3,
+        panel_items=2,
+        panel_length=64,
+    )
+    expected = 0 if limit_error else 3
+    assert checked == [3]
+    assert used == [expected]
+    inference = report["models"]["tiny"]["inference"]
+    assert inference["status"] == "ok"
+    assert inference["workers"] == expected
+    assert inference["worker_reason"] == limit_error
+
+
+@pytest.mark.parametrize("platform,multiplier", [("linux", 1024), ("darwin", 1)])
+def test_ru_maxrss_is_converted_to_bytes(monkeypatch, platform, multiplier):
+    import resource
+
+    measure = api()
+    monkeypatch.setattr(measure, "sys", SimpleNamespace(platform=platform))
+    monkeypatch.setattr(measure, "_host_memory", lambda: (None, None))
+    monkeypatch.setattr(
+        resource,
+        "getrusage",
+        lambda who: SimpleNamespace(ru_maxrss=100 if who == resource.RUSAGE_SELF else 23),
+    )
+    with measure._HostPeak() as memory:
+        pass
+    assert memory.peak is None
+    assert memory.peak_rusage == 123 * multiplier
+    assert memory.peak_pss is None
+
+
+def test_host_memory_sums_pss_and_reports_null_without_smaps(tmp_path, monkeypatch):
+    measure = api()
+    monkeypatch.setattr(measure, "os", SimpleNamespace(getpid=lambda: 100))
+    root, child = (tmp_path / str(pid) for pid in (100, 101))
+    for process, rss, children in ((root, 300, "101"), (child, 200, "")):
+        task = process / "task" / process.name
+        task.mkdir(parents=True)
+        (task / "children").write_text(children)
+        (process / "status").write_text(f"VmSize:\t 999 kB\nVmRSS:\t {rss} kB\n")
+    assert measure._host_memory(tmp_path) == (500 * 1024, None)
+    smaps = "Rss: 300 kB\nPss_Dirty: 30 kB\nPss: {} kB\nPss_Anon: 11 kB\n"
+    (root / "smaps_rollup").write_text(smaps.format(150))
+    assert measure._host_memory(tmp_path) == (500 * 1024, None)
+    (child / "smaps_rollup").write_text(smaps.format(100))
+    assert measure._host_memory(tmp_path) == (500 * 1024, 250 * 1024)
 
 
 def test_qualify_uses_expensive_settings_and_real_optimizer_ema_checkpoint(tmp_path, monkeypatch):
@@ -661,7 +1000,7 @@ def test_inference_memory_excludes_panel_generation(tmp_path, monkeypatch):
         return result
 
     monkeypatch.setattr(measure, "_HostPeak", Peak)
-    monkeypatch.setattr(measure, "_host_rss", lambda: 999_999 if generating[0] else 100)
+    monkeypatch.setattr(measure, "_host_memory", lambda: (999_999 if generating[0] else 100, None))
     monkeypatch.setattr(measure, "_inference_panel", generate)
     c = config()
     result = measure.qualify(

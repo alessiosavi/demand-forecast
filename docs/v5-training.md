@@ -245,16 +245,44 @@ rows in `skips`, so the realised folder shares can differ from the proposal
 shares. Source weights apply to panel draws. A typed panel can supply several
 episodes, while corpus and upstream panels supply at most one.
 
-For Q, use `--action qualify --config q.yaml --name q-typed`; run a separate
-unit for typed 0.5 + corpus 0.5 with the corpus options. `qualify.json` measures
-full and T1 models, throughput and supervised/padded cells for worker counts,
-summed host and peak GPU memory, one and configured origins, worst-batch forward
-and backward, cold index/first-batch/restore times, excluded corpus row share,
-admitted corpus rows per unparsed label (`unparsed_frequency_rows`), checkpoint
-write time and size, parameter counts, and full-panel inference for 30,490
-series. Q selects nothing automatically. The operator uses these
-measurements to register the bases, batch shapes, workers, checkpoint cadence,
-recovery bound and revised cost ceilings before S1.
+For Q, use `--action qualify --config q.yaml --name q-typed`. Run a separate
+unit for typed 0.5 + corpus 0.5 with the corpus options. Both the generator and
+`job.py qualify` accept `--models full|t1|both`, `--workers N[,N...]`,
+`--updates N` and `--no-inference`. The defaults run both models with 8, 16,
+32 and 46 training loader workers, 200 batch attempts per trial and a 30,490-series
+inference probe per model. `--no-inference` omits the probe and retains parameter
+counts. `--inference-workers N` overrides the default of 16 on Linux hosts with
+at least 18 CPUs and 0 elsewhere. The inference result records the count in
+`workers` and any serial fallback in `worker_reason`, including when the
+file-descriptor limit cannot accommodate the request.
+
+`qualify.json` records cold index/first-batch/restore timings, excluded corpus
+row share, admitted corpus rows per unparsed label (`unparsed_frequency_rows`),
+trials at one and the configured number of origins, worst-batch forward and
+backward, checkpoint write time and size, and inference. Each measurement has
+`status` set to `ok`, `oom` or `failed`, with a `message` on error. The parameter
+count is the exception: it carries a status only when counting fails. The job
+publishes the report once at least one training trial succeeds. If all training
+trials fail, the job writes `failure.json` and can be retried under the same name.
+Restore timing uses the first successful worker trial's checkpoint. Checkpoint
+write timing retries with later successful worker trials' checkpoints until
+one works, and reports the last error if every attempt fails.
+For training trials, `supervised_cells_per_second`
+multiplies supervised cells per successful update by updates per second after
+warmup. It is null when the timed tail has no successful updates.
+`peak_gpu_bytes` includes the optimiser and averaged weights.
+
+For training trials and inference, `host_memory_bytes` is the peak sampled
+sum of process and descendant RSS in bytes. Shared pages can contribute to
+more than one process's RSS. The value is null when RSS cannot be sampled,
+including on hosts without `/proc`.
+`host_memory_pss_bytes` uses the same sampling points and apportions shared
+pages across the processes that map them. It is null without a complete PSS
+sample. `host_memory_rusage_bytes` adds the lifetime RSS high-water figures
+reported by `getrusage` for the process and its waited-for children. This
+figure is in bytes on Linux and macOS and can include earlier work in the unit.
+The operator uses Q to register the bases, batch shapes, workers, checkpoint
+cadence, recovery bound and revised cost ceilings before S1.
 
 Every batch report includes `exposure`, keyed by source kind (two sources of
 the same kind are counted together). Its `panels`

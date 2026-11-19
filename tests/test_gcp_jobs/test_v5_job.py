@@ -114,6 +114,19 @@ def test_v5_job_byte_identical_to_ec6c5c4(jobs, tmp_path, action, digest):
     assert hashlib.sha256(script.encode()).hexdigest() == digest
 
 
+def test_default_qualify_job_is_byte_identical_to_c5_base(jobs, tmp_path):
+    config = tmp_path / "fixed.yaml"
+    config.write_bytes(b"sources: []\n")
+    script = jobs.generate(name="unit", action="qualify", repo_sha=SHA, config=str(config))
+    # Run the generator at a97135e with the exact inputs above and hash its output.
+    assert hashlib.sha256(script.encode()).hexdigest() == (
+        "3bdc873d40a45fb9d3a92a077022aeb6ce24ff4d2ce2a5590783a47ebf8bf215"
+    )
+    destination = tmp_path / "job.sh"
+    destination.write_text(script)
+    assert subprocess.run(["bash", "-n", str(destination)]).returncode == 0
+
+
 @pytest.mark.parametrize(
     "changes",
     [
@@ -541,6 +554,77 @@ def test_cloud_actions_and_initial_checkpoint(jobs, settings, machine, action):
     )
     assert result.returncode == 0, result.stderr
     assert "--init-file" in events[-1]
+
+
+def test_generator_passes_qualification_options(jobs, settings, machine, tmp_path):
+    _, execute = machine
+    output = tmp_path / "scoped.sh"
+    flags = [
+        "--models",
+        "t1",
+        "--workers",
+        "0,2",
+        "--updates",
+        "3",
+        "--no-inference",
+        "--inference-workers",
+        "7",
+    ]
+    assert (
+        jobs.main(
+            [
+                "--name",
+                "scoped",
+                "--action",
+                "qualify",
+                "--repo-sha",
+                SHA,
+                "--config",
+                str(settings),
+                "--output",
+                str(output),
+                *flags,
+            ]
+        )
+        == 0
+    )
+    result, events = execute(output.read_text())
+    assert result.returncode == 0, result.stderr
+    command = events[-1]
+    assert command[3:6] == ["qualify", "--name", "scoped"]
+    for flag, value in (
+        ("--models", "t1"),
+        ("--workers", "0,2"),
+        ("--updates", "3"),
+        ("--inference-workers", "7"),
+    ):
+        assert command[command.index(flag) + 1] == value
+    assert command.count("--no-inference") == 1
+
+
+@pytest.mark.parametrize(
+    "options,match",
+    [
+        ({"models": "unknown"}, "models"),
+        ({"workers": "0,,-1"}, "workers"),
+        ({"workers": "16,16"}, r"--workers.*duplicate"),
+        ({"workers": "16,016"}, r"--workers.*duplicate"),
+        ({"updates": 0}, "updates"),
+        ({"inference_workers": -1}, "inference_workers"),
+    ],
+)
+def test_generator_rejects_invalid_qualification_options(jobs, settings, options, match):
+    with pytest.raises(ValueError, match=match):
+        jobs.generate(name="unit", action="qualify", repo_sha=SHA, config=str(settings), **options)
+
+
+@pytest.mark.parametrize(
+    "member",
+    [{"member_uri": "gs://offline/checkpoint.pt"}, {"member_sha256": "d" * 64}],
+)
+def test_generator_rejects_export_member_options_for_other_actions(jobs, settings, member):
+    with pytest.raises(ValueError, match="only to export"):
+        jobs.generate(**arguments(settings, **member))
 
 
 def export_arguments(**changes):
