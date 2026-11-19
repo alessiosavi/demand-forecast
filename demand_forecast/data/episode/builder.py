@@ -75,7 +75,14 @@ class EpisodeRequest:
 
 @dataclass
 class Episode:
-    """Model inputs, supervision and reporting names for one item."""
+    """Model inputs, supervision and reporting metadata for one item.
+
+    ``row_keys`` has one entry per row in the final row order: the
+    ``(source, name)`` of the screening candidate that produced a sibling or
+    dynamic row (every label row and the effect row of an expanded category
+    carry the category's key), and ``None`` for forecast, peer and whole-panel
+    rows.
+    """
 
     x: np.ndarray
     patch_valid: np.ndarray
@@ -116,6 +123,7 @@ class Episode:
     origin_patches: np.ndarray
     context_target: str | None
     trace: tuple[Candidate, ...] = ()
+    row_keys: tuple[tuple[str, str] | None, ...] = ()
 
 
 def apply_summary_off(episode: Episode, names: tuple[str, ...]) -> Episode:
@@ -145,6 +153,7 @@ class _Row:
     mode: str = "number"
     cand: int = -1
     support: np.ndarray | None = None
+    candidate_key: tuple[str, str] | None = None
 
 
 def _array(values: object, dtype: type, *shape: int) -> np.ndarray:
@@ -463,13 +472,19 @@ class EpisodeBuilder:
             self._row(name, item.targets[name], KIND_NUMBER, ROLE_FORECAST, 1.0, end, cutoff=cutoff)
             for name in targets
         ]
-        rows.extend(
-            self._row(
-                c.name, item.targets[c.name], KIND_NUMBER, ROLE_SIBLING, c.score, end, cutoff=cutoff
-            )
-            for c in selected
-            if c.source == "sibling"
-        )
+        for c in selected:
+            if c.source == "sibling":
+                row = self._row(
+                    c.name,
+                    item.targets[c.name],
+                    KIND_NUMBER,
+                    ROLE_SIBLING,
+                    c.score,
+                    end,
+                    cutoff=cutoff,
+                )
+                row.candidate_key = c.source, c.name
+                rows.append(row)
         dispositions: dict[tuple[str, str], str | None] = {
             (c.source, c.name): None for c in selected if c.source in ("sibling", "static")
         }
@@ -504,6 +519,7 @@ class EpisodeBuilder:
             features.extend((part, key) for part in expanded)
         features.sort(key=lambda pair: (pair[0].role, -pair[0].score, pair[0].name))
         for row, key in features[:MAX_FEATURE_ROWS]:
+            row.candidate_key = key
             rows.append(row)
             dispositions[key] = None
 
@@ -718,4 +734,5 @@ class EpisodeBuilder:
             ),
             context_target=context_target,
             trace=tuple(trace),
+            row_keys=tuple(row.candidate_key for row in rows),
         )

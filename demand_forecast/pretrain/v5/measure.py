@@ -11,11 +11,12 @@ from __future__ import annotations
 import json
 import os
 import statistics
+import sys
 import threading
 import time
 from collections import Counter
 from dataclasses import replace
-from itertools import islice
+from os import cpu_count
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -39,8 +40,7 @@ from demand_forecast.data.episode.schema import (
     MAX_FORECAST_ROWS,
     PATCH,
 )
-from demand_forecast.models.v5 import V5Config, V5Model, v5_loss
-from demand_forecast.models.v5.model import prune
+from demand_forecast.models.v5 import V5Config, V5Model, forecast_items, v5_loss
 from demand_forecast.synthetic.typed.draft import stream
 
 from . import loop
@@ -51,7 +51,6 @@ from .loop import load_model, train
 from .sampler import loader
 
 
-@torch.no_grad()
 def forecast_panel(
     model: V5Model,
     panel: Panel,
@@ -63,11 +62,13 @@ def forecast_panel(
     gates: str = "learned",
     pruned: bool = True,
     device: str | None = None,
+    workers: int = 0,
+    prefetch: int = 2,
 ) -> dict[tuple[str, str], np.ndarray]:
     """Forecast bounded batches on the model's device, without moving the model.
 
     An explicit device must match the model's device. Restore its training mode
-    on success or failure.
+    on success or failure. On Linux, workers can build and collate episodes.
     """
     if type(batch_episodes) is not int or batch_episodes < 1:
         raise ValueError("batch_episodes must be a positive integer")
@@ -80,45 +81,22 @@ def forecast_panel(
             raise ValueError(
                 f"requested device {requested} differs from model device {model_device}"
             )
-    builder = EpisodeBuilder(panel)
-
-    def requests():
-        for index, item in enumerate(panel.items):
-            for request in builder.plan_requests(
-                index, (origin,), horizon, context=context, cutoff=origin
-            ):
-                yield item.item_id, request
-
-    training = model.training
-    try:
-        model.eval()
-        planned = requests()
-        result = {}
-        while group := list(islice(planned, batch_episodes)):
-            # The comprehension releases every Episode before forwarding. Never
-            # retain a previous group while building the next one's episodes.
-            batch = collate([builder.build(request) for _, request in group]).to(model_device)
-            selected = model.gates(batch, mode=gates)
-            if pruned:
-                batch, selected = prune(batch, selected)
-            quantiles = model(batch, selected).quantiles[:, 0]
-            quantiles = batch.loc[..., None, None] + batch.scale[..., None, None] * quantiles
-            quantiles = torch.where(
-                batch.fallback[..., None, None], batch.loc[..., None, None], quantiles
-            )
-            quantiles = quantiles[:, :, :horizon].cpu().numpy()
-            for b, (item_id, _) in enumerate(group):
-                kept = (batch.keep[b] & batch.forecast_mask[b]).nonzero().flatten().tolist()
-                for row in kept:
-                    name = batch.row_names[b][int(batch.forecast_rows[b, row])]
-                    values = quantiles[b, row].copy()
-                    if not np.isfinite(values).all():
-                        raise ValueError(f"nonfinite forecast for {item_id!r}, {name!r}")
-                    result[item_id, name] = values
-            del batch, selected, quantiles
-        return result
-    finally:
-        model.train(training)
+    forecasts = forecast_items(
+        model,
+        panel,
+        [(index, origin) for index in range(len(panel.items))],
+        horizon,
+        context=context,
+        batch_episodes=batch_episodes,
+        gates=gates,
+        pruned=pruned,
+        workers=workers,
+        prefetch=prefetch,
+    )
+    return {
+        (panel.items[index].item_id, name): values
+        for (index, name), values in forecasts.values.items()
+    }
 
 
 def worst_batch(config: V5TrainConfig) -> EpisodeBatch:
@@ -482,6 +460,7 @@ def qualify(
     if not models or any(not isinstance(name, str) or not name for name in models):
         raise ValueError("models requires nonempty string names")
     device = _device(config)
+    inference_workers = 16 if sys.platform == "linux" and (cpu_count() or 0) >= 18 else 0
     # Q always measures the bank and all inputs, even if passed a T1 null arm.
     base = replace(
         config,
@@ -570,6 +549,7 @@ def qualify(
                         context=512,
                         gates="ones",
                         pruned=False,
+                        workers=inference_workers,
                     ),
                 )
                 if len(forecasts) != panel_items or fallback_forecasts:
