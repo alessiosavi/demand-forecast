@@ -232,6 +232,30 @@ def test_equals_single_episode_forecast(model):
     assert model.training
 
 
+def test_scale_floor_matches_a_manual_build_and_changes_the_forecast(model):
+    origin = 40
+    horizon = 3
+    panel = _panel(n_items=1)
+    item = panel.items[0]
+    prefix = 1000 + 1e-9 * np.random.default_rng(19).normal(size=origin)
+    targets = {"y": np.r_[prefix, [1100.0] * (len(item.targets["y"]) - origin)]}
+    panel = replace(panel, items=(replace(item, targets=targets),))
+    jobs = [(0, origin)]
+    screening = ScreeningConfig(scale_floor=0.01)
+    builder = EpisodeBuilder(panel, screening)
+    requests = [EpisodeRequest(0, (origin,), horizon, CONTEXT, cutoff=origin)]
+    expected, scales = _reference(model, panel, builder, requests)
+    assert scales[0, "y"] == pytest.approx(10.0, rel=1e-12)
+
+    assert v5.planned_layouts(panel, jobs, horizon, context=CONTEXT, screening=screening) == [
+        "joint"
+    ]
+    actual = v5.forecast_items(model, panel, jobs, horizon, context=CONTEXT, screening=screening)
+    _assert_forecasts(actual.values, expected, scales)
+    unfloored = v5.forecast_items(model, panel, jobs, horizon, context=CONTEXT)
+    assert not np.allclose(actual.values[0, "y"], unfloored.values[0, "y"], rtol=0, atol=1e-4)
+
+
 def test_float64_forecasts_match_float32_and_single_episode(model, monkeypatch):
     if not torch.amp.autocast_mode.is_autocast_available("cpu"):
         pytest.skip("CPU autocast is unavailable")

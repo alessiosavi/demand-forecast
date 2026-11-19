@@ -283,6 +283,7 @@ def _screening(training: dict) -> ScreeningConfig:
     return ScreeningConfig(
         no_evidence=sampler.get("screen_no_evidence", 0.0),
         fair_static_spread=sampler.get("screen_fair_spread", False),
+        scale_floor=sampler.get("scale_floor"),
     )
 
 
@@ -540,6 +541,8 @@ def _selftest(out: Path, derive: tuple[str, ...] = ()) -> None:
         checkpoint_config["sampler"]["derive"] = list(config.sampler.derive)
     else:
         del checkpoint_config["sampler"]["derive"]
+    if config.sampler.scale_floor is None:
+        del checkpoint_config["sampler"]["scale_floor"]
     with TemporaryDirectory(prefix="v5-selftest-") as directory:
         checkpoint, _ = save_checkpoint(
             directory,

@@ -251,6 +251,7 @@ def _build(generated, entry, config):
     screening = ScreeningConfig(
         no_evidence=config.sampler.screen_no_evidence,
         fair_static_spread=config.sampler.screen_fair_spread,
+        scale_floor=config.sampler.scale_floor,
     )
     episode = EpisodeBuilder(panel, screening).build(request)
     _postprocess(episode, replace(config.sampler, designate_target=True))
@@ -315,10 +316,12 @@ def eval_set(
         designate_target=True,
         screen_no_evidence=base.sampler.screen_no_evidence,
         screen_fair_spread=base.sampler.screen_fair_spread,
+        scale_floor=base.sampler.scale_floor,
     )
     screening = ScreeningConfig(
         no_evidence=sampler.screen_no_evidence,
         fair_static_spread=sampler.screen_fair_spread,
+        scale_floor=sampler.scale_floor,
     )
     results, counts = [], Counter()
     for i in range(max_panels):

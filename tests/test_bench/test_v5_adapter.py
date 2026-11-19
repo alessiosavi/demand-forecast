@@ -324,6 +324,29 @@ def test_fair_spread_reaches_every_screening_site(make_adapter, tmp_path, monkey
     assert score(calibrated) < score(legacy) == pytest.approx(1.0)
 
 
+def test_scale_floor_reaches_every_adapter_request(make_adapter, tmp_path, monkeypatch):
+    adapter = make_adapter(checkpoint=_export(tmp_path, sampler_options={"scale_floor": 0.01}))
+    window = _window(3, targets=2, features=True)
+    window.items[0].axis = None
+    for series in window.items:
+        prefix = 1000 + 1e-9 * np.random.default_rng(series.item_index).normal(size=48)
+        series.target = np.stack((prefix, 2 * prefix))
+    seen = []
+    validate = EpisodeBuilder._validate
+
+    def observe(builder, request):
+        seen.append(builder.config.scale_floor)
+        return validate(builder, request)
+
+    monkeypatch.setattr(EpisodeBuilder, "_validate", observe)
+    episodes = _capture_episodes(monkeypatch)
+    adapter.predict([window], HORIZON, [0.5])
+    assert len(episodes) == 6
+    assert len(seen) > len(episodes) and set(seen) == {0.01}
+    for episode in episodes.values():
+        np.testing.assert_allclose(episode.scale, 0.01 * np.abs(episode.loc), rtol=1e-12)
+
+
 def test_off_grid_items_are_forecast_alone_and_the_rest_keep_their_peers(make_adapter, monkeypatch):
     adapter = make_adapter()
     window = _window(10, features=True)

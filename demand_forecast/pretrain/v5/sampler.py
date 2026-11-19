@@ -215,6 +215,7 @@ def _plan_panel(panel, record, config, source, rng, *, path_quota=None, ordinary
                     ScreeningConfig(
                         no_evidence=config.screen_no_evidence,
                         fair_static_spread=config.screen_fair_spread,
+                        scale_floor=config.scale_floor,
                     ),
                 )
             requests = builder.plan_requests(
@@ -354,6 +355,7 @@ def _make_batch(config, k, sources):
                     ScreeningConfig(
                         no_evidence=config.sampler.screen_no_evidence,
                         fair_static_spread=config.sampler.screen_fair_spread,
+                        scale_floor=config.sampler.scale_floor,
                     ),
                 )
         except SamplerSkip as error:

@@ -15,8 +15,8 @@ class Scale:
     scale: float
 
 
-def fit_scale(values: np.ndarray, cutoff: int, season: int) -> Scale:
-    """Fit the median and seasonal error using only values before the cutoff."""
+def fit_scale(values: np.ndarray, cutoff: int, season: int, *, floor: float | None = None) -> Scale:
+    """Fit a prefix-only scale with an optional floor relative to the mean absolute level."""
     prefix = np.asarray(values[: max(0, cutoff)], dtype=np.float64)
     finite = prefix[np.isfinite(prefix)]
     if not len(finite):
@@ -25,7 +25,10 @@ def fit_scale(values: np.ndarray, cutoff: int, season: int) -> Scale:
     scale = seasonal_error(prefix, season)
     if not np.isfinite(scale) or scale == 0:
         scale = float(np.mean(np.abs(finite - loc)))
-    return Scale(loc, scale if scale > 0 else 1.0)
+    scale = scale if scale > 0 else 1.0
+    if floor is not None:
+        scale = max(scale, floor * float(np.mean(np.abs(finite))))
+    return Scale(loc, scale)
 
 
 def to_scaled(values: np.ndarray, s: Scale) -> np.ndarray:

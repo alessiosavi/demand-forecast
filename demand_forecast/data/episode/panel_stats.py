@@ -25,18 +25,22 @@ class PanelStats:
     SUMMARY_CHUNK = 2048
     SUMMARY_CHUNK_CELLS = 4_000_000
 
-    def __init__(self, panel: Panel, target: str, cutoff: int) -> None:
+    def __init__(
+        self, panel: Panel, target: str, cutoff: int, *, scale_floor: float | None = None
+    ) -> None:
         self.panel = panel
         self.target = target
         self.cutoff = cutoff
+        self.scale_floor = scale_floor
         self.screen_cache: dict = {}
         self.lag_cache: dict[tuple[int, str], tuple[int, float, float]] = {}
         self.scales: list[Scale] = []
         self._eligible = np.zeros(len(panel.items), dtype=bool)
+        scale_options = {} if scale_floor is None else {"floor": scale_floor}
         for i, item in enumerate(panel.items):
             values = item.targets.get(target, np.empty(0, dtype=np.float64))
             end = max(0, cutoff - item.start)
-            self.scales.append(fit_scale(values, end, panel.season))
+            self.scales.append(fit_scale(values, end, panel.season, **scale_options))
             self._eligible[i] = np.isfinite(values[:end]).any()
 
         self.summaries = np.zeros((len(panel.items), N_SUMMARY), dtype=np.float32)
@@ -279,10 +283,13 @@ class PanelStats:
 class PanelStatsProvider:
     """Cache panel statistics by target and cutoff, optionally bounding retention."""
 
-    def __init__(self, panel: Panel, *, limit: int | None = 16) -> None:
+    def __init__(
+        self, panel: Panel, *, limit: int | None = 16, scale_floor: float | None = None
+    ) -> None:
         if limit is not None and limit < 0:
             raise ValueError("statistics cache limit must be nonnegative")
         self.panel = panel
+        self.scale_floor = scale_floor
         self.builds = 0
         self._limit = limit
         self._cache: OrderedDict[tuple[str, int], PanelStats] = OrderedDict()
@@ -291,7 +298,9 @@ class PanelStatsProvider:
         key = target, cutoff
         stats = self._cache.get(key)
         if stats is None:
-            stats = PanelStats(self.panel, target, cutoff)
+            floor = self.scale_floor
+            scale_options = {} if floor is None else {"scale_floor": floor}
+            stats = PanelStats(self.panel, target, cutoff, **scale_options)
             self.builds += 1
             self._cache[key] = stats
         self._cache.move_to_end(key)
