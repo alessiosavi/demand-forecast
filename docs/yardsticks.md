@@ -258,7 +258,7 @@ The report supplies the v5 metadata when the summary is reconstructed.
 ## Cloud scoring jobs
 
 `make_score_job.py` uses the same harness, saved forecast windows and completion
-checks for Simons, Timestral and Chronos-2. Set `REPO_SHA` to the scoring code's
+checks for Simons, Timestral, Chronos-2 and v5. Set `REPO_SHA` to the scoring code's
 40-hex commit and `TASKS_SHA256` to the task YAML's SHA-256. For a development
 subset, add `--names-uri` and `--names-sha256` to each command. The required
 `--upstream-pin` retains the repository's Simons integration pin for all jobs;
