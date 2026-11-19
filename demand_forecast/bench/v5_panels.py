@@ -13,8 +13,10 @@ import pandas as pd
 from demand_forecast.data.episode.kinds import infer_kind, infer_static_kind, is_missing, label_of
 from demand_forecast.data.episode.schema import KIND_CATEGORY, MAX_HORIZON, PATCH, Item, Panel
 from demand_forecast.data.frequency import (
+    DAY_NS,
     GridError,
     _requires_midnight,
+    grid_range,
     steps_between,
     to_offset,
 )
@@ -71,13 +73,21 @@ def time_axis(
 
 def _is_history_on_grid(dates: pd.DatetimeIndex, offset: pd.offsets.BaseOffset) -> bool:
     """Distinguish a gap or duplicate from an off-grid timestamp after a mismatch."""
+    step_ns = 0
     if isinstance(offset, (pd.offsets.Day, pd.offsets.Week)):
-        local = dates.tz_localize(None)
+        dates = dates.tz_localize(None)
         days = offset.n * (7 if isinstance(offset, pd.offsets.Week) else 1)
-        return bool(((local - local[0]) % pd.Timedelta(days, "D") == pd.Timedelta(0)).all())
-    if isinstance(offset, pd.offsets.Tick):
-        step = pd.Timedelta(offset.nanos, "ns")
-        return bool(((dates - dates[0]) % step == pd.Timedelta(0)).all())
+        step_ns = days * DAY_NS
+    elif isinstance(offset, pd.offsets.Tick):
+        step_ns = offset.nanos
+    if step_ns:
+        try:
+            step = pd.Timedelta(step_ns, unit="ns")
+            return bool(((dates - dates[0]) % step == pd.Timedelta(0)).all())
+        except (pd.errors.OutOfBoundsDatetime, pd.errors.OutOfBoundsTimedelta, OverflowError):
+            for date in dates[1:]:
+                steps_between(dates[0], date, offset)
+            return True
 
     month_start = (pd.offsets.MonthBegin, pd.offsets.QuarterBegin, pd.offsets.YearBegin)
     month_end = (pd.offsets.MonthEnd, pd.offsets.QuarterEnd, pd.offsets.YearEnd)
@@ -94,8 +104,22 @@ def _is_history_on_grid(dates: pd.DatetimeIndex, offset: pd.offsets.BaseOffset) 
         return bool(((dates.day == anchor_day) & whole_steps).all())
 
     # Other pandas calendars, such as business calendars, need a membership range.
-    grid = pd.date_range(dates.min(), dates.max(), freq=offset)
+    grid = grid_range(dates.min(), None, offset, end=dates.max())
     return bool(dates.isin(grid).all())
+
+
+def _timestamp_index(values: np.ndarray) -> pd.DatetimeIndex:
+    try:
+        return pd.DatetimeIndex(values)
+    except pd.errors.OutOfBoundsDatetime:
+        stamps = [pd.Timestamp(value).as_unit("us", round_ok=False) for value in values]
+        zones = [stamp.tz for stamp in stamps if not pd.isna(stamp)]
+        tz = zones[0] if zones else None
+        # A timezone-aware dtype would otherwise coerce naive or mixed-zone input.
+        if any(getattr(zone, "zone", zone) != getattr(tz, "zone", tz) for zone in zones):
+            raise ValueError("Timestamps must share a timezone") from None
+        dtype = pd.DatetimeTZDtype(unit="us", tz=tz) if tz is not None else "datetime64[us]"
+        return pd.DatetimeIndex(stamps, dtype=dtype)
 
 
 def _prove_time_axis(
@@ -106,7 +130,7 @@ def _prove_time_axis(
     horizon: int | None = None,
 ) -> TimeAxis:
     try:
-        dates = pd.DatetimeIndex(history)
+        dates = _timestamp_index(history)
     except (TypeError, ValueError, OverflowError):
         return TimeAxis(None, False, "invalid_history_timestamps", missing_timestamps=True)
     # DatetimeIndex reports one dimension even if its backing array has more.
@@ -124,7 +148,7 @@ def _prove_time_axis(
     missing_timestamps = dates.hasnans
     if future is not None:
         try:
-            future_dates = pd.DatetimeIndex(future)
+            future_dates = _timestamp_index(future)
         except (TypeError, ValueError, OverflowError):
             future_dates = None
         if future_dates is None or future_dates.array.ndim != 1:
@@ -145,13 +169,13 @@ def _prove_time_axis(
     length = len(dates)
     future_steps = len(future_dates) if future_dates is not None and future_reason is None else 0
     try:
-        expected = pd.date_range(first, periods=length + future_steps, freq=offset)
+        expected = grid_range(first, length + future_steps, offset)
     except (ValueError, OverflowError):
         if not future_steps:
             return TimeAxis(first, False, "history_off_grid", missing_timestamps)
         # Preserve history error precedence if generating the future overflowed.
         try:
-            expected = pd.date_range(first, periods=length, freq=offset)
+            expected = grid_range(first, length, offset)
         except (ValueError, OverflowError):
             return TimeAxis(first, False, "history_off_grid", missing_timestamps)
         future_reason = "future_off_grid"
