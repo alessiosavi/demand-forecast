@@ -104,6 +104,10 @@ class V5Model(nn.Module):
         )
         self.step_projection = nn.Linear(config.d_model, PATCH * config.d_out)
         self.head = MonotoneQuantileHead(config.d_out, config.quantiles, config.width_factor)
+        if config.horizon_seed:
+            self.horizon_seed_projection = nn.Linear(config.d_model, config.d_model)
+            nn.init.zeros_(self.horizon_seed_projection.weight)
+            nn.init.zeros_(self.horizon_seed_projection.bias)
 
     def parameter_report(self) -> dict[str, int | None]:
         """Return both parameter totals and the extra width of each dense expert block.
@@ -287,6 +291,21 @@ class V5Model(nn.Module):
         query = self.query + self.horizon_calendar(calh.flatten(-2))
         nf = batch.forecast_rows.shape[1]
         forecast_tokens = query[:, :, None].expand(-1, -1, nf, -1, -1)
+        if self.config.horizon_seed:
+            last_patch = batch.origin_patches - 1
+            examples = torch.arange(tokens.shape[0], device=tokens.device)[:, None, None]
+            rows = batch.forecast_rows[:, None, :]
+            patches = last_patch.clamp_min(0)[..., None]
+            history = tokens[examples, rows, patches]
+            valid = batch.patch_valid[examples, rows, patches]
+            valid = (
+                valid
+                & ((last_patch >= 0) & batch.origin_mask)[..., None]
+                & batch.forecast_mask[:, None, :]
+            )
+            seed = self.horizon_seed_projection(history.masked_fill(~valid[..., None], 0))
+            seed = seed.masked_fill(~valid[..., None], 0)
+            forecast_tokens = forecast_tokens + seed.unsqueeze(-2)
         xh = batch.xh.masked_fill(~step_mask[:, None, None, ..., None], 0)
         kinds = _rows(batch.row_kind, batch.known_rows)[:, None, :, None]
         roles = _rows(batch.row_role, batch.known_rows)[:, None, :, None]

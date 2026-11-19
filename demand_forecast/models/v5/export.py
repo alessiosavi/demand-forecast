@@ -534,6 +534,8 @@ def _selftest(out: Path, derive: tuple[str, ...] = ()) -> None:
         model = V5Model(config.model)
     # Retain the selftest's original checkpoint representation and source digest.
     checkpoint_config = asdict(config)
+    if not config.model.horizon_seed:
+        del checkpoint_config["model"]["horizon_seed"]
     if config.sampler.derive:
         checkpoint_config["sampler"]["derive"] = list(config.sampler.derive)
     else:
