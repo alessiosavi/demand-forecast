@@ -4,7 +4,7 @@ import copy
 import hashlib
 import importlib
 import json
-from dataclasses import asdict, replace
+from dataclasses import asdict, fields, replace
 from pathlib import Path
 
 import numpy as np
@@ -204,9 +204,37 @@ def test_paths_recipes_37_valid_arms_and_exact_overrides():
         module.t1_config("bank", "typo", seed=0)
 
 
-def test_only_the_four_repaired_paths_change():
+@pytest.mark.parametrize(
+    "path,derive,cohort",
+    [
+        ("past_driver", "lag_rows", None),
+        ("label_lag", "lag_rows", None),
+        ("category_timing", "onset_rows", "known"),
+        ("category_spread", "increment_spread", "known"),
+    ],
+)
+def test_aligned_path_overrides(path, derive, cohort):
+    module = api()
+    assert module.PATHS[path].get("decide_on") == cohort
+    for arm in ("true", "null"):
+        assert module.t1_config(path, arm, seed=7).sampler.derive == (derive,)
+
+
+def test_decision_cohorts_are_registered_slices():
+    for path, entry in api().PATHS.items():
+        cohort = entry["decide_on"]
+        assert cohort is None or cohort in entry["slices"], path
+
+
+def test_path_rejects_unknown_decision_cohort():
+    with pytest.raises(ValueError, match="decide_on.*know"):
+        api()._path((("dynamic_category_timing",),), slices=("known",), decide_on="know")
+
+
+def test_only_the_four_aligned_paths_change_config_digests():
     module = api()
     assert module.PATHS.keys() == _BASE_ARM_DIGESTS.keys()
+    moved = set()
     for path, entry in module.PATHS.items():
         assert entry["arms"].keys() == _BASE_ARM_DIGESTS[path].keys()
         for arm in entry["arms"]:
@@ -219,7 +247,7 @@ def test_only_the_four_repaired_paths_change():
                 assert source.pop("folder_power") is None
                 assert source.pop("plain_share") == 0.0
             assert sampler.pop("first_event_only") is (path == "event_response")
-            assert sampler.pop("derive") == ()
+            derive = sampler.pop("derive")
             cold_share = sampler.pop("cold_share")
             assert sampler.pop("cold_steps") == (3, 4)
             if path in ("static_category", "multi_label"):
@@ -235,6 +263,16 @@ def test_only_the_four_repaired_paths_change():
                 sampler["horizon"] = (16, 288)  # Restore the base field before hashing.
             digest = hashlib.sha256(json.dumps(cfg, sort_keys=True).encode()).hexdigest()
             assert digest == _BASE_ARM_DIGESTS[path][arm], (path, arm)
+            if derive:
+                sampler["derive"] = derive
+            aligned_digest = hashlib.sha256(json.dumps(cfg, sort_keys=True).encode()).hexdigest()
+            if aligned_digest != digest:
+                moved.add((path, arm))
+    assert moved == {
+        (path, arm)
+        for path in ("past_driver", "label_lag", "category_timing", "category_spread")
+        for arm in ("true", "null")
+    }
 
 
 @pytest.mark.parametrize("path", ["static_category", "multi_label"])
@@ -461,11 +499,84 @@ def test_derive_reaches_every_request(small, monkeypatch):
     model = V5Model(saved.model)
     monkeypatch.setattr(small, "load_model", lambda *a, **kw: (model, saved))
     built.clear()
-    small.evaluate(Path("unused"), "category_mean", "true", episodes)
+    on = small.evaluate(Path("unused"), "category_mean", "true", episodes)
     assert built == [derive, derive]
+    assert on["derive"] == ["increment_spread", "onset_rows"]
     built.clear()
-    small.evaluate(Path("unused"), "category_mean", "true", episodes, derive_override=frozenset())
+    off = small.evaluate(
+        Path("unused"), "category_mean", "true", episodes, derive_override=frozenset()
+    )
     assert built == [derive, frozenset()]
+    assert off["derive"] == []
+
+
+@pytest.mark.parametrize(
+    "path,presentation",
+    [("category_timing", "onset_rows"), ("category_spread", "increment_spread")],
+)
+def test_derive_off_preserves_the_reference(small, monkeypatch, path, presentation):
+    base = tiny()
+    saved = small.t1_config(path, "true", seed=17, base=base)
+    model = V5Model(saved.model)
+    monkeypatch.setattr(small, "load_model", lambda *a, **kw: (model, saved))
+    episodes = small.eval_set(path, base=base, episodes=3, max_panels=60)
+    scored = []
+    build = small._build
+
+    def observe(*args):
+        episode = build(*args)
+        scored.append(episode)
+        return episode
+
+    monkeypatch.setattr(small, "_build", observe)
+    on = small.evaluate(Path("unused"), path, "true", episodes)
+    on_references, on_builds = scored[::2], scored[1::2]
+    scored.clear()
+    off = small.evaluate(Path("unused"), path, "true", episodes, derive_override=frozenset())
+    off_references, off_builds = scored[::2], scored[1::2]
+
+    assert len(on_references) == len(episodes)
+    for enabled, disabled in zip(on_references, off_references, strict=True):
+        assert enabled.row_names == disabled.row_names
+        assert enabled.row_keys == disabled.row_keys
+        for field in fields(enabled):
+            value = getattr(enabled, field.name)
+            if isinstance(value, np.ndarray):
+                np.testing.assert_array_equal(
+                    value, getattr(disabled, field.name), err_msg=field.name
+                )
+
+    assert off["derived"] == [[] for _ in episodes]
+    assert off["eval_digest"] == on["eval_digest"]
+    if presentation == "increment_spread":
+        assert on["derived"] == [[] for _ in episodes]
+        assert on["loss"] != pytest.approx(off["loss"])
+        return
+
+    expected = []
+    for enabled, disabled in zip(on_builds, off_builds, strict=True):
+        base_rows = [
+            i for i, key in enumerate(enabled.row_keys) if key is None or key[0] != "derived"
+        ]
+        expected.append(sorted(key[1] for key in enabled.row_keys if key and key[0] == "derived"))
+        assert disabled.row_names == [enabled.row_names[i] for i in base_rows]
+        assert disabled.row_keys == tuple(enabled.row_keys[i] for i in base_rows)
+        for field in ("x", "row_summary", "row_score"):
+            np.testing.assert_allclose(
+                getattr(disabled, field), getattr(enabled, field)[base_rows], atol=1e-7
+            )
+        for field in ("patch_valid", "row_kind", "row_role", "row_summary_flags", "row_cand"):
+            np.testing.assert_array_equal(
+                getattr(disabled, field), getattr(enabled, field)[base_rows]
+            )
+        known = [i for i, row in enumerate(enabled.known_rows) if row in base_rows]
+        assert [disabled.row_names[i] for i in disabled.known_rows] == [
+            enabled.row_names[enabled.known_rows[i]] for i in known
+        ]
+        np.testing.assert_allclose(disabled.xh, enabled.xh[:, known], atol=1e-7)
+
+    assert any(expected) and [] in expected
+    assert on["derived"] == expected
 
 
 def test_t1_evaluation_uses_the_configured_level(monkeypatch, tmp_path):
@@ -571,6 +682,12 @@ def test_evaluate_all_arms_same_requests_cells_and_finite_losses(small, monkeypa
         result = small.evaluate(Path("unused"), path, arm, episodes, batch_episodes=2)
         assert len(result["loss"]) == len(episodes) and np.isfinite(result["loss"]).all()
         assert result["eval_digest"] == small.eval_digest(episodes)
+        presentations = small.t1_config(path, arm, seed=7).sampler.derive
+        if presentations:
+            assert result["derive"] == list(presentations)
+            assert len(result["derived"]) == len(episodes)
+        else:
+            assert {"derive", "derived"}.isdisjoint(result)
         assert set(result["pruned"]) == {"rows", "tokens", "cells"}
         observed = [(a, b, c, d, mask.tolist()) for a, b, c, d, mask in requests]
         if reference is None:
@@ -967,6 +1084,25 @@ def test_compare_paired_bootstrap_seed_and_required_slice():
     with pytest.raises(ValueError):
         module.compare([float("nan")] * 30, [1.0] * 30)
     assert module.compare([0.0] * 40, [0.0] * 40)["outcome"] == "inconclusive"
+
+
+@pytest.mark.parametrize(
+    "known,past_loss,want,overall",
+    [(30, 1.2, "pass", "fail"), (29, 0.8, "inconclusive", "pass")],
+)
+def test_compare_decides_on_known_cohort(known, past_loss, want, overall):
+    episodes = [{"slices": ("known",)}] * known + [{"slices": ("past",)}] * 30
+    report = api().compare(
+        [0.8] * known + [past_loss] * 30,
+        [1.0] * len(episodes),
+        episodes=episodes,
+        decide_on="known",
+    )
+    assert report["overall"]["n"] == len(episodes)
+    assert report["overall"]["outcome"] == overall
+    assert report["outcome"] == report["slices"]["known"]["outcome"] == want
+    assert report["slices"]["known"]["n"] == known
+    assert report["slices"]["known"]["gain"] == pytest.approx(0.2)
 
 
 def test_bootstrap_pairs_episodes_and_gain_is_ratio_of_sums():

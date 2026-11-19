@@ -41,7 +41,18 @@ from .sources import TypedSource, apply_control
 from .support import has_prior_event, supported
 
 
-def _path(sets, *, both=None, arms=None, slices=(), required=(), present="inputs"):
+def _path(
+    sets,
+    *,
+    both=None,
+    arms=None,
+    slices=(),
+    required=(),
+    present="inputs",
+    decide_on: str | None = None,
+):
+    if decide_on is not None and decide_on not in slices:
+        raise ValueError(f"decide_on {decide_on!r} must be a registered slice")
     arms = {"null": {"source": {"control": "shuffle"}}} if arms is None else arms
     return {
         "sets": sets,
@@ -53,6 +64,7 @@ def _path(sets, *, both=None, arms=None, slices=(), required=(), present="inputs
         "slices": slices,
         "required": required,
         "present": present,
+        "decide_on": decide_on,
     }
 
 
@@ -64,18 +76,26 @@ PATHS: dict[str, dict] = {
     for name in ("static_category", "multi_label")
 }
 PATHS["static_number"] = _path((("static_number",),))
+CATEGORY_SLICES = ("rare", "late_first", "known", "past")
 PATHS.update(
-    {
-        f"category_{effect}": _path(
-            ((f"dynamic_category_{effect}",),), slices=("rare", "late_first", "known", "past")
-        )
-        for effect in ("mean", "spread", "timing")
-    }
+    category_mean=_path((("dynamic_category_mean",),), slices=CATEGORY_SLICES),
+    category_spread=_path(
+        (("dynamic_category_spread",),),
+        both={"sampler": {"derive": ("increment_spread",)}},
+        slices=CATEGORY_SLICES,
+        decide_on="known",
+    ),
+    category_timing=_path(
+        (("dynamic_category_timing",),),
+        both={"sampler": {"derive": ("onset_rows",)}},
+        slices=CATEGORY_SLICES,
+        decide_on="known",
+    ),
 )
 PATHS.update(
     known_driver=_path((("known_driver",),)),
     planned_event=_path((("planned_event",),), slices=("first_event",)),
-    past_driver=_path((("delayed_past_driver",),)),
+    past_driver=_path((("delayed_past_driver",),), both={"sampler": {"derive": ("lag_rows",)}}),
     calendar=_path(
         (("calendar",),),
         both={"source": {"freq": "D", "length": (64, 300)}, "sampler": {"contexts": (64, 128)}},
@@ -112,14 +132,16 @@ PATHS.update(
         required=("seasonal_lag", "intermittent", "level_shift"),
         present="bank",
     ),
-    **{
-        name: _path(
-            ((name,),),
-            both={"sampler": {"first_event_only": True}} if name == "event_response" else None,
-            arms={"null": {"source": {"control": "shuffle", "control_inputs": "attribute"}}},
-        )
-        for name in ("event_response", "label_lag")
-    },
+    event_response=_path(
+        (("event_response",),),
+        both={"sampler": {"first_event_only": True}},
+        arms={"null": {"source": {"control": "shuffle", "control_inputs": "attribute"}}},
+    ),
+    label_lag=_path(
+        (("label_lag",),),
+        both={"sampler": {"derive": ("lag_rows",)}},
+        arms={"null": {"source": {"control": "shuffle", "control_inputs": "attribute"}}},
+    ),
     routing=_path(
         (("static_category",), ("known_driver",), ("intermittent",)),
         arms={"null_uniform": {"router": "uniform"}, "null_rolled": {"router": "rolled"}},
@@ -418,6 +440,7 @@ def evaluate(
     )
     config = t1_config(path, arm, seed=saved.seed, base=base)
     true_config = t1_config(path, "true", seed=saved.seed, base=base)
+    derived = [] if config.sampler.derive else None
     if derive_override is not None:
         config = replace(config, sampler=replace(config.sampler, derive=tuple(derive_override)))
     if config.router == "rolled":
@@ -435,6 +458,9 @@ def evaluate(
         "without_candidate": 0,
         "eval_digest": eval_digest(episodes),
     }
+    if derived is not None:
+        result["derive"] = list(config.sampler.derive)
+        result["derived"] = derived
     if forced:
         result["forced"] = {m: [] for m in mechanisms}
     for i, start in enumerate(starts):
@@ -445,6 +471,10 @@ def evaluate(
             generated = generate_typed_panel(PanelRecipe(**entry["recipe"]))
             reference = _build(generated, entry, true_config)
             built = _build(generated, entry, config)
+            if derived is not None:
+                derived.append(
+                    sorted(key[1] for key in built.row_keys if key and key[0] == "derived")
+                )
             own = {r["mechanism"] for r in entry["drivers"]} or set(generated.recipe.mechanisms)
             result["without_candidate"] += not _present(path, generated, built, own)
             true_episodes.append(reference)
@@ -545,17 +575,24 @@ def _loss_arrays(true, null):
     return true, null
 
 
+def _cohort_indices(episodes: list[dict], name: str) -> np.ndarray:
+    return np.asarray(
+        [i for i, episode in enumerate(episodes) if name in episode["slices"]], dtype=int
+    )
+
+
 def compare(
     true: list[float],
     null: list[float],
     *,
     episodes: list[dict] | None = None,
     required: tuple[str, ...] = (),
+    decide_on: str | None = None,
     resamples: int = 10_000,
     seed: int = 0,
     min_count: int = 30,
 ) -> dict:
-    """Compare paired episode losses, with only explicitly required slices deciding."""
+    """Compare paired losses and optionally decide on one named cohort."""
     true, null = _loss_arrays(true, null)
     if resamples < 1 or min_count < 1:
         raise ValueError("resamples and min_count must be positive")
@@ -563,6 +600,8 @@ def compare(
         raise ValueError("episodes and losses must have equal lengths")
     if required and episodes is None:
         raise ValueError("required slices need episodes")
+    if decide_on is not None and episodes is None:
+        raise ValueError("a decision cohort needs episodes")
 
     def decision(indices):
         record = _interval(
@@ -582,18 +621,26 @@ def compare(
         return record
 
     names = sorted(set(required) | {s for e in episodes or [] for s in e["slices"]})
-    slices = {
-        name: decision(
-            np.asarray([i for i, e in enumerate(episodes or []) if name in e["slices"]], dtype=int)
-        )
-        for name in names
-    }
+    if decide_on is not None and decide_on not in names:
+        names = sorted([*names, decide_on])
+    slices = {name: decision(_cohort_indices(episodes or [], name)) for name in names}
     overall = decision(np.arange(len(true)))
+    if decide_on is not None:
+        return {"overall": overall, "slices": slices, "outcome": slices[decide_on]["outcome"]}
     return {
         "all": overall,
         "slices": slices,
         "outcome": _outcome([overall["outcome"], *(slices[s]["outcome"] for s in required)]),
     }
+
+
+def _removal(on, off, episodes: list[dict], *, decide_on: str | None) -> dict:
+    """Paired gain with the derived-off replay as the loss baseline."""
+    on, off = _loss_arrays(on, off)
+    if decide_on is not None:
+        indices = _cohort_indices(episodes, decide_on)
+        on, off = on[indices], off[indices]
+    return _interval(off - on, off)
 
 
 def selection_report(
