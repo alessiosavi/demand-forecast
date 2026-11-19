@@ -7,8 +7,10 @@ from dataclasses import replace
 
 import numpy as np
 import pytest
+import torch
 
-from demand_forecast.data.episode import Item, Panel
+from demand_forecast.data.episode import EpisodeBuilder, EpisodeRequest, Item, Panel, collate
+from demand_forecast.data.episode import builder as episode_builder
 from demand_forecast.data.episode import screening as sc
 from demand_forecast.data.episode.panel_stats import PanelStats
 from demand_forecast.data.episode.schema import KIND_FLAG, KIND_NUMBER
@@ -23,7 +25,93 @@ from demand_forecast.data.episode.screening import (
     screen,
     select,
 )
+from demand_forecast.models.v5 import V5Config, V5Model
 from tests.helpers.episodes import perturb_after, toy_panel
+
+
+@pytest.fixture
+def panel_with_candidate_budget(monkeypatch):
+    steps = np.arange(96, dtype=np.float64)
+    driver = np.sin(steps / 3)
+    items = tuple(
+        Item(
+            f"item{i}",
+            0,
+            {"y": driver + i},
+            {"driver": driver, "duplicate": driver.copy(), "empty": np.full_like(steps, np.nan)},
+            {"driver": f"group{i % 2}", "id": f"item{i}", "z_cut": f"group{i // 4}"},
+        )
+        for i in range(8)
+    )
+    panel = Panel(
+        "trace", items, {"driver": "past", "duplicate": "past", "empty": "past"}, None, None, False
+    )
+    request = EpisodeRequest(0, (64,), 5, context=64)
+    config = ScreeningConfig(min_items=9)
+
+    def select_one_attribute(candidates, **budgets):
+        return select(candidates, **(budgets | {"attribute_budget": 1}))
+
+    monkeypatch.setattr(episode_builder, "select", select_one_attribute)
+    return panel, request, config
+
+
+def test_trace_lists_every_candidate_with_its_disposition(panel_with_candidate_budget):
+    panel, request, config = panel_with_candidate_budget
+    episode = EpisodeBuilder(panel, config).build(request)
+    assert isinstance(episode.trace, tuple)
+    assert [(c.source, c.name, c.removed) for c in episode.trace] == [
+        ("past", "driver", None),
+        ("past", "duplicate", "duplicate"),
+        ("past", "empty", "empty"),
+        ("static", "driver", None),
+        ("static", "id", "entity"),
+        ("static", "z_cut", "budget"),
+    ]
+    assert episode.trace[0].score == pytest.approx(1)
+    assert tuple(c.score for c in episode.trace[1:]) == (0,) * 5
+    assert episode.row_names == ["y", "driver"]
+    assert episode.cand_names == ["driver"]
+
+
+def test_dropped_candidate_does_not_count_in_sparsity(panel_with_candidate_budget):
+    panel, request, config = panel_with_candidate_budget
+    episode = EpisodeBuilder(panel, config).build(request)
+    cut = next(c for c in episode.trace if (c.source, c.name) == ("static", "z_cut"))
+    assert cut.removed == "budget"
+    assert len(episode.cand_names) == sum(
+        c.removed is None and c.source == "static" for c in episode.trace
+    )
+    reference = replace(
+        panel,
+        items=tuple(
+            replace(
+                item,
+                static={name: value for name, value in item.static.items() if name != cut.name},
+            )
+            for item in panel.items
+        ),
+    )
+    batch = collate([episode])
+    clean_batch = collate([EpisodeBuilder(reference, config).build(request)])
+    assert batch.cand_mask.tolist() == [[True]]
+    model = V5Model(
+        V5Config(
+            d_model=16,
+            nhead=2,
+            enc_layers=1,
+            dec_layers=1,
+            dim_feedforward=32,
+            expert_enc_layers=0,
+            expert_dec_layers=0,
+        )
+    ).eval()
+    with torch.no_grad():
+        # Distinguish family from candidate probabilities in the normalized L0.
+        model.family_logits.bias.zero_()
+        torch.testing.assert_close(
+            model.gates(batch).expected_l0, model.gates(clean_batch).expected_l0, rtol=0, atol=0
+        )
 
 
 def promo_never_seen_before_cutoff():

@@ -1,14 +1,13 @@
 """Build cutoff-bounded, typed numpy episodes on an absolute panel grid."""
 
-from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 
 from .bank import step_features, summary_vectors
 from .calendar import calendar_arrays
 from .kinds import flag_codes, is_missing, label_of
-from .panel_stats import PanelStats
+from .panel_stats import PanelStats, PanelStatsProvider
 from .scale import Scale, compress, fit_scale, to_scaled
 from .schema import (
     BANK_WINDOW,
@@ -38,6 +37,7 @@ from .schema import (
     ROLE_PEER,
     ROLE_SIBLING,
     STEP_FAMILIES,
+    SUMMARY_FEATURES,
     Panel,
 )
 from .screening import Candidate, ScreeningConfig, relevance_number, screen, select
@@ -55,6 +55,7 @@ DROPPABLE = (
     "lags",
     "zeros",
     "value_stats",
+    "value_effects",
 )
 
 
@@ -114,6 +115,20 @@ class Episode:
     horizon: int
     origin_patches: np.ndarray
     context_target: str | None
+    trace: tuple[Candidate, ...] = ()
+
+
+def apply_summary_off(episode: Episode, names: tuple[str, ...]) -> Episode:
+    """Clear named summaries and their flags in place and return the episode."""
+    for name in names:
+        j = SUMMARY_FEATURES.index(name)
+        episode.row_summary[..., j] = 0
+        episode.row_summary_flags[..., j] = False
+        episode.cand_summary[..., j] = 0
+        episode.cand_flags[..., j] = False
+        episode.attr_stats[..., j] = 0
+        episode.attr_stats[..., N_SUMMARY + j] = 0
+    return episode
 
 
 @dataclass
@@ -149,22 +164,24 @@ def _window(values: np.ndarray, left: int, right: int) -> np.ndarray:
 
 
 class EpisodeBuilder:
-    """Reuse the last eight (target, cutoff) statistics across panel episodes."""
+    """Reuse cutoff statistics across planning, screening and episode assembly."""
 
-    def __init__(self, panel: Panel, config: ScreeningConfig = ScreeningConfig()) -> None:
+    def __init__(
+        self,
+        panel: Panel,
+        config: ScreeningConfig = ScreeningConfig(),
+        *,
+        stats: PanelStatsProvider | None = None,
+    ) -> None:
         panel.validate()
+        if stats is not None and stats.panel is not panel:
+            raise ValueError("statistics provider must use the builder's panel")
         self.panel = panel
         self.config = config
-        self._cache: OrderedDict[tuple[str, int], PanelStats] = OrderedDict()
+        self.stats = PanelStatsProvider(panel) if stats is None else stats
 
     def _stats(self, target: str, cutoff: int) -> PanelStats:
-        key = target, cutoff
-        if key not in self._cache:
-            self._cache[key] = PanelStats(self.panel, target, cutoff)
-        self._cache.move_to_end(key)
-        while len(self._cache) > 8:
-            self._cache.popitem(last=False)
-        return self._cache[key]
+        return self.stats.get(target, cutoff)
 
     def _validate(self, request: EpisodeRequest) -> int:
         origins = request.origins
@@ -194,17 +211,24 @@ class EpisodeBuilder:
 
     @staticmethod
     def _restricted(candidates: list[Candidate], request: EpisodeRequest) -> list[Candidate]:
-        return [
-            c
-            for c in candidates
-            if not (c.source in ("known", "past") and "features" in request.drop)
-            and not (c.source == "sibling" and "siblings" in request.drop)
-            and (
-                c.source == "static"
-                or request.keep_columns is None
-                or c.name in request.keep_columns
+        restricted = []
+        for candidate in candidates:
+            reason = candidate.removed
+            if reason is None:
+                if candidate.source in ("known", "past") and "features" in request.drop:
+                    reason = "features"
+                elif candidate.source == "sibling" and "siblings" in request.drop:
+                    reason = "siblings"
+                elif (
+                    candidate.source != "static"
+                    and request.keep_columns is not None
+                    and candidate.name not in request.keep_columns
+                ):
+                    reason = "keep_columns"
+            restricted.append(
+                candidate if reason == candidate.removed else replace(candidate, removed=reason)
             )
-        ]
+        return restricted
 
     @staticmethod
     def _typed(candidates: list[Candidate]) -> bool:
@@ -235,7 +259,13 @@ class EpisodeBuilder:
         )
         end = self._validate(probe)
         candidates = screen(
-            self.panel, self._stats(targets[0], end), item_index, (targets[0],), end, self.config
+            self.panel,
+            self._stats(targets[0], end),
+            item_index,
+            (targets[0],),
+            end,
+            self.config,
+            provider=self.stats,
         )
         split = len(targets) > MAX_FORECAST_ROWS or self._typed(self._restricted(candidates, probe))
         return [
@@ -356,7 +386,9 @@ class EpisodeBuilder:
         np.nan_to_num(result, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
         return result
 
-    def _expand(self, row: _Row, end: int, target: np.ndarray, *, cutoff: int) -> list[_Row]:
+    def _expand(
+        self, row: _Row, end: int, target: np.ndarray, *, cutoff: int, include_effect: bool
+    ) -> list[_Row]:
         prefix = row.raw[: max(0, end)]
         observed = ~np.frompyfunc(is_missing, 1, 1)(prefix).astype(bool)
         names = np.frompyfunc(label_of, 1, 1)(prefix[observed])
@@ -382,6 +414,8 @@ class EpisodeBuilder:
                     "flag",
                 )
             )
+        if not include_effect:
+            return rows
         effects, _ = category_step_stats(
             row.raw, target, left=0, right=max(0, min(end, len(row.raw)))
         )
@@ -410,7 +444,10 @@ class EpisodeBuilder:
         targets = (request.target,) if request.target is not None else tuple(sorted(item.targets))
         stats = self._stats(targets[0], cutoff)
         candidates = self._restricted(
-            screen(panel, stats, request.item_index, targets, cutoff, self.config), request
+            screen(
+                panel, stats, request.item_index, targets, cutoff, self.config, provider=self.stats
+            ),
+            request,
         )
         if len(targets) > 1 and self._typed(candidates):
             raise ValueError(
@@ -433,6 +470,9 @@ class EpisodeBuilder:
             for c in selected
             if c.source == "sibling"
         )
+        dispositions: dict[tuple[str, str], str | None] = {
+            (c.source, c.name): None for c in selected if c.source in ("sibling", "static")
+        }
         features = []
         for c in selected:
             if c.source not in ("known", "past"):
@@ -447,14 +487,34 @@ class EpisodeBuilder:
                 cutoff=cutoff,
             )
             expanded = (
-                self._expand(row, end, target_scaled, cutoff=cutoff)
+                self._expand(
+                    row,
+                    end,
+                    target_scaled,
+                    cutoff=cutoff,
+                    include_effect="value_effects" not in request.drop,
+                )
                 if row.kind == KIND_CATEGORY and "value_stats" in request.drop
                 else [row]
             )
-            features.extend(expanded)
-        rows.extend(
-            sorted(features, key=lambda row: (row.role, -row.score, row.name))[:MAX_FEATURE_ROWS]
-        )
+            key = c.source, c.name
+            if not expanded:
+                # A known category can have labels only after the statistics cutoff.
+                dispositions[key] = None
+            features.extend((part, key) for part in expanded)
+        features.sort(key=lambda pair: (pair[0].role, -pair[0].score, pair[0].name))
+        for row, key in features[:MAX_FEATURE_ROWS]:
+            rows.append(row)
+            dispositions[key] = None
+
+        trace = []
+        for candidate in candidates:
+            reason = candidate.removed or dispositions.get(
+                (candidate.source, candidate.name), "budget"
+            )
+            trace.append(
+                candidate if reason == candidate.removed else replace(candidate, removed=reason)
+            )
 
         statics = (
             sorted((c for c in selected if c.source == "static"), key=lambda c: c.name)
@@ -657,4 +717,5 @@ class EpisodeBuilder:
                 [npatches - (right - origin) // PATCH for origin in request.origins], np.int16, o
             ),
             context_target=context_target,
+            trace=tuple(trace),
         )

@@ -390,6 +390,8 @@ def train(
             k, batch, report = next(iterator)
             if k != counters["batch"]:
                 raise RuntimeError(f"loader returned batch {k}, expected {counters['batch']}")
+            if config.router == "rolled" and batch.x.shape[0] == 1:
+                raise ValueError(f"batch {k}: the rolled router needs at least two episodes")
             batch = batch.to(device)
             _seed(config.seed, "update", k)
             with torch.autocast(device.type, dtype=dtype, enabled=amp):
