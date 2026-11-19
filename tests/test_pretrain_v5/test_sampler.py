@@ -29,7 +29,9 @@ from demand_forecast.pretrain.v5.sources import SourceMix, TypedSource
 from demand_forecast.synthetic.typed import PanelRecipe, generate_typed_panel
 from tests.helpers.batch_fingerprint import assert_fingerprint
 from tests.helpers.corpus_v4_fixture import write_rows
+from tests.helpers.v5_loop import config as tiny_train_config
 from tests.helpers.v5_sampler import FixedSource, config, equal_batches, fixed_mix, panel
+from tests.test_pretrain_v5.test_upstream_source import install_fake_simons
 
 
 def api():
@@ -959,6 +961,216 @@ def test_typed_corpus_mix_fills_any_open_quota(tmp_path):
     assert seen_corpus
 
 
+def write_exposure_corpus(root):
+    pytest.importorskip("pyarrow")
+    write_rows(root / "univariate/a/train-000.parquet", [[np.arange(64) + i] for i in range(3)])
+    write_rows(root / "univariate/b/train-000.parquet", [[np.arange(80)]])
+
+
+def exposure_config(root):
+    c = config(episodes_per_batch=12, episodes_per_panel=2, path_share=0, drop=())
+    return replace(
+        c,
+        sources=(
+            c.sources[0],
+            SourceConfig("corpus", 2, root=str(root)),
+            SourceConfig("upstream", 1),
+        ),
+    )
+
+
+def with_source_options(c):
+    typed, corpus, upstream = c.sources
+    return replace(
+        c, sources=(typed, replace(corpus, folder_power=0.5), replace(upstream, plain_share=0.5))
+    )
+
+
+# Batch 0 of the three-source fixture at 7c22e269.
+_MIXED_BASE_FINGERPRINT = json.loads("""
+{
+    "x": {"dtype": "<f4", "shape": [12, 2, 4, 16, 39], "nan": 0, "sums": [22910.37163190065, 27415.336622441784, 8963.631817902284]},
+    "patch_valid": {"sha256": "07d8ed8335ee87cebc50350274d82a2f56c744cb2581ec20d0a5ba473a410479"},
+    "row_kind": {"sha256": "dd0b3b93f48f36fb5eec9b45793416aa9f6f1bb80a469cd03e876c7ed9b87c19"},
+    "row_role": {"sha256": "6604ef0cb08c2857ff772df19c5924bbbb68041160c4042c298e19b998140b13"},
+    "row_names": {"sha256": "f1f9482c4d9198677037f74805a60cf3775ce949158d64064f1f139955cc493c"},
+    "row_summary": {"dtype": "<f4", "shape": [12, 2, 28], "nan": 0, "sums": [173.43108962921644, 221.02666699307258, 74.74268180751558]},
+    "row_summary_flags": {"sha256": "18aff31a84b017f637d842e1a4426dd065d994fd285b44f472c277e145a30b17"},
+    "row_score": {"dtype": "<f4", "shape": [12, 2], "nan": 0, "sums": [12.142222990398295, 12.142222990398295, 6.09354669287374]},
+    "row_cand": {"sha256": "168d68c31f67f9ef8f73c1c7037f9f33ee0cd177705b3b8e36be0284db86a28f"},
+    "forecast_rows": {"sha256": "5bbc784ed24e9bd8e631f58ae8e0e37fbbf3834f6008b9fe98bad4cb8cec8d56"},
+    "keep": {"sha256": "380915c78a4628e8cb64167e572947a33729da27b2b8641f11a08022970eed83"},
+    "labels": {"dtype": "<f4", "shape": [12, 2, 1, 16], "nan": 0, "sums": [37312.77017635852, 37320.72152593732, 14646.270434552056]},
+    "label_mask": {"sha256": "2a30899e5b8bb2da64a02e724964c05e6538da755dc535ff9be36daf981b91fc"},
+    "loc": {"dtype": "<f8", "shape": [12, 1], "nan": 0, "sums": [2233.1110722218755, 2233.1110722218755, 1026.824048147917]},
+    "scale": {"dtype": "<f8", "shape": [12, 1], "nan": 0, "sums": [66.63104019118602, 66.63104019118602, 38.92069346079068]},
+    "fallback": {"sha256": "b35fcad85d4f6472131955a4345f4f8002b4a8e9e98b671e6a5bdb889f193eed"},
+    "known_rows": {"sha256": "558305fb1f648d3135541d4cfcafe0954f7cc5a6090786f660994ede7b3da06b"},
+    "xh": {"dtype": "<f4", "shape": [12, 2, 1, 1, 16, 39], "nan": 0, "sums": [16.186547003686428, 33.22231122106314, 0.47892255015506074]},
+    "cal_phases": {"dtype": "<f4", "shape": [12, 4, 16, 16], "nan": 0, "sums": [224.53181282058358, 399.70576843060553, 139.85499382316144]},
+    "cal_ids": {"sha256": "22d14447158ceebfeb395c349a6ef2b65d04a0ee1e825912193845e760596147"},
+    "calh_phases": {"dtype": "<f4", "shape": [12, 2, 1, 16, 16], "nan": 0, "sums": [37.801059260964394, 124.0400933176279, 22.741180746694834]},
+    "calh_ids": {"sha256": "0fe284fac5402500fc01079fa78ae315fd88a694132a96f4937219758d10ebe0"},
+    "cand_names": {"sha256": "e13253ab1258d3fe642f8ff63955f0987b3747164774650239e102b262158844"},
+    "cand_kind": {"sha256": "50afbb77c3f927565570b99d1ced0fbf84d2a935ae23ccb6342e045eb791537c"},
+    "cand_summary": {"dtype": "<f4", "shape": [12, 0, 28], "nan": 0, "sums": [0.0, 0.0, 0.0]},
+    "cand_flags": {"sha256": "d923688b0cac081babeed49ffd3933015342380a5b2cb672fc61a72a0986460e"},
+    "cand_score": {"dtype": "<f4", "shape": [12, 0], "nan": 0, "sums": [0.0, 0.0, 0.0]},
+    "attr_stats": {"dtype": "<f4", "shape": [12, 0, 57], "nan": 0, "sums": [0.0, 0.0, 0.0]},
+    "attr_flags": {"sha256": "be0d7b7be0f95110002457cf963ffcccf35b36b97ddb8fe349a496de52edecd1"},
+    "attr_cand": {"sha256": "fdab8cafc47c01d79fd7fe1fd1489ff89fd66f1805fd96a8572d31a85d16bfe2"},
+    "attr_names": {"sha256": "3f8b8ead8969e75d27bd63e8bf231bf97a8e8945634f6c7048ce6b2caf82fc40"},
+    "static_num": {"dtype": "<f4", "shape": [12, 0], "nan": 0, "sums": [0.0, 0.0, 0.0]},
+    "static_num_flags": {"sha256": "aeb39824cb83e8547ea9dbf59f3816a554da5ea1b4c9b3f3443cd3321dafb70a"},
+    "static_num_cand": {"sha256": "291a15a2396bdfc47df6f0b1cf0c61dd76e680b0f4e082a626a7a2ee42c6cd3d"},
+    "freq_class": {"sha256": "57251ebe0eb90ea7fa7adf1ff8955927a83ca212bfe4ab867280fbcc02e947e8"},
+    "horizon": {"sha256": "7ef33ed777d9e80765d0e523b652b1d0a8824fb7a0b9f129615ab26fd7b59e5d"},
+    "origin_patches": {"sha256": "4fda996fe1b1a0c01df6bca645e87b48c257a5d49611f0da35480539e179ef50"},
+    "context_target": {"sha256": "a94dc827224adcfb282c7921cf14b0518baa87074ee10e0ed123fabe858efde2"},
+    "row_mask": {"sha256": "7544f9752870d76ba57c96170481dadcf50e33db77dcaf875678cd8178f4f99e"},
+    "forecast_mask": {"sha256": "7a9cb10cd475801604a50cf8d628f62cff2cb96343f86ffb14e5dffd66edc488"},
+    "known_mask": {"sha256": "cc81bebe22bb9d54435a3284196e3f89174ee42f190db6a5c740e8dff51f0f5a"},
+    "cand_mask": {"sha256": "e67697fa19826e32e6bd4fd6c920e35cf4f7b591f00ac7865da897e75a42f2d6"},
+    "attr_mask": {"sha256": "f8eaf0d2e4c13c5167de9c70790e18cce368a0dca61b521fe1f9dd5801a38050"},
+    "static_num_mask": {"sha256": "f82e2566a9343ea6c74f4a613b38272e1053fa9c2be6b6b364c1c1297a685e43"},
+    "origin_mask": {"sha256": "6ba13c4332be52f908914d9e0fa7c044be47f8c38632431ea58febe3093ffad3"},
+    "horizon_mask": {"sha256": "72b9134c3f42f6a61b0f79061431dd771a5e9824da2878f82557466c2cc2b6cf"}
+}
+""")
+
+
+def test_default_options_preserve_the_base_mixed_batch(tmp_path, monkeypatch):
+    install_fake_simons(tmp_path, monkeypatch)
+    root = tmp_path / "corpus"
+    write_exposure_corpus(root)
+    batch, report = api().make_batch(exposure_config(root), 0)
+    assert_fingerprint(batch, _MIXED_BASE_FINGERPRINT)
+    assert report["sources"] == {"upstream": 3, "corpus": 8, "typed": 1}
+    assert report["supervised"] == 173
+
+
+def test_three_source_batch_reports_exposure_by_kind_and_folder(tmp_path, monkeypatch):
+    install_fake_simons(tmp_path, monkeypatch)
+    root = tmp_path / "corpus"
+    write_exposure_corpus(root)
+    c = with_source_options(exposure_config(root))
+    batch, report = api().make_batch(c, 0)
+    exposure = report["exposure"]
+    assert set(exposure) == {"typed", "corpus", "upstream"}
+    assert exposure["typed"]["panels"] < exposure["typed"]["episodes"]
+    assert exposure["upstream"]["panels"] == exposure["upstream"]["episodes"]
+    assert {kind: counts["episodes"] for kind, counts in exposure.items()} == report["sources"]
+    assert sum(v["episodes"] for v in exposure.values()) == report["episodes"] == batch.x.shape[0]
+    mask = batch.label_mask & ~batch.fallback[:, None, :, None]
+    mask = mask & batch.horizon_mask[:, None, None, :]
+    assert sum(v["cells"] for v in exposure.values()) == report["supervised"] == int(mask.sum())
+    corpus = exposure["corpus"]
+    assert set(corpus["folders"]) == {"univariate/a", "univariate/b"}
+    for key in ("panels", "episodes", "cells"):
+        assert sum(v[key] for v in corpus["folders"].values()) == corpus[key]
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_trial_sums_exposure_and_checkpoint_saves_nondefault_options(
+    tmp_path, monkeypatch, enabled
+):
+    from demand_forecast.pretrain.v5.checkpoint import read_payload
+    from demand_forecast.pretrain.v5.loop import load_model
+    from demand_forecast.pretrain.v5.measure import _trial
+
+    install_fake_simons(tmp_path, monkeypatch)
+    root = tmp_path / "corpus"
+    write_exposure_corpus(root)
+    c = exposure_config(root)
+    tiny = tiny_train_config(steps=2)
+    c = replace(c, model=tiny.model, device=tiny.device, optim=replace(tiny.optim, log_every=1))
+    if enabled:
+        c = with_source_options(c)
+    metrics, checkpoint = _trial(c, tmp_path / "state", torch.device("cpu"))
+    exposure = metrics["exposure"]
+    reports = [api().make_batch(c, k)[1] for k in range(2)]
+    for kind, counts in exposure.items():
+        for key in ("panels", "episodes", "cells"):
+            assert counts[key] == sum(r["exposure"].get(kind, {}).get(key, 0) for r in reports)
+    for folder, counts in exposure["corpus"]["folders"].items():
+        for key in ("panels", "episodes", "cells"):
+            assert counts[key] == sum(
+                r["exposure"].get("corpus", {}).get("folders", {}).get(folder, {}).get(key, 0)
+                for r in reports
+            )
+    assert sum(v["episodes"] for v in exposure.values()) == sum(r["episodes"] for r in reports)
+    assert sum(v["cells"] for v in exposure.values()) == sum(r["supervised"] for r in reports)
+
+    source_options = {"folder_power", "plain_share"}
+    typed, corpus, upstream = read_payload(checkpoint)["config"]["sources"]
+    assert source_options.isdisjoint(typed)
+    if enabled:
+        assert set(corpus) & source_options == {"folder_power"}
+        assert set(upstream) & source_options == {"plain_share"}
+        assert corpus["folder_power"] == pytest.approx(0.5)
+        assert upstream["plain_share"] == pytest.approx(0.5)
+    else:
+        assert source_options.isdisjoint(corpus)
+        assert source_options.isdisjoint(upstream)
+    assert load_model(checkpoint)[1] == c
+
+
+@pytest.mark.parametrize("workers", [0, 1, 2])
+def test_folder_weighted_batches_match_for_workers(tmp_path, workers):
+    from demand_forecast.pretrain.v5.loop import _release
+
+    write_exposure_corpus(tmp_path)
+    c = replace(
+        config(episodes_per_batch=4),
+        sources=(SourceConfig("corpus", 1, root=str(tmp_path), folder_power=0.5),),
+    )
+    iterator = api().loader(replace(c, workers=workers), 3)
+    try:
+        for index in range(3, 7):
+            k, batch, report = next(iterator)
+            expected, counts = api().make_batch(c, index)
+            assert k == index and report == counts
+            for field in fields(batch):
+                actual, reference = getattr(batch, field.name), getattr(expected, field.name)
+                if isinstance(actual, torch.Tensor) and actual.is_floating_point():
+                    torch.testing.assert_close(
+                        actual, reference, rtol=1e-6, atol=1e-7, equal_nan=True
+                    )
+                elif isinstance(actual, torch.Tensor):
+                    assert torch.equal(actual, reference)
+                else:
+                    assert actual == reference
+    finally:
+        _release(iterator)
+
+
+@pytest.mark.parametrize("valid_folder", [True, False])
+def test_folder_weighting_keeps_refused_rows_as_bounded_planner_skips(tmp_path, valid_folder):
+    pytest.importorskip("pyarrow")
+    row = np.arange(64, dtype=np.float64)
+    if valid_folder:
+        write_rows(tmp_path / "univariate/good/train-000.parquet", [[row]])
+    row = row.copy()
+    row[3] = np.inf
+    write_rows(tmp_path / "univariate/bad/train-000.parquet", [[row]])
+    c = replace(
+        config(),
+        sources=(SourceConfig("corpus", 1, root=str(tmp_path), folder_power=0),),
+    )
+    if not valid_folder:
+        with pytest.raises(
+            RuntimeError, match="batch 0.*no episodes after panel limit.*bad_values.*16"
+        ):
+            api().make_batch(c, 0)
+        return
+    _, report = api().make_batch(c, 0)
+    assert report["skips"]["bad_values"] > 0
+    assert report["episodes"] == 4
+    assert report["exposure"]["corpus"]["folders"] == {
+        "univariate/good": {"panels": 4, "episodes": 4, "cells": report["supervised"]}
+    }
+
+
 @pytest.mark.parametrize("mechanisms", [(), ("known_driver",)])
 def test_plan_panel_respects_open_quotas(mechanisms):
     c = config(path_share=1.0, designate_target=True, episodes_per_panel=8)
@@ -1213,7 +1425,10 @@ def test_cold_retry_and_rejection(cold_panel, monkeypatch, rejection):
 def test_cold_counts_are_reported_apart_from_skips():
     c = static_batch_config()
     _, default = api().make_batch(c, 3)
-    assert default == _COLD_BASE_REPORT
+    assert default == {
+        **_COLD_BASE_REPORT,
+        "exposure": {"typed": {"panels": 1, "episodes": 2, "cells": 19}},
+    }
     assert "cold" not in default
     cold = replace(c, sampler=replace(c.sampler, cold_share=1.0))
     _, report = api().make_batch(cold, 3)
@@ -1746,6 +1961,11 @@ def test_oversized_skipped_then_stream_continues(monkeypatch):
     monkeypatch.setattr(api().EpisodeBuilder, "build", lambda self, r: next(episodes))
     _, report = api().make_batch(c, 0, sources=fixed_mix(c, FixedSource(panel())))
     assert report["skips"]["oversized"] == 1 and report["episodes"] == 1
+    assert report["exposure"]["typed"] == {
+        "panels": 2,
+        "episodes": 1,
+        "cells": report["supervised"],
+    }
 
 
 @pytest.mark.parametrize("stage", ["draw", "plan", "build"])

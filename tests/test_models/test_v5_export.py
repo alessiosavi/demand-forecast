@@ -116,7 +116,10 @@ def test_round_trip_of_the_whole_state_dict(tmp_path, monkeypatch, export_api, w
     assert written == metadata
     assert set(metadata) == {"format", "model", "training", "source", "files"}
     assert metadata["format"] == "v5-export-1"
-    assert metadata["model"] == json.loads(json.dumps(asdict(TINY)))
+    # The stored model mapping leaves the default expert mode out, as it did before the mode existed.
+    stored = json.loads(json.dumps(asdict(TINY)))
+    assert stored.pop("expert_mode") == "routed"
+    assert metadata["model"] == stored
     assert metadata["training"] == config.canonical()
     assert metadata["source"] == {
         "sha256": file_digest(checkpoint),

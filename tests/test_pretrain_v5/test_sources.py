@@ -352,6 +352,22 @@ def test_every_v41_corpus_frequency_label_yields_a_valid_panel(tmp_path, label):
             assert FREQ_CLASSES[panel.freq_class] == "subhourly"
 
 
+def test_corpus_panel_reports_the_actual_folder_for_weighted_and_default_draws(tmp_path):
+    pytest.importorskip("pyarrow")
+    write_corpus(tmp_path)
+    for power in (None, 0.5):
+        source = api().CorpusSource(SourceConfig("corpus", 1, folder_power=power), root=tmp_path)
+        rng = np.random.default_rng(6)
+        seen = set()
+        for _ in range(20):
+            panel, record = source.panel(rng)
+            folder = record["file"].rsplit("/", 1)[0]
+            assert record["folder"] == folder
+            assert panel.items[0].item_id == f"{record['file']}:{record['row']}"
+            seen.add(folder)
+        assert seen == {"covariates/drivers", "univariate/alpha", "univariate/beta"}
+
+
 def test_corpus_only_batch_without_frequencies(tmp_path):
     pytest.importorskip("pyarrow")
     write_rows(

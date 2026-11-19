@@ -46,15 +46,17 @@ environment fingerprint has been taken it exports `<upstream>/src` on
 so dependency installation, `pip check` and the environment fingerprint are
 unchanged by this option.
 The source lazily imports its standalone synthetic APIs and yields one undated
-item with a generated target and numeric covariate effects per panel, using
-local random streams seeded by one caller draw. It generates 2,048 history
-steps plus 288 future steps and assigns each covariate a known or past role.
+item per panel, using local random streams seeded by one caller draw. It
+generates 2,048 history steps plus 288 future steps. The upstream-only
+`plain_share` option is the probability of returning the base target series
+alone. For the other panels, the source applies numeric covariate effects
+and assigns each covariate a known or past role. The default `plain_share: 0.0`
+keeps the covariate effects on every panel and preserves the draw sequence.
 Base sampling uses `families=("kernel", "sarima")`, `noise=0.0`, `missing=0.1`,
 `min_observed=96`, `weights=None` and `pad=0.0`; leading padding is off because it
 can leave the history entirely missing before covariate-effect normalization.
-Generator options remain typed-only; `control: missing_as_zero` is applied by
-the sampler. Local tests use `SIMONS_UPSTREAM` pointing at a clone at the pin (the clean clone the
-other upstream tests use; no preparation is needed).
+The sampler applies `control: missing_as_zero`. To run the upstream integration
+tests locally, set `SIMONS_UPSTREAM` to a clean clone at the pin.
 
 For corpus jobs, add `--corpus-uri gs://bucket/corpus-v4.1 --corpus-digest <hex>`.
 Corpus sources in the YAML must have `root: null`. Only `univariate/` and
@@ -187,6 +189,18 @@ manifest, so they remain valid when copied locally; this uses additional disk
 and bucket space per evaluation. There are no parent-relative paths or symlinks
 in a manifest. Checkpoint bytes also carry the training loop's SHA-256 footer.
 
+**Corpus sampling.** The default `folder_power: null` draws uniformly across
+admitted rows. With a power in `[0, 1]`, the source draws a `<kind>/<dataset>`
+folder with weight `values ** folder_power`, using the number of numeric entries
+in its admitted groups. It then draws a row uniformly within that folder.
+Power 0 gives every admitted folder equal proposal probability. Power 1 makes
+that probability proportional to its entry count. Power 1 is therefore not
+the default draw: a folder with longer series or more columns is proposed more
+often than its row count alone would give. The sampler counts refused
+rows in `skips`, so the realised folder shares can differ from the proposal
+shares. Source weights apply to panel draws. A typed panel can supply several
+episodes, while corpus and upstream panels supply at most one.
+
 For Q, use `--action qualify --config q.yaml --name q-typed`; run a separate
 unit for typed 0.5 + corpus 0.5 with the corpus options. `qualify.json` measures
 full and T1 models, throughput and supervised/padded cells for worker counts,
@@ -197,6 +211,14 @@ write time and size, parameter counts, and full-panel inference for 30,490
 series. Q selects nothing automatically. The operator uses these
 measurements to register the bases, batch shapes, workers, checkpoint cadence,
 recovery bound and revised cost ceilings before S1.
+
+Every batch report includes `exposure`, keyed by source kind (two sources of
+the same kind are counted together). Its `panels`
+counts returned panels, including those that yield no retained episode.
+`episodes` counts retained episodes and `cells` counts their supervised
+labels. At `exposure.corpus.folders`, each `<kind>/<dataset>` entry records
+the same three counts. Each qualification trial in `qualify.json` sums these
+counts across all observed batches.
 
 On Linux, PyTorch loader workers pass batch tensors through file descriptors,
 and prefetched batches can keep many descriptors open. Before starting workers,

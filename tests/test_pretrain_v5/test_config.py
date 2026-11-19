@@ -98,6 +98,76 @@ def test_default_screen_no_evidence_keeps_base_identities(with_corpus, expected)
 
 
 @pytest.mark.parametrize(
+    "kind,field,value",
+    [
+        ("typed", "folder_power", 0),
+        ("upstream", "folder_power", 0.5),
+        ("typed", "plain_share", 0.5),
+        ("corpus", "plain_share", 0.5),
+        ("corpus", "folder_power", -0.1),
+        ("corpus", "folder_power", 1.1),
+        ("corpus", "folder_power", False),
+        ("corpus", "folder_power", float("nan")),
+        ("upstream", "plain_share", -0.1),
+        ("upstream", "plain_share", 1.1),
+        ("upstream", "plain_share", True),
+        ("upstream", "plain_share", float("inf")),
+    ],
+)
+def test_source_options_reject_wrong_kinds_and_invalid_values(kind, field, value):
+    with pytest.raises(ValueError, match=field):
+        config_module().SourceConfig(kind, 1, **{field: value})
+
+
+def test_source_options_yaml_round_trip(tmp_path):
+    api = config_module()
+    base = training_config()
+    cfg = replace(
+        base,
+        sources=(
+            base.sources[0],
+            replace(base.sources[1], folder_power=0),
+            api.SourceConfig("upstream", 1, plain_share=0.5),
+        ),
+    )
+    path = tmp_path / "train.yaml"
+    cfg.to_yaml(path)
+    serialized = yaml.safe_load(path.read_text())["sources"]
+    assert serialized[1]["folder_power"] == pytest.approx(0.0)
+    assert serialized[2]["plain_share"] == pytest.approx(0.5)
+    assert type(cfg).from_yaml(path) == cfg
+
+
+def test_source_options_preserve_base_identities_and_hash_nondefaults():
+    api = config_module()
+    base = api.T1_BASE
+    mixed = replace(
+        base, sources=(api.SourceConfig("typed", 1), api.SourceConfig("corpus", 1, root="/corpus"))
+    )
+    # Same identity inputs used with the unmodified code at the base revision.
+    args = dict(code="7c22e269e1707f4451f88b666ba1c704fdc005dc", init=None, env="e" * 64)
+    assert api.identity(base, corpus=None, **args) == (
+        "c4db1ab37289a1e975941c12dfffb582da9ff397f93e477cd8730cf53981a8bb"
+    )
+    args["corpus"] = "c" * 64
+    pinned = "9a691c94a529115d5879b66697797083f555d5d21bc1f23cb8150b1bbafa8809"
+    assert api.identity(mixed, **args) == pinned
+    assert all(
+        {"folder_power", "plain_share"}.isdisjoint(source)
+        for source in mixed.canonical()["sources"]
+    )
+    weighted = replace(mixed, sources=(mixed.sources[0], replace(mixed.sources[1], folder_power=0)))
+    assert weighted.canonical()["sources"][1]["folder_power"] == pytest.approx(0.0)
+    assert api.identity(weighted, **args) != pinned
+
+    upstream = replace(base, sources=(api.SourceConfig("upstream", 1),))
+    plain = replace(upstream, sources=(replace(upstream.sources[0], plain_share=0.5),))
+    assert "plain_share" not in upstream.canonical()["sources"][0]
+    assert plain.canonical()["sources"][0]["plain_share"] == pytest.approx(0.5)
+    assert api.identity(plain, **args) != api.identity(upstream, **args)
+
+
+@pytest.mark.parametrize(
     ("field", "value"),
     [
         ("cold_share", 1.2),
