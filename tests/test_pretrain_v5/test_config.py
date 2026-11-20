@@ -1008,3 +1008,25 @@ def test_flags_must_be_real_booleans(section, field, value):
     }[section]
     with pytest.raises(ValueError, match=field):
         replace(base, **{field: value})
+
+
+def test_naive_anchor_and_mix_round_trip_independently(tmp_path):
+    base = training_config()
+    assert base.model.naive_mix is False
+    assert "naive_mix" not in base.canonical()["model"]
+    with pytest.raises(ValueError, match="naive_mix must be a boolean"):
+        replace(base.model, naive_mix=1)
+    with pytest.raises(ValueError, match="derive"):
+        replace(base.sampler, derive=("naive_anchors",))
+    path = tmp_path / "training.yaml"
+    for use_anchor, use_mix in ((True, False), (False, True), (True, True)):
+        enabled = replace(
+            base,
+            model=replace(base.model, naive_mix=use_mix),
+            sampler=replace(base.sampler, derive=("naive_anchor",) if use_anchor else ()),
+        )
+        enabled.to_yaml(path)
+        assert type(base).from_yaml(path) == enabled
+        actual = enabled.canonical()
+        assert actual["sampler"].get("derive", []) == (["naive_anchor"] if use_anchor else [])
+        assert actual["model"].get("naive_mix") is (True if use_mix else None)

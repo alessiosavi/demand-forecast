@@ -347,6 +347,8 @@ class V5TrainConfig:
             del data["model"]["expert_mode"]
         if not self.model.horizon_seed:
             del data["model"]["horizon_seed"]
+        if not self.model.naive_mix:
+            del data["model"]["naive_mix"]
         if not self.sampler.derive:
             del data["sampler"]["derive"]
         if not self.sampler.screen_fair_spread:

@@ -150,6 +150,7 @@ def test_round_trip_of_the_whole_state_dict(tmp_path, monkeypatch, export_api, w
     stored = json.loads(json.dumps(asdict(TINY)))
     assert stored.pop("expert_mode") == "routed"
     assert stored.pop("horizon_seed") is False
+    assert stored.pop("naive_mix") is False
     assert metadata["model"] == stored
     assert metadata["training"] == config.canonical()
     assert metadata["source"] == {
@@ -709,3 +710,36 @@ def test_command_line(tmp_path):
     result = run("check", second)
     assert result.returncode == 1
     assert "cal_ids" in result.stdout
+
+
+@pytest.mark.parametrize("mix", [False, True])
+def test_naive_anchor_export_stores_the_carrier_and_passes_parity(tmp_path, export_api, mix):
+    checkpoint = _checkpoint(
+        tmp_path, model=replace(TINY, naive_mix=mix), sampler_options={"derive": ("naive_anchor",)}
+    )
+    out = tmp_path / "anchor-export"
+    export_api.write_export(checkpoint, out)
+    loaded, metadata = export_api.load_export(out)
+    assert loaded.config.naive_mix is mix
+    assert metadata["model"].get("naive_mix") is (True if mix else None)
+    archive = _read_archive(out / "parity.npz")
+    assert archive["case_9/batch/naive_paths"].dtype == np.float32
+    assert archive["case_9/batch/naive_seen"].dtype == bool
+    assert archive["case_9/batch/naive_seen"][0, 0, 0, :37].all()
+    export_api.require_parity(out)
+
+
+def test_selftest_omits_the_default_mix_option(tmp_path, export_api, monkeypatch):
+    original = export_api.save_checkpoint
+
+    def capture(directory, payload, **kwargs):
+        assert "naive_mix" not in payload["config"]["model"]
+        assert "label_cap" in payload["config"]["optim"]
+        return original(directory, payload, **kwargs)
+
+    monkeypatch.setattr(export_api, "save_checkpoint", capture)
+    out = tmp_path / "selftest"
+    export_api._selftest(out)
+    loaded, metadata = export_api.load_export(out)
+    assert loaded.config.naive_mix is False
+    assert "naive_mix" not in metadata["model"]

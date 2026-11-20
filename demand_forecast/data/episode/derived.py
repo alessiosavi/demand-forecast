@@ -39,6 +39,17 @@ class NaiveHistory:
             means = pd.Series(differences).rolling(drift_width, min_periods=pairs_needed).mean()
             self.slope = np.r_[np.nan, means.to_numpy()]
 
+    def level(self, origin: int) -> float:
+        """Mean of the local window ending just before this origin."""
+        if origin <= 0:
+            return np.nan
+        window = self.values[max(0, origin - self.width) + 1 : origin + 1]
+        observed = window[np.isfinite(window)]
+        if len(observed) < (self.width + 1) // 2:
+            return np.nan
+        with np.errstate(over="ignore", invalid="ignore"):
+            return float(observed.mean())
+
     def _same_phase(
         self, cells: np.ndarray, bounds: np.ndarray, upper: np.ndarray, lag: int
     ) -> np.ndarray:

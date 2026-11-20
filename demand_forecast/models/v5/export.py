@@ -268,7 +268,7 @@ def _parity_cases(
         ],
     )
 
-    if "naive_rows" in derive:
+    if derive.intersection(("naive_rows", "naive_anchor")):
         steps = np.arange(240, dtype=np.float64)
         values = steps / 30 + np.sin(2 * np.pi * steps / 24) + np.sin(2 * np.pi * steps / 168)
         hourly = Item("hourly", 13, {"y": values}, {}, {})
@@ -441,7 +441,7 @@ def check_parity(directory: Path, device: str = "cpu") -> dict[str, float | bool
     training = metadata["training"]
     screening = _screening(training)
     case_count = _CASE_COUNT
-    if "naive_rows" in training["sampler"].get("derive", ()):
+    if {"naive_rows", "naive_anchor"}.intersection(training["sampler"].get("derive", ())):
         case_count += 1
     tolerance = _CPU_TOLERANCE if torch.device(device).type == "cpu" else _DEVICE_TOLERANCE
     differences = {}
@@ -537,6 +537,8 @@ def _selftest(out: Path, derive: tuple[str, ...] = ()) -> None:
     checkpoint_config = asdict(config)
     if not config.model.horizon_seed:
         del checkpoint_config["model"]["horizon_seed"]
+    if not config.model.naive_mix:
+        del checkpoint_config["model"]["naive_mix"]
     if config.sampler.derive:
         checkpoint_config["sampler"]["derive"] = list(config.sampler.derive)
     else:

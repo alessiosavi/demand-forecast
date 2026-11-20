@@ -6,6 +6,7 @@ import numpy as np
 import torch
 
 from .builder import Episode
+from .schema import NAIVE_OPTIONS
 
 
 @dataclass
@@ -78,6 +79,19 @@ class EpisodeBatchWithRowKeys(EpisodeBatch):
     row_keys: list[list[tuple[str, str] | None]]
 
 
+@dataclass
+class EpisodeBatchWithNaive(EpisodeBatch):
+    """An episode batch with uncompressed naive paths in label units."""
+
+    naive_paths: torch.Tensor
+    naive_seen: torch.Tensor
+
+
+@dataclass
+class EpisodeBatchWithNaiveAndRowKeys(EpisodeBatchWithNaive, EpisodeBatchWithRowKeys):
+    """Naive paths and row provenance for a forecasting batch hook."""
+
+
 def collate(episodes: list[Episode], *, include_row_keys: bool = False) -> EpisodeBatch:
     """Pad each independent axis and shift origins by their context's left padding."""
     if not episodes:
@@ -86,7 +100,7 @@ def collate(episodes: list[Episode], *, include_row_keys: bool = False) -> Episo
     lists = {"row_names", "cand_names", "attr_names", "context_target"}
     for field in fields(Episode):
         name = field.name
-        if name in ("trace", "row_keys"):
+        if name in ("trace", "row_keys", "naive_paths", "naive_seen"):
             continue
         values = [getattr(episode, name) for episode in episodes]
         if name in lists:
@@ -130,8 +144,21 @@ def collate(episodes: list[Episode], *, include_row_keys: bool = False) -> Episo
         ("horizon_mask", [e.calh_phases.shape[1] for e in episodes]),
     ):
         result[name] = torch.arange(max(lengths))[None, :] < torch.tensor(lengths)[:, None]
+    have_naive = any(episode.naive_paths is not None for episode in episodes)
+    if have_naive:
+        shape = (*result["labels"].shape, len(NAIVE_OPTIONS))
+        paths, seen = np.zeros(shape, np.float32), np.zeros(shape, bool)
+        for index, episode in enumerate(episodes):
+            if episode.naive_paths is not None:
+                slices = (index, *(slice(0, length) for length in episode.labels.shape))
+                paths[slices] = episode.naive_paths
+                seen[slices] = episode.naive_seen
+        result.update(naive_paths=torch.from_numpy(paths), naive_seen=torch.from_numpy(seen))
     if include_row_keys:
-        return EpisodeBatchWithRowKeys(
-            **result, row_keys=[list(episode.row_keys) for episode in episodes]
+        result["row_keys"] = [list(episode.row_keys) for episode in episodes]
+        return (
+            EpisodeBatchWithNaiveAndRowKeys(**result)
+            if have_naive
+            else EpisodeBatchWithRowKeys(**result)
         )
-    return EpisodeBatch(**result)
+    return EpisodeBatchWithNaive(**result) if have_naive else EpisodeBatch(**result)
