@@ -6,12 +6,11 @@ from dataclasses import fields, replace
 import numpy as np
 import pytest
 import torch
-from torch.nn.functional import softplus
 
 from demand_forecast.data.episode import EpisodeBuilder, EpisodeRequest, ScreeningConfig, collate
 from demand_forecast.data.episode.collate import EpisodeBatchWithRowKeys
 from demand_forecast.data.episode.schema import NAIVE_OPTIONS, PATCH, QUANTILES, ROLE_SIBLING
-from demand_forecast.models.v5 import V5Config
+from demand_forecast.models.v5 import V5Config, v5_loss
 from demand_forecast.models.v5.batch_forecast import _batch_to_model
 from demand_forecast.models.v5.model import prune
 from tests.test_models.test_v5_naive_mix import ANCHOR, TINY, episode, model, panel
@@ -81,6 +80,7 @@ def test_window_bounds_and_last_residuals(horizon, windows):
     assert sample.naive_resq.shape == (*shape, len(QUANTILES))
     assert sample.naive_error.dtype == sample.naive_resq.dtype == np.float32
     assert sample.naive_error_seen.dtype == bool
+    # No path is defined at cell 0, so skipping that window gives the same residuals.
     residuals = [
         (values[start : start + horizon] - values[start - 1]) / sample.scale[0]
         for k in range(1, min(4, windows) + 1)
@@ -241,8 +241,12 @@ def test_untrained_mix_equals_the_batch_reference_and_legacy_fallback():
     seen[..., 1, :] = False  # The last real cell uses the N6 bias and head.
     batch = replace(batch, naive_error_seen=seen)
     net, legacy = evidence_model(), model()
-    additions = net.state_dict().keys() - legacy.state_dict().keys()
-    assert sum(net.state_dict()[name].numel() for name in additions) == 9
+    state, legacy_state = net.state_dict(), legacy.state_dict()
+    additions = tuple(name for name in state if name not in legacy_state)
+    assert additions == ("evidence_bias", "beta_raw", "gamma_raw", "head_gain")
+    assert sum(state[name].numel() for name in additions) == 9
+    assert net.head_gain.ndim == 0
+    assert net.head_gain.item() == pytest.approx(1e-3)
     with torch.no_grad():
         out, old = net(batch), legacy(batch)
     paths = batch.naive_paths[0, 0, 0, :16]
@@ -257,7 +261,7 @@ def test_untrained_mix_equals_the_batch_reference_and_legacy_fallback():
     fan = fan_weights @ batch.naive_resq[0, 0, 0, 0]
     anchor = (weights * paths).sum(-1)
     head = legacy(replace(batch, naive_seen=torch.zeros_like(batch.naive_seen))).quantiles
-    knots = anchor[:, None] + fan + softplus(torch.tensor(-7.0)) * head[0, 0, 0, :16]
+    knots = anchor[:, None] + fan + 1e-3 * head[0, 0, 0, :16]
     for actual, expected in (
         (out.mix[0, 0, 0, :16], weights),
         (out.fan[0, 0, 0, :16], fan),
@@ -275,15 +279,29 @@ def test_untrained_mix_equals_the_batch_reference_and_legacy_fallback():
     with torch.no_grad():
         net.mix_projection.weight.normal_(std=0.5, generator=torch.Generator().manual_seed(11))
         legacy.mix_projection.weight.copy_(net.mix_projection.weight)
-        torch.testing.assert_close(
-            net(no_arrays).quantiles, legacy(no_arrays).quantiles, atol=0, rtol=0
-        )
+        no_evidence = net(no_arrays)
+        torch.testing.assert_close(no_evidence.quantiles, legacy(no_arrays).quantiles)
+        torch.testing.assert_close(no_evidence.fan, torch.zeros_like(no_evidence.quantiles))
+        assert not no_evidence.evidence.any()
         torch.testing.assert_close(
             net(batch).quantiles[..., 16:, :],
             legacy(batch).quantiles[..., 16:, :],
             atol=0,
             rtol=0,
         )
+
+
+@pytest.mark.parametrize("at_zero", [False, True])
+def test_training_loss_has_a_nonzero_head_gain_gradient(at_zero):
+    net = evidence_model()
+    if at_zero:
+        with torch.no_grad():
+            net.head_gain.zero_()
+    batch = collate([episode(panel(), DERIVE)])
+    loss, _ = v5_loss(net(batch), batch, net.config)
+    (gradient,) = torch.autograd.grad(loss, net.head_gain)
+    assert torch.isfinite(gradient)
+    assert gradient.abs().item() > 1e-6
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
@@ -294,8 +312,11 @@ def test_quantiles_stay_sorted_with_random_masks_and_explicit_precision(dtype):
     errors_seen = torch.rand(batch.naive_error_seen.shape, generator=gen) > 0.4
     resq = torch.rand(batch.naive_resq.shape, generator=gen).sort(dim=-1).values
     batch = replace(batch, naive_seen=seen, naive_error_seen=errors_seen, naive_resq=resq)
+    net = evidence_model().to(dtype)
+    with torch.no_grad():
+        net.head_gain.fill_(-0.5)
     with torch.autocast("cpu", dtype=torch.bfloat16, enabled=dtype == torch.float32):
-        out = evidence_model().to(dtype)(batch)
+        out = net(batch)
     for tensor in (out.quantiles, out.mix, out.anchor, out.fan):
         assert tensor.dtype == dtype
         assert torch.isfinite(tensor).all()

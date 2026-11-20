@@ -54,6 +54,8 @@ class V5Output:
     ``router`` holds the expert weights applied in the forward pass, including
     the null weights under ``"uniform"`` and ``"rolled"`` routing. It is ``None``
     in dense expert mode.
+    With mix evidence enabled but no evidence in the batch, ``fan`` is zero and
+    ``evidence`` is all false. Both fields are ``None`` when the option is off.
     """
 
     quantiles: Tensor
@@ -136,7 +138,7 @@ class V5Model(nn.Module):
             self.evidence_bias = nn.Parameter(torch.zeros(len(NAIVE_OPTIONS)))
             self.beta_raw = nn.Parameter(torch.tensor(math.log(math.expm1(4))))
             self.gamma_raw = nn.Parameter(torch.tensor(math.log(math.expm1(1))))
-            self.head_gain_raw = nn.Parameter(torch.tensor(-7.0))
+            self.head_gain = nn.Parameter(torch.tensor(1e-3))
 
     def _evidence_logits(
         self, steps: Tensor, batch: EpisodeBatchWithNaiveEvidence, seen: Tensor
@@ -423,7 +425,9 @@ class V5Model(nn.Module):
                     head,
                 )
                 if fan is not None:
-                    gain = softplus(self.head_gain_raw.to(fan.dtype))
+                    raw_gain = self.head_gain.to(fan.dtype)
+                    # Choose the positive branch at zero so the gain can learn again.
+                    gain = torch.where(raw_gain >= 0, raw_gain, -raw_gain)
                     quantiles = torch.where(
                         evidence[..., None],
                         anchor[..., None] + fan + gain * head.to(fan.dtype),

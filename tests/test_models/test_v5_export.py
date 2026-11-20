@@ -650,6 +650,15 @@ def test_legacy_export_replays_without_a_scale_floor(export_api):
     export_api.require_parity(directory, device="cpu")
 
 
+def test_n6_naive_mix_export_replays_without_evidence(export_api):
+    directory = Path(__file__).parents[1] / "fixtures" / "v5_n6_export"
+    model, metadata = export_api.load_export(directory)
+    assert model.config.naive_mix is True
+    assert model.config.mix_evidence is False
+    assert metadata["training"]["sampler"]["derive"] == ["naive_anchor"]
+    export_api.require_parity(directory, device="cpu")
+
+
 def test_export_is_one_unit(tmp_path, export_api, monkeypatch):
     checkpoint = _checkpoint(tmp_path)
     out = tmp_path / "export"
@@ -719,6 +728,9 @@ def test_naive_anchor_export_stores_the_carrier_and_passes_parity(tmp_path, expo
         tmp_path, model=replace(TINY, naive_mix=mix), sampler_options={"derive": ("naive_anchor",)}
     )
     out = tmp_path / "anchor-export"
+    checkpoint_model, _ = load_model(checkpoint)
+    assert checkpoint_model.config.mix_evidence is False
+    assert not hasattr(checkpoint_model, "head_gain")
     export_api.write_export(checkpoint, out)
     loaded, metadata = export_api.load_export(out)
     assert loaded.config.naive_mix is mix
@@ -758,6 +770,7 @@ def test_mix_evidence_export_round_trips_and_passes_parity(tmp_path, export_api)
     export_api.write_export(checkpoint, out)
     model, metadata = export_api.load_export(out)
     assert model.config.mix_evidence
+    assert model.head_gain.item() == pytest.approx(1e-3)
     assert (
         metadata["model"]["mix_evidence"] is metadata["training"]["model"]["mix_evidence"] is True
     )

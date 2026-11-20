@@ -78,8 +78,13 @@ class _PretrainEMA:
 
 
 def parameter_groups(model: V5Model, weight_decay: float) -> list[dict]:
-    """Decay matrices except embeddings, normalisation and gate-logit projections."""
+    """Group parameters for decay, excluding embeddings, norms, gate logits and calibration."""
     excluded = set()
+    if model.config.mix_evidence:
+        excluded.update(
+            id(parameter)
+            for parameter in (model.evidence_bias, model.beta_raw, model.gamma_raw, model.head_gain)
+        )
     gate_layers = (model.family_logits, model.gate_net.net[-1])
     for module in model.modules():
         for name, parameter in module.named_parameters(recurse=False):

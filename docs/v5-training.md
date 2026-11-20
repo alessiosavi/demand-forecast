@@ -235,9 +235,11 @@ and the default nine quantiles to use the backtests. On cells with evidence,
 relative errors supply a logit prior whose range is bounded at six. Available
 paths with no backtest error receive the floor. The forecast adds the weighted
 signed residual quantiles to the anchor, using detached weights normalized
-over the measured paths, plus a learned gain on the head that starts at about
-0.0009. Cells without evidence use the ordinary naive mix. The option adds
-nine parameters, defaults to false, and is recorded when enabled.
+over the measured paths, plus the head scaled by the absolute value of
+`head_gain`, which starts at 0.001. Cells without evidence use the ordinary
+naive mix. The option adds nine parameters, defaults to false, and is recorded
+when enabled. The evidence bias, prior and fan scales, and head gain are exempt
+from weight decay.
 
 ### Export as a resumable job
 
@@ -320,7 +322,11 @@ path. The gate uses the main forecast.
 With `model.mix_evidence` enabled, `evidence_share` gives the fraction of kept
 cells with a label and at least one available path with a measured error.
 `fan_off` clears the residual quantiles, and `evidence_off` clears the
-backtest mask to restore the ordinary mix and head.
+backtest mask to restore the ordinary mix and head. `head_off` sets the head
+gain to zero for the ablation, removing the head contribution on cells with
+evidence. The top-level `evidence_parameters` entry records the effective
+`beta`, `gamma`, and `head_gain` scales and the six `evidence_bias` values
+in naive-option order.
 
 The five shape families require MASE at most seasonal naive's and
 correlation of at least 0.5. Noise allows MASE up to 1.05 times the history

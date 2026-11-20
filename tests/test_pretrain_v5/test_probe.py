@@ -522,7 +522,18 @@ def test_probe_evidence_reports_the_ablations_and_gates_full_figures(probe, monk
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(23)
         model = V5Model(replace(config().model, naive_mix=True, mix_evidence=True)).eval()
+    original = {key: value.cpu().numpy().tobytes() for key, value in model.state_dict().items()}
     report = probe.run_probe(model, settings)
+    parameters = report["evidence_parameters"]
+    assert set(parameters) == {"beta", "gamma", "head_gain", "evidence_bias"}
+    for key, expected in (("beta", 4), ("gamma", 1), ("head_gain", 1e-3)):
+        assert type(parameters[key]) is float
+        assert parameters[key] == pytest.approx(expected)
+    assert all(type(bias) is float for bias in parameters["evidence_bias"])
+    assert parameters["evidence_bias"] == pytest.approx([0] * 6)
+    assert {
+        key: value.cpu().numpy().tobytes() for key, value in model.state_dict().items()
+    } == original
     figures = report["families"][panel.name]
     assert figures["evidence_share"] == 1
     assert sum(figures["mix_mean"].values()) == pytest.approx(1)
@@ -536,7 +547,9 @@ def test_probe_evidence_reports_the_ablations_and_gates_full_figures(probe, monk
         assert figures[name] == expected
         assert figures["mase"] != pytest.approx(expected["mase"])
     assert figures["anchor_only"]["mase"] == pytest.approx(figures["fan_off"]["mase"], abs=0.001)
-    gate = probe.gate(report)["families"][panel.name]
+    full_gate = probe.gate(report)
+    assert full_gate == probe.gate({**report, "evidence_parameters": {}})
+    gate = full_gate["families"][panel.name]
     assert gate["criterion"] == probe._failure(panel.name, figures, report["levels"])
     assert (
         probe.gate({**report, "families": {panel.name: figures["fan_off"]}})["families"][
@@ -544,3 +557,56 @@ def test_probe_evidence_reports_the_ablations_and_gates_full_figures(probe, monk
         ]["criterion"]
         == "coverage"
     )
+
+
+def test_probe_head_off_scores_with_zero_gain_and_restores_calibration(probe, monkeypatch):
+    panel = probe.probe_panels()["seasonal_d"]
+    panel = replace(panel, items=panel.items[:2])
+    monkeypatch.setattr(probe, "probe_panels", lambda: {panel.name: panel})
+    settings = probe.ProbeSettings(derive=frozenset({"naive_anchor", "naive_evidence"}))
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(23)
+        model = V5Model(replace(config().model, naive_mix=True, mix_evidence=True)).eval()
+    with torch.no_grad():
+        model.head_gain.fill_(-0.5)
+        model.evidence_bias.copy_(torch.arange(6) / 2)
+    zero_gain = V5Model(model.config).eval()
+    zero_gain.load_state_dict(model.state_dict())
+    with torch.no_grad():
+        zero_gain.head_gain.zero_()
+    expected = probe._score_model(zero_gain, panel, settings)
+
+    report = probe.run_probe(model, settings)
+    assert report["evidence_parameters"]["head_gain"] == pytest.approx(0.5)
+    assert report["evidence_parameters"]["evidence_bias"] == pytest.approx(
+        [i / 2 for i in range(6)]
+    )
+    figures = report["families"][panel.name]
+    head_off = figures["head_off"]
+    assert set(head_off) == set(expected)
+    assert head_off["mase"] != pytest.approx(figures["mase"])
+    for key, value in expected.items():
+        if key == "coverage":
+            for actual_knot, expected_knot in zip(head_off[key], value, strict=True):
+                assert actual_knot == pytest.approx(expected_knot)
+        else:
+            assert head_off[key] == pytest.approx(value)
+    assert model.head_gain.item() == pytest.approx(-0.5)
+
+
+def test_probe_restores_the_gain_if_head_off_scoring_raises(probe, monkeypatch):
+    panel = probe.probe_panels()["seasonal_d"]
+    monkeypatch.setattr(probe, "probe_panels", lambda: {panel.name: panel})
+    model = V5Model(replace(config().model, naive_mix=True, mix_evidence=True)).eval()
+    with torch.no_grad():
+        model.head_gain.fill_(-0.5)
+
+    def score(model, *args, **kwargs):
+        if abs(model.head_gain.item()) < 1e-8:
+            raise RuntimeError("head-off score failed")
+        return {}
+
+    monkeypatch.setattr(probe, "_score_model", score)
+    with pytest.raises(RuntimeError, match="head-off score failed"):
+        probe.run_probe(model, probe.ProbeSettings())
+    assert model.head_gain.item() == pytest.approx(-0.5)

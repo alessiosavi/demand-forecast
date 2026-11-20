@@ -6,6 +6,8 @@ from math import isfinite
 
 import numpy as np
 import pandas as pd
+import torch
+from torch.nn.functional import softplus
 
 from demand_forecast.data.episode import EpisodeBatch, Item, Panel, ScreeningConfig
 from demand_forecast.data.episode.collate import (
@@ -330,10 +332,25 @@ def run_probe(model: V5Model, settings: ProbeSettings, *, device: str = "cpu") -
                 figures["evidence_off"] = _score_model(
                     model, panel, settings, batch_hook=evidence_off
                 )
+                with torch.no_grad():
+                    saved_gain = model.head_gain.clone()
+                    try:
+                        model.head_gain.zero_()
+                        figures["head_off"] = _score_model(model, panel, settings)
+                    finally:
+                        model.head_gain.copy_(saved_gain)
             families[name] = figures
     finally:
         model.to(original_device)
-    return {"levels": list(model.config.quantiles), "families": families}
+    report = {"levels": list(model.config.quantiles), "families": families}
+    if model.config.mix_evidence:
+        report["evidence_parameters"] = {
+            "beta": softplus(model.beta_raw.detach()).item(),
+            "gamma": softplus(model.gamma_raw.detach()).item(),
+            "head_gain": model.head_gain.detach().abs().item(),
+            "evidence_bias": model.evidence_bias.detach().tolist(),
+        }
+    return report
 
 
 def _defined(value: float | None) -> bool:

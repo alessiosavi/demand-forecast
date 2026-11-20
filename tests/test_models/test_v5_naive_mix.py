@@ -19,7 +19,11 @@ from demand_forecast.data.episode import (
     ScreeningConfig,
     collate,
 )
-from demand_forecast.data.episode.collate import EpisodeBatchWithRowKeys
+from demand_forecast.data.episode.collate import (
+    EpisodeBatchWithNaive,
+    EpisodeBatchWithNaiveAndRowKeys,
+    EpisodeBatchWithRowKeys,
+)
 from demand_forecast.data.episode.derived import naive_series
 from demand_forecast.data.episode.schema import ROLE_SIBLING
 from demand_forecast.models.v5 import V5Model, forecast_items, planned_layouts, usable_workers
@@ -30,6 +34,54 @@ ANCHOR = frozenset({"naive_anchor"})
 BOTH = ANCHOR | {"naive_rows"}
 TINY = replace(config().model, d_out=32, horizon_seed=True)
 OPTIONS = ("none", "last", "level", "season", "season2", "drift")
+N6_BATCH_FIELDS = (
+    "x",
+    "patch_valid",
+    "row_kind",
+    "row_role",
+    "row_names",
+    "row_summary",
+    "row_summary_flags",
+    "row_score",
+    "row_cand",
+    "forecast_rows",
+    "keep",
+    "labels",
+    "label_mask",
+    "loc",
+    "scale",
+    "fallback",
+    "known_rows",
+    "xh",
+    "cal_phases",
+    "cal_ids",
+    "calh_phases",
+    "calh_ids",
+    "cand_names",
+    "cand_kind",
+    "cand_summary",
+    "cand_flags",
+    "cand_score",
+    "attr_stats",
+    "attr_flags",
+    "attr_cand",
+    "attr_names",
+    "static_num",
+    "static_num_flags",
+    "static_num_cand",
+    "freq_class",
+    "horizon",
+    "origin_patches",
+    "context_target",
+    "row_mask",
+    "forecast_mask",
+    "known_mask",
+    "cand_mask",
+    "attr_mask",
+    "static_num_mask",
+    "origin_mask",
+    "horizon_mask",
+)
 
 
 def panel(*, freq="h", sibling=False, collision=False, size=256):
@@ -65,6 +117,31 @@ def model(*, mix=True, zero_head=False, config=TINY):
             net.step_projection.bias.zero_()
             net.head.projection.bias.zero_()
     return net
+
+
+@pytest.mark.parametrize(
+    ("derive", "keyed", "batch_type", "extra_fields"),
+    [
+        ("naive_rows", False, EpisodeBatch, ()),
+        ("naive_rows", True, EpisodeBatchWithRowKeys, ("row_keys",)),
+        ("naive_anchor", False, EpisodeBatchWithNaive, ("naive_paths", "naive_seen")),
+        (
+            "naive_anchor",
+            True,
+            EpisodeBatchWithNaiveAndRowKeys,
+            ("row_keys", "naive_paths", "naive_seen"),
+        ),
+    ],
+)
+def test_earlier_derives_preserve_the_n6_batch_contract(derive, keyed, batch_type, extra_fields):
+    batch = collate([episode(panel(), frozenset({derive}))], include_row_keys=keyed)
+    assert type(batch) is batch_type
+    assert tuple(field.name for field in fields(batch)) == N6_BATCH_FIELDS + extra_fields
+    assert not {"naive_error", "naive_error_seen", "naive_resq"}.intersection(dir(batch))
+    if derive == "naive_anchor":
+        assert batch.naive_paths.shape == batch.naive_seen.shape == (*batch.labels.shape, 6)
+        assert batch.naive_paths.dtype == torch.float32
+        assert batch.naive_seen.dtype == torch.bool
 
 
 def test_later_targets_do_not_change_an_earlier_anchor_or_forecast():

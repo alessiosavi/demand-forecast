@@ -498,26 +498,50 @@ def test_finished_manifest_returns_before_reading_damaged_slots(tmp_path, monkey
     assert repeated == result
 
 
-def test_parameter_groups_cover_once_and_exclude_special_weights():
+@pytest.mark.parametrize("naive_mix", [False, True])
+def test_parameter_groups_cover_once_and_exclude_special_weights(naive_mix):
     loop = api()
-    model = V5Model(config().model)
+    model = V5Model(replace(config().model, naive_mix=naive_mix))
     groups = loop.parameter_groups(model, 0.1)
     flattened = [parameter for group in groups for parameter in group["params"]]
     assert len(flattened) == len({id(p) for p in flattened}) == len(list(model.parameters()))
     no_decay = {id(p) for group in groups if group["weight_decay"] == 0 for p in group["params"]}
     special = set()
-    for name, module in model.named_modules():
+    for module in model.modules():
         for local_name, parameter in module.named_parameters(recurse=False):
             if (
                 local_name == "bias"
                 or isinstance(module, (nn.LayerNorm, nn.Embedding))
-                or "logits" in name
                 or local_name == "logits"
+                or module is model.family_logits
                 or module is model.gate_net.net[-1]
             ):
                 special.add(id(parameter))
-    assert special <= no_decay
+    assert special == no_decay
+    assert [[id(p) for p in group["params"]] for group in groups] == [
+        [id(p) for p in model.parameters() if id(p) not in special],
+        [id(p) for p in model.parameters() if id(p) in special],
+    ]
     assert id(model.patch_encoder.encoders[0][0].weight) not in no_decay
+
+
+def test_parameter_groups_exempt_only_the_models_evidence_calibration_parameters():
+    model = V5Model(replace(config().model, naive_mix=True, mix_evidence=True))
+    model.head.register_parameter("evidence_bias", nn.Parameter(torch.zeros(6)))
+    decay, no_decay = api().parameter_groups(model, 0.1)
+    assert decay["weight_decay"] == pytest.approx(0.1)
+    assert no_decay["weight_decay"] == pytest.approx(0.0)
+    decayed, exempt = ({id(p) for p in group["params"]} for group in (decay, no_decay))
+    assert len(decay["params"]) + len(no_decay["params"]) == len(list(model.parameters()))
+    assert decayed.isdisjoint(exempt)
+    assert decayed | exempt == {id(p) for p in model.parameters()}
+    assert {
+        id(model.evidence_bias),
+        id(model.beta_raw),
+        id(model.gamma_raw),
+        id(model.head_gain),
+    } <= exempt
+    assert id(model.head.evidence_bias) in decayed
 
 
 def test_package_reexports_loop_api():
