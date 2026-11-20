@@ -248,6 +248,8 @@ def test_only_the_four_aligned_paths_change_config_digests():
             assert cfg["model"].pop("horizon_seed") is False
             assert cfg["model"].pop("naive_mix") is False
             assert cfg["model"].pop("mix_evidence") is False
+            assert cfg["model"].pop("fan_mode") == "head"
+            assert cfg["model"].pop("mix_bound") is None
             # The optimiser field added after the base revision; no T1 arm sets a label cap.
             assert cfg["optim"].pop("label_cap") is None
             for source in cfg["sources"]:

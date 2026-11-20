@@ -353,6 +353,10 @@ class V5TrainConfig:
             del data["model"]["naive_mix"]
         if not self.model.mix_evidence:
             del data["model"]["mix_evidence"]
+        if self.model.fan_mode == "head":
+            del data["model"]["fan_mode"]
+        if self.model.mix_bound is None:
+            del data["model"]["mix_bound"]
         if not self.sampler.derive:
             del data["sampler"]["derive"]
         if not self.sampler.screen_fair_spread:

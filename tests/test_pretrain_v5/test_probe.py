@@ -610,3 +610,78 @@ def test_probe_restores_the_gain_if_head_off_scoring_raises(probe, monkeypatch):
     with pytest.raises(RuntimeError, match="head-off score failed"):
         probe.run_probe(model, probe.ProbeSettings())
     assert model.head_gain.item() == pytest.approx(-0.5)
+
+
+def test_residual_probe_ablates_spread_and_centre_separately(probe, monkeypatch):
+    panel = probe.probe_panels()["trend"]
+    panel = replace(panel, items=panel.items[:2])
+    monkeypatch.setattr(probe, "probe_panels", lambda: {panel.name: panel})
+    settings = probe.ProbeSettings(derive=frozenset({"naive_anchor", "naive_evidence"}))
+    model = V5Model(
+        replace(config().model, naive_mix=True, mix_evidence=True, fan_mode="residual")
+    ).eval()
+    original = probe.forecast_items
+    observed = {}
+
+    def capture(*args, batch_hook, output_hook, **kwargs):
+        def observe(batch, output):
+            observed[batch_hook] = (batch, output)
+            output_hook(batch, output)
+
+        return original(*args, batch_hook=batch_hook, output_hook=observe, **kwargs)
+
+    monkeypatch.setattr(probe, "forecast_items", capture)
+    figures = probe.run_probe(model, settings)["families"][panel.name]
+    spread_batch, spread_output = observed[probe.spread_off]
+    centre_batch, centre_output = observed[probe.centre_off]
+    fan_batch, fan_output = observed[probe.fan_off]
+    spread_off = spread_batch.naive_resq
+    centre_off = centre_batch.naive_resq
+    torch.testing.assert_close(spread_off, spread_off[..., 4:5].expand_as(spread_off))
+    torch.testing.assert_close(centre_off[..., 4], torch.zeros_like(centre_off[..., 4]))
+    torch.testing.assert_close(fan_batch.naive_resq, torch.zeros_like(fan_batch.naive_resq))
+    torch.testing.assert_close(
+        spread_output.fan.diff(dim=-1), torch.zeros_like(spread_output.fan[..., 1:])
+    )
+    torch.testing.assert_close(
+        centre_output.fan[..., 4], torch.zeros_like(centre_output.fan[..., 4])
+    )
+    torch.testing.assert_close(fan_output.fan, torch.zeros_like(fan_output.fan))
+    assert figures["spread_off"]["mase"] == pytest.approx(figures["mase"])
+    assert figures["centre_off"]["mase"] == pytest.approx(figures["fan_off"]["mase"])
+    assert figures["centre_off"]["mase"] != pytest.approx(figures["mase"])
+    assert "bound_saturation" not in figures
+
+
+def test_probe_saturation_averages_scored_evidence_cells_only(probe, monkeypatch):
+    panel = probe.probe_panels()["trend"]
+    panel = replace(panel, items=panel.items[:1])
+    settings = probe.ProbeSettings(derive=frozenset({"naive_anchor", "naive_evidence"}))
+    model = V5Model(
+        replace(config().model, naive_mix=True, mix_evidence=True, mix_bound=2.0)
+    ).eval()
+    original = probe.forecast_items
+
+    def capture(*args, output_hook, **kwargs):
+        def observe(batch, output):
+            label_mask = torch.zeros_like(batch.label_mask)
+            label_mask[..., :6] = True
+            evidence = torch.zeros_like(output.evidence)
+            saturated = torch.zeros_like(output.tilt_saturated)
+            if output.evidence.any():
+                evidence[..., :4] = True
+                saturated[..., :2] = True
+                evidence[..., 6:8] = saturated[..., 6:8] = True
+            output_hook(
+                replace(batch, label_mask=label_mask),
+                replace(output, evidence=evidence, tilt_saturated=saturated),
+            )
+
+        return original(*args, output_hook=observe, **kwargs)
+
+    monkeypatch.setattr(probe, "forecast_items", capture)
+    figures = probe._score_model(model, panel, settings)
+    assert figures["evidence_share"] == pytest.approx(4 / 6)
+    assert figures["bound_saturation"] == pytest.approx(1 / 2)
+    figures = probe._score_model(model, panel, settings, batch_hook=probe.evidence_off)
+    assert figures["bound_saturation"] is None

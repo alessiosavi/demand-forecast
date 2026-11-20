@@ -19,6 +19,7 @@ from demand_forecast.data.episode.schema import (
     N_SUMMARY,
     NAIVE_OPTIONS,
     PATCH,
+    QUANTILES,
     ROLE_FORECAST,
     ROLE_KNOWN,
     ROLE_PANEL,
@@ -34,6 +35,9 @@ from .config import V5Config
 from .context import ExpertRouter, ScaleShift, StaticContext
 from .gates import GateNet, GlobalMask, HardConcreteGate
 from .tokens import CalendarEmbedding, PatchEncoder
+
+_MEDIAN = QUANTILES.index(0.5)
+_HEAD_GAIN_START = 1e-3
 
 
 @dataclass
@@ -56,6 +60,8 @@ class V5Output:
     in dense expert mode.
     With mix evidence enabled but no evidence in the batch, ``fan`` is zero and
     ``evidence`` is all false. Both fields are ``None`` when the option is off.
+    ``tilt_saturated`` marks evidence cells with a centred network logit above
+    95% of the bound in magnitude. It is ``None`` when the bound is off.
     """
 
     quantiles: Tensor
@@ -66,6 +72,7 @@ class V5Output:
     mix: Tensor | None = None
     fan: Tensor | None = None
     evidence: Tensor | None = None
+    tilt_saturated: Tensor | None = None
 
 
 def _reference(batch: EpisodeBatch, summary: Tensor, flags: Tensor) -> tuple[Tensor, Tensor]:
@@ -138,49 +145,73 @@ class V5Model(nn.Module):
             self.evidence_bias = nn.Parameter(torch.zeros(len(NAIVE_OPTIONS)))
             self.beta_raw = nn.Parameter(torch.tensor(math.log(math.expm1(4))))
             self.gamma_raw = nn.Parameter(torch.tensor(math.log(math.expm1(1))))
-            self.head_gain = nn.Parameter(torch.tensor(1e-3))
+            self.head_gain = nn.Parameter(torch.tensor(_HEAD_GAIN_START))
 
     def _evidence_logits(
         self, steps: Tensor, batch: EpisodeBatchWithNaiveEvidence, seen: Tensor
-    ) -> tuple[Tensor, Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor | None]:
         dtype = steps.dtype
         measured = batch.naive_error_seen
         options = seen & measured.repeat_interleave(PATCH, dim=-2)
         evidence = options.any(dim=-1, keepdim=True)
         error = batch.naive_error.to(dtype).masked_fill(~measured, 0)
-        prior = (-softplus(self.beta_raw.to(dtype)) * (error + 1e-3).log()).repeat_interleave(
+        bound = self.config.mix_bound
+        beta_raw = self.beta_raw if bound is None else self.beta_raw.detach()
+        prior = (-softplus(beta_raw.to(dtype)) * (error + 1e-3).log()).repeat_interleave(
             PATCH, dim=-2
         )
         best = prior.masked_fill(~options, -torch.inf).amax(dim=-1, keepdim=True)
         best = best.masked_fill(~evidence, 0)
         prior = (prior - best).clamp_min(-6).masked_fill(~options, -6)
-        logits = linear(steps, self.mix_projection.weight.to(dtype))
-        return logits + self.evidence_bias.to(dtype) + prior, options, evidence
+        tilt = linear(steps, self.mix_projection.weight.to(dtype)) + self.evidence_bias.to(dtype)
+        saturated = None
+        if bound is not None:
+            measured_tilt = tilt.masked_fill(~options, 0)
+            mean = measured_tilt.sum(-1, keepdim=True) / options.sum(-1, keepdim=True).clamp_min(1)
+            centred = (measured_tilt - mean).masked_fill(~options, 0)
+            saturated = (centred.abs() > 0.95 * bound).any(dim=-1)
+            tilt = bound * (centred / bound).tanh()
+        return tilt + prior, options, evidence, saturated
 
     def _mix_naive(
         self, steps_out: Tensor, batch: EpisodeBatchWithNaive, real: Tensor
-    ) -> tuple[Tensor, Tensor, Tensor | None, Tensor | None]:
+    ) -> tuple[Tensor, Tensor, Tensor | None, Tensor | None, Tensor | None]:
         projection = self.mix_projection
         dtype = torch.float64 if projection.weight.dtype == torch.float64 else torch.float32
         steps = steps_out.to(dtype)
         logits = linear(steps, projection.weight.to(dtype), projection.bias.to(dtype))
         seen = batch.naive_seen & real[..., None]
-        fan = evidence = None
+        has_option = seen.any(dim=-1, keepdim=True)
+        fan = evidence = saturated = None
         if self.config.mix_evidence and isinstance(batch, EpisodeBatchWithNaiveEvidence):
-            evidence_logits, options, evidence = self._evidence_logits(steps, batch, seen)
+            evidence_logits, options, evidence, saturated = self._evidence_logits(
+                steps, batch, seen
+            )
             logits = torch.where(evidence, evidence_logits, logits)
+            mix = _path_weights(logits, seen, has_option)
             # Restrict and renormalize in logit space so a dominant unmeasured
             # path cannot underflow all the measured paths' weights to zero.
-            weights = _path_weights(evidence_logits.detach(), options, evidence)
+            weights = _path_weights(evidence_logits.detach(), options, evidence).unflatten(
+                -2, (-1, PATCH)
+            )
             residuals = batch.naive_resq.to(dtype).masked_fill(
                 ~batch.naive_error_seen[..., None], 0
             )
-            fan = (weights.unflatten(-2, (-1, PATCH)) @ residuals).flatten(-3, -2)
-            fan = softplus(self.gamma_raw.to(dtype)) * fan
+            if self.config.fan_mode == "residual":
+                medians = residuals[..., _MEDIAN : _MEDIAN + 1]
+                # Let the mix learn from bias-corrected paths, keeping the spread detached.
+                centre = mix.unflatten(-2, (-1, PATCH)) @ medians
+                spread = weights @ (residuals - medians)
+                fan = (centre + spread).flatten(-3, -2)
+                fan = fan.masked_fill(~evidence, 0)
+            else:
+                fan = (weights @ residuals).flatten(-3, -2)
+                fan = softplus(self.gamma_raw.to(dtype)) * fan
             evidence = evidence.squeeze(-1)
-        mix = _path_weights(logits, seen, seen.any(dim=-1, keepdim=True))
+        else:
+            mix = _path_weights(logits, seen, has_option)
         paths = batch.naive_paths.to(dtype).masked_fill(~seen, 0)
-        return (mix * paths).sum(-1), mix, fan, evidence
+        return (mix * paths).sum(-1), mix, fan, evidence, saturated
 
     def parameter_report(self) -> dict[str, int | None]:
         """Return both parameter totals and the extra width of each dense expert block.
@@ -407,7 +438,7 @@ class V5Model(nn.Module):
                 dec_weights,
             )
         real = batch.origin_mask[:, :, None, None] & batch.forecast_mask[:, None, :, None]
-        anchor = mix = fan = evidence = None
+        anchor = mix = fan = evidence = saturated = None
         # Low precision can round the gaps between adjacent quantiles to zero.
         with torch.autocast(h.device.type, enabled=False):
             # Match the float32 weights in training and honor an explicit forecast dtype.
@@ -417,7 +448,9 @@ class V5Model(nn.Module):
             quantiles = self.head(steps_out)
             if self.config.naive_mix and isinstance(batch, EpisodeBatchWithNaive):
                 real_steps = real & step_mask.flatten(1)[:, None, None, :]
-                anchor, mix, fan, evidence = self._mix_naive(steps_out, batch, real_steps)
+                anchor, mix, fan, evidence, saturated = self._mix_naive(
+                    steps_out, batch, real_steps
+                )
                 head = quantiles
                 quantiles = torch.where(
                     batch.naive_seen.any(dim=-1, keepdim=True) & real_steps[..., None],
@@ -428,16 +461,22 @@ class V5Model(nn.Module):
                     raw_gain = self.head_gain.to(fan.dtype)
                     # Choose the positive branch at zero so the gain can learn again.
                     gain = torch.where(raw_gain >= 0, raw_gain, -raw_gain)
-                    quantiles = torch.where(
-                        evidence[..., None],
-                        anchor[..., None] + fan + gain * head.to(fan.dtype),
-                        quantiles,
-                    )
+                    head = head.to(fan.dtype)
+                    knots = anchor[..., None] + fan
+                    if self.config.fan_mode == "residual":
+                        median = head[..., _MEDIAN : _MEDIAN + 1]
+                        knots = knots + gain * median + _HEAD_GAIN_START * (head - median).detach()
+                    else:
+                        knots = knots + gain * head
+                    quantiles = torch.where(evidence[..., None], knots, quantiles)
             if self.config.mix_evidence and fan is None:
                 dtype = torch.float64 if quantiles.dtype == torch.float64 else torch.float32
                 fan = torch.zeros_like(quantiles, dtype=dtype)
                 evidence = torch.zeros_like(quantiles[..., 0], dtype=torch.bool)
+                if self.config.mix_bound is not None:
+                    saturated = torch.zeros_like(evidence)
         quantiles = quantiles.masked_fill(~real[..., None], 0)
+        diagnostics = {} if saturated is None else {"tilt_saturated": saturated}
         return V5Output(
             quantiles,
             gates,
@@ -447,6 +486,7 @@ class V5Model(nn.Module):
             mix,
             fan,
             evidence,
+            **diagnostics,
         )
 
 

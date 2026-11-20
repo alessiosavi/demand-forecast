@@ -541,6 +541,10 @@ def _selftest(out: Path, derive: tuple[str, ...] = ()) -> None:
         del checkpoint_config["model"]["naive_mix"]
     if not config.model.mix_evidence:
         del checkpoint_config["model"]["mix_evidence"]
+    if config.model.fan_mode == "head":
+        del checkpoint_config["model"]["fan_mode"]
+    if config.model.mix_bound is None:
+        del checkpoint_config["model"]["mix_bound"]
     if config.sampler.derive:
         checkpoint_config["sampler"]["derive"] = list(config.sampler.derive)
     else:
