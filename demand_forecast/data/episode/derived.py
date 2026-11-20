@@ -4,9 +4,12 @@ import numpy as np
 import pandas as pd
 
 from .kinds import labels_of, observed_mask
+from .scale import Scale, to_scaled
+from .schema import NAIVE_OPTIONS, PATCH, QUANTILES
 
 LAG_SCAN_WINDOW = 512
 _ONSET_AGES = 32
+NAIVE_LIMIT = 1e6
 
 
 class NaiveHistory:
@@ -83,6 +86,55 @@ class NaiveHistory:
             observed = np.isfinite(values)
             result[name] = np.where(observed, values, 0.0), observed
         return result
+
+    def backtest(
+        self, raw: np.ndarray, scale: Scale, *, origin: int, horizon: int
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Pool causal, signed residuals in each patch of up to four earlier horizons."""
+        patches = (horizon + PATCH - 1) // PATCH
+        residuals = np.full((4, patches * PATCH, len(NAIVE_OPTIONS)), np.nan)
+        for m in range(1, 5):
+            start, stop = origin - m * horizon, origin - (m - 1) * horizon
+            if start < 0:
+                break
+            if stop >= len(self.values) or np.isfinite(raw[start:stop]).sum() < (horizon + 1) // 2:
+                continue
+            outcomes = self.values[start + 1 : stop + 1]
+            paths = self.series(left=start, right=stop, origin=start)
+            prefix = raw[:start]
+            finite = prefix[np.isfinite(prefix)]
+            with np.errstate(over="ignore", invalid="ignore"):
+                if finite.size:
+                    median = to_scaled(np.median(finite), scale)
+                    paths["none"] = median, np.isfinite(median)
+                level = self.level(start)
+                paths["level"] = level, np.isfinite(level)
+                if self.long_lag is not None and start < self.long_lag:
+                    paths.pop("season2")
+                for j, name in enumerate(NAIVE_OPTIONS):
+                    if name in paths:
+                        path, available = paths[name]
+                        difference = outcomes - path
+                        valid = np.isfinite(difference) & available & (np.abs(path) <= NAIVE_LIMIT)
+                        residuals[m - 1, :horizon, j] = np.where(valid, difference, np.nan)
+
+        # Pool pairs across windows before applying the minimum count in each patch.
+        pairs = residuals.reshape(4, patches, PATCH, -1).transpose(1, 3, 0, 2)
+        pairs = pairs.reshape(patches, len(NAIVE_OPTIONS), 4 * PATCH)
+        count = np.isfinite(pairs).sum(axis=-1)
+        patch_size = np.minimum(PATCH, horizon - np.arange(patches) * PATCH)
+        with np.errstate(over="ignore"):
+            error = np.nansum(np.abs(pairs), axis=-1) / np.maximum(count, 1)
+        seen = (count >= (patch_size[:, None] + 1) // 2) & (error <= NAIVE_LIMIT)
+        resq = np.zeros((*seen.shape, len(QUANTILES)), dtype=np.float32)
+        # Sort the viable columns once, with missing pairs at the end.
+        ordered = np.sort(pairs[seen], axis=-1)
+        ranks = (count[seen][:, None] - 1) * np.asarray(QUANTILES)
+        lower = np.floor(ranks).astype(int)
+        low = np.take_along_axis(ordered, lower, axis=-1)
+        high = np.take_along_axis(ordered, np.ceil(ranks).astype(int), axis=-1)
+        resq[seen] = low + (ranks - lower) * (high - low)
+        return np.where(seen, error, 0).astype(np.float32), seen, resq
 
 
 def naive_series(

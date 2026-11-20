@@ -250,7 +250,9 @@ def _validate_workers(workers: int, prefetch: int) -> None:
         raise ValueError("prefetch must be a positive integer")
 
 
-def usable_workers(requested: int, *, naive_anchor: bool = False) -> tuple[int, str | None]:
+def usable_workers(
+    requested: int, *, naive_anchor: bool = False, naive_evidence: bool = False
+) -> tuple[int, str | None]:
     """Return the worker count and any serial fallback reason for a nonnegative request.
 
     A positive Linux request may raise the process file-descriptor limit.
@@ -266,7 +268,9 @@ def usable_workers(requested: int, *, naive_anchor: bool = False) -> tuple[int, 
 
     try:
         # Without an anchor the call is the one made before the option existed.
-        if naive_anchor:
+        if naive_evidence:
+            sampler._ensure_worker_file_limit(requested, naive_anchor=True, naive_evidence=True)
+        elif naive_anchor:
             sampler._ensure_worker_file_limit(requested, naive_anchor=True)
         else:
             sampler._ensure_worker_file_limit(requested)
@@ -391,9 +395,15 @@ def _batch_to_model(batch: EpisodeBatch, device: torch.device, dtype: torch.dtyp
     for field in fields(batch):
         value = getattr(batch, field.name)
         if isinstance(value, torch.Tensor):
-            # Keep the inverse frame and the full float32 precision of the naive paths.
+            # Keep the inverse frame and the float32 precision of the paths and evidence.
             target_dtype = value.dtype
-            if value.is_floating_point() and field.name not in ("loc", "scale", "naive_paths"):
+            if value.is_floating_point() and field.name not in (
+                "loc",
+                "scale",
+                "naive_paths",
+                "naive_error",
+                "naive_resq",
+            ):
                 target_dtype = dtype
             tensors[field.name] = value.to(device=device, dtype=target_dtype)
     return replace(batch, **tensors)
@@ -458,7 +468,9 @@ def forecast_items(
         # Pretraining imports the model, so load its helpers only at runtime.
         from demand_forecast.pretrain.v5 import sampler
 
-        if "naive_anchor" in derive:
+        if "naive_evidence" in derive:
+            sampler._ensure_worker_file_limit(workers, naive_anchor=True, naive_evidence=True)
+        elif "naive_anchor" in derive:
             sampler._ensure_worker_file_limit(workers, naive_anchor=True)
         else:
             sampler._ensure_worker_file_limit(workers)

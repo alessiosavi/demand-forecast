@@ -6,9 +6,15 @@ from math import isfinite
 
 import numpy as np
 import pandas as pd
+import torch
+from torch.nn.functional import softplus
 
 from demand_forecast.data.episode import EpisodeBatch, Item, Panel, ScreeningConfig
-from demand_forecast.data.episode.collate import EpisodeBatchWithNaive, EpisodeBatchWithRowKeys
+from demand_forecast.data.episode.collate import (
+    EpisodeBatchWithNaive,
+    EpisodeBatchWithNaiveEvidence,
+    EpisodeBatchWithRowKeys,
+)
 from demand_forecast.data.episode.derived import naive_series
 from demand_forecast.data.episode.schema import NAIVE_OPTIONS
 from demand_forecast.models.v5 import V5Model, V5Output, forecast_items
@@ -229,6 +235,22 @@ def anchor_off(batch: EpisodeBatch) -> EpisodeBatch:
     return batch
 
 
+def fan_off(batch: EpisodeBatch) -> EpisodeBatch:
+    """Zero residual quantiles while retaining the mix prior and head gain."""
+    if isinstance(batch, EpisodeBatchWithNaiveEvidence):
+        return replace(batch, naive_resq=batch.naive_resq.new_zeros(batch.naive_resq.shape))
+    return batch
+
+
+def evidence_off(batch: EpisodeBatch) -> EpisodeBatch:
+    """Clear the evidence mask so the forecast uses the original mix and head."""
+    if isinstance(batch, EpisodeBatchWithNaiveEvidence):
+        return replace(
+            batch, naive_error_seen=batch.naive_error_seen.new_zeros(batch.naive_error_seen.shape)
+        )
+    return batch
+
+
 def _score_model(
     model: V5Model,
     panel: Panel,
@@ -237,12 +259,16 @@ def _score_model(
     batch_hook: Callable[[EpisodeBatch], EpisodeBatch] | None = None,
     observe_mix: bool = False,
 ) -> dict:
-    anchors, weights, label_masks = [], [], []
+    anchors, weights, label_masks, evidence_masks = [], [], [], []
 
     def observe(batch: EpisodeBatch, output: V5Output) -> None:
         # Probe jobs have one origin and one kept target per item, in item order.
         keep = batch.keep & batch.forecast_mask & batch.origin_mask[:, :1]
         label_masks.append(batch.label_mask[:, 0][keep][:, :_HORIZON].cpu().numpy())
+        if output.evidence is not None:
+            evidence_masks.append(output.evidence[:, 0][keep][:, :_HORIZON].cpu().numpy())
+        if not observe_mix:
+            return
         loc = batch.loc[keep][:, None]
         if output.anchor is None:
             anchors.append(loc.expand(-1, _HORIZON).cpu().numpy())
@@ -264,11 +290,14 @@ def _score_model(
         derive=settings.derive,
         batch_episodes=_BATCH_EPISODES,
         batch_hook=batch_hook,
-        output_hook=observe if observe_mix else None,
+        output_hook=observe if observe_mix or model.config.mix_evidence else None,
     )
     quantiles = np.stack([forecasts.values[i, "y"] for i, _ in jobs])
     levels = model.config.quantiles
     figures = score_panel(panel, quantiles, levels)
+    if evidence_masks:
+        scored = np.concatenate(evidence_masks)[np.concatenate(label_masks)]
+        figures["evidence_share"] = float(scored.mean()) if len(scored) else None
     if observe_mix:
         quantiles[..., levels.index(0.5)] = np.concatenate(anchors)
         figures["anchor_only"] = score_panel(panel, quantiles, levels)
@@ -298,10 +327,30 @@ def run_probe(model: V5Model, settings: ProbeSettings, *, device: str = "cpu") -
                 )
             if model.config.naive_mix:
                 figures["anchor_off"] = _score_model(model, panel, settings, batch_hook=anchor_off)
+            if model.config.mix_evidence:
+                figures["fan_off"] = _score_model(model, panel, settings, batch_hook=fan_off)
+                figures["evidence_off"] = _score_model(
+                    model, panel, settings, batch_hook=evidence_off
+                )
+                with torch.no_grad():
+                    saved_gain = model.head_gain.clone()
+                    try:
+                        model.head_gain.zero_()
+                        figures["head_off"] = _score_model(model, panel, settings)
+                    finally:
+                        model.head_gain.copy_(saved_gain)
             families[name] = figures
     finally:
         model.to(original_device)
-    return {"levels": list(model.config.quantiles), "families": families}
+    report = {"levels": list(model.config.quantiles), "families": families}
+    if model.config.mix_evidence:
+        report["evidence_parameters"] = {
+            "beta": softplus(model.beta_raw.detach()).item(),
+            "gamma": softplus(model.gamma_raw.detach()).item(),
+            "head_gain": model.head_gain.detach().abs().item(),
+            "evidence_bias": model.evidence_bias.detach().tolist(),
+        }
+    return report
 
 
 def _defined(value: float | None) -> bool:

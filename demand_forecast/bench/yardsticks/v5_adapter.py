@@ -151,12 +151,14 @@ class V5Adapter:
             dict.fromkeys((*sampler["summary_off"], *self.variant.summary_off))
         )
         count = _worker_count(self.options.device)
-        # Without an anchor the call is the one made before the option existed.
-        self._workers, self._worker_reason = (
-            usable_workers(count, naive_anchor=True)
-            if "naive_anchor" in self._derive
-            else usable_workers(count)
-        )
+        if "naive_evidence" in self._derive:
+            self._workers, self._worker_reason = usable_workers(
+                count, naive_anchor=True, naive_evidence=True
+            )
+        elif "naive_anchor" in self._derive:
+            self._workers, self._worker_reason = usable_workers(count, naive_anchor=True)
+        else:
+            self._workers, self._worker_reason = usable_workers(count)
         self.prepare(task)
 
     def prepare(self, task) -> None:

@@ -6,7 +6,7 @@ import numpy as np
 import torch
 
 from .builder import Episode
-from .schema import NAIVE_OPTIONS
+from .schema import NAIVE_OPTIONS, QUANTILES
 
 
 @dataclass
@@ -92,6 +92,22 @@ class EpisodeBatchWithNaiveAndRowKeys(EpisodeBatchWithNaive, EpisodeBatchWithRow
     """Naive paths and row provenance for a forecasting batch hook."""
 
 
+@dataclass
+class EpisodeBatchWithNaiveEvidence(EpisodeBatchWithNaive):
+    """Naive paths with per-patch backtest errors and signed residual quantiles."""
+
+    naive_error: torch.Tensor
+    naive_error_seen: torch.Tensor
+    naive_resq: torch.Tensor
+
+
+@dataclass
+class EpisodeBatchWithNaiveEvidenceAndRowKeys(
+    EpisodeBatchWithNaiveEvidence, EpisodeBatchWithNaiveAndRowKeys
+):
+    """Naive backtest evidence and row provenance for a forecasting batch hook."""
+
+
 def collate(episodes: list[Episode], *, include_row_keys: bool = False) -> EpisodeBatch:
     """Pad each independent axis and shift origins by their context's left padding."""
     if not episodes:
@@ -100,7 +116,15 @@ def collate(episodes: list[Episode], *, include_row_keys: bool = False) -> Episo
     lists = {"row_names", "cand_names", "attr_names", "context_target"}
     for field in fields(Episode):
         name = field.name
-        if name in ("trace", "row_keys", "naive_paths", "naive_seen"):
+        if name in (
+            "trace",
+            "row_keys",
+            "naive_paths",
+            "naive_seen",
+            "naive_error",
+            "naive_error_seen",
+            "naive_resq",
+        ):
             continue
         values = [getattr(episode, name) for episode in episodes]
         if name in lists:
@@ -154,11 +178,32 @@ def collate(episodes: list[Episode], *, include_row_keys: bool = False) -> Episo
                 paths[slices] = episode.naive_paths
                 seen[slices] = episode.naive_seen
         result.update(naive_paths=torch.from_numpy(paths), naive_seen=torch.from_numpy(seen))
+    have_evidence = any(episode.naive_error is not None for episode in episodes)
+    if have_evidence:
+        shape = (*result["labels"].shape[:3], result["horizon_mask"].shape[1], len(NAIVE_OPTIONS))
+        error = np.zeros(shape, np.float32)
+        error_seen = np.zeros(shape, bool)
+        resq = np.zeros((*shape, len(QUANTILES)), np.float32)
+        for index, episode in enumerate(episodes):
+            if episode.naive_error is not None:
+                slices = (index, *(slice(0, length) for length in episode.naive_error.shape))
+                error[slices] = episode.naive_error
+                error_seen[slices] = episode.naive_error_seen
+                resq[slices] = episode.naive_resq
+        result.update(
+            naive_error=torch.from_numpy(error),
+            naive_error_seen=torch.from_numpy(error_seen),
+            naive_resq=torch.from_numpy(resq),
+        )
     if include_row_keys:
         result["row_keys"] = [list(episode.row_keys) for episode in episodes]
+        if have_evidence:
+            return EpisodeBatchWithNaiveEvidenceAndRowKeys(**result)
         return (
             EpisodeBatchWithNaiveAndRowKeys(**result)
             if have_naive
             else EpisodeBatchWithRowKeys(**result)
         )
+    if have_evidence:
+        return EpisodeBatchWithNaiveEvidence(**result)
     return EpisodeBatchWithNaive(**result) if have_naive else EpisodeBatch(**result)

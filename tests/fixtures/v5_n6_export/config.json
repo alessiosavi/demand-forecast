@@ -1,0 +1,160 @@
+{
+  "files": {
+    "model.safetensors": "76106c2eb4f98ccb121a058cf98545ff2e0fab29f3eadabbc9c35f8a4ff6a49e",
+    "parity.npz": "7cf6ceb3c40398a93a32c1dd9a9dde269b7d58c4820a9119fdb1e8a9e17b5570"
+  },
+  "format": "v5-export-1",
+  "model": {
+    "balance_weight": 0.01,
+    "d_calendar": 4,
+    "d_model": 16,
+    "d_out": 4,
+    "d_step": 4,
+    "dec_layers": 1,
+    "dim_feedforward": 16,
+    "dropout": 0.1,
+    "enc_layers": 1,
+    "expert_dec_layers": 1,
+    "expert_enc_layers": 1,
+    "gate_init": 3.0,
+    "known_gate_floor": 0.05,
+    "n_experts": 4,
+    "naive_mix": true,
+    "nhead": 2,
+    "quantiles": [
+      0.1,
+      0.2,
+      0.3,
+      0.4,
+      0.5,
+      0.6,
+      0.7,
+      0.8,
+      0.9
+    ],
+    "sparsity_weight": 0.001,
+    "top_k": 2,
+    "width_factor": 2.0
+  },
+  "source": {
+    "identity": "c97bf6c7390f6283fd29a9736aa62507bdc3536a2f26c1588ca95bf8213e3855",
+    "sha256": "1f34f180ed62c550fe7c391a85d123e2c9785b01dd0948a7305236d282ac67e6",
+    "updates": 0,
+    "weights": "raw"
+  },
+  "training": {
+    "gates": "learned",
+    "model": {
+      "balance_weight": 0.01,
+      "d_calendar": 4,
+      "d_model": 16,
+      "d_out": 4,
+      "d_step": 4,
+      "dec_layers": 1,
+      "dim_feedforward": 16,
+      "dropout": 0.1,
+      "enc_layers": 1,
+      "expert_dec_layers": 1,
+      "expert_enc_layers": 1,
+      "gate_init": 3.0,
+      "known_gate_floor": 0.05,
+      "n_experts": 4,
+      "naive_mix": true,
+      "nhead": 2,
+      "quantiles": [
+        0.1,
+        0.2,
+        0.3,
+        0.4,
+        0.5,
+        0.6,
+        0.7,
+        0.8,
+        0.9
+      ],
+      "sparsity_weight": 0.001,
+      "top_k": 2,
+      "width_factor": 2.0
+    },
+    "optim": {
+      "amp": true,
+      "checkpoint_minutes": 10.0,
+      "ema_decay": null,
+      "grad_clip": 1.0,
+      "learning_rate": 0.0005,
+      "log_every": 50,
+      "max_steps": 1,
+      "warmup_steps": 0,
+      "weight_decay": 0.01
+    },
+    "router": "learned",
+    "sampler": {
+      "contexts": [
+        256,
+        512,
+        1024
+      ],
+      "cutoff_at_origin": 0.5,
+      "derive": [
+        "naive_anchor"
+      ],
+      "designate_target": false,
+      "drop": [
+        [
+          "features",
+          0.1
+        ],
+        [
+          "peers",
+          0.15
+        ],
+        [
+          "attributes",
+          0.15
+        ],
+        [
+          "static_numbers",
+          0.1
+        ],
+        [
+          "panel_row",
+          0.2
+        ],
+        [
+          "siblings",
+          0.1
+        ],
+        [
+          "calendar",
+          0.1
+        ],
+        [
+          "rolling",
+          0.1
+        ],
+        [
+          "lags",
+          0.1
+        ],
+        [
+          "zeros",
+          0.1
+        ]
+      ],
+      "drop_always": [],
+      "episodes_per_batch": 32,
+      "episodes_per_panel": 8,
+      "horizon": [
+        16,
+        288
+      ],
+      "max_cells": 4000000,
+      "origin_stride": 2,
+      "origins": 4,
+      "path_share": 0.5,
+      "summary_off": []
+    },
+    "seed": 2026,
+    "sources": []
+  }
+}

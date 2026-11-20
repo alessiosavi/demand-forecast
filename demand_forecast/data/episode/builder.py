@@ -33,6 +33,7 @@ from .schema import (
     N_VALUE_TOKEN,
     NAIVE_OPTIONS,
     PATCH,
+    QUANTILES,
     ROLE_FORECAST,
     ROLE_KNOWN,
     ROLE_PANEL,
@@ -60,7 +61,14 @@ DROPPABLE = (
     "value_stats",
     "value_effects",
 )
-DERIVABLE = ("increment_spread", "lag_rows", "naive_anchor", "naive_rows", "onset_rows")
+DERIVABLE = (
+    "increment_spread",
+    "lag_rows",
+    "naive_anchor",
+    "naive_evidence",
+    "naive_rows",
+    "onset_rows",
+)
 
 
 @dataclass(frozen=True)
@@ -131,6 +139,9 @@ class Episode:
     row_keys: tuple[tuple[str, str] | None, ...] = ()
     naive_paths: np.ndarray | None = None
     naive_seen: np.ndarray | None = None
+    naive_error: np.ndarray | None = None
+    naive_error_seen: np.ndarray | None = None
+    naive_resq: np.ndarray | None = None
 
 
 def apply_summary_off(episode: Episode, names: tuple[str, ...]) -> Episode:
@@ -243,6 +254,8 @@ class EpisodeBuilder:
             raise ValueError("unknown drop switch")
         if request.derive.difference(DERIVABLE):
             raise ValueError("unknown derive switch")
+        if "naive_evidence" in request.derive and "naive_anchor" not in request.derive:
+            raise ValueError("naive_evidence requires naive_anchor")
         targets = self.panel.items[request.item_index].targets
         if not targets or (request.target is not None and request.target not in targets):
             raise ValueError("a forecast target must exist")
@@ -712,10 +725,12 @@ class EpisodeBuilder:
                 dispositions[key] = None
             features.extend((part, key) for part in expanded)
         features.sort(key=lambda pair: (pair[0].role, -pair[0].score, pair[0].name))
-        naive = None
+        naive = backtest_history = None
         naive_rows, naive_trace = [], []
         anchor = "naive_anchor" in request.derive
+        with_evidence = "naive_evidence" in request.derive
         if context_target is not None and (anchor or "naive_rows" in request.derive):
+            history_end = right - item.start
             long_lag = panel.long_lag
             if (
                 long_lag is not None
@@ -723,8 +738,24 @@ class EpisodeBuilder:
             ):
                 long_lag = None
             naive = derived.NaiveHistory(
-                rows[0].scaled, season=panel.season, long_lag=long_lag, end=right - item.start
+                rows[0].scaled, season=panel.season, long_lag=long_lag, end=history_end
             )
+            if with_evidence:
+                backtest_history = naive
+                # Forecast paths use the first origin's lag eligibility. A
+                # later backtest window can qualify independently.
+                latest_window_start = min(history_end, len(target_scaled)) - request.horizon
+                if (
+                    long_lag is None
+                    and panel.long_lag is not None
+                    and latest_window_start >= panel.long_lag
+                ):
+                    backtest_history = derived.NaiveHistory(
+                        rows[0].scaled,
+                        season=panel.season,
+                        long_lag=panel.long_lag,
+                        end=history_end,
+                    )
             if "naive_rows" in request.derive:
                 names = {
                     *item.dynamic,
@@ -879,6 +910,12 @@ class EpisodeBuilder:
         label_mask = np.zeros(labels.shape, bool)
         naive_paths = np.zeros((*labels.shape, len(NAIVE_OPTIONS)), np.float32) if anchor else None
         naive_seen = np.zeros(naive_paths.shape, bool) if naive_paths is not None else None
+        naive_error = naive_error_seen = naive_resq = None
+        if with_evidence:
+            evidence_shape = (*labels.shape[:2], nh, len(NAIVE_OPTIONS))
+            naive_error = np.zeros(evidence_shape, np.float32)
+            naive_error_seen = np.zeros(evidence_shape, bool)
+            naive_resq = np.zeros((*evidence_shape, len(QUANTILES)), np.float32)
         xh = np.zeros((len(request.origins), len(known_rows), nh * PATCH, N_CHANNELS), np.float32)
         for oi, origin in enumerate(request.origins):
             local = origin - item.start
@@ -902,9 +939,16 @@ class EpisodeBuilder:
                     for j, name in enumerate(NAIVE_OPTIONS[1:], start=1):
                         if name in options:
                             values, observed = options[name]
-                            seen[:, j] = observed & (np.abs(values) <= 1e6)
+                            seen[:, j] = observed & (np.abs(values) <= derived.NAIVE_LIMIT)
                             paths[:, j] = np.where(seen[:, j], values, 0)
                     seen[:, 0] = seen[:, 1:].any(axis=-1)
+                    if backtest_history is not None:
+                        row = rows[ri]
+                        naive_error[oi, fi], naive_error_seen[oi, fi], naive_resq[oi, fi] = (
+                            backtest_history.backtest(
+                                row.raw, row.scale, origin=local, horizon=request.horizon
+                            )
+                        )
             for ki, ri in enumerate(known_rows):
                 row = rows[ri]
                 frozen_values = None
@@ -995,4 +1039,7 @@ class EpisodeBuilder:
             row_keys=tuple(row.candidate_key for row in rows),
             naive_paths=naive_paths,
             naive_seen=naive_seen,
+            naive_error=naive_error,
+            naive_error_seen=naive_error_seen,
+            naive_resq=naive_resq,
         )

@@ -1798,3 +1798,12 @@ def test_builder_rejects_unknown_derive_names_with_naive_anchor():
     assert builder.build(request).naive_seen[..., :5, 1].all()
     with pytest.raises(ValueError, match="unknown derive switch"):
         builder.plan_requests(0, (32,), 5, context=32, derive=frozenset({"naive_anchors"}))
+
+
+def test_naive_evidence_requires_naive_anchor():
+    builder = EpisodeBuilder(_naive_panel())
+    derive = frozenset({"naive_evidence"})
+    with pytest.raises(ValueError, match="naive_evidence requires naive_anchor"):
+        builder.build(EpisodeRequest(0, (103,), 5, context=32, derive=derive))
+    with pytest.raises(ValueError, match="naive_evidence requires naive_anchor"):
+        builder.plan_requests(0, (103,), 5, context=32, derive=derive)

@@ -183,6 +183,16 @@ missing labels. They use no feature slots and can be enabled independently
 of `naive_rows`. Scoring plans one request per target for multi-target items
 when `naive_anchor` is enabled.
 
+Add `naive_evidence` to `sampler.derive` alongside `naive_anchor` to backtest
+the paths on up to four non-overlapping windows of one forecast horizon each,
+ending at the origin. Each window uses only the history before its own start,
+including its own history median for the none path. A window must be inside
+the item and contain at least half a horizon of observed outcomes. Per horizon
+patch and path, the episode pools valid pairs across the windows. It stores
+the mean absolute error and nine signed residual quantiles in the episode's
+scaled units if the pair count is at least half the patch length and the mean
+absolute error is at most `1e6`.
+
 **Calibrated score for static categories.** Set `sampler.screen_fair_spread` to
 `true` to score a static category attribute against 32 seeded permutations of
 its labels. The default score is the share of spread between label groups, which
@@ -219,6 +229,17 @@ available and give most of the weight to last and level when the season
 is one. Cells without available paths use the existing quantile head.
 The option adds 198 parameters at the default `d_out` of 32. It defaults
 to false and is recorded in saved configurations when enabled.
+
+**Optional mix evidence.** Set `model.mix_evidence: true` with `model.naive_mix`
+and the default nine quantiles to use the backtests. On cells with evidence,
+relative errors supply a logit prior whose range is bounded at six. Available
+paths with no backtest error receive the floor. The forecast adds the weighted
+signed residual quantiles to the anchor, using detached weights normalized
+over the measured paths, plus the head scaled by the absolute value of
+`head_gain`, which starts at 0.001. Cells without evidence use the ordinary
+naive mix. The option adds nine parameters, defaults to false, and is recorded
+when enabled. The evidence bias, prior and fan scales, and head gain are exempt
+from weight decay.
 
 ### Export as a resumable job
 
@@ -297,6 +318,15 @@ the decoder inputs. `anchor_only` replaces the forecast's median with the
 anchor. `mix_mean` gives the mean weights over kept cells that have a label and
 `mix_no_seen_share` gives the fraction of those cells with no available
 path. The gate uses the main forecast.
+
+With `model.mix_evidence` enabled, `evidence_share` gives the fraction of kept
+cells with a label and at least one available path with a measured error.
+`fan_off` clears the residual quantiles, and `evidence_off` clears the
+backtest mask to restore the ordinary mix and head. `head_off` sets the head
+gain to zero for the ablation, removing the head contribution on cells with
+evidence. The top-level `evidence_parameters` entry records the effective
+`beta`, `gamma`, and `head_gain` scales and the six `evidence_bias` values
+in naive-option order.
 
 The five shape families require MASE at most seasonal naive's and
 correlation of at least 0.5. Noise allows MASE up to 1.05 times the history

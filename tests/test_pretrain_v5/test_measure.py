@@ -857,16 +857,18 @@ def test_qualify_keys_are_unchanged(tmp_path, monkeypatch, platform, cores, expe
     assert measured["inference"]["worker_reason"] is None
 
 
+@pytest.mark.parametrize("with_evidence", [False, True])
 @pytest.mark.parametrize("limit_error", [None, "injected RLIMIT_NOFILE failure"])
 def test_qualify_inference_workers_reach_forecast_items(
-    tmp_path, recorded_qualification, monkeypatch, limit_error
+    tmp_path, recorded_qualification, monkeypatch, limit_error, with_evidence
 ):
     measure, _ = recorded_qualification
     sampler = importlib.import_module("demand_forecast.pretrain.v5.sampler")
     batch_forecast = importlib.import_module("demand_forecast.models.v5.batch_forecast")
     checked, used = [], []
 
-    def ensure_limit(workers):
+    def ensure_limit(workers, **kwargs):
+        assert kwargs == ({"naive_anchor": True, "naive_evidence": True} if with_evidence else {})
         checked.append(workers)
         if limit_error:
             raise RuntimeError(limit_error)
@@ -879,6 +881,8 @@ def test_qualify_inference_workers_reach_forecast_items(
     monkeypatch.setattr(sampler, "_ensure_worker_file_limit", ensure_limit)
     monkeypatch.setattr(measure, "forecast_items", forecast_items)
     c = config()
+    if with_evidence:
+        c = replace(c, sampler=replace(c.sampler, derive=("naive_anchor", "naive_evidence")))
     report = measure.qualify(
         c,
         tmp_path,

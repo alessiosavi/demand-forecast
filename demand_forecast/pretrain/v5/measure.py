@@ -755,12 +755,15 @@ def qualify(
             if not no_inference:
                 inference = measured["inference"] = {}
                 with _record_part(inference):
-                    # Without an anchor the call is the one made before the option existed.
-                    chosen, reason = (
-                        usable_workers(inference_workers, naive_anchor=True)
-                        if "naive_anchor" in model_config.sampler.derive
-                        else usable_workers(inference_workers)
-                    )
+                    derive = model_config.sampler.derive
+                    if "naive_evidence" in derive:
+                        chosen, reason = usable_workers(
+                            inference_workers, naive_anchor=True, naive_evidence=True
+                        )
+                    elif "naive_anchor" in derive:
+                        chosen, reason = usable_workers(inference_workers, naive_anchor=True)
+                    else:
+                        chosen, reason = usable_workers(inference_workers)
                     inference.update(workers=chosen, worker_reason=reason)
                     inference.update(
                         _inference_measure(model_config, device, panel_items, panel_length, chosen)

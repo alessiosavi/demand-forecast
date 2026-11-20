@@ -15,7 +15,12 @@ import torch
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
 from demand_forecast.data.episode import EpisodeBuilder, EpisodeRequest, Panel, apply_summary_off
-from demand_forecast.data.episode.collate import EpisodeBatch, EpisodeBatchWithNaive, collate
+from demand_forecast.data.episode.collate import (
+    EpisodeBatch,
+    EpisodeBatchWithNaive,
+    EpisodeBatchWithNaiveEvidence,
+    collate,
+)
 from demand_forecast.data.episode.schema import PATCH
 from demand_forecast.data.episode.screening import ScreeningConfig
 from demand_forecast.synthetic.typed import necessary_items
@@ -434,14 +439,20 @@ class _Batches(IterableDataset):
             index += stride
 
 
-def _ensure_worker_file_limit(workers: int, *, naive_anchor: bool = False) -> None:
+def _ensure_worker_file_limit(
+    workers: int, *, naive_anchor: bool = False, naive_evidence: bool = False
+) -> None:
     try:
         import resource
     except ImportError:
         return
 
     # Allow two prefetched batches and two more in flight per worker.
-    batch_type = EpisodeBatchWithNaive if naive_anchor else EpisodeBatch
+    batch_type = EpisodeBatch
+    if naive_evidence:
+        batch_type = EpisodeBatchWithNaiveEvidence
+    elif naive_anchor:
+        batch_type = EpisodeBatchWithNaive
     needed = 256 + workers * 4 * len(fields(batch_type))
     preferred = 1_048_576
     # The limit is process-wide. Serialize reads and raises across loader calls.
@@ -481,9 +492,11 @@ def loader(
 ) -> Iterator[tuple[int, EpisodeBatch, dict]]:
     """Each process lazily owns its sources; ordered workers partition indices."""
     if config.workers > 0:
-        _ensure_worker_file_limit(
-            config.workers, naive_anchor="naive_anchor" in config.sampler.derive
-        )
+        derive = config.sampler.derive
+        if "naive_evidence" in derive:
+            _ensure_worker_file_limit(config.workers, naive_anchor=True, naive_evidence=True)
+        else:
+            _ensure_worker_file_limit(config.workers, naive_anchor="naive_anchor" in derive)
     generator = torch.Generator().manual_seed(config.seed)
     return iter(
         DataLoader(

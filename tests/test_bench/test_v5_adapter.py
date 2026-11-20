@@ -53,6 +53,7 @@ def _export(
     fair_spread=False,
     sampler_options=None,
     naive_mix=False,
+    mix_evidence=False,
 ):
     config = V5TrainConfig(
         V5Config(
@@ -67,6 +68,7 @@ def _export(
             d_step=4,
             d_out=4,
             **({"naive_mix": True} if naive_mix else {}),
+            **({"mix_evidence": True} if mix_evidence else {}),
         ),
         (),
         SamplerConfig(
@@ -195,13 +197,16 @@ def test_predict_shapes_order_and_units(make_adapter):
 
 
 @pytest.mark.parametrize("workers,reason", [(0, "injected"), (16, None)])
-def test_predict_uses_preflight_worker_count(make_adapter, monkeypatch, workers, reason):
+@pytest.mark.parametrize("with_evidence", [False, True])
+def test_predict_uses_preflight_worker_count(
+    make_adapter, monkeypatch, workers, reason, with_evidence, tmp_path
+):
     from demand_forecast.bench.yardsticks import v5_adapter
 
     requested_counts, forecast_counts = [], []
 
-    def preflight(requested, *, naive_anchor=False):
-        assert not naive_anchor
+    def preflight(requested, **kwargs):
+        assert kwargs == ({"naive_anchor": True, "naive_evidence": True} if with_evidence else {})
         requested_counts.append(requested)
         return workers, reason
 
@@ -213,7 +218,15 @@ def test_predict_uses_preflight_worker_count(make_adapter, monkeypatch, workers,
     monkeypatch.setattr(v5_adapter, "_worker_count", lambda device: 16)
     monkeypatch.setattr(v5_adapter, "usable_workers", preflight)
     monkeypatch.setattr(v5_adapter, "forecast_items", record_forecast)
-    adapter = make_adapter()
+    options = {}
+    if with_evidence:
+        options["checkpoint"] = _export(
+            tmp_path,
+            sampler_options={"derive": ("naive_anchor", "naive_evidence")},
+            naive_mix=True,
+            mix_evidence=True,
+        )
+    adapter = make_adapter(**options)
     [[actual]] = adapter.predict([_window()], HORIZON, [0.5])
 
     assert actual.shape == (1, HORIZON, 1)
