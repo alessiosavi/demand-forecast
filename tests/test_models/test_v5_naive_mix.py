@@ -359,3 +359,22 @@ def test_file_descriptor_budget_accounts_for_two_extra_tensors(monkeypatch):
     workers, reason = usable_workers(1, naive_anchor=True)
     assert workers == 0
     assert reason is not None and f"below the {base_budget + 8} file descriptors" in reason
+
+
+def test_evidence_file_limit_matches_forecast_preflight(monkeypatch):
+    import resource
+
+    from demand_forecast.data.episode.collate import EpisodeBatchWithNaive
+    from demand_forecast.models.v5 import batch_forecast
+
+    anchor_limit = 256 + 4 * len(fields(EpisodeBatchWithNaive))
+    monkeypatch.setattr(resource, "getrlimit", lambda key: (anchor_limit, anchor_limit))
+    monkeypatch.setattr(batch_forecast.sys, "platform", "linux")
+    derive = ANCHOR | {"naive_evidence"}
+    assert usable_workers(1, naive_anchor=True) == (1, None)
+    chosen, reason = usable_workers(1, naive_anchor=True, naive_evidence=True)
+    assert chosen == 0
+    assert f"below the {anchor_limit + 12} file descriptors" in reason
+    with pytest.raises(RuntimeError) as failure:
+        forecast_items(model(), panel(), [(0, 205)], 19, context=48, workers=1, derive=derive)
+    assert str(failure.value) == reason

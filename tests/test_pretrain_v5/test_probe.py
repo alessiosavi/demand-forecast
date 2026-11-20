@@ -512,3 +512,35 @@ def test_probe_mix_excludes_a_missing_horizon_label(probe):
         dict(none=0, last=1, level=0, season=0, season2=0, drift=0)
     )
     assert report["mix_no_seen_share"] == pytest.approx(0)
+
+
+def test_probe_evidence_reports_the_ablations_and_gates_full_figures(probe, monkeypatch):
+    panel = probe.probe_panels()["seasonal_d"]
+    panel = replace(panel, items=panel.items[:2])
+    monkeypatch.setattr(probe, "probe_panels", lambda: {panel.name: panel})
+    settings = probe.ProbeSettings(derive=frozenset({"naive_anchor", "naive_evidence"}))
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(23)
+        model = V5Model(replace(config().model, naive_mix=True, mix_evidence=True)).eval()
+    report = probe.run_probe(model, settings)
+    figures = report["families"][panel.name]
+    assert figures["evidence_share"] == 1
+    assert sum(figures["mix_mean"].values()) == pytest.approx(1)
+    hooks = {
+        "fan_off": probe.fan_off,
+        "evidence_off": probe.evidence_off,
+        "anchor_off": probe.anchor_off,
+    }
+    for name, hook in hooks.items():
+        expected = probe._score_model(model, panel, settings, batch_hook=hook)
+        assert figures[name] == expected
+        assert figures["mase"] != pytest.approx(expected["mase"])
+    assert figures["anchor_only"]["mase"] == pytest.approx(figures["fan_off"]["mase"], abs=0.001)
+    gate = probe.gate(report)["families"][panel.name]
+    assert gate["criterion"] == probe._failure(panel.name, figures, report["levels"])
+    assert (
+        probe.gate({**report, "families": {panel.name: figures["fan_off"]}})["families"][
+            panel.name
+        ]["criterion"]
+        == "coverage"
+    )

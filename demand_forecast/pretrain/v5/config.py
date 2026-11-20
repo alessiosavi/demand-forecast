@@ -219,6 +219,8 @@ class SamplerConfig:
         derive = tuple(self.derive)
         if any(name not in DERIVABLE for name in derive):
             raise ValueError("derive requires known names")
+        if "naive_evidence" in derive and "naive_anchor" not in derive:
+            raise ValueError("naive_evidence requires naive_anchor")
         object.__setattr__(self, "derive", tuple(sorted(set(derive))))
 
 
@@ -349,6 +351,8 @@ class V5TrainConfig:
             del data["model"]["horizon_seed"]
         if not self.model.naive_mix:
             del data["model"]["naive_mix"]
+        if not self.model.mix_evidence:
+            del data["model"]["mix_evidence"]
         if not self.sampler.derive:
             del data["sampler"]["derive"]
         if not self.sampler.screen_fair_spread:

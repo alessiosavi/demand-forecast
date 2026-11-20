@@ -1030,3 +1030,22 @@ def test_naive_anchor_and_mix_round_trip_independently(tmp_path):
         actual = enabled.canonical()
         assert actual["sampler"].get("derive", []) == (["naive_anchor"] if use_anchor else [])
         assert actual["model"].get("naive_mix") is (True if use_mix else None)
+
+
+def test_naive_evidence_requires_anchor_and_model_default_is_omitted(tmp_path):
+    with pytest.raises(ValueError, match="naive_evidence requires naive_anchor"):
+        config_module().SamplerConfig(derive=("naive_evidence",))
+    original = training_config()
+    path = tmp_path / "train.yaml"
+    original.to_yaml(path)
+    assert "mix_evidence" not in original.canonical()["model"]
+    assert "mix_evidence" not in yaml.safe_load(path.read_text())["model"]
+    enabled = replace(
+        original,
+        sampler=replace(original.sampler, derive=("naive_anchor", "naive_evidence")),
+        model=replace(original.model, naive_mix=True, mix_evidence=True),
+    )
+    enabled.to_yaml(path)
+    assert enabled.canonical()["model"]["mix_evidence"] is True
+    assert yaml.safe_load(path.read_text())["model"]["mix_evidence"] is True
+    assert config_module().V5TrainConfig.from_yaml(path) == enabled

@@ -33,6 +33,7 @@ class V5Config:
     expert_mode: str = "routed"
     horizon_seed: bool = False
     naive_mix: bool = False
+    mix_evidence: bool = False
 
     def __post_init__(self) -> None:
         """Reject invalid dimensions and regularisation before constructing layers."""
@@ -86,9 +87,13 @@ class V5Config:
             raise ValueError("expert_mode must be 'routed' or 'dense'")
         if self.expert_mode == "dense" and self.expert_enc_layers == self.expert_dec_layers == 0:
             raise ValueError("dense expert mode requires at least one expert block")
-        for name in ("horizon_seed", "naive_mix"):
+        for name in ("horizon_seed", "naive_mix", "mix_evidence"):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"{name} must be a boolean")
+        if self.mix_evidence and not self.naive_mix:
+            raise ValueError("mix_evidence requires naive_mix")
+        if self.mix_evidence and self.quantiles != QUANTILES:
+            raise ValueError("mix_evidence requires the schema's nine quantiles")
         for name in ("dropout", "known_gate_floor"):
             if not 0 <= getattr(self, name) < 1:
                 raise ValueError(f"{name} must be in [0, 1)")

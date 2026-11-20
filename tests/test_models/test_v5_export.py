@@ -151,6 +151,7 @@ def test_round_trip_of_the_whole_state_dict(tmp_path, monkeypatch, export_api, w
     assert stored.pop("expert_mode") == "routed"
     assert stored.pop("horizon_seed") is False
     assert stored.pop("naive_mix") is False
+    assert stored.pop("mix_evidence") is False
     assert metadata["model"] == stored
     assert metadata["training"] == config.canonical()
     assert metadata["source"] == {
@@ -734,6 +735,7 @@ def test_selftest_omits_the_default_mix_option(tmp_path, export_api, monkeypatch
 
     def capture(directory, payload, **kwargs):
         assert "naive_mix" not in payload["config"]["model"]
+        assert "mix_evidence" not in payload["config"]["model"]
         assert "label_cap" in payload["config"]["optim"]
         return original(directory, payload, **kwargs)
 
@@ -742,4 +744,25 @@ def test_selftest_omits_the_default_mix_option(tmp_path, export_api, monkeypatch
     export_api._selftest(out)
     loaded, metadata = export_api.load_export(out)
     assert loaded.config.naive_mix is False
-    assert "naive_mix" not in metadata["model"]
+    assert loaded.config.mix_evidence is False
+    assert {"naive_mix", "mix_evidence"}.isdisjoint(metadata["model"])
+
+
+def test_mix_evidence_export_round_trips_and_passes_parity(tmp_path, export_api):
+    checkpoint = _checkpoint(
+        tmp_path,
+        model=replace(TINY, naive_mix=True, mix_evidence=True),
+        sampler_options={"derive": ("naive_anchor", "naive_evidence")},
+    )
+    out = tmp_path / "evidence-export"
+    export_api.write_export(checkpoint, out)
+    model, metadata = export_api.load_export(out)
+    assert model.config.mix_evidence
+    assert (
+        metadata["model"]["mix_evidence"] is metadata["training"]["model"]["mix_evidence"] is True
+    )
+    archive = _read_archive(out / "parity.npz")
+    assert archive["case_9/batch/naive_error"].dtype == np.float32
+    assert archive["case_9/batch/naive_error_seen"].any()
+    assert archive["case_9/batch/naive_resq"].shape == (1, 1, 1, 3, 6, 9)
+    export_api.require_parity(out)
