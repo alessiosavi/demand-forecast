@@ -15,7 +15,7 @@ import torch
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
 from demand_forecast.data.episode import EpisodeBuilder, EpisodeRequest, Panel, apply_summary_off
-from demand_forecast.data.episode.collate import EpisodeBatch, collate
+from demand_forecast.data.episode.collate import EpisodeBatch, EpisodeBatchWithNaive, collate
 from demand_forecast.data.episode.schema import PATCH
 from demand_forecast.data.episode.screening import ScreeningConfig
 from demand_forecast.synthetic.typed import necessary_items
@@ -434,14 +434,15 @@ class _Batches(IterableDataset):
             index += stride
 
 
-def _ensure_worker_file_limit(workers: int) -> None:
+def _ensure_worker_file_limit(workers: int, *, naive_anchor: bool = False) -> None:
     try:
         import resource
     except ImportError:
         return
 
     # Allow two prefetched batches and two more in flight per worker.
-    needed = 256 + workers * 4 * len(fields(EpisodeBatch))
+    batch_type = EpisodeBatchWithNaive if naive_anchor else EpisodeBatch
+    needed = 256 + workers * 4 * len(fields(batch_type))
     preferred = 1_048_576
     # The limit is process-wide. Serialize reads and raises across loader calls.
     with _FILE_LIMIT_LOCK:
@@ -480,7 +481,9 @@ def loader(
 ) -> Iterator[tuple[int, EpisodeBatch, dict]]:
     """Each process lazily owns its sources; ordered workers partition indices."""
     if config.workers > 0:
-        _ensure_worker_file_limit(config.workers)
+        _ensure_worker_file_limit(
+            config.workers, naive_anchor="naive_anchor" in config.sampler.derive
+        )
     generator = torch.Generator().manual_seed(config.seed)
     return iter(
         DataLoader(

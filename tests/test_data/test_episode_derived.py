@@ -380,3 +380,14 @@ def test_gap_before_the_origin(gap, origin, expected):
     )["last"]
     np.testing.assert_array_equal(observed, np.full(3, expected is not None))
     np.testing.assert_allclose(values, np.full(3, expected or 0))
+
+
+def test_naive_level_uses_finite_values_in_the_item_local_window():
+    from demand_forecast.data.episode.derived import NaiveHistory
+
+    values = np.array([1, 3, np.nan, 5, np.inf, 7, 9, np.nan, 1000], dtype=float)
+    history = NaiveHistory(values, season=3, long_lag=None, end=12)
+    assert "level" not in history.series(left=8, right=12, origin=8)
+    assert history.level(8) == pytest.approx(5)
+    assert np.isnan(history.level(6))
+    assert np.isnan(history.level(12))

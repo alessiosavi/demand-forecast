@@ -570,6 +570,17 @@ def test_more_than_sixteen_targets_always_split(model):
     assert len(actual.values) == MAX_FORECAST_ROWS + 1
     _assert_forecasts(actual.values, expected, scales)
 
+    with pytest.raises(ValueError, match="item index 0 at origin 40 must be forecast per target"):
+        v5.forecast_items(
+            model,
+            panel,
+            jobs,
+            1,
+            context=CONTEXT,
+            layouts=["joint"],
+            derive=frozenset({"naive_anchor"}),
+        )
+
 
 def test_drop_and_summary_off_change_the_named_inputs_only(model, monkeypatch):
     panel = _panel()

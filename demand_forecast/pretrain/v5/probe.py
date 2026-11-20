@@ -1,6 +1,6 @@
 """Absolute v5 forecasts on fixed generated series, with classical controls."""
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from math import isfinite
 
@@ -8,9 +8,10 @@ import numpy as np
 import pandas as pd
 
 from demand_forecast.data.episode import EpisodeBatch, Item, Panel, ScreeningConfig
-from demand_forecast.data.episode.collate import EpisodeBatchWithRowKeys
+from demand_forecast.data.episode.collate import EpisodeBatchWithNaive, EpisodeBatchWithRowKeys
 from demand_forecast.data.episode.derived import naive_series
-from demand_forecast.models.v5 import V5Model, forecast_items
+from demand_forecast.data.episode.schema import NAIVE_OPTIONS
+from demand_forecast.models.v5 import V5Model, V5Output, forecast_items
 from demand_forecast.models.v5.export import _screening
 
 _ORIGIN = 2208
@@ -221,9 +222,37 @@ def zero_naive_rows(batch: EpisodeBatch) -> EpisodeBatch:
     return replace(batch, xh=xh)
 
 
+def anchor_off(batch: EpisodeBatch) -> EpisodeBatch:
+    """Clear path availability while preserving the decoder's inputs."""
+    if isinstance(batch, EpisodeBatchWithNaive):
+        return replace(batch, naive_seen=batch.naive_seen.new_zeros(batch.naive_seen.shape))
+    return batch
+
+
 def _score_model(
-    model: V5Model, panel: Panel, settings: ProbeSettings, *, zero: bool = False
+    model: V5Model,
+    panel: Panel,
+    settings: ProbeSettings,
+    *,
+    batch_hook: Callable[[EpisodeBatch], EpisodeBatch] | None = None,
+    observe_mix: bool = False,
 ) -> dict:
+    anchors, weights, label_masks = [], [], []
+
+    def observe(batch: EpisodeBatch, output: V5Output) -> None:
+        # Probe jobs have one origin and one kept target per item, in item order.
+        keep = batch.keep & batch.forecast_mask & batch.origin_mask[:, :1]
+        label_masks.append(batch.label_mask[:, 0][keep][:, :_HORIZON].cpu().numpy())
+        loc = batch.loc[keep][:, None]
+        if output.anchor is None:
+            anchors.append(loc.expand(-1, _HORIZON).cpu().numpy())
+            weights.append(np.zeros((len(loc), _HORIZON, len(NAIVE_OPTIONS))))
+            return
+        anchor = loc + batch.scale[keep][:, None] * output.anchor[:, 0][keep][:, :_HORIZON]
+        anchor = anchor.where(~batch.fallback[keep][:, None], loc)
+        anchors.append(anchor.cpu().numpy())
+        weights.append(output.mix[:, 0][keep][:, :_HORIZON].cpu().numpy())
+
     jobs = [(i, _ORIGIN) for i in range(len(panel.items))]
     forecasts = forecast_items(
         model,
@@ -234,10 +263,25 @@ def _score_model(
         screening=settings.screening,
         derive=settings.derive,
         batch_episodes=_BATCH_EPISODES,
-        batch_hook=zero_naive_rows if zero else None,
+        batch_hook=batch_hook,
+        output_hook=observe if observe_mix else None,
     )
     quantiles = np.stack([forecasts.values[i, "y"] for i, _ in jobs])
-    return score_panel(panel, quantiles, model.config.quantiles)
+    levels = model.config.quantiles
+    figures = score_panel(panel, quantiles, levels)
+    if observe_mix:
+        quantiles[..., levels.index(0.5)] = np.concatenate(anchors)
+        figures["anchor_only"] = score_panel(panel, quantiles, levels)
+        mix = np.concatenate(weights)[np.concatenate(label_masks)]
+        if len(mix):
+            mean_weights = mix.mean(axis=0, dtype=np.float64).tolist()
+            no_seen_share = float((~mix.any(axis=-1)).mean())
+        else:
+            mean_weights = [None] * len(NAIVE_OPTIONS)
+            no_seen_share = None
+        figures["mix_mean"] = dict(zip(NAIVE_OPTIONS, mean_weights, strict=True))
+        figures["mix_no_seen_share"] = no_seen_share
+    return figures
 
 
 def run_probe(model: V5Model, settings: ProbeSettings, *, device: str = "cpu") -> dict:
@@ -247,9 +291,13 @@ def run_probe(model: V5Model, settings: ProbeSettings, *, device: str = "cpu") -
     try:
         model.to(device)
         for name, panel in probe_panels().items():
-            figures = _score_model(model, panel, settings)
+            figures = _score_model(model, panel, settings, observe_mix=model.config.naive_mix)
             if "naive_rows" in settings.derive:
-                figures["zeroed_naive_rows"] = _score_model(model, panel, settings, zero=True)
+                figures["zeroed_naive_rows"] = _score_model(
+                    model, panel, settings, batch_hook=zero_naive_rows
+                )
+            if model.config.naive_mix:
+                figures["anchor_off"] = _score_model(model, panel, settings, batch_hook=anchor_off)
             families[name] = figures
     finally:
         model.to(original_device)

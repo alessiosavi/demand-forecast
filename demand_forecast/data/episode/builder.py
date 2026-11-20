@@ -31,6 +31,7 @@ from .schema import (
     N_PHASES,
     N_SUMMARY,
     N_VALUE_TOKEN,
+    NAIVE_OPTIONS,
     PATCH,
     ROLE_FORECAST,
     ROLE_KNOWN,
@@ -59,7 +60,7 @@ DROPPABLE = (
     "value_stats",
     "value_effects",
 )
-DERIVABLE = ("increment_spread", "lag_rows", "naive_rows", "onset_rows")
+DERIVABLE = ("increment_spread", "lag_rows", "naive_anchor", "naive_rows", "onset_rows")
 
 
 @dataclass(frozen=True)
@@ -128,6 +129,8 @@ class Episode:
     context_target: str | None
     trace: tuple[Candidate, ...] = ()
     row_keys: tuple[tuple[str, str] | None, ...] = ()
+    naive_paths: np.ndarray | None = None
+    naive_seen: np.ndarray | None = None
 
 
 def apply_summary_off(episode: Episode, names: tuple[str, ...]) -> Episode:
@@ -245,6 +248,8 @@ class EpisodeBuilder:
             raise ValueError("a forecast target must exist")
         if request.target is None and len(targets) > MAX_FORECAST_ROWS:
             raise ValueError("more than 16 targets requires a designated target")
+        if request.target is None and len(targets) > 1 and "naive_anchor" in request.derive:
+            raise ValueError("naive_anchor requires forecasting per target; use plan_requests")
         return cutoff
 
     @staticmethod
@@ -287,7 +292,7 @@ class EpisodeBuilder:
         keep_columns: frozenset[str] | None = None,
         derive: frozenset[str] = frozenset(),
     ) -> list[EpisodeRequest]:
-        """Split multi-target items when typed context needs a designated column."""
+        """Split multi-target items when context or anchoring needs a designated column."""
         if not 0 <= item_index < len(self.panel.items):
             raise ValueError("item index outside the panel")
         targets = sorted(self.panel.items[item_index].targets)
@@ -306,7 +311,11 @@ class EpisodeBuilder:
             self.config,
             provider=self.stats,
         )
-        split = len(targets) > MAX_FORECAST_ROWS or self._typed(self._restricted(candidates, probe))
+        split = (
+            len(targets) > MAX_FORECAST_ROWS
+            or "naive_anchor" in derive
+            or self._typed(self._restricted(candidates, probe))
+        )
         return [
             EpisodeRequest(
                 item_index, origins, horizon, context, target, cutoff, drop, keep_columns, derive
@@ -705,7 +714,8 @@ class EpisodeBuilder:
         features.sort(key=lambda pair: (pair[0].role, -pair[0].score, pair[0].name))
         naive = None
         naive_rows, naive_trace = [], []
-        if "naive_rows" in request.derive and context_target is not None:
+        anchor = "naive_anchor" in request.derive
+        if context_target is not None and (anchor or "naive_rows" in request.derive):
             long_lag = panel.long_lag
             if (
                 long_lag is not None
@@ -715,10 +725,16 @@ class EpisodeBuilder:
             naive = derived.NaiveHistory(
                 rows[0].scaled, season=panel.season, long_lag=long_lag, end=right - item.start
             )
-            names = {*item.dynamic, *item.targets, *item.static, *(row.name for row, _ in features)}
-            naive_rows, naive_trace = self._naive_rows(
-                naive, context_target, names, end, cutoff=cutoff
-            )
+            if "naive_rows" in request.derive:
+                names = {
+                    *item.dynamic,
+                    *item.targets,
+                    *item.static,
+                    *(row.name for row, _ in features),
+                }
+                naive_rows, naive_trace = self._naive_rows(
+                    naive, context_target, names, end, cutoff=cutoff
+                )
         base_budget = MAX_FEATURE_ROWS - len(naive_rows)
         for row, key in features[:base_budget]:
             row.candidate_key = key
@@ -861,12 +877,14 @@ class EpisodeBuilder:
         known_rows = [i for i, r in enumerate(rows) if r.role == ROLE_KNOWN]
         labels = np.zeros((len(request.origins), len(forecast_rows), nh * PATCH), np.float32)
         label_mask = np.zeros(labels.shape, bool)
+        naive_paths = np.zeros((*labels.shape, len(NAIVE_OPTIONS)), np.float32) if anchor else None
+        naive_seen = np.zeros(naive_paths.shape, bool) if naive_paths is not None else None
         xh = np.zeros((len(request.origins), len(known_rows), nh * PATCH, N_CHANNELS), np.float32)
         for oi, origin in enumerate(request.origins):
             local = origin - item.start
             frozen = (
                 naive.series(left=local, right=local + request.horizon, origin=local)
-                if naive is not None and naive_rows
+                if naive is not None and (anchor or naive_rows)
                 else {}
             )
             for fi, ri in enumerate(forecast_rows):
@@ -876,6 +894,17 @@ class EpisodeBuilder:
                     valid, to_scaled(raw, rows[ri].scale), 0
                 )
                 label_mask[oi, fi, : request.horizon] = valid
+                if naive_paths is not None and rows[ri].role == ROLE_FORECAST:
+                    paths = naive_paths[oi, fi, : request.horizon]
+                    seen = naive_seen[oi, fi, : request.horizon]
+                    level = naive.level(local)
+                    options = {**frozen, "level": (level, np.isfinite(level))}
+                    for j, name in enumerate(NAIVE_OPTIONS[1:], start=1):
+                        if name in options:
+                            values, observed = options[name]
+                            seen[:, j] = observed & (np.abs(values) <= 1e6)
+                            paths[:, j] = np.where(seen[:, j], values, 0)
+                    seen[:, 0] = seen[:, 1:].any(axis=-1)
             for ki, ri in enumerate(known_rows):
                 row = rows[ri]
                 frozen_values = None
@@ -964,4 +993,6 @@ class EpisodeBuilder:
             context_target=context_target,
             trace=tuple(trace),
             row_keys=tuple(row.candidate_key for row in rows),
+            naive_paths=naive_paths,
+            naive_seen=naive_seen,
         )

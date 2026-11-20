@@ -1,7 +1,7 @@
 """In-memory v5 benchmark adapter fixtures and contracts."""
 
 import json
-from dataclasses import asdict, replace
+from dataclasses import asdict, fields, replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -15,7 +15,7 @@ pytestmark = pytest.mark.bench
 
 from demand_forecast.bench.v5_panels import time_axis, window_panels  # noqa: E402
 from demand_forecast.bench.yardsticks.runner import Options, SeriesInput, WindowInput  # noqa: E402
-from demand_forecast.data.episode import EpisodeBuilder, EpisodeRequest  # noqa: E402
+from demand_forecast.data.episode import EpisodeBatch, EpisodeBuilder, EpisodeRequest  # noqa: E402
 from demand_forecast.data.episode.scale import fit_scale  # noqa: E402
 from demand_forecast.data.episode.schema import (  # noqa: E402
     CH_STEP,
@@ -45,7 +45,14 @@ TASK = SimpleNamespace(
 
 
 def _export(
-    directory, *, drop=(), summary=(), threshold=0.0, fair_spread=False, sampler_options=None
+    directory,
+    *,
+    drop=(),
+    summary=(),
+    threshold=0.0,
+    fair_spread=False,
+    sampler_options=None,
+    naive_mix=False,
 ):
     config = V5TrainConfig(
         V5Config(
@@ -59,6 +66,7 @@ def _export(
             d_calendar=4,
             d_step=4,
             d_out=4,
+            **({"naive_mix": True} if naive_mix else {}),
         ),
         (),
         SamplerConfig(
@@ -192,7 +200,8 @@ def test_predict_uses_preflight_worker_count(make_adapter, monkeypatch, workers,
 
     requested_counts, forecast_counts = [], []
 
-    def preflight(requested):
+    def preflight(requested, *, naive_anchor=False):
+        assert not naive_anchor
         requested_counts.append(requested)
         return workers, reason
 
@@ -212,6 +221,25 @@ def test_predict_uses_preflight_worker_count(make_adapter, monkeypatch, workers,
     assert adapter.metadata()["v5_worker_reason"] == reason
     assert adapter.metadata()["v5_workers"] == workers
     assert requested_counts == [16]
+
+
+def test_anchored_export_and_forecast_agree_on_worker_fallback(tmp_path, make_adapter, monkeypatch):
+    from demand_forecast.bench.yardsticks import v5_adapter
+
+    checkpoint = _export(tmp_path, sampler_options={"derive": ("naive_anchor",)}, naive_mix=True)
+    plain_need = 256 + 4 * len(fields(EpisodeBatch))
+    monkeypatch.setattr(v5_adapter.resource, "getrlimit", lambda key: (plain_need, plain_need))
+    monkeypatch.setattr(v5_adapter.sys, "platform", "linux")
+    monkeypatch.setattr(v5_adapter, "_worker_count", lambda device: 1)
+
+    adapter = make_adapter(checkpoint=checkpoint)
+    [[actual]] = adapter.predict([_window(targets=2)], HORIZON, [0.5])
+
+    assert actual.shape == (2, HORIZON, 1)
+    assert np.isfinite(actual).all()
+    metadata = adapter.metadata()
+    assert metadata["v5_workers"] == 0
+    assert "RLIMIT_NOFILE" in metadata["v5_worker_reason"]
 
 
 def test_levels_are_indexed_or_interpolated(make_adapter):
@@ -674,3 +702,36 @@ def test_workers_use_process_affinity(platform, device, cores, expected, monkeyp
     monkeypatch.setattr(api.sys, "platform", platform)
     monkeypatch.setattr(api.os, "sched_getaffinity", lambda pid: range(cores), raising=False)
     assert api._worker_count(device) == expected
+
+
+def test_naive_anchor_scores_each_target_and_no_derived_runs_head_only(tmp_path, make_adapter):
+    checkpoint = _export(tmp_path, sampler_options={"derive": ("naive_anchor",)}, naive_mix=True)
+    full = make_adapter(checkpoint=checkpoint)
+    per_target = make_adapter(checkpoint=checkpoint, variant="per_target")
+    no_derived = make_adapter(checkpoint=checkpoint, variant="no_derived")
+    window = _window(targets=2)
+    levels = list(full.model.config.quantiles)
+    for adapter in (full, per_target, no_derived):
+        with torch.no_grad():
+            adapter.model.step_projection.weight.zero_()
+            adapter.model.step_projection.bias.zero_()
+            adapter.model.head.projection.bias.zero_()
+            adapter.model.mix_projection.bias.fill_(-50)
+            adapter.model.mix_projection.bias[3] = 50
+    (anchored,) = full.predict([window], HORIZON, levels)
+    (split,) = per_target.predict([window], HORIZON, levels)
+    (head,) = no_derived.predict([window], HORIZON, levels)
+    np.testing.assert_allclose(anchored, split, **TOL)
+    (part,) = _panels(window).parts
+    y = window.items[0].target
+    season = part.panel.season
+    np.testing.assert_allclose(
+        anchored[0][..., levels.index(0.5)], y[:, -season:][:, :HORIZON], **TOL
+    )
+    np.testing.assert_allclose(
+        head[0][..., levels.index(0.5)],
+        np.median(y, axis=1)[:, None] + np.zeros((2, HORIZON)),
+        **TOL,
+    )
+    assert full.evidence()[0].requests == per_target.evidence()[0].requests
+    assert full.evidence()[0].requests == no_derived.evidence()[0].requests
