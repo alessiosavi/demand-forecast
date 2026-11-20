@@ -34,6 +34,8 @@ class V5Config:
     horizon_seed: bool = False
     naive_mix: bool = False
     mix_evidence: bool = False
+    fan_mode: str = "head"
+    mix_bound: float | None = None
 
     def __post_init__(self) -> None:
         """Reject invalid dimensions and regularisation before constructing layers."""
@@ -94,6 +96,17 @@ class V5Config:
             raise ValueError("mix_evidence requires naive_mix")
         if self.mix_evidence and self.quantiles != QUANTILES:
             raise ValueError("mix_evidence requires the schema's nine quantiles")
+        if not isinstance(self.fan_mode, str) or self.fan_mode not in ("head", "residual"):
+            raise ValueError("fan_mode must be 'head' or 'residual'")
+        if self.fan_mode == "residual" and not self.mix_evidence:
+            raise ValueError("fan_mode='residual' requires mix_evidence")
+        if self.mix_bound is not None:
+            bound = numeric(self.mix_bound, "mix_bound", float)
+            if not 0.1 <= bound <= 10:
+                raise ValueError("mix_bound must be in [0.1, 10]")
+            if not self.mix_evidence:
+                raise ValueError("mix_bound requires mix_evidence")
+            object.__setattr__(self, "mix_bound", bound)
         for name in ("dropout", "known_gate_floor"):
             if not 0 <= getattr(self, name) < 1:
                 raise ValueError(f"{name} must be in [0, 1)")

@@ -241,6 +241,23 @@ naive mix. The option adds nine parameters, defaults to false, and is recorded
 when enabled. The evidence bias, prior and fan scales, and head gain are exempt
 from weight decay.
 
+Two model settings can be enabled independently with mix evidence.
+
+- `fan_mode: residual` weights each measured path's residual median with
+  its ordinary mix weight. The spread around that median uses detached
+  weights normalized over the measured paths. The residual spread has unit
+  scale, and the head contributes its scaled median plus a detached
+  0.001 share of its spread to break ties. The default is `head`.
+- `mix_bound` accepts a number from 0.1 to 10. The model centres its network
+  logits over the measured paths and applies a scaled tanh before adding
+  the prior. Unmeasured paths keep the prior floor. The prior scale `beta`
+  is frozen when the bound is enabled. The default is unset.
+
+Both defaults are omitted from saved configurations. Cells without evidence
+continue to use the ordinary naive mix and head. For checkpoint selection in
+the evidence-guard pilot, keep the untrained start if a trained checkpoint
+loses any probe family its own start passed.
+
 ### Export as a resumable job
 
 Generate a job from a checkpoint's storage URI and SHA-256:
@@ -321,12 +338,18 @@ path. The gate uses the main forecast.
 
 With `model.mix_evidence` enabled, `evidence_share` gives the fraction of kept
 cells with a label and at least one available path with a measured error.
-`fan_off` clears the residual quantiles, and `evidence_off` clears the
-backtest mask to restore the ordinary mix and head. `head_off` sets the head
-gain to zero for the ablation, removing the head contribution on cells with
-evidence. The top-level `evidence_parameters` entry records the effective
-`beta`, `gamma`, and `head_gain` scales and the six `evidence_bias` values
-in naive-option order.
+`fan_off` clears the residual centre and spread, and `evidence_off` clears
+the backtest mask to restore the ordinary mix and head. `head_off` sets the
+head gain to zero. In residual mode this removes the head median and retains
+the tiny head spread. Residual mode also reports `spread_off`, which repeats
+each residual median across its knots, and `centre_off`, which subtracts
+that median from every knot. With a bound, `bound_saturation` gives the
+fraction of scored evidence cells where a measured path's centred logit
+exceeds 95% of the bound in magnitude before tanh. It is null if there are
+no scored evidence cells. The top-level `evidence_parameters` entry records
+the `beta`, `gamma`, and `head_gain` scales and the six `evidence_bias`
+values in naive-option order. Residual mode retains `gamma` for checkpoint
+compatibility and uses unit scale for the residual spread.
 
 The five shape families require MASE at most seasonal naive's and
 correlation of at least 0.5. Noise allows MASE up to 1.05 times the history

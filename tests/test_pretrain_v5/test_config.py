@@ -1049,3 +1049,32 @@ def test_naive_evidence_requires_anchor_and_model_default_is_omitted(tmp_path):
     assert enabled.canonical()["model"]["mix_evidence"] is True
     assert yaml.safe_load(path.read_text())["model"]["mix_evidence"] is True
     assert config_module().V5TrainConfig.from_yaml(path) == enabled
+
+
+@pytest.mark.parametrize(
+    "options",
+    [{}, {"fan_mode": "residual"}, {"mix_bound": 2}, {"fan_mode": "residual", "mix_bound": 0.1}],
+)
+def test_evidence_guard_yaml_records_only_enabled_options(tmp_path, options):
+    original = training_config()
+    enabled = replace(
+        original,
+        sampler=replace(original.sampler, derive=("naive_anchor", "naive_evidence")),
+        model=replace(original.model, naive_mix=True, mix_evidence=True, **options),
+    )
+    path = tmp_path / "train.yaml"
+    enabled.to_yaml(path)
+    for saved in (enabled.canonical(), yaml.safe_load(path.read_text())):
+        fields = saved["model"]
+        assert fields.keys() & {"fan_mode", "mix_bound"} == options.keys()
+        if "fan_mode" in options:
+            assert fields["fan_mode"] == options["fan_mode"]
+        if "mix_bound" in options:
+            assert type(fields["mix_bound"]) is float
+            assert fields["mix_bound"] == pytest.approx(options["mix_bound"])
+    loaded = type(original).from_yaml(path)
+    assert loaded.model.fan_mode == options.get("fan_mode", "head")
+    if "mix_bound" in options:
+        assert loaded.model.mix_bound == pytest.approx(options["mix_bound"])
+    else:
+        assert loaded.model.mix_bound is None

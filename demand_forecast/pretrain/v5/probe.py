@@ -16,7 +16,7 @@ from demand_forecast.data.episode.collate import (
     EpisodeBatchWithRowKeys,
 )
 from demand_forecast.data.episode.derived import naive_series
-from demand_forecast.data.episode.schema import NAIVE_OPTIONS
+from demand_forecast.data.episode.schema import NAIVE_OPTIONS, QUANTILES
 from demand_forecast.models.v5 import V5Model, V5Output, forecast_items
 from demand_forecast.models.v5.export import _screening
 
@@ -29,6 +29,7 @@ _BATCH_EPISODES = 16
 _SHAPE = ("seasonal_h", "seasonal_h2", "seasonal_d", "trend", "seasonal_trend")
 _FAMILIES = (*_SHAPE, "noise", "intermittent", "level_shift")
 _NAIVE_SUFFIXES = ("~last", "~season", "~season2", "~drift")
+_MEDIAN = QUANTILES.index(0.5)
 
 
 @dataclass(frozen=True)
@@ -236,9 +237,25 @@ def anchor_off(batch: EpisodeBatch) -> EpisodeBatch:
 
 
 def fan_off(batch: EpisodeBatch) -> EpisodeBatch:
-    """Zero residual quantiles while retaining the mix prior and head gain."""
+    """Remove the residual centre and spread, retaining the mix prior and head gain."""
     if isinstance(batch, EpisodeBatchWithNaiveEvidence):
         return replace(batch, naive_resq=batch.naive_resq.new_zeros(batch.naive_resq.shape))
+    return batch
+
+
+def spread_off(batch: EpisodeBatch) -> EpisodeBatch:
+    """Repeat each residual median across the knots, preserving the centre."""
+    if isinstance(batch, EpisodeBatchWithNaiveEvidence):
+        median = batch.naive_resq[..., _MEDIAN : _MEDIAN + 1]
+        return replace(batch, naive_resq=median.expand_as(batch.naive_resq))
+    return batch
+
+
+def centre_off(batch: EpisodeBatch) -> EpisodeBatch:
+    """Subtract each residual median from its knots, preserving the spread."""
+    if isinstance(batch, EpisodeBatchWithNaiveEvidence):
+        median = batch.naive_resq[..., _MEDIAN : _MEDIAN + 1]
+        return replace(batch, naive_resq=batch.naive_resq - median)
     return batch
 
 
@@ -259,7 +276,7 @@ def _score_model(
     batch_hook: Callable[[EpisodeBatch], EpisodeBatch] | None = None,
     observe_mix: bool = False,
 ) -> dict:
-    anchors, weights, label_masks, evidence_masks = [], [], [], []
+    anchors, weights, label_masks, evidence_masks, saturation_masks = [], [], [], [], []
 
     def observe(batch: EpisodeBatch, output: V5Output) -> None:
         # Probe jobs have one origin and one kept target per item, in item order.
@@ -267,6 +284,8 @@ def _score_model(
         label_masks.append(batch.label_mask[:, 0][keep][:, :_HORIZON].cpu().numpy())
         if output.evidence is not None:
             evidence_masks.append(output.evidence[:, 0][keep][:, :_HORIZON].cpu().numpy())
+        if output.tilt_saturated is not None:
+            saturation_masks.append(output.tilt_saturated[:, 0][keep][:, :_HORIZON].cpu().numpy())
         if not observe_mix:
             return
         loc = batch.loc[keep][:, None]
@@ -296,8 +315,13 @@ def _score_model(
     levels = model.config.quantiles
     figures = score_panel(panel, quantiles, levels)
     if evidence_masks:
-        scored = np.concatenate(evidence_masks)[np.concatenate(label_masks)]
+        labels = np.concatenate(label_masks)
+        evidence = np.concatenate(evidence_masks)
+        scored = evidence[labels]
         figures["evidence_share"] = float(scored.mean()) if len(scored) else None
+        if saturation_masks:
+            saturated = np.concatenate(saturation_masks)[labels & evidence]
+            figures["bound_saturation"] = float(saturated.mean()) if len(saturated) else None
     if observe_mix:
         quantiles[..., levels.index(0.5)] = np.concatenate(anchors)
         figures["anchor_only"] = score_panel(panel, quantiles, levels)
@@ -329,6 +353,13 @@ def run_probe(model: V5Model, settings: ProbeSettings, *, device: str = "cpu") -
                 figures["anchor_off"] = _score_model(model, panel, settings, batch_hook=anchor_off)
             if model.config.mix_evidence:
                 figures["fan_off"] = _score_model(model, panel, settings, batch_hook=fan_off)
+                if model.config.fan_mode == "residual":
+                    figures["spread_off"] = _score_model(
+                        model, panel, settings, batch_hook=spread_off
+                    )
+                    figures["centre_off"] = _score_model(
+                        model, panel, settings, batch_hook=centre_off
+                    )
                 figures["evidence_off"] = _score_model(
                     model, panel, settings, batch_hook=evidence_off
                 )

@@ -146,12 +146,14 @@ def test_round_trip_of_the_whole_state_dict(tmp_path, monkeypatch, export_api, w
     assert written == metadata
     assert set(metadata) == {"format", "model", "training", "source", "files"}
     assert metadata["format"] == "v5-export-1"
-    # The stored model mapping leaves the default expert mode out, as it did before the mode existed.
+    # The stored model mapping omits options at their defaults.
     stored = json.loads(json.dumps(asdict(TINY)))
     assert stored.pop("expert_mode") == "routed"
     assert stored.pop("horizon_seed") is False
     assert stored.pop("naive_mix") is False
     assert stored.pop("mix_evidence") is False
+    assert stored.pop("fan_mode") == "head"
+    assert stored.pop("mix_bound") is None
     assert metadata["model"] == stored
     assert metadata["training"] == config.canonical()
     assert metadata["source"] == {
@@ -748,6 +750,7 @@ def test_selftest_omits_the_default_mix_option(tmp_path, export_api, monkeypatch
     def capture(directory, payload, **kwargs):
         assert "naive_mix" not in payload["config"]["model"]
         assert "mix_evidence" not in payload["config"]["model"]
+        assert {"fan_mode", "mix_bound"}.isdisjoint(payload["config"]["model"])
         assert "label_cap" in payload["config"]["optim"]
         return original(directory, payload, **kwargs)
 
@@ -758,12 +761,14 @@ def test_selftest_omits_the_default_mix_option(tmp_path, export_api, monkeypatch
     assert loaded.config.naive_mix is False
     assert loaded.config.mix_evidence is False
     assert {"naive_mix", "mix_evidence"}.isdisjoint(metadata["model"])
+    assert {"fan_mode", "mix_bound"}.isdisjoint(metadata["model"])
 
 
-def test_mix_evidence_export_round_trips_and_passes_parity(tmp_path, export_api):
+@pytest.mark.parametrize("guards", [{}, {"fan_mode": "residual", "mix_bound": 2.0}])
+def test_mix_evidence_export_round_trips_and_passes_parity(tmp_path, export_api, guards):
     checkpoint = _checkpoint(
         tmp_path,
-        model=replace(TINY, naive_mix=True, mix_evidence=True),
+        model=replace(TINY, naive_mix=True, mix_evidence=True, **guards),
         sampler_options={"derive": ("naive_anchor", "naive_evidence")},
     )
     out = tmp_path / "evidence-export"
@@ -774,6 +779,16 @@ def test_mix_evidence_export_round_trips_and_passes_parity(tmp_path, export_api)
     assert (
         metadata["model"]["mix_evidence"] is metadata["training"]["model"]["mix_evidence"] is True
     )
+    for section in (metadata["model"], metadata["training"]["model"]):
+        assert section.keys() & {"fan_mode", "mix_bound"} == guards.keys()
+        if guards:
+            assert section["fan_mode"] == "residual"
+            assert section["mix_bound"] == pytest.approx(2.0)
+    assert model.config.fan_mode == guards.get("fan_mode", "head")
+    if guards:
+        assert model.config.mix_bound == pytest.approx(2.0)
+    else:
+        assert model.config.mix_bound is None
     archive = _read_archive(out / "parity.npz")
     assert archive["case_9/batch/naive_error"].dtype == np.float32
     assert archive["case_9/batch/naive_error_seen"].any()

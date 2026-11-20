@@ -398,3 +398,243 @@ def test_mix_evidence_config_requires_the_mix_and_fixed_quantiles():
         V5Config(mix_evidence=True)
     with pytest.raises(ValueError, match="quantiles"):
         V5Config(naive_mix=True, mix_evidence=True, quantiles=(0.1, 0.5, 0.9))
+
+
+def guarded_model(*, fan_mode="residual", mix_bound=2.0):
+    return model(
+        config=replace(
+            TINY, naive_mix=True, mix_evidence=True, fan_mode=fan_mode, mix_bound=mix_bound
+        )
+    )
+
+
+def two_measured_paths(corrections=(0, 3)):
+    batch = collate([episode(panel(), DERIVE)])
+    seen = torch.zeros_like(batch.naive_seen)
+    seen[..., :3] = True
+    measured = torch.zeros_like(batch.naive_error_seen)
+    measured[..., :2] = True
+    paths = torch.zeros_like(batch.naive_paths)
+    paths[..., :2] = torch.tensor([1.0, 4.0])
+    paths[..., 2] = 2
+    errors = torch.zeros_like(batch.naive_error)
+    errors[..., :2] = torch.tensor([0.1, 0.2])
+    residuals = torch.zeros_like(batch.naive_resq)
+    spread = torch.tensor([[1.0], [2.0]]) * torch.arange(-4.0, 5.0)
+    residuals[..., :2, :] = torch.tensor(corrections)[:, None] + spread
+    return replace(
+        batch,
+        naive_seen=seen,
+        naive_paths=paths,
+        naive_error_seen=measured,
+        naive_error=errors,
+        naive_resq=residuals,
+    )
+
+
+@pytest.mark.parametrize(
+    ("options", "message"),
+    [
+        ({"fan_mode": "learned"}, "fan_mode"),
+        ({"fan_mode": True}, "fan_mode"),
+        ({"fan_mode": "residual", "mix_evidence": False}, "requires mix_evidence"),
+        ({"mix_bound": 2, "mix_evidence": False}, "requires mix_evidence"),
+        *[
+            ({"mix_bound": value}, "mix_bound")
+            for value in (True, "2", 0, -1, 0.09, 10.01, float("inf"), float("-inf"), float("nan"))
+        ],
+    ],
+)
+def test_evidence_guards_reject_invalid_configurations(options, message):
+    with pytest.raises(ValueError, match=message):
+        V5Config(**({"naive_mix": True, "mix_evidence": True} | options))
+
+
+def test_guarded_start_matches_corrected_paths_and_the_residual_fan():
+    batch = two_measured_paths()
+    guarded, n7 = guarded_model(), evidence_model()
+    assert tuple(guarded.state_dict()) == tuple(n7.state_dict())
+    guarded.load_state_dict(n7.state_dict(), strict=True)
+    with torch.no_grad():
+        out, old = guarded(batch), n7(batch)
+        head = n7(replace(batch, naive_seen=torch.zeros_like(batch.naive_seen))).quantiles
+    index = (0, 0, 0, 0)
+    prior = torch.tensor([0.0, -4 * np.log(0.201 / 0.101), -6.0], dtype=out.mix.dtype)
+    mix = prior.softmax(0)
+    measured_mix = prior[:2].softmax(0)
+    centre = mix[1] * 3
+    spread = (measured_mix[0] + 2 * measured_mix[1]) * torch.arange(-4.0, 5.0)
+    anchor = (mix * torch.tensor([1.0, 4.0, 2.0])).sum()
+    torch.testing.assert_close(out.mix[index][:3], mix)
+    torch.testing.assert_close(out.anchor[index], anchor)
+    torch.testing.assert_close(out.fan[index], centre + spread)
+    torch.testing.assert_close(out.quantiles[index], anchor + centre + spread + 1e-3 * head[index])
+    # N7 gives the median the entire measured softmax mass. G1 keeps the mixed
+    # mask's measured mass while preserving the spread around that median.
+    torch.testing.assert_close(old.fan[index][4], measured_mix[1] * 3)
+    torch.testing.assert_close(out.fan[index][4], mix[:2].sum() * old.fan[index][4])
+    torch.testing.assert_close(
+        out.fan[index] - out.fan[index][4], old.fan[index] - old.fan[index][4]
+    )
+    assert out.evidence[index]
+    assert not out.tilt_saturated.any()
+    assert old.tilt_saturated is None
+
+
+@pytest.mark.parametrize(("correction", "factor"), [(3, 2), (-3, 0)])
+def test_residual_centre_can_reinforce_or_cancel_the_anchor_gradient(correction, factor):
+    batch = two_measured_paths((0, correction))
+    # Only these two paths are seen, so both corrected paths equal 1 when
+    # the second correction is -3.
+    seen = batch.naive_seen.clone()
+    seen[..., 2] = False
+    net = guarded_model()
+    out = net(replace(batch, naive_seen=seen))
+    weight = net.mix_projection.weight
+    index = (0, 0, 0, 0)
+    (anchor_grad,) = torch.autograd.grad(out.anchor[index], weight, retain_graph=True)
+    (median_grad,) = torch.autograd.grad(out.quantiles[index][4], weight, retain_graph=True)
+    (spread_grad,) = torch.autograd.grad(out.fan[index][-1] - out.fan[index][0], weight)
+    assert anchor_grad.norm() > 1e-6
+    torch.testing.assert_close(median_grad, factor * anchor_grad, atol=1e-6, rtol=1e-5)
+    torch.testing.assert_close(spread_grad, torch.zeros_like(spread_grad), atol=1e-7, rtol=0)
+
+
+@pytest.mark.parametrize("fan_mode", ["head", "residual"])
+@pytest.mark.parametrize("bound", [None, 2.0])
+def test_evidence_calibration_gradients_follow_each_guard(fan_mode, bound):
+    net = guarded_model(fan_mode=fan_mode, mix_bound=bound)
+    out = net(two_measured_paths())
+    grad_beta, grad_gamma = torch.autograd.grad(
+        out.quantiles[0, 0, 0, 0].sum(), (net.beta_raw, net.gamma_raw), allow_unused=True
+    )
+    if bound is None:
+        assert grad_beta is not None and torch.isfinite(grad_beta) and grad_beta.abs() > 1e-6
+    else:
+        assert grad_beta is None
+    if fan_mode == "head":
+        assert grad_gamma is not None and torch.isfinite(grad_gamma) and grad_gamma.abs() > 1e-6
+    else:
+        assert grad_gamma is None
+
+
+def test_fixed_head_spread_breaks_flat_evidence_ties_without_training_the_head_tails():
+    batch = two_measured_paths()
+    # One measured option at zero residual, with all other available options
+    # at the prior floor. The bounded network tilt is zero on this cell.
+    measured = batch.naive_error_seen.clone()
+    measured[..., 1] = False
+    batch = replace(batch, naive_error_seen=measured, naive_resq=torch.zeros_like(batch.naive_resq))
+    net = guarded_model()
+    index = (0, 0, 0, 0)
+    out = net(batch)
+    head = net.head.projection.bias
+    assert out.evidence[index]
+    assert not out.tilt_saturated[index]
+    torch.testing.assert_close(
+        out.mix[index][0] / out.mix[index][1], torch.tensor(np.exp(6)).float()
+    )
+    torch.testing.assert_close(out.fan[index], torch.zeros_like(out.fan[index]))
+    assert (out.quantiles[index].diff() > 0).all()
+    (spread_grad,) = torch.autograd.grad(out.quantiles[index].diff().sum(), head, retain_graph=True)
+    torch.testing.assert_close(spread_grad, torch.zeros_like(spread_grad), atol=1e-7, rtol=0)
+    grad_head, grad_mix = torch.autograd.grad(
+        out.quantiles[index].sum(), (head, net.mix_projection.weight)
+    )
+    assert torch.isfinite(grad_head).all() and torch.isfinite(grad_mix).all()
+    assert grad_head[4].abs() > 1e-6
+    with torch.no_grad():
+        net.head_gain.zero_()
+    (gain_grad,) = torch.autograd.grad(net(batch).quantiles[index][4], net.head_gain)
+    assert torch.isfinite(gain_grad) and gain_grad.abs() > 1e-6
+
+
+@pytest.mark.parametrize("dtype", [torch.float64, torch.float32])
+def test_guarded_quantiles_stay_sorted_with_random_masks_and_extreme_decoder_steps(dtype):
+    batch = _batch_to_model(two_measured_paths(), torch.device("cpu"), dtype)
+    rng = torch.Generator().manual_seed(21)
+    batch = replace(
+        batch,
+        naive_seen=torch.rand(batch.naive_seen.shape, generator=rng) > 0.4,
+        naive_error_seen=torch.rand(batch.naive_error_seen.shape, generator=rng) > 0.4,
+    )
+    net = guarded_model().to(dtype)
+    with torch.no_grad():
+        net.head_gain.fill_(-0.5)
+        net.step_projection.bias[::2].fill_(1e4)
+        net.step_projection.bias[1::2].fill_(-1e4)
+        net.mix_projection.weight.normal_(generator=rng)
+    with torch.autocast("cpu", dtype=torch.bfloat16, enabled=dtype == torch.float32):
+        out = net(batch)
+    for tensor in (out.quantiles, out.mix, out.anchor, out.fan):
+        assert tensor.dtype == dtype
+        assert torch.isfinite(tensor).all()
+    assert (out.quantiles.diff(dim=-1) >= 0).all()
+    assert not out.evidence[..., 19:].any()
+    assert not out.tilt_saturated[..., 19:].any()
+
+
+@pytest.mark.parametrize("bound", [0.1, 10])
+@pytest.mark.parametrize("amplitude", [0.0, 1e4])
+def test_bounded_logits_center_only_measured_options_and_keep_the_floor(bound, amplitude):
+    net = guarded_model(mix_bound=bound)
+    batch = two_measured_paths()
+    steps = batch.naive_paths.new_ones((*batch.naive_paths.shape[:-1], net.config.d_out))
+    with torch.no_grad():
+        net.mix_projection.weight[0, 0] = amplitude
+        net.mix_projection.weight[1, 0] = -amplitude
+        net.evidence_bias[2] = 1e4  # Unmeasured, so it cannot affect the mean or saturate.
+    logits, options, evidence, saturated = net._evidence_logits(steps, batch, batch.naive_seen)
+    tilt = bound * np.tanh(amplitude / bound)
+    expected = logits.new_tensor([tilt, -4 * np.log(0.201 / 0.101) - tilt, -6])
+    torch.testing.assert_close(logits[0, 0, 0, 0, :3], expected, atol=1e-6, rtol=1e-6)
+    assert options[..., :2].all() and not options[..., 2:].any()
+    assert evidence.all()
+    assert saturated.dtype == torch.bool
+    assert saturated.shape == batch.naive_paths.shape[:-1]
+    assert saturated.all() if amplitude else not saturated.any()
+    grads = torch.autograd.grad(
+        logits[..., 0].sum(), (net.mix_projection.weight, net.evidence_bias)
+    )
+    assert all(torch.isfinite(grad).all() for grad in grads)
+    with torch.no_grad():
+        net.evidence_bias.add_(123)
+        shifted, _, _, shifted_saturated = net._evidence_logits(steps, batch, batch.naive_seen)
+    torch.testing.assert_close(shifted, logits)
+    assert torch.equal(shifted_saturated, saturated)
+
+
+def test_mix_bound_saturation_uses_the_centred_logit_before_tanh():
+    net = guarded_model(mix_bound=2.0)
+    batch = two_measured_paths()
+    with torch.no_grad():
+        net.evidence_bias[:2] = torch.tensor([5.0, 5.0 + 2 * 1.89])
+        below = net(batch).tilt_saturated
+        net.evidence_bias[:2] = torch.tensor([5.0, 5.0 + 2 * 1.91])
+        above = net(batch)
+    assert not below.any()
+    assert torch.equal(above.tilt_saturated, above.evidence)
+
+
+@pytest.mark.parametrize("keyed", [False, True])
+def test_guards_leave_mixed_pruned_and_padded_cells_without_evidence_on_the_old_path(keyed):
+    first = episode(panel(sibling=True), DERIVE, origins=(205, 221), horizon=17)
+    second = episode(panel(), ANCHOR, horizon=37)
+    batch = collate([first, second], include_row_keys=keyed)
+    net, old = guarded_model(), evidence_model()
+    with torch.no_grad():
+        gates = net.gates(batch, zero_rows=batch.row_role == ROLE_SIBLING)
+        small, small_gates = prune(batch, gates)
+        result, expected, trimmed = net(batch, gates), old(batch, gates), net(small, small_gates)
+        plain = net(collate([second], include_row_keys=keyed))
+    assert not plain.tilt_saturated.any()
+    assert not result.evidence[1].any()
+    assert not result.evidence[0, :, :, 17:].any()
+    assert not result.tilt_saturated[~result.evidence].any()
+    assert not result.fan[~result.evidence].any()
+    for key in ("anchor", "mix", "quantiles"):
+        torch.testing.assert_close(
+            getattr(result, key)[~result.evidence], getattr(expected, key)[~result.evidence]
+        )
+    torch.testing.assert_close(trimmed.quantiles, result.quantiles[:, :, :1], atol=1e-5, rtol=1e-5)
+    assert torch.equal(trimmed.tilt_saturated, result.tilt_saturated[:, :, :1])
