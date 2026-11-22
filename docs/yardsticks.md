@@ -216,7 +216,8 @@ and `no_siblings`.
 The `only_*` variants use the same export requirements and gain setting as
 `no_head_gain`. Each available path supplies the anchor and its own residual
 evidence. With no residual evidence, the ordinary quantile head uses that path
-as its anchor. Where the path is unavailable, the `no_head_gain` forecast applies.
+as its anchor. Where the path is unavailable, the `no_head_gain` forecast applies
+(the `centred_fan` forecast for the `only_*_centred` variants).
 
 ## Evidence and resume
 

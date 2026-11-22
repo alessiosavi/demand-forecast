@@ -15,12 +15,19 @@ import torch
 from demand_forecast.bench.v5_panels import describe, window_panels
 from demand_forecast.data.episode import EpisodeBatch, ScreeningConfig
 from demand_forecast.data.episode.collate import EpisodeBatchWithNaiveEvidence
-from demand_forecast.data.episode.schema import MAX_CONTEXT, NAIVE_OPTIONS, PATCH, SUMMARY_FEATURES
+from demand_forecast.data.episode.schema import (
+    MAX_CONTEXT,
+    NAIVE_OPTIONS,
+    PATCH,
+    QUANTILES,
+    SUMMARY_FEATURES,
+)
 from demand_forecast.models.v5 import Evidence, forecast_items, planned_layouts, usable_workers
 from demand_forecast.models.v5.export import load_export, require_parity
-from demand_forecast.models.v5.model import _MEDIAN
 
 from .runner import Options, WindowInput
+
+_MEDIAN = QUANTILES.index(0.5)
 
 
 @dataclass(frozen=True)
