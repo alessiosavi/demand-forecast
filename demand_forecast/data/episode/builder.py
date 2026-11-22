@@ -10,7 +10,7 @@ from .bank import step_features, summary_vectors
 from .calendar import calendar_arrays
 from .kinds import flag_codes, labels_of, observed_mask
 from .panel_stats import PanelStats, PanelStatsProvider
-from .scale import Scale, compress, fit_scale, to_scaled
+from .scale import Scale, compress, finite_scale_values, fit_scale, to_scaled
 from .schema import (
     BANK_WINDOW,
     CH_OBSERVED,
@@ -210,10 +210,15 @@ class EpisodeBuilder:
                 raise ValueError("statistics provider must use the builder's panel")
             if stats.scale_floor != config.scale_floor:
                 raise ValueError("statistics provider must use the builder's scale_floor")
+            if stats.scale_kind != config.scale_kind:
+                raise ValueError("statistics provider must use the builder's scale_kind")
         self.panel = panel
         self.config = config
+        scale_options = {} if config.scale_kind is None else {"scale_kind": config.scale_kind}
         self.stats = (
-            PanelStatsProvider(panel, scale_floor=config.scale_floor) if stats is None else stats
+            PanelStatsProvider(panel, scale_floor=config.scale_floor, **scale_options)
+            if stats is None
+            else stats
         )
         self._calendar_cache: OrderedDict[tuple[int, int], tuple[np.ndarray, np.ndarray] | None] = (
             OrderedDict()
@@ -375,6 +380,8 @@ class EpisodeBuilder:
             )
         floor = self.config.scale_floor
         scale_options = {} if floor is None else {"floor": floor}
+        if self.config.scale_kind is not None:
+            scale_options["kind"] = self.config.scale_kind
         scale = (
             fit_scale(raw, max(0, end), self.panel.season, **scale_options)
             if kind == KIND_NUMBER
@@ -944,9 +951,15 @@ class EpisodeBuilder:
                     seen[:, 0] = seen[:, 1:].any(axis=-1)
                     if backtest_history is not None:
                         row = rows[ri]
+                        scale_kind = self.config.scale_kind
+                        backtest_options = {} if scale_kind is None else {"kind": scale_kind}
                         naive_error[oi, fi], naive_error_seen[oi, fi], naive_resq[oi, fi] = (
                             backtest_history.backtest(
-                                row.raw, row.scale, origin=local, horizon=request.horizon
+                                row.raw,
+                                row.scale,
+                                origin=local,
+                                horizon=request.horizon,
+                                **backtest_options,
                             )
                         )
             for ki, ri in enumerate(known_rows):
@@ -980,8 +993,7 @@ class EpisodeBuilder:
                 calh_ids[oi, : request.horizon] = ids
         fallback = []
         for ri in forecast_rows:
-            observed = rows[ri].raw[: max(0, end)]
-            observed = observed[np.isfinite(observed)]
+            observed = finite_scale_values(rows[ri].raw, end, kind=self.config.scale_kind)
             fallback.append(not len(observed) or np.all(observed == observed[0]))
         r, g, a, k, o = (
             len(rows),

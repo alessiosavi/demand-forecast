@@ -250,6 +250,7 @@ def test_only_the_four_aligned_paths_change_config_digests():
             assert cfg["model"].pop("mix_evidence") is False
             assert cfg["model"].pop("fan_mode") == "head"
             assert cfg["model"].pop("mix_bound") is None
+            assert cfg["model"].pop("output_space") == "linear"
             # The optimiser field added after the base revision; no T1 arm sets a label cap.
             assert cfg["optim"].pop("label_cap") is None
             for source in cfg["sources"]:
@@ -260,6 +261,7 @@ def test_only_the_four_aligned_paths_change_config_digests():
             derive = sampler.pop("derive")
             assert sampler.pop("screen_fair_spread") is False
             assert sampler.pop("scale_floor") is None
+            assert sampler.pop("scale_kind") is None
             cold_share = sampler.pop("cold_share")
             assert sampler.pop("cold_steps") == (3, 4)
             if path in ("static_category", "multi_label"):
@@ -1363,3 +1365,31 @@ def test_derive_off_replays_a_mix_model(small, monkeypatch):
         )
     assert result["derive"] == []
     assert anchors and all(anchor is None for anchor in anchors)
+
+
+def test_scale_kind_reaches_t1_eval_set_and_replay(monkeypatch):
+    module = api()
+    base = replace(module.T1_BASE, sampler=replace(module.T1_BASE.sampler, scale_kind="spread"))
+    seen = []
+
+    def observe(panel, screening):
+        seen.append(screening.scale_kind)
+        return EpisodeBuilder(panel, screening)
+
+    monkeypatch.setattr(module, "EpisodeBuilder", observe)
+    assert module.eval_set("static_category", episodes=1, min_count=1, max_panels=30, base=base)
+    assert seen and set(seen) == {"spread"}
+    seen.clear()
+    panel = paired_static_panel()
+    config = module.t1_config("static_category", "true", seed=0, base=base)
+    entry = {
+        "item_id": panel.items[0].item_id,
+        "origin": 48,
+        "horizon": 8,
+        "context": 48,
+        "target": "y0",
+        "cutoff": 48,
+    }
+    module._build(SimpleNamespace(panel=panel), entry, config)
+    assert config.sampler.scale_kind == "spread"
+    assert seen == ["spread"]

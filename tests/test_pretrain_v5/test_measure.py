@@ -11,7 +11,8 @@ import numpy as np
 import pytest
 import torch
 
-from demand_forecast.data.episode import EpisodeBuilder, collate
+from demand_forecast.data.episode import EpisodeBuilder, EpisodeRequest, collate
+from demand_forecast.data.episode.scale import finite_scale_values
 from demand_forecast.data.episode.screening import ScreeningConfig
 from demand_forecast.models.v5 import V5Model, forecast, v5_loss
 from demand_forecast.synthetic.typed import PanelRecipe, generate_typed_panel
@@ -1149,3 +1150,70 @@ def test_qualify_preflight_knows_about_anchored_batches(tmp_path, monkeypatch, d
     )
     # Without an anchor the call keeps the shape it had before the option existed.
     assert calls == [expected]
+
+
+@pytest.mark.parametrize("entry", ["worst_batch", "inference"])
+def test_measure_builders_receive_scale_kind(monkeypatch, entry):
+    measure = api()
+    train = config()
+    train = replace(train, sampler=replace(train.sampler, scale_kind="spread"))
+    seen = []
+    build = EpisodeBuilder.build
+
+    def observe(builder, request):
+        episode = build(builder, request)
+        item = builder.panel.items[request.item_index]
+        values = item.targets[episode.row_names[0]]
+        end = min(len(values), (request.cutoff or request.origins[0]) - item.start)
+        prefix = values[max(0, end - 2048) : end]
+        loc = np.median(prefix)
+        assert episode.loc[0] == pytest.approx(loc)
+        assert episode.scale[0] == pytest.approx(np.sqrt(np.mean(np.square(prefix - loc))))
+        seen.append(builder.config.scale_kind)
+        return episode
+
+    monkeypatch.setattr(EpisodeBuilder, "build", observe)
+    if entry == "worst_batch":
+        measure.worst_batch(train)
+    else:
+        measure._inference_measure(train, torch.device("cpu"), 2, 64, workers=0)
+    assert seen == ["spread"] * (1 if entry == "worst_batch" else 2)
+
+
+def test_worst_batch_ignores_the_floor_under_either_kind(monkeypatch):
+    measure = api()
+    train = config()
+    seen = []
+    build = EpisodeBuilder.build
+
+    def observe(builder, request):
+        seen.append((builder.config.scale_kind, builder.config.scale_floor))
+        return build(builder, request)
+
+    monkeypatch.setattr(EpisodeBuilder, "build", observe)
+    for kind in (None, "spread"):
+        sampler = replace(train.sampler, scale_floor=0.5, scale_kind=kind)
+        measure.worst_batch(replace(train, sampler=sampler))
+    assert seen == [(None, None), ("spread", None)]
+
+
+def test_measure_and_builder_agree_on_a_constant_spread_window(monkeypatch):
+    measure = api()
+    train = config()
+    panel = measure._inference_panel(seed=train.seed, items=1, length=4096)
+    item = panel.items[0]
+    values = item.targets["target"].copy()
+    values[-2076:-28] = 5
+    panel = replace(panel, items=(replace(item, targets={"target": values}),))
+    monkeypatch.setattr(measure, "_inference_panel", lambda **_: panel)
+    baseline = measure._inference_measure(train, torch.device("cpu"), 1, len(values), 0)
+    assert baseline["fallback_forecasts"] == 0
+    train = replace(train, sampler=replace(train.sampler, scale_kind="spread"))
+    request = EpisodeRequest(0, (len(values) - 28,), 28, context=512)
+    for kind, constant in ((None, False), ("spread", True)):
+        observed = finite_scale_values(values, len(values) - 28, kind=kind)
+        assert bool(np.all(observed == observed[0])) is constant
+        built = EpisodeBuilder(panel, ScreeningConfig(scale_kind=kind)).build(request)
+        assert bool(built.fallback[0]) is constant
+    with pytest.raises(RuntimeError, match="got 1 forecasts and 1 fallbacks"):
+        measure._inference_measure(train, torch.device("cpu"), 1, len(values), 0)

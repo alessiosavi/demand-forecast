@@ -1078,3 +1078,56 @@ def test_evidence_guard_yaml_records_only_enabled_options(tmp_path, options):
         assert loaded.model.mix_bound == pytest.approx(options["mix_bound"])
     else:
         assert loaded.model.mix_bound is None
+
+
+@pytest.mark.parametrize("value", ["rms", True, 1])
+def test_scale_kind_validation(value):
+    with pytest.raises(ValueError, match="scale_kind"):
+        config_module().SamplerConfig(scale_kind=value)
+
+
+def test_n9_options_are_sparse_in_serialized_configs_and_change_identity(tmp_path):
+    from demand_forecast.pretrain.v5 import read_payload, save_checkpoint
+    from demand_forecast.pretrain.v5.loop import _configuration
+
+    base = training_config()
+    path = tmp_path / "train.yaml"
+    base.to_yaml(path)
+    original = path.read_bytes()
+    raw = yaml.safe_load(original)
+    assert "scale_kind" not in raw["sampler"] and "output_space" not in raw["model"]
+    raw["sampler"]["scale_kind"] = None
+    raw["model"]["output_space"] = "linear"
+    path.write_text(yaml.safe_dump(raw))
+    explicit = type(base).from_yaml(path)
+    explicit.to_yaml(path)
+    assert path.read_bytes() == original
+
+    identity = config_module().identity
+    parts = dict(code="0" * 40, corpus=None, init=None, env=None)
+    assert identity(base, **parts) == identity(explicit, **parts)
+    for counter, (kind, space) in enumerate(
+        [
+            (None, "linear"),
+            ("seasonal", "linear"),
+            ("spread", "linear"),
+            (None, "asinh"),
+            ("spread", "asinh"),
+        ],
+        start=1,
+    ):
+        configured = replace(
+            base,
+            sampler=replace(base.sampler, scale_kind=kind),
+            model=replace(base.model, output_space=space),
+        )
+        configured.to_yaml(path)
+        assert type(base).from_yaml(path) == configured
+        for mapping in (yaml.safe_load(path.read_bytes()), configured.canonical()):
+            assert mapping["sampler"].get("scale_kind") == kind
+            assert ("scale_kind" in mapping["sampler"]) is (kind is not None)
+            assert mapping["model"].get("output_space") == (space if space != "linear" else None)
+        assert (identity(configured, **parts) == identity(base, **parts)) is (counter == 1)
+        payload = {"config": configured._serialized(), "counters": {"batch": 0, "saves": counter}}
+        checkpoint, _ = save_checkpoint(tmp_path, payload, counter=counter)
+        assert _configuration(read_payload(checkpoint)["config"]) == configured

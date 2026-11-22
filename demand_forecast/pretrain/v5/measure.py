@@ -38,6 +38,7 @@ from demand_forecast.data.episode import (
     ScreeningConfig,
     collate,
 )
+from demand_forecast.data.episode.scale import finite_scale_values
 from demand_forecast.data.episode.schema import (
     MAX_ATTRIBUTE_TOKENS,
     MAX_FEATURE_ROWS,
@@ -143,7 +144,14 @@ def worst_batch(config: V5TrainConfig) -> EpisodeBatch:
         None,
         True,
     )
-    episode = EpisodeBuilder(panel).build(
+    kind = sampler.scale_kind
+    # This stress batch has never applied the floor; the kind alone is carried.
+    builder = (
+        EpisodeBuilder(panel)
+        if kind is None
+        else EpisodeBuilder(panel, ScreeningConfig(scale_kind=kind))
+    )
+    episode = builder.build(
         EpisodeRequest(
             0,
             positions,
@@ -532,17 +540,19 @@ def _inference_measure(config, device, panel_items, panel_length, workers):
     panel = _inference_panel(seed=config.seed, items=panel_items, length=panel_length)
     origin = panel_length - 28
     fallback_forecasts = 0
-    # Match EpisodeBuilder's fallback rule on each target's finite prefix.
+    kind = config.sampler.scale_kind
+    # Match EpisodeBuilder's fallback rule on the cells used to fit each target.
     for item in panel.items:
         for values in item.targets.values():
-            observed = values[: max(0, origin - item.start)]
-            observed = observed[np.isfinite(observed)]
+            observed = finite_scale_values(values, origin - item.start, kind=kind)
             fallback_forecasts += int(not observed.size or np.all(observed == observed[0]))
     model = V5Model(config.model).to(device)
+    scale_options = {} if kind is None else {"scale_kind": kind}
     screening = ScreeningConfig(
         no_evidence=config.sampler.screen_no_evidence,
         fair_static_spread=config.sampler.screen_fair_spread,
         scale_floor=config.sampler.scale_floor,
+        **scale_options,
     )
     _reset_gpu(device)
     with _HostPeak() as memory:

@@ -175,6 +175,7 @@ class SamplerConfig:
     derive: tuple[str, ...] = ()
     screen_fair_spread: bool = False
     scale_floor: float | None = None
+    scale_kind: str | None = None
 
     def __post_init__(self) -> None:
         _flag(self, "designate_target")
@@ -204,6 +205,10 @@ class SamplerConfig:
             _normalize(self, "scale_floor", minimum=0)
             if self.scale_floor == 0:
                 raise ValueError("scale_floor must be positive")
+        if self.scale_kind is not None and (
+            not isinstance(self.scale_kind, str) or self.scale_kind not in ("seasonal", "spread")
+        ):
+            raise ValueError("scale_kind must be 'seasonal' or 'spread'")
         if self.max_cells is not None:
             _normalize(self, "max_cells", integer=True, minimum=1)
         drops = []
@@ -357,12 +362,16 @@ class V5TrainConfig:
             del data["model"]["fan_mode"]
         if self.model.mix_bound is None:
             del data["model"]["mix_bound"]
+        if self.model.output_space == "linear":
+            del data["model"]["output_space"]
         if not self.sampler.derive:
             del data["sampler"]["derive"]
         if not self.sampler.screen_fair_spread:
             del data["sampler"]["screen_fair_spread"]
         if self.sampler.scale_floor is None:
             del data["sampler"]["scale_floor"]
+        if self.sampler.scale_kind is None:
+            del data["sampler"]["scale_kind"]
         if self.optim.label_cap is None:
             del data["optim"]["label_cap"]
         for source in data["sources"]:

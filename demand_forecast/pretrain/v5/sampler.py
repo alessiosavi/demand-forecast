@@ -21,6 +21,7 @@ from demand_forecast.data.episode.collate import (
     EpisodeBatchWithNaiveEvidence,
     collate,
 )
+from demand_forecast.data.episode.scale import finite_scale_values
 from demand_forecast.data.episode.schema import PATCH
 from demand_forecast.data.episode.screening import ScreeningConfig
 from demand_forecast.synthetic.typed import necessary_items
@@ -68,6 +69,13 @@ def _cutoff(item, origins, panel_cutoff):
     return panel_cutoff if np.isfinite(prefix).sum() >= PATCH else origins[0]
 
 
+def _zero_fill_prefix(values, end):
+    filled = values.copy()
+    prefix = filled[: max(0, end)]
+    prefix[np.isnan(prefix)] = 0.0
+    return filled
+
+
 def plan_panel(
     panel: Panel,
     record: dict,
@@ -91,8 +99,9 @@ def plan_panel(
 
 
 def _plan_panel(panel, record, config, source, rng, *, path_quota=None, ordinary_quota=None):
+    fill_missing = source.control == "missing_as_zero"
     # An injected SourceMix or direct planner call can bypass V5TrainConfig.
-    if config.cold_share > 0 and source.control == "missing_as_zero":
+    if config.cold_share > 0 and fill_missing:
         raise ValueError("missing_as_zero requires sampler.cold_share == 0")
     target_paths = round(config.path_share * config.episodes_per_batch)
     path_quota = target_paths if path_quota is None else path_quota
@@ -200,6 +209,7 @@ def _plan_panel(panel, record, config, source, rng, *, path_quota=None, ordinary
     plans = []
     builder = None
     derive = frozenset(config.derive)
+    scale_options = {} if config.scale_kind is None else {"scale_kind": config.scale_kind}
     for index, path in selected:
         item = original.items[index]
         cold = index == lead and lead_cold
@@ -221,6 +231,7 @@ def _plan_panel(panel, record, config, source, rng, *, path_quota=None, ordinary
                         no_evidence=config.screen_no_evidence,
                         fair_static_spread=config.screen_fair_spread,
                         scale_floor=config.scale_floor,
+                        **scale_options,
                     ),
                 )
             requests = builder.plan_requests(
@@ -232,12 +243,19 @@ def _plan_panel(panel, record, config, source, rng, *, path_quota=None, ordinary
         request = replace(request, drop=frozenset(drops))
         targets = (request.target,) if request.target is not None else tuple(sorted(item.targets))
         nonfallback = []
+        end = cutoff - item.start
         for name in targets:
             values = item.targets[name]
-            prefix = values[: max(0, cutoff - item.start)]
-            observed = prefix[np.isfinite(prefix)]
-            if len(observed) and np.any(observed != observed[0]):
-                nonfallback.append(values)
+            observed = finite_scale_values(values, end, kind=config.scale_kind)
+            if not len(observed) or np.all(observed == observed[0]):
+                continue
+            if fill_missing:
+                # Check the filled history EpisodeBuilder uses for its fallback flag.
+                filled = _zero_fill_prefix(values, anchor - item.start)
+                observed = finite_scale_values(filled, end, kind=config.scale_kind)
+                if not len(observed) or np.all(observed == observed[0]):
+                    continue
+            nonfallback.append(values)
         if not nonfallback:
             skips["fallback"] += 1
             continue
@@ -251,13 +269,13 @@ def _plan_panel(panel, record, config, source, rng, *, path_quota=None, ordinary
         plans.append(EpisodePlan(request, item.item_id, path, cold=cold))
         if cold:
             skips["cold_planned"] += 1
-    if source.control == "missing_as_zero":
+    if fill_missing:
         items = []
         for item in panel.items:
-            targets = {name: values.copy() for name, values in item.targets.items()}
-            for values in targets.values():
-                prefix = values[: max(0, anchor - item.start)]
-                prefix[np.isnan(prefix)] = 0.0
+            targets = {
+                name: _zero_fill_prefix(values, anchor - item.start)
+                for name, values in item.targets.items()
+            }
             items.append(replace(item, targets=targets))
         panel = replace(panel, items=tuple(items))
     return panel, plans, dict(skips), builder
@@ -355,12 +373,15 @@ def _make_batch(config, k, sources):
             if not plans:
                 continue
             if builder is None or builder.panel is not panel:
+                scale_kind = config.sampler.scale_kind
+                scale_options = {} if scale_kind is None else {"scale_kind": scale_kind}
                 builder = EpisodeBuilder(
                     panel,
                     ScreeningConfig(
                         no_evidence=config.sampler.screen_no_evidence,
                         fair_static_spread=config.sampler.screen_fair_spread,
                         scale_floor=config.sampler.scale_floor,
+                        **scale_options,
                     ),
                 )
         except SamplerSkip as error:

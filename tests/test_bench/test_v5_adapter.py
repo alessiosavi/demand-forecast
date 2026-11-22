@@ -447,10 +447,11 @@ REMOVALS = {
     "gates_one": (),
     "screening_alone": (),
     "router_uniform": (),
+    "no_head_gain": (),
 }
 
 
-@pytest.mark.parametrize("name", REMOVALS)
+@pytest.mark.parametrize("name", [name for name in REMOVALS if name != "no_head_gain"])
 def test_each_variant_changes_only_its_inputs(make_adapter, monkeypatch, name):
     from demand_forecast.bench.yardsticks import v5_adapter as api
 
@@ -748,3 +749,92 @@ def test_naive_anchor_scores_each_target_and_no_derived_runs_head_only(tmp_path,
     )
     assert full.evidence()[0].requests == per_target.evidence()[0].requests
     assert full.evidence()[0].requests == no_derived.evidence()[0].requests
+
+
+def test_scale_kind_reaches_every_adapter_request(make_adapter, tmp_path, monkeypatch):
+    adapter = make_adapter(checkpoint=_export(tmp_path, sampler_options={"scale_kind": "spread"}))
+    window = _window(3, targets=2, features=True)
+    window.items[0].axis = None
+    seen = []
+    validate = EpisodeBuilder._validate
+
+    def record(builder, request):
+        seen.append(builder.config.scale_kind)
+        return validate(builder, request)
+
+    monkeypatch.setattr(EpisodeBuilder, "_validate", record)
+    episodes = _capture_episodes(monkeypatch)
+    captured, ends = EpisodeBuilder.build, {}
+
+    def keep_end(builder, request):
+        item = builder.panel.items[request.item_index]
+        ends[item.item_id, request.target] = (request.cutoff or request.origins[0]) - item.start
+        return captured(builder, request)
+
+    monkeypatch.setattr(EpisodeBuilder, "build", keep_end)
+    adapter.predict([window], HORIZON, [0.5])
+    assert len(episodes) == 6 and len(seen) > len(episodes) and set(seen) == {"spread"}
+    for (item, target), episode in episodes.items():
+        series = window.items[window.ids.index(item)]
+        end = ends[item, target]
+        prefix = series.target[window.targets.index(target)][max(0, end - 2048) : end]
+        loc = np.median(prefix)
+        assert len(prefix) and episode.loc[0] == pytest.approx(loc)
+        assert episode.scale[0] == pytest.approx(np.sqrt(np.mean(np.square(prefix - loc))))
+
+
+@pytest.mark.parametrize("mix_evidence", [False, True])
+def test_no_head_gain_rejects_exports_missing_the_model_or_derive(
+    make_adapter, tmp_path, mix_evidence
+):
+    derive = ("naive_anchor",) if mix_evidence else ("naive_anchor", "naive_evidence")
+    path = _export(
+        tmp_path, naive_mix=True, mix_evidence=mix_evidence, sampler_options={"derive": derive}
+    )
+    with pytest.raises(ValueError, match="no_head_gain.*mix_evidence.*naive_evidence"):
+        make_adapter(checkpoint=path, variant="no_head_gain")
+
+
+def test_no_head_gain_changes_only_evidence_cells_after_parity(make_adapter, tmp_path, monkeypatch):
+    from demand_forecast.bench.yardsticks import v5_adapter
+    from demand_forecast.data.episode import collate
+    from tests.test_models.test_v5_mix_evidence import DERIVE
+    from tests.test_models.test_v5_naive_mix import episode, panel
+
+    derive = ("naive_anchor", "naive_evidence")
+    path = _export(tmp_path, naive_mix=True, mix_evidence=True, sampler_options={"derive": derive})
+    full = make_adapter(checkpoint=path)
+    load, parity = v5_adapter.load_export, v5_adapter.require_parity
+    loaded, verified = [], []
+
+    def record_load(*args, **kwargs):
+        model, metadata = load(*args, **kwargs)
+        loaded.append(model)
+        return model, metadata
+
+    def record_parity(*args, **kwargs):
+        assert loaded[-1].head_gain.item() == pytest.approx(1e-3)
+        parity(*args, **kwargs)
+        verified.append(kwargs["device"])
+
+    monkeypatch.setattr(v5_adapter, "load_export", record_load)
+    monkeypatch.setattr(v5_adapter, "require_parity", record_parity)
+    off = make_adapter(checkpoint=path, variant="no_head_gain")
+    assert verified == ["cpu", "cpu"]
+    assert off.model.head_gain.item() == pytest.approx(0)
+    assert full.model.head_gain.item() == pytest.approx(1e-3)
+    for name, value in full.model.state_dict().items():
+        if name != "head_gain":
+            torch.testing.assert_close(off.model.state_dict()[name], value)
+    sample = episode(panel(), DERIVE, horizon=17)
+    batch = collate([sample])
+    measured = batch.naive_error_seen.clone()
+    measured[..., 1, :] = False
+    batch = replace(batch, naive_error_seen=measured)
+    with torch.no_grad():
+        before, after = full.model(batch), off.model(batch)
+    assert before.evidence[..., :16].all() and not before.evidence[..., 16:].any()
+    expected = after.anchor[..., None] + after.fan
+    torch.testing.assert_close(after.quantiles[after.evidence], expected[after.evidence])
+    assert not torch.allclose(before.quantiles[after.evidence], after.quantiles[after.evidence])
+    torch.testing.assert_close(before.quantiles[..., 16:, :], after.quantiles[..., 16:, :])

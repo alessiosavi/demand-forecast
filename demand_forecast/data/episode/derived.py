@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 
 from .kinds import labels_of, observed_mask
-from .scale import Scale, to_scaled
+from .scale import Scale, finite_scale_values, spread_location, to_scaled
 from .schema import NAIVE_OPTIONS, PATCH, QUANTILES
 
 LAG_SCAN_WINDOW = 512
@@ -88,7 +88,13 @@ class NaiveHistory:
         return result
 
     def backtest(
-        self, raw: np.ndarray, scale: Scale, *, origin: int, horizon: int
+        self,
+        raw: np.ndarray,
+        scale: Scale,
+        *,
+        origin: int,
+        horizon: int,
+        kind: str = "seasonal",
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Pool causal, signed residuals in each patch of up to four earlier horizons."""
         patches = (horizon + PATCH - 1) // PATCH
@@ -101,11 +107,11 @@ class NaiveHistory:
                 continue
             outcomes = self.values[start + 1 : stop + 1]
             paths = self.series(left=start, right=stop, origin=start)
-            prefix = raw[:start]
-            finite = prefix[np.isfinite(prefix)]
+            finite = finite_scale_values(raw, start, kind=kind)
             with np.errstate(over="ignore", invalid="ignore"):
                 if finite.size:
-                    median = to_scaled(np.median(finite), scale)
+                    loc = spread_location(finite) if kind == "spread" else np.median(finite)
+                    median = to_scaled(loc, scale)
                     paths["none"] = median, np.isfinite(median)
                 level = self.level(start)
                 paths["level"] = level, np.isfinite(level)

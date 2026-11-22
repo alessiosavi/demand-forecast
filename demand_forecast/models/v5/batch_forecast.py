@@ -170,7 +170,11 @@ def planned_layouts(
     derive: frozenset[str] = frozenset(),
 ) -> list[str]:
     """Return the builder's joint or per-target layout in input job order."""
-    stats = PanelStatsProvider(panel, limit=None, scale_floor=screening.scale_floor)
+    kind = screening.scale_kind
+    scale_options = {} if kind is None else {"scale_kind": kind}
+    stats = PanelStatsProvider(
+        panel, limit=None, scale_floor=screening.scale_floor, **scale_options
+    )
     builder = EpisodeBuilder(panel, screening, stats=stats)
     layouts = ["joint"] * len(jobs)
     for origin, same_origin in _jobs_by_origin(jobs):
@@ -495,7 +499,11 @@ def forecast_items(
             f"forecast_items requires one floating-point dtype for parameters, got {found}"
         )
     device, dtype = parameter.device, parameter.dtype
-    stats = PanelStatsProvider(panel, limit=None, scale_floor=screening.scale_floor)
+    kind = screening.scale_kind
+    scale_options = {} if kind is None else {"scale_kind": kind}
+    stats = PanelStatsProvider(
+        panel, limit=None, scale_floor=screening.scale_floor, **scale_options
+    )
     builder = EpisodeBuilder(panel, screening, stats=stats)
     values, fallback = {}, set()
     evidence_requests: list[tuple[int, str | None]] = []

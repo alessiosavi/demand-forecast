@@ -45,7 +45,11 @@ def v5_loss(
     mask = batch.label_mask & real_steps[:, None, None, :]
     capped = 0
     with torch.autocast(output.quantiles.device.type, enabled=False):
-        predictions = _full_precision(output.quantiles).flatten(0, 2)
+        asinh_output = config.output_space == "asinh"
+        values = output.compressed if asinh_output else output.quantiles
+        if values is None:
+            raise ValueError("output_space='asinh' requires compressed quantiles")
+        predictions = _full_precision(values).flatten(0, 2)
         labels = _full_precision(batch.labels)
         if label_cap is not None:
             selected = mask & eligible[..., None]
@@ -57,6 +61,8 @@ def v5_loss(
             # The empty sum stays connected to predictions and never reads a NaN.
             pinball, count = predictions[:0].sum(), 0
         else:
+            if asinh_output:
+                labels = labels.asinh()
             pinball, count = pinball_loss(
                 predictions,
                 labels.flatten(0, 2),
@@ -98,7 +104,11 @@ def forecast(
     gates: str = "learned",
     pruned: bool = True,
 ) -> ForecastResult:
-    """Build one episode, select/prune inputs, and trim kept forecasts to the horizon."""
+    """Build one episode, select/prune inputs, and trim kept forecasts to the horizon.
+
+    The default builder uses seasonal scaling without a floor. Pass a builder
+    configured for the model's scale when it uses a different kind or a floor.
+    """
     builder = EpisodeBuilder(panel) if builder is None else builder
     batch = collate([builder.build(request)]).to(next(model.parameters()).device)
     training = model.training

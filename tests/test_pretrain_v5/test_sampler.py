@@ -16,12 +16,13 @@ from demand_forecast.data.episode import EpisodeBuilder, EpisodeRequest, Item, P
 from demand_forecast.data.episode.panel_stats import PanelStats
 from demand_forecast.data.episode.schema import (
     KIND_CATEGORY,
+    MAX_CONTEXT,
     MAX_FEATURE_ROWS,
     N_SUMMARY,
     ROLE_PEER,
     SUMMARY_FEATURES,
 )
-from demand_forecast.data.episode.screening import screen
+from demand_forecast.data.episode.screening import ScreeningConfig, screen
 from demand_forecast.pretrain.v5 import t1
 from demand_forecast.pretrain.v5.config import SourceConfig
 from demand_forecast.pretrain.v5.corpus import CorpusValueError, ShortRow
@@ -1784,6 +1785,57 @@ def test_fallback_checked_on_uncontrolled_panel():
     assert not plans and skips["fallback"] == 1
 
 
+def test_fallback_admission_uses_the_cells_the_spread_scale_is_fitted_on():
+    p = panel(length=3 * MAX_CONTEXT, count=1)
+    values = p.items[0].targets["y0"]
+    values[:] = 5.0
+    values[0] = 1.0  # The only varying cell lies before every long spread window.
+    seasonal, spread = config(origins=1), config(origins=1, scale_kind="spread")
+    _, plans, _ = api().plan_panel(
+        p, {}, seasonal.sampler, seasonal.sources[0], np.random.default_rng(1)
+    )
+    assert plans and plans[0].request.cutoff > MAX_CONTEXT + 1
+    _, plans, skips = api().plan_panel(
+        p, {}, spread.sampler, spread.sources[0], np.random.default_rng(1)
+    )
+    assert not plans and skips["fallback"] == 1
+
+
+@pytest.mark.parametrize(
+    ("scale_kind", "observed_tail", "admitted"),
+    [
+        pytest.param("spread", 0, False, id="spread-all-missing"),
+        pytest.param("spread", 2, True, id="spread-partially-observed"),
+        pytest.param(None, 0, True, id="default-all-missing"),
+    ],
+)
+def test_missing_as_zero_fallback_admission_matches_builder(scale_kind, observed_tail, admitted):
+    p = panel(length=3 * MAX_CONTEXT, count=1)
+    item = p.items[0]
+    values = item.targets["y0"]
+    c = config(origins=1, cutoff_at_origin=1, designate_target=True, scale_kind=scale_kind)
+    source = replace(c.sources[0], control="missing_as_zero")
+    _, baseline, _ = api().plan_panel(p, {}, c.sampler, c.sources[0], np.random.default_rng(1))
+    assert len(baseline) == 1
+    request = baseline[0].request
+    cutoff = request.cutoff - item.start
+    assert cutoff > MAX_CONTEXT + 1
+    assert cutoff + request.horizon <= len(values)
+    values[cutoff - MAX_CONTEXT : cutoff - observed_tail] = np.nan
+    assert np.isfinite(values[cutoff : cutoff + request.horizon]).all()
+
+    filled, plans, skips = api().plan_panel(p, {}, c.sampler, source, np.random.default_rng(1))
+    if not admitted:
+        assert not plans
+        assert skips["fallback"] == 1
+        return
+
+    assert plans == baseline
+    assert skips == {}
+    episode = EpisodeBuilder(filled, ScreeningConfig(scale_kind=scale_kind)).build(plans[0].request)
+    assert episode.fallback.tolist() == [False]
+
+
 def test_missing_as_zero_admission_uses_uncontrolled_record(monkeypatch):
     p = panel(length=17, count=4)
     complete = deepcopy(p)
@@ -2131,3 +2183,26 @@ def test_sampler_skip_at_planning_and_building_is_counted(monkeypatch, stage):
     monkeypatch.setattr(owner, name, fail_once)
     _, report = api().make_batch(config(), 0, sources=fixed_mix(config(), FixedSource(panel())))
     assert report["skips"]["short_row"] == 1 and report["episodes"] == 4
+
+
+@pytest.mark.parametrize("designate_target", [False, True], ids=["planner", "batch-builder"])
+def test_sampler_builds_spread_scaled_targets(designate_target):
+    train = replace(
+        config(
+            designate_target=designate_target,
+            drop=(),
+            cutoff_at_origin=1,
+            origins=1,
+            episodes_per_batch=1,
+            episodes_per_panel=1,
+        ),
+        workers=0,
+    )
+    train = replace(train, sampler=replace(train.sampler, scale_kind="spread"))
+    data = panel(length=401, count=1)
+    raw = 10.0 + np.arange(401) / 4
+    data = replace(data, items=(replace(data.items[0], targets={"y0": raw}),))
+    batch, report = api().make_batch(train, 3, sources=fixed_mix(train, FixedSource(data)))
+    count = round((batch.loc[0, 0].item() - 10) * 8 + 1)
+    assert report["supervised"] > 0 and count > 16
+    assert batch.scale[0, 0].item() == pytest.approx(np.sqrt((count**2 - 1) / 12) / 4)

@@ -26,17 +26,26 @@ class PanelStats:
     SUMMARY_CHUNK_CELLS = 4_000_000
 
     def __init__(
-        self, panel: Panel, target: str, cutoff: int, *, scale_floor: float | None = None
+        self,
+        panel: Panel,
+        target: str,
+        cutoff: int,
+        *,
+        scale_floor: float | None = None,
+        scale_kind: str | None = None,
     ) -> None:
         self.panel = panel
         self.target = target
         self.cutoff = cutoff
         self.scale_floor = scale_floor
+        self.scale_kind = scale_kind
         self.screen_cache: dict = {}
         self.lag_cache: dict[tuple[int, str], tuple[int, float, float]] = {}
         self.scales: list[Scale] = []
         self._eligible = np.zeros(len(panel.items), dtype=bool)
         scale_options = {} if scale_floor is None else {"floor": scale_floor}
+        if scale_kind is not None:
+            scale_options["kind"] = scale_kind
         for i, item in enumerate(panel.items):
             values = item.targets.get(target, np.empty(0, dtype=np.float64))
             end = max(0, cutoff - item.start)
@@ -284,12 +293,18 @@ class PanelStatsProvider:
     """Cache panel statistics by target and cutoff, optionally bounding retention."""
 
     def __init__(
-        self, panel: Panel, *, limit: int | None = 16, scale_floor: float | None = None
+        self,
+        panel: Panel,
+        *,
+        limit: int | None = 16,
+        scale_floor: float | None = None,
+        scale_kind: str | None = None,
     ) -> None:
         if limit is not None and limit < 0:
             raise ValueError("statistics cache limit must be nonnegative")
         self.panel = panel
         self.scale_floor = scale_floor
+        self.scale_kind = scale_kind
         self.builds = 0
         self._limit = limit
         self._cache: OrderedDict[tuple[str, int], PanelStats] = OrderedDict()
@@ -300,6 +315,8 @@ class PanelStatsProvider:
         if stats is None:
             floor = self.scale_floor
             scale_options = {} if floor is None else {"scale_floor": floor}
+            if self.scale_kind is not None:
+                scale_options["scale_kind"] = self.scale_kind
             stats = PanelStats(self.panel, target, cutoff, **scale_options)
             self.builds += 1
             self._cache[key] = stats

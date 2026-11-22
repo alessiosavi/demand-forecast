@@ -25,4 +25,5 @@ VARIANT_NAMES = (
     "gates_one",
     "screening_alone",
     "router_uniform",
+    "no_head_gain",
 )

@@ -164,7 +164,9 @@ Other requested quantiles are interpolated linearly with constant tails.
 The default encoder context is the largest context in the training sampler.
 `--max-context` sets the encoder context, rounds down to a multiple of 16 and
 caps it at 2,048. The minimum is 16. Scaling and panel statistics still use
-the full available history up to the forecast origin. `--batch-size` counts
+the full available history up to the forecast origin, except that an export
+trained with `sampler.scale_kind: spread` fits each location and scale on the
+finite cells in the last 2,048 steps before the origin. `--batch-size` counts
 episodes and defaults to 64. Linux CUDA scoring uses 16 episode-building
 workers when at least 18 CPU cores are available to the process.
 
@@ -200,6 +202,7 @@ and `no_siblings`.
 | `gates_one` | Use gates fixed at one and disable pruning |
 | `screening_alone` | Use screening-derived gates |
 | `router_uniform` | Use uniform expert routing |
+| `no_head_gain` | Set the loaded model's head gain to zero on evidence cells. Requires `mix_evidence` and a sampler that derives `naive_evidence` |
 
 ## Evidence and resume
 

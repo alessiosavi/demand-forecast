@@ -154,6 +154,7 @@ def test_round_trip_of_the_whole_state_dict(tmp_path, monkeypatch, export_api, w
     assert stored.pop("mix_evidence") is False
     assert stored.pop("fan_mode") == "head"
     assert stored.pop("mix_bound") is None
+    assert stored.pop("output_space") == "linear"
     assert metadata["model"] == stored
     assert metadata["training"] == config.canonical()
     assert metadata["source"] == {
@@ -248,6 +249,8 @@ def test_selftest_serializes_the_seed_option(tmp_path, export_api, monkeypatch, 
     def check_checkpoint(checkpoint, out):
         config = export_api.read_payload(checkpoint)["config"]
         assert "scale_floor" not in config["sampler"]
+        assert "scale_kind" not in config["sampler"]
+        assert "output_space" not in config["model"]
         if horizon_seed:
             assert config["model"]["horizon_seed"] is True
         else:
@@ -794,3 +797,53 @@ def test_mix_evidence_export_round_trips_and_passes_parity(tmp_path, export_api,
     assert archive["case_9/batch/naive_error_seen"].any()
     assert archive["case_9/batch/naive_resq"].shape == (1, 1, 1, 3, 6, 9)
     export_api.require_parity(out)
+
+
+def test_asinh_spread_export_replays_with_finite_self_test_quantiles(tmp_path, export_api):
+    model = replace(TINY, naive_mix=True, mix_evidence=True, output_space="asinh")
+    derive = ("naive_anchor", "naive_evidence")
+    out = tmp_path / "export"
+    checkpoint = _checkpoint(
+        tmp_path, model=model, sampler_options={"derive": derive, "scale_kind": "spread"}
+    )
+    export_api.write_export(checkpoint, out)
+    loaded, metadata = export_api.load_export(out)
+    assert loaded.config.output_space == "asinh"
+    assert metadata["training"]["sampler"]["scale_kind"] == "spread"
+    assert export_api._screening(metadata["training"]).scale_kind == "spread"
+    archive = _read_archive(out / "parity.npz")
+    quantiles = [v for key, v in archive.items() if key.endswith("/output/quantiles")]
+    assert quantiles and all(np.isfinite(values).all() for values in quantiles)
+    for prefix in (f"case_{i}" for i in range(1, len(quantiles) + 1)):
+        panel = export_api._read_panel(archive, prefix)
+        requests = export_api._read_requests(archive[f"{prefix}/requests"])
+        expected = []
+        for request in requests:
+            item = panel.items[request.item_index]
+            cutoff = request.cutoff if request.cutoff is not None else request.origins[0]
+            row = item.targets[request.target or sorted(item.targets)[0]]
+            cells = row[max(0, cutoff - item.start - 2048) : max(0, cutoff - item.start)]
+            observed = cells[np.isfinite(cells)]
+            if len(observed):
+                spread = np.sqrt(np.mean(np.square(observed - np.median(observed))))
+                expected.append(spread or 1)
+            else:
+                expected.append(1)
+        np.testing.assert_allclose(archive[f"{prefix}/batch/scale"][:, 0], expected)
+    export_api.require_parity(out)
+
+
+def test_asinh_export_rejects_nonfinite_self_test_quantiles(tmp_path, export_api, monkeypatch):
+    model = replace(TINY, output_space="asinh")
+    checkpoint = _checkpoint(tmp_path, model=model)
+    forward = V5Model.forward
+
+    def inject_nan(self, *args, **kwargs):
+        output = forward(self, *args, **kwargs)
+        return replace(output, quantiles=torch.full_like(output.quantiles, torch.nan))
+
+    monkeypatch.setattr(V5Model, "forward", inject_nan)
+    out = tmp_path / "export"
+    with pytest.raises(ValueError, match="non-finite.*quantiles"):
+        export_api.write_export(checkpoint, out)
+    assert not out.exists()

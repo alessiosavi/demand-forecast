@@ -36,6 +36,7 @@ class V5Config:
     mix_evidence: bool = False
     fan_mode: str = "head"
     mix_bound: float | None = None
+    output_space: str = "linear"
 
     def __post_init__(self) -> None:
         """Reject invalid dimensions and regularisation before constructing layers."""
@@ -107,6 +108,8 @@ class V5Config:
             if not self.mix_evidence:
                 raise ValueError("mix_bound requires mix_evidence")
             object.__setattr__(self, "mix_bound", bound)
+        if not isinstance(self.output_space, str) or self.output_space not in ("linear", "asinh"):
+            raise ValueError("output_space must be 'linear' or 'asinh'")
         for name in ("dropout", "known_gate_floor"):
             if not 0 <= getattr(self, name) < 1:
                 raise ValueError(f"{name} must be in [0, 1)")

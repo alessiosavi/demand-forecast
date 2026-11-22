@@ -991,3 +991,37 @@ def test_base_evidence_ignores_its_derived_row(model):
     modified = v5.forecast(model, perturb_after(panel, origins[0]), request)
     assert original.gates == modified.gates
     np.testing.assert_array_equal(original.quantiles[0], modified.quantiles[0])
+
+
+@pytest.mark.parametrize("entry", ["planned_layouts", "forecast_items"])
+def test_batch_forecast_spread_reaches_both_statistics_providers(model, monkeypatch, entry):
+    panel = _panel(n_items=1)
+    origin, horizon = 40, 3
+    jobs = [(0, origin)]
+    screening = ScreeningConfig(scale_kind="spread")
+    seen = []
+    original = PanelStatsProvider.get
+
+    def record(provider, target, cutoff):
+        stats = original(provider, target, cutoff)
+        seen.append(stats.scale_kind)
+        prefix = panel.items[0].targets[target][:cutoff]
+        loc = np.median(prefix)
+        assert stats.scales[0].loc == pytest.approx(loc)
+        assert stats.scales[0].scale == pytest.approx(np.sqrt(np.mean(np.square(prefix - loc))))
+        return stats
+
+    monkeypatch.setattr(PanelStatsProvider, "get", record)
+    if entry == "planned_layouts":
+        assert v5.planned_layouts(panel, jobs, horizon, context=CONTEXT, screening=screening) == [
+            "joint"
+        ]
+    else:
+        actual = v5.forecast_items(
+            model, panel, jobs, horizon, context=CONTEXT, screening=screening
+        )
+        builder = EpisodeBuilder(panel, screening)
+        requests = [EpisodeRequest(0, (origin,), horizon, CONTEXT, cutoff=origin)]
+        expected, scales = _reference(model, panel, builder, requests)
+        _assert_forecasts(actual.values, expected, scales)
+    assert seen and set(seen) == {"spread"}

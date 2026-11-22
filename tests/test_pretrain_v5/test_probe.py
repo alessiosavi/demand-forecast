@@ -685,3 +685,35 @@ def test_probe_saturation_averages_scored_evidence_cells_only(probe, monkeypatch
     assert figures["bound_saturation"] == pytest.approx(1 / 2)
     figures = probe._score_model(model, panel, settings, batch_hook=probe.evidence_off)
     assert figures["bound_saturation"] is None
+
+
+def test_probe_with_both_switches_keeps_all_report_keys(probe, monkeypatch):
+    panels = {
+        name: replace(panel, items=panel.items[:1]) for name, panel in probe.probe_panels().items()
+    }
+    monkeypatch.setattr(probe, "probe_panels", lambda: panels)
+    model = V5Model(
+        replace(config().model, naive_mix=True, mix_evidence=True, fan_mode="residual", mix_bound=2)
+    )
+    derive = ["naive_anchor", "naive_evidence"]
+    baseline = probe.run_probe(
+        model, probe.ProbeSettings.from_training({"sampler": {"derive": derive}})
+    )
+    settings = probe.ProbeSettings.from_training(
+        {"sampler": {"derive": derive, "scale_kind": "spread"}}
+    )
+    assert settings.screening.scale_kind == "spread"
+    enabled = V5Model(replace(model.config, output_space="asinh"))
+    enabled.load_state_dict(model.state_dict())
+    report = probe.run_probe(enabled, settings)
+
+    def keys(value):
+        return (
+            {name: keys(child) for name, child in value.items()}
+            if isinstance(value, dict)
+            else None
+        )
+
+    assert tuple(report["families"]) == FAMILIES
+    assert keys(report) == keys(baseline)
+    json.dumps(report, allow_nan=False)

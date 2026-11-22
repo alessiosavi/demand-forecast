@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+import torch
 
 from demand_forecast.bench.v5_panels import describe, window_panels
 from demand_forecast.data.episode import ScreeningConfig
@@ -29,6 +30,7 @@ class Variant:
     router: str = "learned"
     pruned: bool = True
     derive: frozenset[str] | None = None
+    zero_head_gain: bool = False
 
 
 VARIANTS: dict[str, Variant] = {
@@ -65,6 +67,7 @@ VARIANTS: dict[str, Variant] = {
     "gates_one": Variant(gates="ones", pruned=False),
     "screening_alone": Variant(gates="evidence"),
     "router_uniform": Variant(router="uniform"),
+    "no_head_gain": Variant(zero_head_gain=True),
 }
 
 
@@ -132,6 +135,8 @@ class V5Adapter:
         require_parity(export, device=self.options.device)
 
         sampler = metadata["training"]["sampler"]
+        kind = sampler.get("scale_kind")
+        scale_options = {} if kind is None else {"scale_kind": kind}
         self.context = (
             max(sampler["contexts"])
             if self.options.max_context is None
@@ -141,11 +146,19 @@ class V5Adapter:
             no_evidence=sampler.get("screen_no_evidence", 0.0),
             fair_static_spread=sampler.get("screen_fair_spread", False),
             scale_floor=sampler.get("scale_floor"),
+            **scale_options,
         )
         self.variant = VARIANTS[self.options.variant or "full"]
         self._training_drop = frozenset(sampler["drop_always"])
         self._drop = self._training_drop | self.variant.drop
         self._training_derive = frozenset(sampler.get("derive", ()))
+        if self.variant.zero_head_gain:
+            if not (self.model.config.mix_evidence and "naive_evidence" in self._training_derive):
+                raise ValueError(
+                    "no_head_gain requires model.mix_evidence and sampler naive_evidence"
+                )
+            with torch.no_grad():
+                self.model.head_gain.zero_()
         self._derive = self._training_derive if self.variant.derive is None else self.variant.derive
         self._summary_off = tuple(
             dict.fromkeys((*sampler["summary_off"], *self.variant.summary_off))
