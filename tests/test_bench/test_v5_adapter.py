@@ -49,6 +49,8 @@ from tests.helpers.v5_sampler import paired_static_panel  # noqa: E402
 HORIZON = 2
 TOL = {"atol": 1e-5, "rtol": 1e-5}
 ONLY_PATH_NAMES = tuple(f"only_{name}" for name in NAIVE_OPTIONS)
+CENTRED_PATHS = {"only_season_centred": "season", "only_last_centred": "last"}
+CENTRED_NAMES = ("centred_fan", *CENTRED_PATHS)
 EVIDENCE_DERIVE = ("naive_anchor", "naive_evidence")
 TASK = SimpleNamespace(
     task_name="example", known_dynamic_columns=["plan"], past_dynamic_columns=["event", "past"]
@@ -460,11 +462,13 @@ REMOVALS = {
     "router_uniform": (),
     "no_head_gain": (),
     **dict.fromkeys(ONLY_PATH_NAMES, ()),
+    **dict.fromkeys(CENTRED_NAMES, ()),
 }
 
 
 @pytest.mark.parametrize(
-    "name", [name for name in REMOVALS if name not in ("no_head_gain", *ONLY_PATH_NAMES)]
+    "name",
+    [name for name in REMOVALS if name not in ("no_head_gain", *ONLY_PATH_NAMES, *CENTRED_NAMES)],
 )
 def test_each_variant_changes_only_its_inputs(make_adapter, monkeypatch, name):
     from demand_forecast.bench.yardsticks import v5_adapter as api
@@ -809,7 +813,10 @@ def test_no_head_gain_rejects_exports_missing_the_model_or_derive(
         make_adapter(checkpoint=path, variant="no_head_gain")
 
 
-def test_no_head_gain_changes_only_evidence_cells_after_parity(make_adapter, tmp_path, monkeypatch):
+@pytest.mark.parametrize("variant", ["no_head_gain", *CENTRED_NAMES])
+def test_no_head_gain_changes_only_evidence_cells_after_parity(
+    make_adapter, tmp_path, monkeypatch, variant
+):
     from demand_forecast.bench.yardsticks import v5_adapter
     from demand_forecast.data.episode import collate
     from tests.test_models.test_v5_mix_evidence import DERIVE
@@ -833,7 +840,7 @@ def test_no_head_gain_changes_only_evidence_cells_after_parity(make_adapter, tmp
 
     monkeypatch.setattr(v5_adapter, "load_export", record_load)
     monkeypatch.setattr(v5_adapter, "require_parity", record_parity)
-    off = make_adapter(checkpoint=path, variant="no_head_gain")
+    off = make_adapter(checkpoint=path, variant=variant)
     assert verified == ["cpu", "cpu"]
     assert off.model.head_gain.item() == pytest.approx(0)
     assert full.model.head_gain.item() == pytest.approx(1e-3)
@@ -865,8 +872,9 @@ def evidence_export(tmp_path_factory):
 
 
 @pytest.mark.parametrize("mix_evidence", [False, True])
-def test_every_only_path_rejects_exports_missing_the_model_or_derive(
-    make_adapter, tmp_path, mix_evidence
+@pytest.mark.parametrize("variants", [ONLY_PATH_NAMES, CENTRED_NAMES], ids=["only", "centred"])
+def test_naive_fan_variants_reject_exports_missing_the_model_or_derive(
+    make_adapter, tmp_path, mix_evidence, variants
 ):
     path = _export(
         tmp_path,
@@ -874,7 +882,7 @@ def test_every_only_path_rejects_exports_missing_the_model_or_derive(
         mix_evidence=mix_evidence,
         sampler_options={"derive": ("naive_anchor",) if mix_evidence else EVIDENCE_DERIVE},
     )
-    for variant in ONLY_PATH_NAMES:
+    for variant in variants:
         with pytest.raises(
             ValueError,
             match=r"^no_head_gain requires model\.mix_evidence and sampler naive_evidence$",
@@ -954,6 +962,139 @@ def test_only_path_quantiles_with_without_and_missing_evidence(
     torch.testing.assert_close(actual.quantiles[~seen], baseline.quantiles[~seen], **TOL)
 
 
+@pytest.mark.parametrize("fan_mode", ["head", "residual"])
+def test_centred_fan_matches_the_mix_anchor_and_preserves_spread(
+    make_adapter, evidence_export, fan_mode
+):
+    batch = _path_batch(NAIVE_OPTIONS.index("season"))
+    measured = batch.naive_error_seen.clone()
+    measured[..., 1, :] = False
+    batch = replace(batch, naive_error_seen=measured)
+    off = make_adapter(checkpoint=evidence_export, variant="no_head_gain")
+    centred = make_adapter(checkpoint=evidence_export, variant="centred_fan")
+    for adapter in (off, centred):
+        adapter.model.config = replace(
+            adapter.model.config, fan_mode=fan_mode, output_space="linear"
+        )
+    with torch.no_grad():
+        baseline = off.model(batch)
+        actual = centred.model(centred._batch_hook(batch))
+        head = off.model(replace(batch, naive_seen=torch.zeros_like(batch.naive_seen))).quantiles
+
+    evidence = baseline.evidence
+    assert evidence.any() and not evidence[..., PATCH : 2 * PATCH].any()
+    assert torch.equal(actual.evidence, evidence)
+    torch.testing.assert_close(actual.mix, baseline.mix, **TOL)
+    paths = batch.naive_paths.masked_fill(~batch.naive_seen, 0)
+    anchor = (baseline.mix * paths).sum(dim=-1)
+    assert not torch.allclose(baseline.quantiles[..., _MEDIAN][evidence], anchor[evidence], **TOL)
+    torch.testing.assert_close(actual.quantiles[..., _MEDIAN][evidence], anchor[evidence], **TOL)
+
+    # The fan uses weights renormalized over the paths that have residual evidence.
+    options = batch.naive_seen & measured.repeat_interleave(PATCH, dim=-2)
+    weights = baseline.mix[evidence].masked_fill(~options[evidence], 0)
+    weights = weights / weights.sum(dim=-1, keepdim=True)
+    residuals = batch.naive_resq.repeat_interleave(PATCH, dim=-3)[evidence]
+    spread = (weights[..., None] * (residuals - residuals[..., _MEDIAN : _MEDIAN + 1])).sum(dim=-2)
+    if fan_mode == "head":
+        spread = torch.nn.functional.softplus(off.model.gamma_raw.detach()) * spread
+    torch.testing.assert_close(actual.fan[evidence], spread, **TOL)
+
+    expected = anchor[evidence][..., None] + spread
+    if fan_mode == "residual":
+        head = head[evidence]
+        expected = expected + _HEAD_GAIN_START * (head - head[..., _MEDIAN : _MEDIAN + 1])
+    torch.testing.assert_close(actual.quantiles[evidence], expected, **TOL)
+    torch.testing.assert_close(
+        actual.quantiles[evidence].diff(), baseline.quantiles[evidence].diff(), **TOL
+    )
+    torch.testing.assert_close(actual.quantiles[~evidence], baseline.quantiles[~evidence], **TOL)
+
+
+@pytest.mark.parametrize("variant", CENTRED_PATHS)
+@pytest.mark.parametrize("fan_mode", ["head", "residual"])
+def test_only_centred_fan_matches_the_path_and_preserves_spread(
+    make_adapter, evidence_export, variant, fan_mode
+):
+    path = CENTRED_PATHS[variant]
+    index = NAIVE_OPTIONS.index(path)
+    batch = _path_batch(index)
+
+    def score(name):
+        adapter = make_adapter(checkpoint=evidence_export, variant=name)
+        adapter.model.config = replace(
+            adapter.model.config, fan_mode=fan_mode, output_space="linear"
+        )
+        with torch.no_grad():
+            return adapter.model(adapter._batch_hook(batch))
+
+    actual = score(variant)
+    isolated = score(f"only_{path}")
+    centred = score("centred_fan")
+    seen = batch.naive_seen[..., index]
+    measured = batch.naive_error_seen[..., index].repeat_interleave(PATCH, dim=-1)
+    with_evidence, without_evidence = seen & measured, seen & ~measured
+    assert with_evidence.any() and without_evidence.any() and (~seen & centred.evidence).any()
+    assert torch.equal(actual.evidence, isolated.evidence)
+    torch.testing.assert_close(
+        actual.quantiles[..., _MEDIAN][with_evidence],
+        batch.naive_paths[..., index][with_evidence],
+        **TOL,
+    )
+    torch.testing.assert_close(
+        actual.quantiles[with_evidence].diff(), isolated.quantiles[with_evidence].diff(), **TOL
+    )
+    torch.testing.assert_close(
+        actual.quantiles[without_evidence], isolated.quantiles[without_evidence], **TOL
+    )
+    torch.testing.assert_close(actual.quantiles[~seen], centred.quantiles[~seen], **TOL)
+
+
+@pytest.mark.parametrize("variant", CENTRED_NAMES)
+def test_centred_hook_replaces_only_residuals_and_any_isolation_masks(
+    make_adapter, evidence_export, variant
+):
+    path = CENTRED_PATHS.get(variant)
+    batch = _path_batch(NAIVE_OPTIONS.index(path or "season"))
+    originals = vars(batch).copy()
+    snapshots = deepcopy(originals)
+    adapter = make_adapter(checkpoint=evidence_export, variant=variant)
+    actual = adapter._batch_hook(batch)
+    assert actual is not batch and type(actual) is type(batch)
+    assert vars(actual).keys() == originals.keys()
+    mask_names = {"naive_seen", "naive_error_seen"} if path is not None else set()
+    for name, original in originals.items():
+        value = getattr(batch, name)
+        assert value is original
+        if isinstance(value, torch.Tensor):
+            torch.testing.assert_close(value, snapshots[name], equal_nan=True, **TOL)
+        else:
+            assert value == snapshots[name]
+        if name not in mask_names | {"naive_resq"}:
+            assert getattr(actual, name) is original
+
+    residuals = snapshots["naive_resq"]
+    expected = residuals - residuals[..., _MEDIAN : _MEDIAN + 1]
+    assert not torch.allclose(residuals, expected, **TOL)
+    torch.testing.assert_close(actual.naive_resq, expected, **TOL)
+    if path is not None:
+        isolated = make_adapter(checkpoint=evidence_export, variant=f"only_{path}")._batch_hook(
+            batch
+        )
+        for name in mask_names:
+            assert torch.equal(getattr(actual, name), getattr(isolated, name))
+
+
+@pytest.mark.parametrize("variant", CENTRED_NAMES)
+def test_centred_hook_rejects_batch_without_naive_evidence(make_adapter, evidence_export, variant):
+    from tests.test_models.test_v5_naive_mix import episode, panel
+
+    batch = collate([episode(panel(), derive=frozenset({"naive_anchor"}))], include_row_keys=True)
+    adapter = make_adapter(checkpoint=evidence_export, variant=variant)
+    with pytest.raises(TypeError, match="needs a batch with naive evidence"):
+        adapter._batch_hook(batch)
+
+
 def test_only_path_hook_rejects_batch_without_naive_evidence(make_adapter, evidence_export):
     from tests.test_models.test_v5_naive_mix import episode, panel
 
@@ -1025,15 +1166,26 @@ def test_only_path_hook_reaches_every_adapter_forecast(make_adapter, evidence_ex
     assert all(count > 0 for count in batches)
 
 
-@pytest.mark.parametrize("variant", ["full", "no_head_gain"])
-def test_existing_evidence_variants_match_unhooked_forecast_bytes(
+def _n10_season_hook(batch):
+    # This fixture has one short patch with the seasonal path available throughout.
+    index = NAIVE_OPTIONS.index("season")
+    assert batch.naive_seen[..., :HORIZON, index].all() and batch.naive_error_seen[..., index].all()
+    others = [j for j in range(len(NAIVE_OPTIONS)) if j != index]
+    seen, measured = batch.naive_seen.clone(), batch.naive_error_seen.clone()
+    seen[..., :HORIZON, others] = False
+    measured[..., others] = False
+    return replace(batch, naive_seen=seen, naive_error_seen=measured)
+
+
+@pytest.mark.parametrize("variant", ["full", "no_head_gain", "only_season"])
+def test_existing_evidence_variants_match_n10_forecast_bytes(
     make_adapter, evidence_export, variant
 ):
-    # Reproduce the pre-variant call in this process and avoid cross-platform golden floats.
+    # Reproduce the N10 call in this process and avoid cross-platform golden floats.
     window = _window()
     (part,) = _panels(window).parts
     model, _ = load_export(evidence_export, device="cpu")
-    if variant == "no_head_gain":
+    if variant in {"no_head_gain", "only_season"}:
         with torch.no_grad():
             model.head_gain.zero_()
     reference = forecast_items(
@@ -1043,6 +1195,7 @@ def test_existing_evidence_variants_match_unhooked_forecast_bytes(
         HORIZON,
         context=48,
         derive=frozenset(EVIDENCE_DERIVE),
+        batch_hook=_n10_season_hook if variant == "only_season" else None,
     ).values[0, window.targets[0]]
     adapter = make_adapter(checkpoint=evidence_export, variant=variant)
     [[actual]] = adapter.predict([window], HORIZON, list(model.config.quantiles))

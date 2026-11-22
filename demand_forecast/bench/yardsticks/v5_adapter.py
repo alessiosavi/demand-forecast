@@ -18,6 +18,7 @@ from demand_forecast.data.episode.collate import EpisodeBatchWithNaiveEvidence
 from demand_forecast.data.episode.schema import MAX_CONTEXT, NAIVE_OPTIONS, PATCH, SUMMARY_FEATURES
 from demand_forecast.models.v5 import Evidence, forecast_items, planned_layouts, usable_workers
 from demand_forecast.models.v5.export import load_export, require_parity
+from demand_forecast.models.v5.model import _MEDIAN
 
 from .runner import Options, WindowInput
 
@@ -34,6 +35,7 @@ class Variant:
     derive: frozenset[str] | None = None
     zero_head_gain: bool = False
     only_path_index: int | None = None
+    centre_fan: bool = False
 
 
 VARIANTS: dict[str, Variant] = {
@@ -75,6 +77,13 @@ VARIANTS: dict[str, Variant] = {
         f"only_{name}": Variant(zero_head_gain=True, only_path_index=index)
         for index, name in enumerate(NAIVE_OPTIONS)
     },
+    "centred_fan": Variant(zero_head_gain=True, centre_fan=True),
+    **{
+        f"only_{name}_centred": Variant(
+            zero_head_gain=True, only_path_index=NAIVE_OPTIONS.index(name), centre_fan=True
+        )
+        for name in ("season", "last")
+    },
 }
 
 
@@ -96,6 +105,16 @@ def _isolate_naive_path(batch: EpisodeBatch, *, path_index: int) -> EpisodeBatch
         naive_seen=seen & ~(selected[..., None] & other_paths),
         naive_error_seen=batch.naive_error_seen & ~(selected_patches[..., None] & other_paths),
     )
+
+
+def _centre_naive_fan(batch: EpisodeBatch, *, path_index: int | None) -> EpisodeBatch:
+    if not isinstance(batch, EpisodeBatchWithNaiveEvidence):
+        raise TypeError("centred fan needs a batch with naive evidence")
+    residuals = batch.naive_resq
+    centred = replace(batch, naive_resq=residuals - residuals[..., _MEDIAN : _MEDIAN + 1])
+    if path_index is not None:
+        return _isolate_naive_path(centred, path_index=path_index)
+    return centred
 
 
 def _worker_count(device: str) -> int:
@@ -187,9 +206,11 @@ class V5Adapter:
             with torch.no_grad():
                 self.model.head_gain.zero_()
         path_index = self.variant.only_path_index
-        self._batch_hook = (
-            partial(_isolate_naive_path, path_index=path_index) if path_index is not None else None
-        )
+        self._batch_hook: partial[EpisodeBatch] | None = None
+        if self.variant.centre_fan:
+            self._batch_hook = partial(_centre_naive_fan, path_index=path_index)
+        elif path_index is not None:
+            self._batch_hook = partial(_isolate_naive_path, path_index=path_index)
         self._derive = self._training_derive if self.variant.derive is None else self.variant.derive
         self._summary_off = tuple(
             dict.fromkeys((*sampler["summary_off"], *self.variant.summary_off))
