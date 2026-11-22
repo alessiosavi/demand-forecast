@@ -203,6 +203,17 @@ and `no_siblings`.
 | `screening_alone` | Use screening-derived gates |
 | `router_uniform` | Use uniform expert routing |
 | `no_head_gain` | Set the loaded model's head gain to zero on evidence cells. Requires `mix_evidence` and a sampler that derives `naive_evidence` |
+| `only_none` | Select the zero anchor in scaled units |
+| `only_last` | Select the last-observation path |
+| `only_level` | Select the local-level path |
+| `only_season` | Select the seasonal path |
+| `only_season2` | Select the longer seasonal-lag path |
+| `only_drift` | Select the drift path |
+
+The `only_*` variants use the same export requirements and gain setting as
+`no_head_gain`. Each available path supplies the anchor and its own residual
+evidence. With no residual evidence, the ordinary quantile head uses that path
+as its anchor. Where the path is unavailable, the `no_head_gain` forecast applies.
 
 ## Evidence and resume
 
