@@ -15,6 +15,8 @@ from pathlib import Path
 
 import pytest
 
+from demand_forecast.data.episode.schema import NAIVE_OPTIONS
+
 ROOT = Path(__file__).resolve().parents[2]
 PIN = "8e338e915d26c8960713889ef12ab1cf5c08d591"
 SHA = "a" * 40
@@ -283,10 +285,10 @@ def test_covariates_cli(tmp_path, covariates):
     assert config["covariates"] == (covariates or "all")
 
 
-@pytest.mark.parametrize("variant", [None, "no_peers"])
+@pytest.mark.parametrize("variant", [None, "no_peers", *(f"only_{name}" for name in NAIVE_OPTIONS)])
 def test_v5_cli_emits_raw_job(tmp_path, variant):
     output = tmp_path / "job.sh"
-    command = [sys.executable, str(ROOT / "scripts/gcp/jobs/make_score_job.py")]
+    command = [sys.executable, "-I", "-S", str(ROOT / "scripts/gcp/jobs/make_score_job.py")]
     for key, value in v5_arguments(variant=variant).items():
         if value is not None:
             command += ["--" + key.replace("_", "-"), value]

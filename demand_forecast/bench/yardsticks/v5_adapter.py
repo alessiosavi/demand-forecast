@@ -5,15 +5,17 @@ from __future__ import annotations
 import os
 import resource
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from functools import partial
 from pathlib import Path
 
 import numpy as np
 import torch
 
 from demand_forecast.bench.v5_panels import describe, window_panels
-from demand_forecast.data.episode import ScreeningConfig
-from demand_forecast.data.episode.schema import MAX_CONTEXT, PATCH, SUMMARY_FEATURES
+from demand_forecast.data.episode import EpisodeBatch, ScreeningConfig
+from demand_forecast.data.episode.collate import EpisodeBatchWithNaiveEvidence
+from demand_forecast.data.episode.schema import MAX_CONTEXT, NAIVE_OPTIONS, PATCH, SUMMARY_FEATURES
 from demand_forecast.models.v5 import Evidence, forecast_items, planned_layouts, usable_workers
 from demand_forecast.models.v5.export import load_export, require_parity
 
@@ -31,6 +33,7 @@ class Variant:
     pruned: bool = True
     derive: frozenset[str] | None = None
     zero_head_gain: bool = False
+    only_path_index: int | None = None
 
 
 VARIANTS: dict[str, Variant] = {
@@ -68,7 +71,31 @@ VARIANTS: dict[str, Variant] = {
     "screening_alone": Variant(gates="evidence"),
     "router_uniform": Variant(router="uniform"),
     "no_head_gain": Variant(zero_head_gain=True),
+    **{
+        f"only_{name}": Variant(zero_head_gain=True, only_path_index=index)
+        for index, name in enumerate(NAIVE_OPTIONS)
+    },
 }
+
+
+def _isolate_naive_path(batch: EpisodeBatch, *, path_index: int) -> EpisodeBatch:
+    if not isinstance(batch, EpisodeBatchWithNaiveEvidence):
+        raise TypeError("only_* needs a batch with naive evidence")
+    seen = batch.naive_seen
+    selected = seen[..., path_index]
+    other_paths = torch.arange(seen.shape[-1], device=seen.device) != path_index
+    steps = torch.arange(seen.shape[-2], device=seen.device)
+    real_steps = (steps[None] < batch.horizon[:, None]).unflatten(-1, (-1, PATCH))
+    real_steps = (real_steps & batch.horizon_mask[..., None])[:, None, None]
+    # A mixed patch needs its evidence for the steps that keep the original mix.
+    # At selected steps the model also intersects the patch mask with naive_seen.
+    selected_steps = selected.unflatten(-1, (-1, PATCH))
+    selected_patches = (selected_steps | ~real_steps).all(dim=-1) & real_steps.any(dim=-1)
+    return replace(
+        batch,
+        naive_seen=seen & ~(selected[..., None] & other_paths),
+        naive_error_seen=batch.naive_error_seen & ~(selected_patches[..., None] & other_paths),
+    )
 
 
 def _worker_count(device: str) -> int:
@@ -159,6 +186,10 @@ class V5Adapter:
                 )
             with torch.no_grad():
                 self.model.head_gain.zero_()
+        path_index = self.variant.only_path_index
+        self._batch_hook = (
+            partial(_isolate_naive_path, path_index=path_index) if path_index is not None else None
+        )
         self._derive = self._training_derive if self.variant.derive is None else self.variant.derive
         self._summary_off = tuple(
             dict.fromkeys((*sampler["summary_off"], *self.variant.summary_off))
@@ -229,6 +260,7 @@ class V5Adapter:
                 pruned=self.variant.pruned,
                 batch_episodes=self.options.batch_size,
                 workers=self._workers,
+                batch_hook=self._batch_hook,
             )
             for i, position in enumerate(part.positions):
                 targets = window.items[position].target_indices

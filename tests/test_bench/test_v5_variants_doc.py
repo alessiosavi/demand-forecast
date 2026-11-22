@@ -21,7 +21,7 @@ def test_documented_variants_are_the_accepted_ones():
     rows = text.split("| Variant | Scoring change |\n|---|---|\n", 1)[1].splitlines()
     documented = []
     for row in rows:
-        match = re.match(r"\| `([a-z_]+)` \| \S", row)
+        match = re.match(r"\| `([a-z_][a-z_0-9]*)` \| \S", row)
         if match is None:
             break
         documented.append(match.group(1))

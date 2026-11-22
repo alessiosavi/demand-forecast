@@ -26,4 +26,10 @@ VARIANT_NAMES = (
     "screening_alone",
     "router_uniform",
     "no_head_gain",
+    "only_none",
+    "only_last",
+    "only_level",
+    "only_season",
+    "only_season2",
+    "only_drift",
 )
