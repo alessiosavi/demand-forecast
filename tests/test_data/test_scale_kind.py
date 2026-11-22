@@ -188,3 +188,12 @@ def test_screening_config_rejects_an_unknown_scale_kind():
     assert ScreeningConfig(scale_kind="seasonal").scale_kind == "seasonal"
     with pytest.raises(ValueError, match="scale_kind"):
         ScreeningConfig(scale_kind="spreadd")
+
+
+def test_fit_scale_rejects_an_unknown_kind():
+    values = np.array([1.0, 3.0, 9.0])
+    assert fit_scale(values, 3, 7, kind=None) == fit_scale(values, 3, 7, kind="seasonal")
+    with pytest.raises(ValueError, match="scale_kind"):
+        fit_scale(values, 3, 7, kind="spreadd")
+    with pytest.raises(ValueError, match="scale_kind"):
+        PanelStatsProvider(_window_panel(), scale_kind="spreadd").get("a", 2 * MAX_CONTEXT)

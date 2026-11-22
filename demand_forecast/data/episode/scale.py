@@ -58,9 +58,11 @@ def fit_scale(
     season: int,
     *,
     floor: float | None = None,
-    kind: str = "seasonal",
+    kind: str | None = "seasonal",
 ) -> Scale:
     """Fit a prefix-only scale with an optional floor relative to the mean absolute level."""
+    if kind not in (None, "seasonal", "spread"):
+        raise ValueError("scale_kind must be 'seasonal' or 'spread'")
     prefix = np.asarray(values[: max(0, cutoff)], dtype=np.float64)
     finite = finite_scale_values(prefix, len(prefix), kind=kind)
     if not len(finite):

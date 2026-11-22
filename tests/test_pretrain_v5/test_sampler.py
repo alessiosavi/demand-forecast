@@ -16,6 +16,7 @@ from demand_forecast.data.episode import EpisodeBuilder, EpisodeRequest, Item, P
 from demand_forecast.data.episode.panel_stats import PanelStats
 from demand_forecast.data.episode.schema import (
     KIND_CATEGORY,
+    MAX_CONTEXT,
     MAX_FEATURE_ROWS,
     N_SUMMARY,
     ROLE_PEER,
@@ -1780,6 +1781,22 @@ def test_fallback_checked_on_uncontrolled_panel():
     source = replace(config().sources[0], control="missing_as_zero")
     _, plans, skips = api().plan_panel(
         p, {}, config(origins=1).sampler, source, np.random.default_rng(1)
+    )
+    assert not plans and skips["fallback"] == 1
+
+
+def test_fallback_admission_uses_the_cells_the_spread_scale_is_fitted_on():
+    p = panel(length=3 * MAX_CONTEXT, count=1)
+    values = p.items[0].targets["y0"]
+    values[:] = 5.0
+    values[0] = 1.0  # The only varying cell lies before every long spread window.
+    seasonal, spread = config(origins=1), config(origins=1, scale_kind="spread")
+    _, plans, _ = api().plan_panel(
+        p, {}, seasonal.sampler, seasonal.sources[0], np.random.default_rng(1)
+    )
+    assert plans and plans[0].request.cutoff > MAX_CONTEXT + 1
+    _, plans, skips = api().plan_panel(
+        p, {}, spread.sampler, spread.sources[0], np.random.default_rng(1)
     )
     assert not plans and skips["fallback"] == 1
 

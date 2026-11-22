@@ -12,6 +12,7 @@ import pytest
 import torch
 
 from demand_forecast.data.episode import EpisodeBuilder, EpisodeRequest, collate
+from demand_forecast.data.episode.scale import finite_scale_values
 from demand_forecast.data.episode.screening import ScreeningConfig
 from demand_forecast.models.v5 import V5Model, forecast, v5_loss
 from demand_forecast.synthetic.typed import PanelRecipe, generate_typed_panel
@@ -1208,7 +1209,11 @@ def test_measure_and_builder_agree_on_a_constant_spread_window(monkeypatch):
     baseline = measure._inference_measure(train, torch.device("cpu"), 1, len(values), 0)
     assert baseline["fallback_forecasts"] == 0
     train = replace(train, sampler=replace(train.sampler, scale_kind="spread"))
-    builder = EpisodeBuilder(panel, ScreeningConfig(scale_kind="spread"))
-    assert builder.build(EpisodeRequest(0, (len(values) - 28,), 28, context=512)).fallback[0]
+    request = EpisodeRequest(0, (len(values) - 28,), 28, context=512)
+    for kind, constant in ((None, False), ("spread", True)):
+        observed = finite_scale_values(values, len(values) - 28, kind=kind)
+        assert bool(np.all(observed == observed[0])) is constant
+        built = EpisodeBuilder(panel, ScreeningConfig(scale_kind=kind)).build(request)
+        assert bool(built.fallback[0]) is constant
     with pytest.raises(RuntimeError, match="got 1 forecasts and 1 fallbacks"):
         measure._inference_measure(train, torch.device("cpu"), 1, len(values), 0)

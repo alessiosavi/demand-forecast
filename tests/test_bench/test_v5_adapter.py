@@ -764,14 +764,23 @@ def test_scale_kind_reaches_every_adapter_request(make_adapter, tmp_path, monkey
 
     monkeypatch.setattr(EpisodeBuilder, "_validate", record)
     episodes = _capture_episodes(monkeypatch)
+    captured, ends = EpisodeBuilder.build, {}
+
+    def keep_end(builder, request):
+        item = builder.panel.items[request.item_index]
+        ends[item.item_id, request.target] = (request.cutoff or request.origins[0]) - item.start
+        return captured(builder, request)
+
+    monkeypatch.setattr(EpisodeBuilder, "build", keep_end)
     adapter.predict([window], HORIZON, [0.5])
     assert len(episodes) == 6 and len(seen) > len(episodes) and set(seen) == {"spread"}
     for (item, target), episode in episodes.items():
         series = window.items[window.ids.index(item)]
-        row = series.target[window.targets.index(target)]
-        loc = np.median(row)
-        assert episode.loc[0] == pytest.approx(loc)
-        assert episode.scale[0] == pytest.approx(np.sqrt(np.mean(np.square(row - loc))))
+        end = ends[item, target]
+        prefix = series.target[window.targets.index(target)][max(0, end - 2048) : end]
+        loc = np.median(prefix)
+        assert len(prefix) and episode.loc[0] == pytest.approx(loc)
+        assert episode.scale[0] == pytest.approx(np.sqrt(np.mean(np.square(prefix - loc))))
 
 
 @pytest.mark.parametrize("mix_evidence", [False, True])

@@ -21,6 +21,7 @@ from demand_forecast.data.episode.collate import (
     EpisodeBatchWithNaiveEvidence,
     collate,
 )
+from demand_forecast.data.episode.scale import finite_scale_values
 from demand_forecast.data.episode.schema import PATCH
 from demand_forecast.data.episode.screening import ScreeningConfig
 from demand_forecast.synthetic.typed import necessary_items
@@ -236,8 +237,8 @@ def _plan_panel(panel, record, config, source, rng, *, path_quota=None, ordinary
         nonfallback = []
         for name in targets:
             values = item.targets[name]
-            prefix = values[: max(0, cutoff - item.start)]
-            observed = prefix[np.isfinite(prefix)]
+            # The cells EpisodeBuilder's fallback flag and the scale fit read.
+            observed = finite_scale_values(values, cutoff - item.start, kind=config.scale_kind)
             if len(observed) and np.any(observed != observed[0]):
                 nonfallback.append(values)
         if not nonfallback:
