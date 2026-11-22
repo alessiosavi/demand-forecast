@@ -22,7 +22,7 @@ from demand_forecast.data.episode.schema import (
     ROLE_PEER,
     SUMMARY_FEATURES,
 )
-from demand_forecast.data.episode.screening import screen
+from demand_forecast.data.episode.screening import ScreeningConfig, screen
 from demand_forecast.pretrain.v5 import t1
 from demand_forecast.pretrain.v5.config import SourceConfig
 from demand_forecast.pretrain.v5.corpus import CorpusValueError, ShortRow
@@ -1799,6 +1799,41 @@ def test_fallback_admission_uses_the_cells_the_spread_scale_is_fitted_on():
         p, {}, spread.sampler, spread.sources[0], np.random.default_rng(1)
     )
     assert not plans and skips["fallback"] == 1
+
+
+@pytest.mark.parametrize(
+    ("scale_kind", "observed_tail", "admitted"),
+    [
+        pytest.param("spread", 0, False, id="spread-all-missing"),
+        pytest.param("spread", 2, True, id="spread-partially-observed"),
+        pytest.param(None, 0, True, id="default-all-missing"),
+    ],
+)
+def test_missing_as_zero_fallback_admission_matches_builder(scale_kind, observed_tail, admitted):
+    p = panel(length=3 * MAX_CONTEXT, count=1)
+    item = p.items[0]
+    values = item.targets["y0"]
+    c = config(origins=1, cutoff_at_origin=1, designate_target=True, scale_kind=scale_kind)
+    source = replace(c.sources[0], control="missing_as_zero")
+    _, baseline, _ = api().plan_panel(p, {}, c.sampler, c.sources[0], np.random.default_rng(1))
+    assert len(baseline) == 1
+    request = baseline[0].request
+    cutoff = request.cutoff - item.start
+    assert cutoff > MAX_CONTEXT + 1
+    assert cutoff + request.horizon <= len(values)
+    values[cutoff - MAX_CONTEXT : cutoff - observed_tail] = np.nan
+    assert np.isfinite(values[cutoff : cutoff + request.horizon]).all()
+
+    filled, plans, skips = api().plan_panel(p, {}, c.sampler, source, np.random.default_rng(1))
+    if not admitted:
+        assert not plans
+        assert skips["fallback"] == 1
+        return
+
+    assert plans == baseline
+    assert skips == {}
+    episode = EpisodeBuilder(filled, ScreeningConfig(scale_kind=scale_kind)).build(plans[0].request)
+    assert episode.fallback.tolist() == [False]
 
 
 def test_missing_as_zero_admission_uses_uncontrolled_record(monkeypatch):
