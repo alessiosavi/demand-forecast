@@ -19,6 +19,7 @@ SHA = "a" * 40
 HISTORY_ERROR = "All time series in the dataset are too short for the chosen cutoff, horizon and min_context_length"
 TASKS = b"tasks:\n- name: alpha\n  dataset_path: fake/data\n- task_name: beta/new\n  dataset_path: fake/data\n"
 NAMES = b"beta/new\nalpha\n"
+REPLAY_MODELS = ("snaive", "snaive_v5lag", "snaive_v5point", "snaive_v5pairs", "snaive_v5patch")
 
 
 @pytest.fixture
@@ -67,11 +68,29 @@ def test_validation(jobs, changes):
         jobs.generate(**arguments(**changes))
 
 
-@pytest.mark.parametrize("model", [None, "seasonal_naive", "auto_ets", "auto_theta", "median3"])
-def test_cli_bash_and_embedded_guest_hash(jobs, tmp_path, model):
+@pytest.mark.parametrize(
+    "model", [None, "seasonal_naive", "auto_ets", "auto_theta", "median3", *REPLAY_MODELS]
+)
+def test_cli_bash_and_embedded_guest_hash(jobs, tmp_path, model, guest):
     output = tmp_path / "job.sh"
     command = [sys.executable, str(ROOT / "scripts/gcp/jobs/make_baseline_job.py")]
-    for key, value in arguments().items():
+    inputs = arguments()
+    if model in REPLAY_MODELS:
+        names = [f"synthetic_{index}/new" for index in range(12)]
+        names_bytes = ("\n".join(names) + "\n").encode()
+        (tmp_path / "names.txt").write_bytes(names_bytes)
+        tasks_bytes = (
+            "tasks:\n"
+            + "".join(f"- name: {name}\n  dataset_path: fake/data\n" for name in reversed(names))
+            + "- name: excluded\n  dataset_path: fake/data\n"
+        ).encode()
+        (tmp_path / "tasks.yaml").write_bytes(tasks_bytes)
+        inputs.update(
+            tasks_sha256=hashlib.sha256(tasks_bytes).hexdigest(),
+            names_uri="gs://offline/names.txt",
+            names_sha256=hashlib.sha256(names_bytes).hexdigest(),
+        )
+    for key, value in inputs.items():
         command += ["--" + key.replace("_", "-"), value]
     if model:
         command += ["--model", model]
@@ -85,12 +104,16 @@ def test_cli_bash_and_embedded_guest_hash(jobs, tmp_path, model):
         [sys.executable, "-", str(tmp_path)], input=snippet, capture_output=True, text=True
     )
     assert unpack.returncode == 0, unpack.stderr
-    guest = (tmp_path / "baseline.py").read_bytes()
-    assert guest.decode() == jobs.GUEST
+    guest_bytes = (tmp_path / "baseline.py").read_bytes()
+    assert guest_bytes.decode() == jobs.GUEST
     config = json.loads((tmp_path / "inputs.json").read_text())
-    assert config["guest_sha256"] == hashlib.sha256(guest).hexdigest()
+    assert config["guest_sha256"] == hashlib.sha256(guest_bytes).hexdigest()
     assert config["model"] == (model or "seasonal_naive")
-    ast.parse(guest, feature_version=(3, 10))
+    ast.parse(guest_bytes, feature_version=(3, 10))
+    if model in REPLAY_MODELS:
+        assert config["names_uri"] == inputs["names_uri"]
+        assert config["names_sha256"] == inputs["names_sha256"]
+        assert [spec.name for spec in guest["selected"](config, tmp_path)] == names
 
 
 @pytest.fixture

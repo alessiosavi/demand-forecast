@@ -541,7 +541,12 @@ def fev_baseline(
     ),
     out_dir: Path = typer.Option(..., "--out-dir", help="Directory for resumable summaries.csv"),
     model: str = typer.Option(
-        "seasonal_naive", "--model", help="seasonal_naive, auto_ets, auto_theta, or median3"
+        "seasonal_naive",
+        "--model",
+        help=(
+            "seasonal_naive, auto_ets, auto_theta, median3, snaive, snaive_v5lag, "
+            "snaive_v5point, snaive_v5pairs, or snaive_v5patch"
+        ),
     ),
     profiles: Path | None = typer.Option(
         None, "--profiles", exists=True, dir_okay=False, help="Override task role profiles YAML"
