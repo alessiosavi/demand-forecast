@@ -411,6 +411,14 @@ Each arm writes its own `model_name` into `summaries.csv`; resume skips only
 completed task/model pairs, preserving rows from other arms. All arms use a
 seasonal-naive fallback if a StatsForecast model fails.
 
+`fev baseline --model` also accepts the model-free replay ladder. `snaive`
+replays the benchmark's Seasonal Naive forecast. Each successive rung changes
+one convention. `snaive_v5lag` uses the v5 frequency lag, `snaive_v5point`
+looks up points in the unfilled history, `snaive_v5pairs` estimates width from
+finite lag pairs, and `snaive_v5patch` averages width growth over 16-step
+patches. The per-task `summaries.csv` rows count `point_lookup_misses` per
+forecast step and `sigma_fallbacks` per item, target, and window.
+
 `generate-data` defaults to sales-format CSV; `--format long` instead writes
 `long.csv` and `static.csv` in an output directory. In long format, `--days`
 counts grid steps and `--products` counts series. `generate-sales` reads a

@@ -23,6 +23,7 @@ except ImportError as exc:
 
 
 BASELINE_MODELS = ("seasonal_naive", "auto_ets", "auto_theta", "median3")
+REPLAY_MODELS = ("snaive", "snaive_v5lag", "snaive_v5point", "snaive_v5pairs", "snaive_v5patch")
 
 
 class StatsForecastBaseline(fev.ForecastingModel):
@@ -152,17 +153,81 @@ class SeasonalNaiveBaseline(StatsForecastBaseline):
         super().__init__("seasonal_naive", max_context_length, n_jobs)
 
 
-def make_baseline(model: str) -> StatsForecastBaseline:
+class SeasonalNaiveReplayBaseline(fev.ForecastingModel):
+    """Score one replay rung through the same fev protocol as Seasonal Naive."""
+
+    model_name = "snaive"
+
+    def __init__(self, model: str = "snaive"):
+        super().__init__()
+        self.model_name = model
+        self._rung = REPLAY_MODELS.index(model)
+        self.point_lookup_misses = 0
+        self.sigma_fallbacks = 0
+
+    def _fit_predict(self, task: fev.Task) -> list:
+        self.point_lookup_misses = self.sigma_fallbacks = 0
+        task.load_full_dataset()
+        if self._rung:
+            from demand_forecast.pretrain.periods import pretrain_period
+
+            lag = pretrain_period(task.freq)
+        else:
+            lag = max(task.seasonality, seasonal_period(task.freq))
+        return [
+            self._predict_window(window, lag, task.quantile_levels)
+            for window in task.iter_windows()
+        ]
+
+    def _predict_window(self, window: fev.EvaluationWindow, lag: int, quantile_levels: list[float]):
+        from demand_forecast.bench.naive_replay import seasonal_naive_replay
+
+        train_df, _, _ = fev.convert_input_data(window, adapter="nixtla", as_univariate=True)
+        forecasts = []
+        columns = ["predictions", *map(str, quantile_levels)]
+        with self._record_inference_time():
+            # Match StatsForecast's sorted IDs before fev splits the positional forecasts.
+            for _, group in train_df.groupby("unique_id", sort=True):
+                point, quantiles, misses, fallbacks = seasonal_naive_replay(
+                    group["y"].to_numpy(),
+                    lag,
+                    window.horizon,
+                    quantile_levels,
+                    v5_point=self._rung >= 2,
+                    v5_pairs=self._rung >= 3,
+                    v5_patch=self._rung >= 4,
+                )
+                self.point_lookup_misses += misses
+                self.sigma_fallbacks += fallbacks
+                forecasts.append(np.column_stack((point, quantiles)))
+
+        return fev.utils.convert_forecast_df_to_predictions(
+            pd.DataFrame(np.concatenate(forecasts), columns=columns),
+            horizon=window.horizon,
+            quantile_levels=quantile_levels,
+            target_columns=window.target_columns,
+        )
+
+
+def make_baseline(model: str) -> StatsForecastBaseline | SeasonalNaiveReplayBaseline:
     """Build a baseline by its summary-row model name."""
+    if model in REPLAY_MODELS:
+        return SeasonalNaiveReplayBaseline(model)
     return SeasonalNaiveBaseline() if model == "seasonal_naive" else StatsForecastBaseline(model)
 
 
 def baseline_summary(task: fev.Task, model: str = "seasonal_naive") -> dict:
     """Evaluate a baseline on every window, including fev's timing fields."""
     baseline = make_baseline(model)
-    return task.evaluation_summary(
+    summary = task.evaluation_summary(
         baseline.fit_predict(task),
         model_name=baseline.model_name,
         training_time_s=baseline.training_time,
         inference_time_s=baseline.inference_time,
     )
+    if isinstance(baseline, SeasonalNaiveReplayBaseline):
+        summary.update(
+            point_lookup_misses=baseline.point_lookup_misses,
+            sigma_fallbacks=baseline.sigma_fallbacks,
+        )
+    return summary

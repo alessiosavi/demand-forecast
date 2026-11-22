@@ -9,7 +9,7 @@ not a spending limit. Review the training protocol separately before provisionin
 For classical reference rows on shifted windows, generate an offline job with
 `python scripts/gcp/jobs/make_baseline_job.py --name shifted-sn --repo-sha <40-hex-SHA> --tasks-uri gs://<bucket>/tasks.yaml --tasks-sha256 <64-hex-SHA256> --output /tmp/baseline.sh`;
 optionally add `--names-uri` and `--names-sha256` for one selected task name per
-line, or `--model auto_ets|auto_theta|median3` (default `seasonal_naive`). The
+line, or `--model auto_ets|auto_theta|median3|snaive|snaive_v5lag|snaive_v5point|snaive_v5pairs|snaive_v5patch` (default `seasonal_naive`). The
 guest uses its Python 3.10 in an isolated CPU environment, pinning `fev==0.10.0`
 and `datasets==3.6.0` to the scoring job's yardstick versions, plus
 `statsforecast==2.0.1` and `torch==2.8.0+cpu`; other bench/base dependencies are

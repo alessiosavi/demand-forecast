@@ -125,7 +125,7 @@ def test_cli_runs_local_baseline_then_leaderboard(tmp_path):
     assert "seasonal_naive" in board.output and "skill_score" in board.output
 
 
-@pytest.mark.parametrize("model_name", ["auto_ets", "auto_theta", "median3"])
+@pytest.mark.parametrize("model_name", ["auto_ets", "auto_theta", "median3", "snaive_v5patch"])
 def test_cli_baseline_selects_model(tmp_path, model_name):
     parquet = write_fev_fixture(tmp_path)
     tasks = tmp_path / "tasks.yaml"

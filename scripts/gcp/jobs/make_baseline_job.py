@@ -10,7 +10,17 @@ import re
 import shlex
 from pathlib import Path
 
-MODELS = ("seasonal_naive", "auto_ets", "auto_theta", "median3")
+MODELS = (
+    "seasonal_naive",
+    "auto_ets",
+    "auto_theta",
+    "median3",
+    "snaive",
+    "snaive_v5lag",
+    "snaive_v5point",
+    "snaive_v5pairs",
+    "snaive_v5patch",
+)
 # Only these packages are pinned here; the remaining bench/base dependencies
 # resolve for the guest's Python (3.10). The full yardstick lock needs >=3.11
 # and includes GPU-model packages, so must not be installed by this CPU job.
