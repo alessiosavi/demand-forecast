@@ -200,6 +200,7 @@ and `no_siblings`.
 | `gates_one` | Use gates fixed at one and disable pruning |
 | `screening_alone` | Use screening-derived gates |
 | `router_uniform` | Use uniform expert routing |
+| `no_head_gain` | Set the loaded model's head gain to zero on evidence cells. Requires `mix_evidence` and a sampler that derives `naive_evidence` |
 
 ## Evidence and resume
 

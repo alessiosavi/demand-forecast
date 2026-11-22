@@ -280,10 +280,13 @@ def _parity_cases(
 
 def _screening(training: dict) -> ScreeningConfig:
     sampler = training["sampler"]
+    kind = sampler.get("scale_kind")
+    scale_options = {} if kind is None else {"scale_kind": kind}
     return ScreeningConfig(
         no_evidence=sampler.get("screen_no_evidence", 0.0),
         fair_static_spread=sampler.get("screen_fair_spread", False),
         scale_floor=sampler.get("scale_floor"),
+        **scale_options,
     )
 
 
@@ -298,8 +301,11 @@ def _output_arrays(model: V5Model, batch: EpisodeBatch) -> dict[str, np.ndarray]
     device = next(model.parameters()).device
     with torch.autocast(device_type=device.type, enabled=False):
         output = model(batch.to(device))
+    quantiles = output.quantiles.cpu().numpy()
+    if model.config.output_space == "asinh" and not np.isfinite(quantiles).all():
+        raise ValueError("v5 export self-test produced non-finite scaled quantiles")
     return {
-        "quantiles": output.quantiles.cpu().numpy(),
+        "quantiles": quantiles,
         **{
             f"gates.{field.name}": getattr(output.gates, field.name).cpu().numpy()
             for field in fields(output.gates)
@@ -545,12 +551,16 @@ def _selftest(out: Path, derive: tuple[str, ...] = ()) -> None:
         del checkpoint_config["model"]["fan_mode"]
     if config.model.mix_bound is None:
         del checkpoint_config["model"]["mix_bound"]
+    if config.model.output_space == "linear":
+        del checkpoint_config["model"]["output_space"]
     if config.sampler.derive:
         checkpoint_config["sampler"]["derive"] = list(config.sampler.derive)
     else:
         del checkpoint_config["sampler"]["derive"]
     if config.sampler.scale_floor is None:
         del checkpoint_config["sampler"]["scale_floor"]
+    if config.sampler.scale_kind is None:
+        del checkpoint_config["sampler"]["scale_kind"]
     with TemporaryDirectory(prefix="v5-selftest-") as directory:
         checkpoint, _ = save_checkpoint(
             directory,

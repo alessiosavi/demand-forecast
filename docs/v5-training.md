@@ -258,6 +258,15 @@ continue to use the ordinary naive mix and head. For checkpoint selection in
 the evidence-guard pilot, keep the untrained start if a trained checkpoint
 loses any probe family its own start passed.
 
+Set `sampler.scale_kind: spread` to fit the median and root mean square deviation
+from the finite cells in the last 2,048 steps before the statistics cutoff.
+An empty window uses the finite prefix and the optional scale floor uses the
+same cells as the fit. Set `model.output_space: asinh` to add the head correction
+and compute pinball loss in compressed units. Forecasts use
+`sinh(z.clamp(-80, 80))` before conversion to original units, and the label cap
+still applies in linear scaled units. The switches are independent and default
+to seasonal scaling and linear output.
+
 ### Export as a resumable job
 
 Generate a job from a checkpoint's storage URI and SHA-256:

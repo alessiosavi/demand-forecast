@@ -248,10 +248,13 @@ def _build(generated, entry, config):
         frozenset(config.sampler.drop_always),
         derive=frozenset(config.sampler.derive),
     )
+    kind = config.sampler.scale_kind
+    scale_options = {} if kind is None else {"scale_kind": kind}
     screening = ScreeningConfig(
         no_evidence=config.sampler.screen_no_evidence,
         fair_static_spread=config.sampler.screen_fair_spread,
         scale_floor=config.sampler.scale_floor,
+        **scale_options,
     )
     episode = EpisodeBuilder(panel, screening).build(request)
     _postprocess(episode, replace(config.sampler, designate_target=True))
@@ -306,6 +309,8 @@ def eval_set(
     planning_base = replace(T1_BASE, sampler=replace(T1_BASE.sampler, derive=base.sampler.derive))
     config = t1_config(path, "true", seed=seed, base=planning_base)
     source = replace(config.sources[0], heldout=True)
+    kind = base.sampler.scale_kind
+    scale_options = {} if kind is None else {"scale_kind": kind}
     sampler = replace(
         config.sampler,
         episodes_per_batch=1,
@@ -317,11 +322,13 @@ def eval_set(
         screen_no_evidence=base.sampler.screen_no_evidence,
         screen_fair_spread=base.sampler.screen_fair_spread,
         scale_floor=base.sampler.scale_floor,
+        **scale_options,
     )
     screening = ScreeningConfig(
         no_evidence=sampler.screen_no_evidence,
         fair_static_spread=sampler.screen_fair_spread,
         scale_floor=sampler.scale_floor,
+        **scale_options,
     )
     results, counts = [], Counter()
     for i in range(max_panels):

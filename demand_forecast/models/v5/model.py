@@ -62,6 +62,8 @@ class V5Output:
     ``evidence`` is all false. Both fields are ``None`` when the option is off.
     ``tilt_saturated`` marks evidence cells with a centred network logit above
     95% of the bound in magnitude. It is ``None`` when the bound is off.
+    ``compressed`` holds the unclamped quantiles used for loss in the asinh
+    space. It is ``None`` in the linear space.
     """
 
     quantiles: Tensor
@@ -73,6 +75,7 @@ class V5Output:
     fan: Tensor | None = None
     evidence: Tensor | None = None
     tilt_saturated: Tensor | None = None
+    compressed: Tensor | None = None
 
 
 def _reference(batch: EpisodeBatch, summary: Tensor, flags: Tensor) -> tuple[Tensor, Tensor]:
@@ -439,6 +442,8 @@ class V5Model(nn.Module):
             )
         real = batch.origin_mask[:, :, None, None] & batch.forecast_mask[:, None, :, None]
         anchor = mix = fan = evidence = saturated = None
+        asinh_output = self.config.output_space == "asinh"
+        compressed = None
         # Low precision can round the gaps between adjacent quantiles to zero.
         with torch.autocast(h.device.type, enabled=False):
             # Match the float32 weights in training and honor an explicit forecast dtype.
@@ -446,15 +451,20 @@ class V5Model(nn.Module):
             steps_out = self.step_projection(states).unflatten(-1, (PATCH, self.config.d_out))
             steps_out = steps_out.flatten(3, 4)
             quantiles = self.head(steps_out)
+            if asinh_output and quantiles.dtype != torch.float64:
+                quantiles = quantiles.float()
             if self.config.naive_mix and isinstance(batch, EpisodeBatchWithNaive):
                 real_steps = real & step_mask.flatten(1)[:, None, None, :]
                 anchor, mix, fan, evidence, saturated = self._mix_naive(
                     steps_out, batch, real_steps
                 )
                 head = quantiles
+                offset = anchor[..., None]
+                if asinh_output:
+                    offset = offset.asinh()
                 quantiles = torch.where(
                     batch.naive_seen.any(dim=-1, keepdim=True) & real_steps[..., None],
-                    head + anchor[..., None],
+                    head + offset,
                     head,
                 )
                 if fan is not None:
@@ -463,6 +473,8 @@ class V5Model(nn.Module):
                     gain = torch.where(raw_gain >= 0, raw_gain, -raw_gain)
                     head = head.to(fan.dtype)
                     knots = anchor[..., None] + fan
+                    if asinh_output:
+                        knots = knots.asinh()
                     if self.config.fan_mode == "residual":
                         median = head[..., _MEDIAN : _MEDIAN + 1]
                         knots = knots + gain * median + _HEAD_GAIN_START * (head - median).detach()
@@ -475,8 +487,14 @@ class V5Model(nn.Module):
                 evidence = torch.zeros_like(quantiles[..., 0], dtype=torch.bool)
                 if self.config.mix_bound is not None:
                     saturated = torch.zeros_like(evidence)
-        quantiles = quantiles.masked_fill(~real[..., None], 0)
+            if asinh_output:
+                compressed = quantiles.masked_fill(~real[..., None], 0)
+                quantiles = compressed.clamp(-80, 80).sinh()
+        if compressed is None:
+            quantiles = quantiles.masked_fill(~real[..., None], 0)
         diagnostics = {} if saturated is None else {"tilt_saturated": saturated}
+        if compressed is not None:
+            diagnostics["compressed"] = compressed
         return V5Output(
             quantiles,
             gates,

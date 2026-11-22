@@ -2131,3 +2131,26 @@ def test_sampler_skip_at_planning_and_building_is_counted(monkeypatch, stage):
     monkeypatch.setattr(owner, name, fail_once)
     _, report = api().make_batch(config(), 0, sources=fixed_mix(config(), FixedSource(panel())))
     assert report["skips"]["short_row"] == 1 and report["episodes"] == 4
+
+
+@pytest.mark.parametrize("designate_target", [False, True], ids=["planner", "batch-builder"])
+def test_sampler_builds_spread_scaled_targets(designate_target):
+    train = replace(
+        config(
+            designate_target=designate_target,
+            drop=(),
+            cutoff_at_origin=1,
+            origins=1,
+            episodes_per_batch=1,
+            episodes_per_panel=1,
+        ),
+        workers=0,
+    )
+    train = replace(train, sampler=replace(train.sampler, scale_kind="spread"))
+    data = panel(length=401, count=1)
+    raw = 10.0 + np.arange(401) / 4
+    data = replace(data, items=(replace(data.items[0], targets={"y0": raw}),))
+    batch, report = api().make_batch(train, 3, sources=fixed_mix(train, FixedSource(data)))
+    count = round((batch.loc[0, 0].item() - 10) * 8 + 1)
+    assert report["supervised"] > 0 and count > 16
+    assert batch.scale[0, 0].item() == pytest.approx(np.sqrt((count**2 - 1) / 12) / 4)

@@ -200,6 +200,7 @@ def _plan_panel(panel, record, config, source, rng, *, path_quota=None, ordinary
     plans = []
     builder = None
     derive = frozenset(config.derive)
+    scale_options = {} if config.scale_kind is None else {"scale_kind": config.scale_kind}
     for index, path in selected:
         item = original.items[index]
         cold = index == lead and lead_cold
@@ -221,6 +222,7 @@ def _plan_panel(panel, record, config, source, rng, *, path_quota=None, ordinary
                         no_evidence=config.screen_no_evidence,
                         fair_static_spread=config.screen_fair_spread,
                         scale_floor=config.scale_floor,
+                        **scale_options,
                     ),
                 )
             requests = builder.plan_requests(
@@ -355,12 +357,15 @@ def _make_batch(config, k, sources):
             if not plans:
                 continue
             if builder is None or builder.panel is not panel:
+                scale_kind = config.sampler.scale_kind
+                scale_options = {} if scale_kind is None else {"scale_kind": scale_kind}
                 builder = EpisodeBuilder(
                     panel,
                     ScreeningConfig(
                         no_evidence=config.sampler.screen_no_evidence,
                         fair_static_spread=config.sampler.screen_fair_spread,
                         scale_floor=config.sampler.scale_floor,
+                        **scale_options,
                     ),
                 )
         except SamplerSkip as error:

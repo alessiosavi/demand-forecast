@@ -47,6 +47,12 @@ class ScreeningConfig:
     no_evidence: float = 0.0
     fair_static_spread: bool = False
     scale_floor: float | None = None
+    scale_kind: str | None = None
+
+    def __post_init__(self) -> None:
+        """Reject a misspelt kind, which would otherwise fit seasonal scales silently."""
+        if self.scale_kind not in (None, "seasonal", "spread"):
+            raise ValueError("scale_kind must be 'seasonal' or 'spread'")
 
 
 @dataclass(frozen=True)
@@ -376,8 +382,9 @@ def _standalone_provider(stats: PanelStats) -> PanelStatsProvider:
     # Direct screen callers can supply just one PanelStats and reuse it across items.
     key = ("provider",)
     if key not in stats.screen_cache:
+        scale_options = {} if stats.scale_kind is None else {"scale_kind": stats.scale_kind}
         stats.screen_cache[key] = PanelStatsProvider(
-            stats.panel, limit=None, scale_floor=stats.scale_floor
+            stats.panel, limit=None, scale_floor=stats.scale_floor, **scale_options
         )
     return stats.screen_cache[key]
 
@@ -445,11 +452,15 @@ def screen(
         raise ValueError("cutoff must match stats.cutoff")
     if stats.scale_floor != config.scale_floor:
         raise ValueError("statistics must use the screening config's scale_floor")
+    if stats.scale_kind != config.scale_kind:
+        raise ValueError("statistics must use the screening config's scale_kind")
     item = panel.items[item_index]
     end = max(0, cutoff - item.start)
     histories = []
     floor = config.scale_floor
     scale_options = {} if floor is None else {"floor": floor}
+    if config.scale_kind is not None:
+        scale_options["kind"] = config.scale_kind
     for target in sorted(targets):
         raw = item.targets[target][:end]
         scale = (
