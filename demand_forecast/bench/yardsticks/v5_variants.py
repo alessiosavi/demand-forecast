@@ -32,4 +32,7 @@ VARIANT_NAMES = (
     "only_season",
     "only_season2",
     "only_drift",
+    "centred_fan",
+    "only_season_centred",
+    "only_last_centred",
 )

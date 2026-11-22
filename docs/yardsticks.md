@@ -209,11 +209,15 @@ and `no_siblings`.
 | `only_season` | Select the seasonal path |
 | `only_season2` | Select the longer seasonal-lag path |
 | `only_drift` | Select the drift path |
+| `centred_fan` | Apply `no_head_gain` and subtract each path's median residual from its nine residual quantiles |
+| `only_season_centred` | Use `only_season` with a centred fan. Where the seasonal path is unavailable, use `centred_fan` |
+| `only_last_centred` | Use `only_last` with a centred fan. Where the last-observation path is unavailable, use `centred_fan` |
 
 The `only_*` variants use the same export requirements and gain setting as
 `no_head_gain`. Each available path supplies the anchor and its own residual
 evidence. With no residual evidence, the ordinary quantile head uses that path
-as its anchor. Where the path is unavailable, the `no_head_gain` forecast applies.
+as its anchor. Where the path is unavailable, the `no_head_gain` forecast applies
+(the `centred_fan` forecast for the `only_*_centred` variants).
 
 ## Evidence and resume
 

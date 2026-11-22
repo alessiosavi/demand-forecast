@@ -285,7 +285,17 @@ def test_covariates_cli(tmp_path, covariates):
     assert config["covariates"] == (covariates or "all")
 
 
-@pytest.mark.parametrize("variant", [None, "no_peers", *(f"only_{name}" for name in NAIVE_OPTIONS)])
+@pytest.mark.parametrize(
+    "variant",
+    [
+        None,
+        "no_peers",
+        *(f"only_{name}" for name in NAIVE_OPTIONS),
+        "centred_fan",
+        "only_season_centred",
+        "only_last_centred",
+    ],
+)
 def test_v5_cli_emits_raw_job(tmp_path, variant):
     output = tmp_path / "job.sh"
     command = [sys.executable, "-I", "-S", str(ROOT / "scripts/gcp/jobs/make_score_job.py")]
